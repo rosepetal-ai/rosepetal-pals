@@ -19,6 +19,7 @@ use a2a::{
 use anyhow::{Context, bail, ensure};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use tracing::warn;
 
 use super::Store;
 use crate::identity::AgentId;
@@ -316,7 +317,9 @@ impl Store {
     /// `WORKING`, and returns how many: each becomes `FAILED` at `now_unix`
     /// with an agent status message whose text is [`INTERRUPTED_MESSAGE`],
     /// as a new version. Tasks in a terminal state or waiting for input or
-    /// authorization are left as they are.
+    /// authorization are left as they are, and so is a row whose task does
+    /// not decode, skipped with a warning so one bad row cannot stop the
+    /// daemon from starting.
     ///
     /// The daemon calls it when it starts, before it accepts connections:
     /// no work survives a restart, so a task left in progress would never
@@ -340,8 +343,19 @@ impl Store {
             )?
             .collect::<Result<_, _>>()?
         };
+        let mut failed = 0;
         for (task_id, json, version) in &rows {
-            let mut task = decode(task_id, json)?;
+            let mut task = match decode(task_id, json) {
+                Ok(task) => task,
+                Err(err) => {
+                    warn!(
+                        %task_id,
+                        error = %format_args!("{err:#}"),
+                        "skipping an unreadable task row while failing interrupted tasks"
+                    );
+                    continue;
+                }
+            };
             let mut message = Message::new(Role::Agent, vec![Part::text(INTERRUPTED_MESSAGE)]);
             message.task_id = Some(task.id.clone());
             message.context_id = Some(task.context_id.clone());
@@ -351,9 +365,10 @@ impl Store {
                 timestamp: Some(now),
             };
             rewrite(&tx, &task, version + 1, now_unix)?;
+            failed += 1;
         }
         tx.commit()?;
-        Ok(rows.len() as u64)
+        Ok(failed)
     }
 }
 
@@ -455,6 +470,43 @@ mod tests {
             );
         }
         assert_eq!(store.tasks_fail_interrupted(NOW + 1).unwrap(), 0);
+    }
+
+    #[test]
+    fn an_unreadable_task_row_does_not_stop_recovery() {
+        let store = Store::open_in_memory(AgentKey::generate().id()).unwrap();
+        let readable = task("t-readable", TaskState::Working);
+        store.task_create(&readable, NOW - 60).unwrap();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO tasks (task_id, context_id, state, updated_at, version, task_json)
+                 VALUES ('t-corrupt', 'ctx', 'TASK_STATE_WORKING', ?1, 1, '{not json')",
+                params![NOW - 60],
+            )
+            .unwrap();
+        let corrupt_row = |store: &Store| -> (String, i64, i64, String) {
+            store
+                .conn()
+                .query_row(
+                    "SELECT state, version, updated_at, task_json FROM tasks
+                     WHERE task_id = 't-corrupt'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap()
+        };
+        let before = corrupt_row(&store);
+
+        assert_eq!(store.tasks_fail_interrupted(NOW).unwrap(), 1);
+
+        let failed = store.task_get("t-readable").unwrap().unwrap();
+        assert_eq!(failed.status.state, TaskState::Failed);
+        assert_eq!(
+            failed.status.message.as_ref().unwrap().text(),
+            Some(INTERRUPTED_MESSAGE)
+        );
+        assert_eq!(corrupt_row(&store), before);
     }
 
     #[test]
