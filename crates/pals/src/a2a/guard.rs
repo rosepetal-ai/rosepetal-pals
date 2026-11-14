@@ -107,9 +107,12 @@ type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 /// input, streams the task as it is now and then follows it until it ends
 /// ([`follow`]); the SDK would answer `TaskNotFoundError`.
 ///
-/// Push notification configs and the extended card go to the inner handler
-/// unchecked, and it refuses them because the agent card declares neither.
-/// Serving push configs would need an ownership check here first.
+/// Push notification configs go to the inner handler unchecked, and it
+/// refuses them because the agent card declares none; serving them would
+/// need an ownership check here first. The extended card goes to it too,
+/// and it serves the card of the request's scope, which the grant layer set
+/// from the accepted grant ([`SCOPE_HEADER`](super::auth::SCOPE_HEADER)):
+/// a card shows services, and owns no task.
 pub struct GuardedHandler<H> {
     inner: Arc<H>,
     store: Arc<Store>,

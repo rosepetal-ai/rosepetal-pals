@@ -17,6 +17,7 @@ use rusqlite::{Connection, ToSql, TransactionBehavior};
 
 use crate::identity::AgentId;
 
+mod cards;
 mod contacts;
 mod dedup;
 mod grants;
@@ -25,6 +26,7 @@ mod outbox;
 mod records;
 mod tasks;
 
+pub use cards::MAX_CARD_CONTEXTS_PER_PEER;
 pub use contacts::Contact;
 pub use dedup::{DEDUP_INFLIGHT_WAIT_S, DEDUP_RETENTION_S, DedupBegin, DedupRow};
 pub use outbox::{OUTBOX_PENDING, OUTBOX_REFUSED, OutboxRow};

@@ -15,15 +15,26 @@
 //! from its own call, never from the peer's `Content-Type` ([`Call`]): on
 //! the JSON-RPC binding, the `method` of a request object,
 //! `SendStreamingMessage` or `SubscribeToTask` (the pinned SDK's
-//! `methods::is_streaming`), and a batch or a body that is not JSON is
-//! unary; on the HTTP+JSON binding, the routes the pinned SDK's
-//! `rest_router` answers with a stream: `POST /message:stream` and
-//! `/message/stream`, and `GET` or `POST` on `/tasks/{id}` whose decoded
-//! `{id}` ends with `:subscribe` or on `/tasks/{id}/subscribe` (that router
-//! serves no tenant-prefixed paths). Only a streaming call whose `2xx`
+//! `methods::is_streaming`), and a batch (unless it asks for the extended
+//! card, below) or a body that is not JSON is unary; on the HTTP+JSON
+//! binding, the routes the pinned SDK's `rest_router` answers with a
+//! stream: `POST /message:stream` and `/message/stream`, and `GET` or
+//! `POST` on `/tasks/{id}` whose decoded `{id}` ends with `:subscribe` or
+//! on `/tasks/{id}/subscribe` (that router serves no tenant-prefixed
+//! paths). Only a streaming call whose `2xx`
 //! answer is `text/event-stream` is read as events; anything else is read
 //! whole, so a unary call answered with an event stream is refused as a
 //! body that is not JSON.
+//!
+//! **The extended card** ([`Call::ExtendedCard`]): `GetExtendedAgentCard`
+//! on JSON-RPC, `GET /extendedAgentCard` or `GET /agent-card/extended` on
+//! HTTP+JSON. Its answer is read up to [`MAX_CARD_ANSWER_BYTES`]; a `2xx`
+//! one must hold a card the peer signed, verified with `kid` equal to the
+//! peer's agent id, the one Iroh's handshake proved (the card itself on
+//! HTTP+JSON, the `result` of a JSON-RPC response), which is replaced by its
+//! [`gateway_view`], built from what the signature covers
+//! ([`extended_card_view`]). A JSON-RPC error goes on as any other. A card
+//! that does not verify is refused, as a body that is not JSON is.
 //!
 //! **A whole body** is read up to the gateway's bound; a `2xx` one must be
 //! empty or JSON (RFC 8259, UTF-8). JSON, of any status, is checked
@@ -60,8 +71,9 @@
 //! that wears a `jsonrpc` member is taken for what a client would take it:
 //! a task, whose `id` it checks. The objects of A2A v1.0 with an `id` are the
 //! task, the push notification configuration (not served: the card
-//! declares no push notifications) and the agent skill (only in an extended
-//! card, not served either); their ids are checked like a task's. Skipped,
+//! declares no push notifications) and the agent skill (in an extended
+//! card, whose skill ids PALS keeps safe); their ids are checked like a
+//! task's. Skipped,
 //! because no client takes an id from them: `metadata` (a free-form
 //! object), `data` (a data part's free-form value, and a JSON-RPC error's)
 //! and `details` (an HTTP+JSON error's `google.rpc.Status` details).
@@ -75,11 +87,14 @@ use std::io;
 
 use bytes::{Bytes, BytesMut};
 use http::Method;
+use pals_core::card_jws::{CardHash, MAX_CARD_BYTES, card_hash, verify_card};
+use pals_core::identity::AgentId;
 use serde::Serialize;
 use serde_json::Value;
 
 use super::rewrite;
-use crate::a2a::is_safe_task_id;
+use crate::a2a::{gateway_view, is_safe_task_id};
+use crate::discovery::signed_card_json;
 
 /// The A2A binding a call speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,27 +103,48 @@ pub(crate) enum Binding {
     Rest,
 }
 
-/// What a client expects of a call: one JSON document, or an event stream.
+/// What a client expects of a call: one JSON document, an event stream,
+/// or the peer's extended card, one JSON document checked as a card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Call {
     Unary,
     Streaming,
+    ExtendedCard,
 }
 
 /// The JSON-RPC methods the pinned SDK answers with an event stream.
 const STREAMING_METHODS: [&str; 2] = ["SendStreamingMessage", "SubscribeToTask"];
+/// The JSON-RPC method of the extended card.
+const EXTENDED_CARD_METHOD: &str = "GetExtendedAgentCard";
+/// The most bytes of a peer's answer to an extended card call: the card, at
+/// most [`MAX_CARD_BYTES`], and its JSON-RPC envelope, whose `id` is the
+/// client's.
+pub(crate) const MAX_CARD_ANSWER_BYTES: usize = 2 * MAX_CARD_BYTES;
 
 impl Call {
     /// A call to the JSON-RPC binding whose body, when it is JSON, is
-    /// `request`.
+    /// `request`. A batch is unary, unless it asks for the extended card.
     pub(crate) fn jsonrpc(request: Option<&Value>) -> Self {
-        let method = request
-            .and_then(Value::as_object)
-            .and_then(|request| request.get("method"))
-            .and_then(Value::as_str);
-        match method {
-            Some(method) if STREAMING_METHODS.contains(&method) => Self::Streaming,
-            _ => Self::Unary,
+        fn method_of(request: &Value) -> Option<&str> {
+            request
+                .as_object()
+                .and_then(|request| request.get("method"))
+                .and_then(Value::as_str)
+        }
+        match request {
+            Some(Value::Array(batch))
+                if batch
+                    .iter()
+                    .any(|item| method_of(item) == Some(EXTENDED_CARD_METHOD)) =>
+            {
+                Self::ExtendedCard
+            }
+            Some(request) => match method_of(request) {
+                Some(method) if STREAMING_METHODS.contains(&method) => Self::Streaming,
+                Some(EXTENDED_CARD_METHOD) => Self::ExtendedCard,
+                _ => Self::Unary,
+            },
+            None => Self::Unary,
         }
     }
 
@@ -117,6 +153,13 @@ impl Call {
     pub(crate) fn rest(method: &Method, path: &str) -> Self {
         let get_or_post = method == Method::GET || method == Method::POST;
         let segments: Vec<&str> = path.split('/').collect();
+        if matches!(
+            segments.as_slice(),
+            ["", "extendedAgentCard"] | ["", "agent-card", "extended"]
+        ) && method == Method::GET
+        {
+            return Self::ExtendedCard;
+        }
         let streaming = match segments.as_slice() {
             ["", "message:stream"] | ["", "message", "stream"] => method == Method::POST,
             ["", "tasks", id] => {
@@ -135,6 +178,42 @@ impl Call {
             Self::Unary
         }
     }
+}
+
+/// `answer`, a peer's successful answer to an extended card call on
+/// `binding`, with its card verified as `peer`'s and replaced by its
+/// [`gateway_view`] at `base_url`; the [hash](card_hash) of the card as
+/// `peer` signed it ([`signed_card_json`]).
+///
+/// On HTTP+JSON the answer is the card. On JSON-RPC it is a response
+/// envelope, with the card as its `result`, or with an `error`, which is
+/// left as it is (`None`). Refused, saying why, when the card does not
+/// verify as `peer`'s, or when the answer is not one of those.
+pub(crate) fn extended_card_view(
+    answer: &mut Value,
+    binding: Binding,
+    peer: &AgentId,
+    base_url: &str,
+) -> Result<Option<CardHash>, String> {
+    let card = match binding {
+        Binding::Rest => answer,
+        Binding::JsonRpc => {
+            let envelope = answer
+                .as_object_mut()
+                .filter(|envelope| is_response_envelope(envelope))
+                .ok_or("an extended card answer that is not a JSON-RPC response")?;
+            match envelope.get_mut("result") {
+                Some(result) => result,
+                None => return Ok(None),
+            }
+        }
+    };
+    let verified = verify_card(card, peer)
+        .map_err(|err| format!("an extended card that is not the peer's: {err}"))?;
+    let hash = card_hash(&signed_card_json(&verified));
+    let view = gateway_view(&verified.card, base_url, peer);
+    *card = serde_json::to_value(view).expect("an AgentCard always serializes");
+    Ok(Some(hash))
 }
 
 /// The members whose values are free-form, and hold no id a client uses.
@@ -451,6 +530,94 @@ mod tests {
             assert_eq!(Call::jsonrpc(Some(&request)), Call::Unary, "{request}");
         }
         assert_eq!(Call::jsonrpc(None), Call::Unary);
+    }
+
+    #[test]
+    fn extended_card_calls_are_recognized_on_both_bindings() {
+        for path in ["/extendedAgentCard", "/agent-card/extended"] {
+            assert_eq!(Call::rest(&Method::GET, path), Call::ExtendedCard, "{path}");
+            for method in [Method::HEAD, Method::POST] {
+                assert_eq!(Call::rest(&method, path), Call::Unary, "{method} {path}");
+            }
+        }
+        for path in [
+            "/extendedAgentCard/",
+            "/tasks/extendedAgentCard",
+            "/agent-card",
+        ] {
+            assert_eq!(Call::rest(&Method::GET, path), Call::Unary, "{path}");
+        }
+        let call = json!({"jsonrpc": "2.0", "id": 1, "method": "GetExtendedAgentCard"});
+        assert_eq!(Call::jsonrpc(Some(&call)), Call::ExtendedCard);
+        let batch = json!([{"method": "GetTask"}, call]);
+        assert_eq!(Call::jsonrpc(Some(&batch)), Call::ExtendedCard);
+        let other = json!({"jsonrpc": "2.0", "id": 1, "method": "getExtendedAgentCard"});
+        assert_eq!(Call::jsonrpc(Some(&other)), Call::Unary);
+    }
+
+    #[test]
+    fn only_a_card_the_peer_signed_goes_on_as_its_view() {
+        use std::sync::Arc;
+
+        use pals_core::card_jws::CardSigner;
+        use pals_core::identity::AgentKey;
+        use pals_core::inventory::Inventory;
+
+        let key = AgentKey::generate();
+        let peer = key.id();
+        let cfg: crate::config::Config = toml::from_str("[agent]\nname = \"bob\"\n").unwrap();
+        let signer = CardSigner::new(Arc::new(AgentKey::from_bytes(&key.to_bytes())));
+        let cards = crate::a2a::CardSet::build(&cfg, &signer, &Inventory::default()).unwrap();
+        let signed = cards.public();
+        let base = "http://127.0.0.1:7420";
+        let view = serde_json::to_value(gateway_view(&signed.card, base, &peer)).unwrap();
+
+        let mut rest = signed.json.clone();
+        let hash = extended_card_view(&mut rest, Binding::Rest, &peer, base).unwrap();
+        assert_eq!(hash, Some(signed.hash.clone()));
+        assert_eq!(rest, view);
+        let mut rpc = json!({"jsonrpc": "2.0", "id": "x", "result": signed.json});
+        let hash = extended_card_view(&mut rpc, Binding::JsonRpc, &peer, base).unwrap();
+        assert_eq!(hash, Some(signed.hash.clone()));
+        assert_eq!(rpc, json!({"jsonrpc": "2.0", "id": "x", "result": view}));
+
+        // A JSON-RPC error goes on as it is.
+        let error = json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32004}});
+        let mut answer = error.clone();
+        assert_eq!(
+            extended_card_view(&mut answer, Binding::JsonRpc, &peer, base),
+            Ok(None)
+        );
+        assert_eq!(answer, error);
+
+        // Refused: another agent's card, a tampered one, no card at all.
+        let mut tampered = signed.json.clone();
+        tampered["name"] = json!("mallory");
+        for (mut answer, binding, signer) in [
+            (
+                signed.json.clone(),
+                Binding::Rest,
+                AgentKey::generate().id(),
+            ),
+            (tampered.clone(), Binding::Rest, peer),
+            (
+                json!({"jsonrpc": "2.0", "id": 1, "result": tampered}),
+                Binding::JsonRpc,
+                peer,
+            ),
+            (json!({"result": signed.json}), Binding::JsonRpc, peer),
+            (
+                json!([{"jsonrpc": "2.0", "id": 1, "result": signed.json}]),
+                Binding::JsonRpc,
+                peer,
+            ),
+            (json!({}), Binding::Rest, peer),
+        ] {
+            assert!(
+                extended_card_view(&mut answer, binding, &signer, base).is_err(),
+                "{answer}"
+            );
+        }
     }
 
     #[test]

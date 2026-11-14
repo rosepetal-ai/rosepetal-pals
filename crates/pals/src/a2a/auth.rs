@@ -11,8 +11,10 @@
 //!
 //! Headers named `x-agentnet-*` are PALS's own: the layer drops any the
 //! request carries, except [`PEER_HEADER`] that the tunnel set, and sets
-//! [`GRANT_ID_HEADER`] and [`PROJECT_HEADER`] from the accepted grant. The
-//! project of a request is the project of its grant.
+//! [`GRANT_ID_HEADER`], [`PROJECT_HEADER`] and [`SCOPE_HEADER`] from the
+//! accepted grant. The project of a request is the project of its grant, and
+//! its scope the one its grant gives ([`Scope::for_grant`]): what a
+//! requester sends never chooses either. The public card gets none of them.
 
 use std::sync::Arc;
 
@@ -28,6 +30,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use pals_core::grant::{GrantCheck, GrantError, Operation, SignedGrant};
 use pals_core::identity::AgentId;
+use pals_core::inventory::Scope;
 use pals_core::store::Store;
 use serde_json::json;
 
@@ -37,6 +40,10 @@ use crate::net::PEER_HEADER;
 pub const GRANT_ID_HEADER: &str = "x-agentnet-grant-id";
 /// The project of the grant a request was accepted with.
 pub const PROJECT_HEADER: &str = "x-agentnet-project";
+/// The scope of the grant a request was accepted with, as
+/// [`Scope::key`] writes it: `public`, `project:<project>` or
+/// `task:<project>`. The extended card served is this scope's.
+pub const SCOPE_HEADER: &str = "x-agentnet-scope";
 
 /// Where the JSON-RPC binding is served.
 pub(crate) const JSONRPC_PATH: &str = "/jsonrpc";
@@ -56,8 +63,8 @@ pub enum RouteClass {
     /// A grant that allows this operation on `skill:ask`.
     Op(Operation),
     /// A valid grant, whatever it allows: push notification configs, the
-    /// extended card, and anything the SDK does not serve, which it then
-    /// refuses.
+    /// extended card, whose content the grant's scope chooses, and anything
+    /// the SDK does not serve, which it then refuses.
     AuthOnly,
 }
 
@@ -238,6 +245,7 @@ impl Authenticator {
         Ok(Accepted {
             grant_id: header(&grant.grant.grant_id)?,
             project: header(&grant.grant.project)?,
+            scope: header(&Scope::for_grant(Some(&grant.grant)).key())?,
         })
     }
 }
@@ -246,6 +254,7 @@ impl Authenticator {
 struct Accepted {
     grant_id: HeaderValue,
     project: HeaderValue,
+    scope: HeaderValue,
 }
 
 /// Why a request was refused.
@@ -362,6 +371,7 @@ async fn authenticate(State(auth): State<Authenticator>, request: Request, next:
             Ok(accepted) => {
                 parts.headers.insert(GRANT_ID_HEADER, accepted.grant_id);
                 parts.headers.insert(PROJECT_HEADER, accepted.project);
+                parts.headers.insert(SCOPE_HEADER, accepted.scope);
             }
             Err(refusal) => {
                 tracing::debug!(?refusal, path = parts.uri.path(), "request refused");
@@ -591,6 +601,7 @@ mod tests {
             .header(AUTHORIZATION, format!("Bearer {}", grant.to_token()))
             .header(PROJECT_HEADER, "someone-elses")
             .header(GRANT_ID_HEADER, "g-forged")
+            .header(SCOPE_HEADER, "task:someone-elses")
             .header("x-agentnet-anything", "forged")
             .body(Body::from(body))
             .unwrap();
@@ -602,6 +613,7 @@ mod tests {
                 PEER_HEADER: peer.to_string(),
                 GRANT_ID_HEADER: "g-unit",
                 PROJECT_HEADER: "demo",
+                SCOPE_HEADER: "task:demo",
             })
         );
         assert_eq!(seen["body"], body);
@@ -614,6 +626,7 @@ mod tests {
         let request = Request::get(WELL_KNOWN_AGENT_CARD_PATH)
             .header(PROJECT_HEADER, "forged")
             .header(GRANT_ID_HEADER, "g-forged")
+            .header(SCOPE_HEADER, "task:forged")
             .body(Body::empty())
             .unwrap();
         let (status, seen) = call(echo_app(&me, &grant), request).await;

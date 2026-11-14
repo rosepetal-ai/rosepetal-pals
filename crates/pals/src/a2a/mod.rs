@@ -1,10 +1,11 @@
-//! The parts of the A2A server that are PALS's own: the public Agent Card
-//! ([`canonical_card`]) and the view of it the local gateway serves
-//! ([`gateway_view`]), grant authentication in front of the SDK's routers
-//! ([`auth`]), the ownership of tasks and the idempotency of messages
-//! ([`GuardedHandler`], with the executor binding each execution to its
-//! request when it starts) and [`SqliteTaskStore`], the SDK's task store on
-//! the agent's SQLite database.
+//! The parts of the A2A server that are PALS's own: the signed Agent Cards,
+//! public ([`canonical_card`]) and extended per scope ([`extended_card`]),
+//! all signed when the node starts ([`CardSet`]), and the view of a card the
+//! local gateway serves ([`gateway_view`]), grant authentication in front of
+//! the SDK's routers ([`auth`]), the ownership of tasks and the idempotency
+//! of messages ([`GuardedHandler`], with the executor binding each execution
+//! to its request when it starts) and [`SqliteTaskStore`], the SDK's task
+//! store on the agent's SQLite database.
 
 pub mod auth;
 mod binding;
@@ -15,8 +16,9 @@ mod task_store;
 
 pub(crate) use binding::BindingExecutor;
 pub use card::{
-    BINDING_URI_HTTP_JSON, BINDING_URI_JSONRPC, IDEMPOTENCY_EXTENSION, SECURITY_SCHEME,
-    canonical_card, gateway_view,
+    BINDING_URI_HTTP_JSON, BINDING_URI_JSONRPC, CardSet, DEFAULT_DESCRIPTION,
+    IDEMPOTENCY_EXTENSION, SECURITY_SCHEME, SignedCard, canonical_card, extended_card,
+    gateway_view,
 };
 pub use guard::GuardedHandler;
 pub(crate) use shims::{echo_extensions, jsonrpc_shim, rest_shim};

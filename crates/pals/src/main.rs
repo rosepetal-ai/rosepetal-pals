@@ -1,9 +1,9 @@
 //! The `pals` command line.
 //!
 //! Only `pals daemon` takes the data directory's lock; every other command
-//! opens the store directly, which a running daemon shares. `pals ask` and
-//! `pals task resume|cancel` reach peers through the running daemon's
-//! gateway.
+//! opens the store directly, which a running daemon shares. `pals ask`,
+//! `pals task resume|cancel` and `pals card show <peer>` reach peers through
+//! the running daemon's gateway.
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -16,14 +16,18 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
-use http_body_util::{BodyExt, Empty, Limited};
+use http_body_util::{BodyExt, Empty, Full, Limited};
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
 use iroh_tickets::endpoint::EndpointTicket;
+use pals::a2a::CardSet;
 use pals::config::{self, CONFIG_FILE, Config, INIT_TEMPLATE, INVENTORY_TEMPLATE, is_header_safe};
+use pals::gateway::CARD_HASH_HEADER;
+use pals::inventory::InventoryState;
 use pals::net::agent_id_of;
 use pals::node::{Node, STORE_FILE};
 use pals::outbox::{AskError, AskOutcome, AskRequest, Outbox};
+use pals_core::card_jws::{CardSigner, verify_card};
 use pals_core::grant::{
     GRANT_SCHEMA, Grant, GrantError, MAX_TOKEN_BYTES, Operation, SignedGrant, format_timestamp,
     parse_timestamp,
@@ -89,6 +93,26 @@ enum Command {
     /// The questions this agent asked its peers
     #[command(subcommand)]
     Task(TaskCommand),
+    /// Agent Cards: this agent's, and its peers'
+    #[command(subcommand)]
+    Card(CardCommand),
+}
+
+#[derive(Subcommand)]
+enum CardCommand {
+    /// Print a signed Agent Card, then `verified: <agent id> <card hash>`:
+    /// this agent's own, as its daemon signs it from config.toml and the
+    /// inventory, or a peer's, read and verified through the running
+    /// daemon's gateway
+    Show {
+        /// The peer, by contact name or agent id; this agent when left out
+        peer: Option<String>,
+        /// The peer's extended card instead, as this agent's grant lets it
+        /// see it: the view the gateway checked, and the hash of the card it
+        /// verified
+        #[arg(long, requires = "peer")]
+        extended: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -211,6 +235,9 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Task(TaskCommand::Cancel { message_id }) => {
             return task_cancel(&home, &message_id);
         }
+        Command::Card(CardCommand::Show { peer, extended }) => {
+            card_show(&home, peer.as_deref(), extended)
+        }
     };
     done.map(|()| ExitCode::SUCCESS)
 }
@@ -314,6 +341,145 @@ async fn gateway_health(listen: SocketAddr) -> anyhow::Result<Value> {
     tokio::time::timeout(TIMEOUT, exchange)
         .await
         .map_err(|_| anyhow!("/healthz did not answer within {TIMEOUT:?}"))?
+}
+
+/// The largest answer `pals card show` reads from the gateway.
+const MAX_CARD_ANSWER_BYTES: usize = 256 * 1024;
+
+/// Prints a signed card and the agent it was verified as signed by: this
+/// agent's own when `peer` is `None`, else `peer`'s public card, or its
+/// extended card's gateway view with `extended`.
+fn card_show(home: &Path, peer: Option<&str>, extended: bool) -> anyhow::Result<()> {
+    let (cfg, key) = load_agent(home)?;
+    let store = Arc::new(open_store(&cfg, &key)?);
+    let Some(peer) = peer else {
+        let inventory = InventoryState::load(&cfg, Arc::clone(&store))?.snapshot();
+        let key = Arc::new(key);
+        let cards = CardSet::build(
+            &cfg,
+            &CardSigner::new(Arc::clone(&key)),
+            &inventory.inventory,
+        )?;
+        let card = &cards.public().json;
+        let verified = verify_card(card, &key.id())
+            .map_err(|err| anyhow!("this agent's own card does not verify: {err}"))?;
+        print_card(card, &key.id(), verified.hash.as_str())?;
+        return Ok(());
+    };
+    let peer_id = match peer.parse::<AgentId>() {
+        Ok(id) => id,
+        Err(_) => {
+            store
+                .contact_by_name(peer)?
+                .ok_or_else(|| {
+                    anyhow!("unknown contact {peer}: save it first with `pals contact add`")
+                })?
+                .agent_id
+        }
+    };
+    let listen = cfg.gateway.listen;
+    runtime(false)?.block_on(async move {
+        let health = gateway_health(listen).await.with_context(|| {
+            format!("no pals daemon answers at http://{listen}: start it with `pals daemon`")
+        })?;
+        let running = health["agent_id"].as_str().unwrap_or_default();
+        ensure!(
+            running == key.id().to_string(),
+            "the pals daemon at http://{listen} runs agent {running}, not this agent {}",
+            key.id()
+        );
+        if extended {
+            let call =
+                json!({"jsonrpc": "2.0", "id": 1, "method": "GetExtendedAgentCard", "params": {}});
+            let path = format!("/peers/{peer_id}/jsonrpc");
+            let (status, headers, body) =
+                gateway_call(listen, http::Method::POST, &path, Some(&call)).await?;
+            let answer = gateway_json(status, &body)?;
+            if let Some(error) = answer.get("error") {
+                bail!("{peer} refused its extended card: {error}");
+            }
+            let card = answer
+                .get("result")
+                .ok_or_else(|| anyhow!("the gateway answered no card: {answer}"))?;
+            let hash = headers
+                .get(CARD_HASH_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| anyhow!("the gateway did not say which card it verified"))?;
+            print_card(card, &peer_id, hash)
+        } else {
+            let path = format!("/peers/{peer_id}/signed-agent-card.json");
+            let (status, _, body) = gateway_call(listen, http::Method::GET, &path, None).await?;
+            let card = gateway_json(status, &body)?;
+            let verified = verify_card(&card, &peer_id)
+                .map_err(|err| anyhow!("the card of {peer} does not verify: {err}"))?;
+            print_card(&card, &peer_id, verified.hash.as_str())
+        }
+    })
+}
+
+/// Prints `card`, then `verified: <signer> <hash>`.
+fn print_card(card: &Value, signer: &AgentId, hash: &str) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(card)?);
+    println!("verified: {signer} {hash}");
+    Ok(())
+}
+
+/// The JSON of a gateway answer of `status`; its error when it is not a
+/// success.
+fn gateway_json(status: http::StatusCode, body: &[u8]) -> anyhow::Result<Value> {
+    let json: Option<Value> = serde_json::from_slice(body).ok();
+    if !status.is_success() {
+        let reason = json
+            .as_ref()
+            .and_then(|json| json.get("error"))
+            .map_or_else(
+                || String::from_utf8_lossy(body).into_owned(),
+                Value::to_string,
+            );
+        bail!("the gateway answered {status}: {reason}");
+    }
+    json.ok_or_else(|| anyhow!("the gateway answered something that is not JSON"))
+}
+
+/// `method path` of the gateway listening on `listen`, with `body` as JSON:
+/// the status, headers and body of its answer, read up to
+/// [`MAX_CARD_ANSWER_BYTES`].
+async fn gateway_call(
+    listen: SocketAddr,
+    method: http::Method,
+    path: &str,
+    body: Option<&Value>,
+) -> anyhow::Result<(http::StatusCode, http::HeaderMap, Bytes)> {
+    const TIMEOUT: Duration = Duration::from_secs(60);
+    let exchange = async {
+        let stream = tokio::net::TcpStream::connect(listen).await?;
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+        tokio::spawn(connection);
+        let mut request = http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(http::header::HOST, listen.to_string())
+            .header("a2a-version", "1.0");
+        let bytes = match body {
+            Some(body) => {
+                request = request.header(http::header::CONTENT_TYPE, "application/json");
+                Bytes::from(serde_json::to_vec(body)?)
+            }
+            None => Bytes::new(),
+        };
+        let response = sender.send_request(request.body(Full::new(bytes))?).await?;
+        let (parts, body) = response.into_parts();
+        let body = Limited::new(body, MAX_CARD_ANSWER_BYTES)
+            .collect()
+            .await
+            .map_err(|err| anyhow!("cannot read the gateway's answer: {err}"))?
+            .to_bytes();
+        Ok((parts.status, parts.headers, body))
+    };
+    tokio::time::timeout(TIMEOUT, exchange)
+        .await
+        .map_err(|_| anyhow!("the gateway did not answer within {TIMEOUT:?}"))?
 }
 
 fn daemon(home: &Path) -> anyhow::Result<()> {

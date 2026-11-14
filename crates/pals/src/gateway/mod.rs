@@ -7,7 +7,8 @@
 //! | Route | Behavior |
 //! |-|-|
 //! | `GET /healthz` | `200 {"agent_id", "name", "ticket"}` |
-//! | `GET /peers/{peer}/.well-known/agent-card.json` | the peer's card, as [`gateway_view`], with `Cache-Control: max-age=300` and an `ETag`; `304` when `If-None-Match` names it |
+//! | `GET /peers/{peer}/.well-known/agent-card.json` | the peer's card, verified, as [`gateway_view`], with `Cache-Control: max-age=300` and an `ETag`; `304` when `If-None-Match` names it |
+//! | `GET /peers/{peer}/signed-agent-card.json` | the peer's card, verified, as the peer signed it ([`signed_card_json`]): signatures and `iroh://` interfaces included, for tools that check the signature themselves |
 //! | `POST /peers/{peer}/jsonrpc`, or `/jsonrpc/` | the peer's `/jsonrpc` |
 //! | any method, `/peers/{peer}/rest/{*rest}` | the peer's `/rest/{rest}` |
 //! | `POST /blobs` | stores the raw body as a blob: `201 {"url", "hash", "size"}` |
@@ -22,8 +23,21 @@
 //! Server-Sent Events streamed as they come. The gateway drops the hop-by-hop
 //! headers, `Host` and any `x-agentnet-*` header the client sent, which only
 //! the peer's tunnel sets, and the cookies a peer sets: every peer shares the
-//! gateway's origin. A2A bindings never redirect, so a peer's `3xx` is a
-//! protocol error, and its `Location` never reaches the client.
+//! gateway's origin. Nor does any `x-agentnet-*` header a peer answers with
+//! reach the client: those the client gets are the gateway's own. A2A
+//! bindings never redirect, so a peer's `3xx` is a protocol error, and its
+//! `Location` never reaches the client.
+//!
+//! **Cards.** A peer's public card ([`PeerCards::public`]) is read up to
+//! 32 KiB and used only once it is valid and signed by the peer (`kid` equal
+//! to the agent id Iroh's handshake proved); then it is kept, as the peer's
+//! `public` card, and served. One that is not gets `502 {"error":"peer card
+//! invalid: <reason>"}`. The gateway does not compare it with the peer's
+//! announce record: discovery does. A peer's answer to the extended card
+//! (`GetExtendedAgentCard`, `GET /rest/extendedAgentCard` or
+//! `/rest/agent-card/extended`) is verified the same way and goes on as its
+//! [`gateway_view`], with [`CARD_HASH_HEADER`] naming the card verified
+//! ([`checks`]); one that does not verify is a protocol error.
 //!
 //! When the request carries no `Authorization`, the gateway presents the
 //! newest unexpired grant it holds for the peer that allows a task operation
@@ -96,8 +110,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use a2a::AgentCard;
-use a2a_server::WELL_KNOWN_AGENT_CARD_PATH;
 use axum::body::{Body, BodyDataStream, Bytes};
 use axum::extract::{Path, Request, State};
 use axum::middleware::{self, Next};
@@ -115,6 +127,7 @@ use http_body_util::{BodyExt, LengthLimitError, Limited};
 use iroh::{Endpoint, EndpointAddr};
 use iroh_blobs::Hash;
 use iroh_blobs::api::TempTag;
+use pals_core::card_jws::VerifiedCard;
 use pals_core::grant::{Grant, Operation};
 use pals_core::identity::AgentId;
 use pals_core::store::{Contact, Store};
@@ -128,19 +141,18 @@ use crate::a2a::gateway_view;
 use crate::a2a::is_safe_task_id;
 use crate::blobs::{BLOB_META_KEY, BLOB_SHARE_TTL_S, BlobError, BlobRef, BlobService, parse_hash};
 use crate::config::LimitsCfg;
+use crate::discovery::{CardFetchError, PeerCards, signed_card_json};
 use crate::net::{PeerHttp, TunnelError, peer_addr};
 use crate::node::ticket_of;
 use crate::outbox::Outbox;
 
-/// The A2A protocol version the gateway asks a peer's card for.
-const A2A_VERSION: &str = "1.0";
-/// The largest Agent Card the gateway reads from a peer.
-const MAX_CARD_BYTES: usize = 1024 * 1024;
+/// The response header in which the gateway names the hash of the extended
+/// card it verified ([`pals_core::card_jws::card_hash`] of the card as the
+/// peer signed it). Only the gateway sets it.
+pub const CARD_HASH_HEADER: &str = "x-agentnet-card-hash";
 /// How long a client may cache a peer's card view, as the SDK lets a node's
 /// own card be cached.
 const CARD_MAX_AGE: &str = "max-age=300";
-/// How long fetching a peer's card may take in all, dialing included.
-const CARD_TIMEOUT: Duration = Duration::from_secs(20);
 /// The prefix of the headers only PALS sets.
 const OWN_HEADER_PREFIX: &str = "x-agentnet-";
 /// The Fetch Metadata headers only a browser adds to its requests. Not
@@ -200,6 +212,8 @@ struct Inner {
     local_addr: SocketAddr,
     /// The questions this agent asks its peers, through this gateway.
     outbox: Outbox,
+    /// Peers' cards, read, verified and kept.
+    cards: PeerCards,
     /// The only directory `pals_fetch` writes to, when configured.
     download_dir: Option<PathBuf>,
     /// Cancelled when the gateway stops: ends the MCP sessions.
@@ -239,6 +253,7 @@ impl GatewayState {
         } = parts;
         let outbox =
             Outbox::new(Arc::clone(&store), base_url(&local_addr)).with_data_dir(&data_dir);
+        let cards = PeerCards::new(peer_http.clone(), Arc::clone(&store));
         Self {
             inner: Arc::new(Inner {
                 id,
@@ -250,6 +265,7 @@ impl GatewayState {
                 limits,
                 local_addr,
                 outbox,
+                cards,
                 download_dir,
                 stopping: CancellationToken::new(),
             }),
@@ -460,6 +476,10 @@ pub fn router(state: GatewayState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/peers/{peer}/.well-known/agent-card.json", get(peer_card))
+        .route(
+            "/peers/{peer}/signed-agent-card.json",
+            get(signed_peer_card),
+        )
         .route("/peers/{peer}/jsonrpc", post(forward_jsonrpc))
         .route("/peers/{peer}/jsonrpc/", post(forward_jsonrpc))
         .route("/peers/{peer}/rest/{*rest}", any(forward_rest))
@@ -539,50 +559,24 @@ async fn healthz(State(state): State<GatewayState>) -> Response {
     Json(state.identity()).into_response()
 }
 
-/// The peer's card as [`gateway_view`], fetched from the peer.
+/// The peer's card as [`gateway_view`], read from the peer and verified
+/// ([`GatewayState::peer_public_card`]).
 ///
-/// The card comes from the endpoint whose id is the peer's: the connection
-/// is dialed to that id, and Iroh's handshake proves the key at the other
-/// end. The response may be cached for [`CARD_MAX_AGE`] and carries a
-/// strong `ETag`, the BLAKE3 of its body; a request whose `If-None-Match`
-/// names it gets `304 Not Modified` (A2A §8.6).
+/// The response may be cached for [`CARD_MAX_AGE`] and carries a strong
+/// `ETag`, the BLAKE3 of its body; a request whose `If-None-Match` names it
+/// gets `304 Not Modified` (A2A §8.6).
 async fn peer_card(
     State(state): State<GatewayState>,
     Path(peer): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let target = match state.resolve(peer).await {
-        Ok(Some(target)) => target,
-        Ok(None) => return unknown_peer(),
-        Err(failure) => return failure.into_response(),
+    let (target, verified) = match state.peer_public_card(peer).await {
+        Ok(found) => found,
+        Err(none) => return none.into_response(),
     };
-    let request = http::Request::get(WELL_KNOWN_AGENT_CARD_PATH)
-        .header("a2a-version", A2A_VERSION)
-        .body(Body::empty())
-        .expect("a valid request");
-    let fetch = async {
-        let response = state.inner.peer_http.send(target.addr, request).await?;
-        if !response.status().is_success() {
-            return Err(TunnelError::Protocol(format!(
-                "the card request got {}",
-                response.status()
-            )));
-        }
-        let body = Limited::new(response.into_body(), MAX_CARD_BYTES)
-            .collect()
-            .await
-            .map_err(|error| TunnelError::Protocol(error.to_string()))?
-            .to_bytes();
-        serde_json::from_slice::<AgentCard>(&body)
-            .map_err(|error| TunnelError::Protocol(format!("not an Agent Card: {error}")))
-    };
-    let card = match tokio::time::timeout(CARD_TIMEOUT, fetch).await {
-        Ok(Ok(card)) => card,
-        Ok(Err(error)) => return tunnel_failure(&target.id, &error),
-        Err(_) => return tunnel_failure(&target.id, &TunnelError::Timeout),
-    };
-    let view = gateway_view(&card, &state.base_url(), &target.id);
-    let body = serde_json::to_vec(&view).expect("an Agent Card serializes");
+    // From what the signature covers, never from the JSON received.
+    let view = gateway_view(&verified.card, &state.base_url(), &target.id);
+    let body = checks::ascii_json(&serde_json::to_value(&view).expect("an Agent Card serializes"));
     let etag = format!("\"{}\"", blake3::hash(&body).to_hex());
     let etag = HeaderValue::from_str(&etag).expect("hex digits in quotes are a valid header");
     let cached = HeaderValue::from_static(CARD_MAX_AGE);
@@ -595,13 +589,66 @@ async fn peer_card(
     }
     (
         [
-            (CONTENT_TYPE, HeaderValue::from_static("application/json")),
+            (CONTENT_TYPE, HeaderValue::from_static(JSON)),
             (ETAG, etag),
             (CACHE_CONTROL, cached),
         ],
         body,
     )
         .into_response()
+}
+
+/// The peer's card as the peer signed it ([`signed_card_json`]), read from
+/// the peer and verified ([`GatewayState::peer_public_card`]): only what
+/// its valid signature covers, and the signatures that verify, re-encoded
+/// in ASCII. For tools that check a card's signature themselves.
+async fn signed_peer_card(State(state): State<GatewayState>, Path(peer): Path<String>) -> Response {
+    match state.peer_public_card(peer).await {
+        Ok((_, verified)) => (
+            [(CONTENT_TYPE, HeaderValue::from_static(JSON))],
+            checks::ascii_json(&signed_card_json(&verified)),
+        )
+            .into_response(),
+        Err(none) => none.into_response(),
+    }
+}
+
+/// Why the gateway has no card of a peer to serve.
+enum NoCard {
+    UnknownPeer,
+    Store(StoreUnavailable),
+    Fetch(AgentId, CardFetchError),
+}
+
+impl IntoResponse for NoCard {
+    fn into_response(self) -> Response {
+        match self {
+            Self::UnknownPeer => unknown_peer(),
+            Self::Store(failure) => failure.into_response(),
+            Self::Fetch(peer, failure) => card_failure(&peer, &failure),
+        }
+    }
+}
+
+impl GatewayState {
+    /// The peer `peer` names and its public card, read and verified as its
+    /// own, and kept ([`PeerCards::public`]); else why there is none.
+    async fn peer_public_card(&self, peer: String) -> Result<(Target, VerifiedCard), NoCard> {
+        let target = match self.resolve(peer).await {
+            Ok(Some(target)) => target,
+            Ok(None) => return Err(NoCard::UnknownPeer),
+            Err(failure) => return Err(NoCard::Store(failure)),
+        };
+        match self
+            .inner
+            .cards
+            .public(&target.id, target.addr.clone())
+            .await
+        {
+            Ok(verified) => Ok((target, verified)),
+            Err(failure) => Err(NoCard::Fetch(target.id, failure)),
+        }
+    }
 }
 
 /// Whether `If-None-Match` in `headers` names `etag`, or is `*`.
@@ -707,7 +754,14 @@ async fn forward(
             let (mut parts, body) = response.into_parts();
             parts.headers = incoming_headers(&parts.headers);
             match state
-                .incoming_body(binding, call, parts.status, &mut parts.headers, body)
+                .incoming_body(
+                    &target.id,
+                    binding,
+                    call,
+                    parts.status,
+                    &mut parts.headers,
+                    body,
+                )
                 .await
             {
                 Ok(body) => Response::from_parts(parts, body),
@@ -803,11 +857,13 @@ impl GatewayState {
         Ok(!declared.is_empty())
     }
 
-    /// The body of a peer's response, of `status`, to `call` on `binding`,
+    /// The body of `peer`'s response, of `status`, to `call` on `binding`,
     /// as it goes to the client: checked and re-encoded, as [`checks`] says.
-    /// `headers` get the type and length of what goes.
+    /// `headers` get the type and length of what goes, and, for the extended
+    /// card, [`CARD_HASH_HEADER`].
     async fn incoming_body(
         &self,
+        peer: &AgentId,
         binding: Binding,
         call: Call,
         status: StatusCode,
@@ -832,20 +888,34 @@ impl GatewayState {
             headers.insert(CONTENT_TYPE, HeaderValue::from_static(EVENT_STREAM));
             return Ok(checked_event_stream(body, self.base_url(), binding));
         }
-        let bytes = Limited::new(body, MAX_REWRITE_BYTES)
+        let card = call == Call::ExtendedCard;
+        let limit = if card {
+            checks::MAX_CARD_ANSWER_BYTES
+        } else {
+            MAX_REWRITE_BYTES
+        };
+        let bytes = Limited::new(body, limit)
             .collect()
             .await
             .map_err(|err| TunnelError::Protocol(format!("unreadable response: {err}")))?
             .to_bytes();
         let mut value = match serde_json::from_slice::<Value>(&bytes) {
             Ok(value) => value,
-            Err(_) if status.is_success() && !bytes.iter().all(u8::is_ascii_whitespace) => {
+            Err(_)
+                if status.is_success() && (card || !bytes.iter().all(u8::is_ascii_whitespace)) =>
+            {
                 return Err(TunnelError::Protocol(
                     "a successful response that is not JSON".to_owned(),
                 ));
             }
             // An error a client takes no task id from, or nothing.
             Err(_) => return Ok(Body::from(bytes)),
+        };
+        let card_hash = if card && status.is_success() {
+            checks::extended_card_view(&mut value, binding, peer, &self.base_url())
+                .map_err(TunnelError::Protocol)?
+        } else {
+            None
         };
         if let Some(id) = checks::unsafe_id(&value, binding) {
             return Err(TunnelError::Protocol(format!("an unsafe id {id}")));
@@ -859,6 +929,10 @@ impl GatewayState {
         };
         headers.insert(CONTENT_TYPE, HeaderValue::from_static(json_type));
         headers.insert(CONTENT_LENGTH, HeaderValue::from(bytes.len()));
+        if let Some(hash) = card_hash {
+            let hash = HeaderValue::from_str(hash.as_str()).expect("a card hash is header safe");
+            headers.insert(CARD_HASH_HEADER, hash);
+        }
         Ok(Body::from(bytes))
     }
 }
@@ -1059,10 +1133,13 @@ fn outgoing_headers(incoming: &HeaderMap) -> HeaderMap {
 
 /// The headers of a peer's response that go on to the client: the
 /// [end-to-end](end_to_end) ones, but for the cookies it sets, which would
-/// apply to every peer.
+/// apply to every peer, and for the `x-agentnet-*` headers, which only the
+/// gateway sets.
 fn incoming_headers(peer: &HeaderMap) -> HeaderMap {
     let mut headers = end_to_end(peer);
-    headers.retain_names(|name| !PEER_COOKIES.contains(&name.as_str()));
+    headers.retain_names(|name| {
+        !PEER_COOKIES.contains(&name.as_str()) && !name.as_str().starts_with(OWN_HEADER_PREFIX)
+    });
     headers
 }
 
@@ -1095,6 +1172,25 @@ impl RetainNames for HeaderMap {
         for name in dropped {
             self.remove(name);
         }
+    }
+}
+
+/// The answer to a card `peer` did not give: [`tunnel_failure`]'s, but for
+/// `502 {"error":"peer card invalid: <reason>"}` when what it gave is not a
+/// card it signed.
+fn card_failure(peer: &AgentId, failure: &CardFetchError) -> Response {
+    tracing::debug!(%peer, error = %failure, "no valid card from the peer");
+    match failure {
+        CardFetchError::Unreachable(_) | CardFetchError::Timeout => {
+            error(StatusCode::BAD_GATEWAY, "peer unreachable")
+        }
+        CardFetchError::Refused(_) | CardFetchError::Protocol(_) => {
+            error(StatusCode::BAD_GATEWAY, "peer protocol error")
+        }
+        CardFetchError::Invalid(reason) => error(
+            StatusCode::BAD_GATEWAY,
+            format!("peer card invalid: {reason}"),
+        ),
     }
 }
 
@@ -1297,6 +1393,21 @@ mod tests {
         let mut names: Vec<&str> = kept.keys().map(HeaderName::as_str).collect();
         names.sort_unstable();
         assert_eq!(names, ["cache-control", "content-type"]);
+    }
+
+    #[test]
+    fn incoming_headers_drop_the_peers_own_headers() {
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("x-agentnet-card-hash", "blake3:forged"),
+            ("x-agentnet-peer", "someone"),
+            ("content-type", "application/json"),
+        ] {
+            headers.append(name, HeaderValue::from_static(value));
+        }
+        let kept = incoming_headers(&headers);
+        let names: Vec<&str> = kept.keys().map(HeaderName::as_str).collect();
+        assert_eq!(names, ["content-type"]);
     }
 
     #[test]

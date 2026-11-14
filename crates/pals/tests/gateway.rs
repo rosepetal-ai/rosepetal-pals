@@ -31,6 +31,7 @@ use pals::net::{agent_id_of, endpoint_id_of};
 use pals_core::grant::Operation::{self, TaskCancel, TaskRead, TaskSend};
 use pals_core::grant::{GRANT_SCHEMA, Grant, SignedGrant, format_timestamp};
 use pals_core::identity::{AgentId, AgentKey};
+use pals_core::inventory::Inventory;
 use pals_core::store::{Contact, Store};
 use serde_json::{Value, json};
 
@@ -342,7 +343,11 @@ async fn gateway_view_declares_standard_bindings_and_no_security() {
     assert!(card.get("signatures").is_none());
 
     // Otherwise it is the peer's canonical card.
-    let canonical = canonical_card(&test_config(b.dir.path(), WorkerCfg::Echo), &b.id());
+    let canonical = canonical_card(
+        &test_config(b.dir.path(), WorkerCfg::Echo),
+        &b.id(),
+        &Inventory::default(),
+    );
     assert_eq!(
         &serde_json::to_value(gateway_view(&canonical, &gw, &b.id())).unwrap(),
         card
