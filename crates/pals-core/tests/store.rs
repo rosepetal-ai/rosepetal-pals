@@ -41,7 +41,7 @@ fn ids(grants: &[SignedGrant]) -> Vec<&str> {
 
 #[test]
 fn contact_put_get_and_replace_by_name() {
-    let store = Store::open_in_memory().unwrap();
+    let store = Store::open_in_memory(AgentKey::generate().id()).unwrap();
     let first = AgentKey::generate().id();
     let second = AgentKey::generate().id();
 
@@ -88,8 +88,8 @@ fn contact_put_get_and_replace_by_name() {
 
 #[test]
 fn held_grants_exclude_expired_and_sort_newest_first() {
-    let store = Store::open_in_memory().unwrap();
     let me = AgentKey::generate().id();
+    let store = Store::open_in_memory(me).unwrap();
     let peer = AgentKey::generate();
     let other_peer = AgentKey::generate();
     // Grants a peer issued to this agent, to be used against that peer.
@@ -131,8 +131,8 @@ fn held_grants_exclude_expired_and_sort_newest_first() {
 
 #[test]
 fn covering_grant_matches_subject_operation_and_resource() {
-    let store = Store::open_in_memory().unwrap();
     let me = AgentKey::generate();
+    let store = Store::open_in_memory(me.id()).unwrap();
     let alice = AgentKey::generate().id();
     let bob = AgentKey::generate().id();
     let stranger = AgentKey::generate().id();
@@ -199,8 +199,8 @@ fn covering_grant_matches_subject_operation_and_resource() {
 
 #[test]
 fn covering_grant_ignores_revoked_and_expired() {
-    let store = Store::open_in_memory().unwrap();
     let me = AgentKey::generate();
+    let store = Store::open_in_memory(me.id()).unwrap();
     let alice = AgentKey::generate().id();
     let blob_grant = |grant_id: &str, resource: &str, expires_at: i64| {
         let g = sign(
@@ -246,13 +246,13 @@ fn covering_grant_ignores_revoked_and_expired() {
 
 #[test]
 fn revoke_unknown_grant_returns_false() {
-    let store = Store::open_in_memory().unwrap();
+    let me = AgentKey::generate().id();
+    let store = Store::open_in_memory(me).unwrap();
     assert!(!store.revoke("g-unknown", NOW).unwrap());
     assert!(!store.is_revoked("g-unknown").unwrap());
 
     // Only grants this agent issued can be revoked here.
     let peer = AgentKey::generate();
-    let me = AgentKey::generate().id();
     store
         .grant_held_put(&sign(&peer, grant(&peer, "g-held", me, peer.id())))
         .unwrap();
@@ -275,14 +275,15 @@ fn reopen_keeps_data_and_schema_version_is_1() {
     let issued = sign(&me, grant(&me, "g-issued", peer.id(), me.id()));
     let held = sign(&peer, grant(&peer, "g-held", me.id(), peer.id()));
     {
-        let store = Store::open(&path).unwrap();
+        let store = Store::open(&path, me.id()).unwrap();
         store.contact_put(&contact).unwrap();
         store.grant_issued_put(&issued).unwrap();
         store.grant_held_put(&held).unwrap();
         assert!(store.revoke("g-issued", NOW).unwrap());
     }
 
-    let store = Store::open(&path).unwrap();
+    let store = Store::open(&path, me.id()).unwrap();
+    assert_eq!(store.owner(), &me.id());
     assert_eq!(store.contacts().unwrap(), vec![contact]);
     assert_eq!(store.grants_issued().unwrap(), vec![issued]);
     assert!(store.is_revoked("g-issued").unwrap());
@@ -325,13 +326,14 @@ fn reopen_keeps_data_and_schema_version_is_1() {
 fn opening_a_newer_schema_version_fails() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pals.db");
-    drop(Store::open(&path).unwrap());
+    let owner = AgentKey::generate().id();
+    drop(Store::open(&path, owner).unwrap());
     rusqlite::Connection::open(&path)
         .unwrap()
         .pragma_update(None, "user_version", 99)
         .unwrap();
 
-    let err = Store::open(&path)
+    let err = Store::open(&path, owner)
         .err()
         .expect("a newer schema version is refused");
     assert!(

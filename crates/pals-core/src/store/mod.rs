@@ -25,28 +25,40 @@ const SCHEMA_VERSION: i64 = 1;
 const SCHEMA: &str = include_str!("schema.sql");
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
 
-/// The local store. `Send + Sync`: share it behind an `Arc`.
+/// The local store of one agent, its owner. `Send + Sync`: share it behind
+/// an `Arc`.
+///
+/// Grants are checked against the owner: issued grants must be issued by it,
+/// held grants must have it as subject. The owner is not kept in the
+/// database; every open names it.
 pub struct Store {
     conn: Mutex<Connection>,
+    owner: AgentId,
 }
 
 impl Store {
-    /// Opens the database at `path`, creating it and its schema if needed.
+    /// Opens `owner`'s database at `path`, creating it and its schema if
+    /// needed.
     ///
     /// Fails with an error containing `unsupported schema version` when the
     /// file was written by a newer schema.
-    pub fn open(path: &Path) -> anyhow::Result<Self> {
+    pub fn open(path: &Path, owner: AgentId) -> anyhow::Result<Self> {
         let conn = Connection::open(path)
             .with_context(|| format!("cannot open the database {}", path.display()))?;
-        Self::init(conn, true).with_context(|| format!("cannot open {}", path.display()))
+        Self::init(conn, true, owner).with_context(|| format!("cannot open {}", path.display()))
     }
 
-    /// A private database in memory, for tests.
-    pub fn open_in_memory() -> anyhow::Result<Self> {
-        Self::init(Connection::open_in_memory()?, false)
+    /// A private database of `owner` in memory, for tests.
+    pub fn open_in_memory(owner: AgentId) -> anyhow::Result<Self> {
+        Self::init(Connection::open_in_memory()?, false, owner)
     }
 
-    fn init(mut conn: Connection, on_disk: bool) -> anyhow::Result<Self> {
+    /// The agent this store belongs to.
+    pub fn owner(&self) -> &AgentId {
+        &self.owner
+    }
+
+    fn init(mut conn: Connection, on_disk: bool, owner: AgentId) -> anyhow::Result<Self> {
         conn.busy_timeout(BUSY_TIMEOUT)?;
         let journal_mode: String =
             conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
@@ -75,6 +87,7 @@ impl Store {
         tx.commit()?;
         Ok(Self {
             conn: Mutex::new(conn),
+            owner,
         })
     }
 
@@ -103,11 +116,14 @@ impl FromSql for AgentId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::AgentKey;
 
     #[test]
     fn connection_pragmas_are_set() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&dir.path().join("pals.db")).unwrap();
+        let owner = AgentKey::generate().id();
+        let store = Store::open(&dir.path().join("pals.db"), owner).unwrap();
+        assert_eq!(store.owner(), &owner);
         let conn = store.conn();
         let pragma = |name: &str| -> String {
             conn.pragma_query_value(None, name, |row| {

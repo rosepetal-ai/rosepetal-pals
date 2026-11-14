@@ -13,11 +13,11 @@ use serde_json::{Value, json};
 /// 2026-11-14T00:00:00Z.
 const NOW: i64 = 1_794_614_400;
 
-/// A store on disk, so a second connection can edit it underneath.
-fn file_store() -> (tempfile::TempDir, PathBuf, Store) {
+/// `owner`'s store on disk, so a second connection can edit it underneath.
+fn file_store(owner: AgentId) -> (tempfile::TempDir, PathBuf, Store) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pals.db");
-    let store = Store::open(&path).unwrap();
+    let store = Store::open(&path, owner).unwrap();
     (dir, path, store)
 }
 
@@ -60,8 +60,8 @@ fn edit(path: &PathBuf, sql: &str, author: &AgentId) {
 
 #[test]
 fn three_appends_form_a_valid_chain() {
-    let store = Store::open_in_memory().unwrap();
     let key = AgentKey::generate();
+    let store = Store::open_in_memory(key.id()).unwrap();
     let id = key.id();
     let events = append_three(&store, &key);
     assert_eq!(store.events_verify(&id).unwrap(), 3);
@@ -105,8 +105,8 @@ fn three_appends_form_a_valid_chain() {
 
 #[test]
 fn first_event_prev_hash_is_64_zeros() {
-    let store = Store::open_in_memory().unwrap();
     let key = AgentKey::generate();
+    let store = Store::open_in_memory(key.id()).unwrap();
     let first = store
         .event_append(&key, "grant.issued", &json!({ "grant_id": "g-1" }), NOW)
         .unwrap();
@@ -129,8 +129,8 @@ fn first_event_prev_hash_is_64_zeros() {
 
 #[test]
 fn tampered_payload_is_detected() {
-    let (_dir, path, store) = file_store();
     let key = AgentKey::generate();
+    let (_dir, path, store) = file_store(key.id());
     append_three(&store, &key);
     edit(
         &path,
@@ -145,8 +145,8 @@ fn tampered_payload_is_detected() {
 
 #[test]
 fn deleted_row_is_detected_as_gap() {
-    let (_dir, path, store) = file_store();
     let key = AgentKey::generate();
+    let (_dir, path, store) = file_store(key.id());
     append_three(&store, &key);
     edit(
         &path,
@@ -174,9 +174,9 @@ fn deleted_row_is_detected_as_gap() {
 
 #[test]
 fn concurrent_appends_get_contiguous_seq() {
-    let (_dir, _path, store) = file_store();
-    let store = Arc::new(store);
     let key = Arc::new(AgentKey::generate());
+    let (_dir, _path, store) = file_store(key.id());
+    let store = Arc::new(store);
     let threads: Vec<_> = (0..8)
         .map(|t| {
             let store = Arc::clone(&store);
@@ -260,7 +260,7 @@ fn frozen_vector_matches() {
     assert_eq!(json!(blake3_hex(&header_canonical)), vector["header_hash"]);
 
     // The store writes exactly that event, and chains the next one to it.
-    let store = Store::open_in_memory().unwrap();
+    let store = Store::open_in_memory(key.id()).unwrap();
     let event = store
         .event_append(&key, "grant.issued", &vector["payload"], NOW)
         .unwrap();

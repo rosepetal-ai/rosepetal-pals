@@ -1,13 +1,22 @@
-//! Grants this agent issued, grants it holds from other agents, and
+//! Grants the store's owner issued, grants it holds from other agents, and
 //! revocations.
 //!
 //! [`SignedGrant::check`] trusts that a grant was made by `issue` or
 //! `from_token`, so a grant is stored as its token and every grant read back
 //! is rebuilt with [`SignedGrant::from_token`], which verifies its signature.
-//! The other columns only select candidate rows; what they selected is checked
-//! again on the rebuilt grant, so a row edited on disk can hide a grant but
-//! never widen one. A row whose token no longer parses, or names another
-//! grant, is skipped with a warning.
+//! The store is bound to its owner, checked on the rebuilt grant both when a
+//! grant is stored and when it is read:
+//!
+//! - `grants_issued` takes and returns only grants the owner issued, and one
+//!   covers a request only if its audience is the owner too;
+//! - `grants_held` takes and returns only grants whose subject is the owner.
+//!
+//! The other columns only select candidate rows, and what they selected is
+//! checked again on the rebuilt grant. A row edited or inserted on disk can
+//! therefore hide a grant, and deleting a revocation row un-revokes one, but
+//! it cannot make a grant cover more than the owner signed: a token signed by
+//! any other key covers nothing. A row whose token no longer parses, names
+//! another grant or does not belong to the owner is skipped with a warning.
 
 use anyhow::{Context, ensure};
 use rusqlite::{OptionalExtension, params};
@@ -71,13 +80,41 @@ fn expired(g: &SignedGrant, now_unix: i64) -> bool {
 }
 
 impl Store {
-    /// Records a grant this agent issued.
+    /// A `grants_issued` row rebuilt, if the owner issued it.
+    fn issued_row(&self, grant_id: &str, token: &str) -> Option<SignedGrant> {
+        let g = rebuild("grants_issued", grant_id, token)?;
+        if g.grant.issuer != self.owner {
+            warn!(grant_id, issuer = %g.grant.issuer, "skipping an issued grant of another issuer");
+            return None;
+        }
+        Some(g)
+    }
+
+    /// A `grants_held` row rebuilt, if its subject is the owner.
+    fn held_row(&self, grant_id: &str, token: &str) -> Option<SignedGrant> {
+        let g = rebuild("grants_held", grant_id, token)?;
+        if g.grant.subject != self.owner {
+            warn!(grant_id, subject = %g.grant.subject, "skipping a held grant of another subject");
+            return None;
+        }
+        Some(g)
+    }
+
+    /// Records a grant the owner issued; a grant of another issuer is
+    /// refused.
     ///
     /// A grant id is issued once: storing the same grant again does nothing,
     /// and another grant with the same id is refused.
     pub fn grant_issued_put(&self, g: &SignedGrant) -> anyhow::Result<()> {
         let row = GrantRow::new(g)?;
         let grant = &row.grant.grant;
+        ensure!(
+            grant.issuer == self.owner,
+            "refusing to store grant {} as issued: its issuer {} is not this agent {}",
+            grant.grant_id,
+            grant.issuer,
+            self.owner
+        );
         let conn = self.conn();
         let inserted = conn.execute(
             "INSERT INTO grants_issued
@@ -109,11 +146,19 @@ impl Store {
         Ok(())
     }
 
-    /// Records a grant another agent issued to this one, replacing an earlier
-    /// copy of the same grant (same issuer and grant id).
+    /// Records a grant another agent issued to the owner, replacing an
+    /// earlier copy of the same grant (same issuer and grant id); a grant
+    /// whose subject is not the owner is refused.
     pub fn grant_held_put(&self, g: &SignedGrant) -> anyhow::Result<()> {
         let row = GrantRow::new(g)?;
         let grant = &row.grant.grant;
+        ensure!(
+            grant.subject == self.owner,
+            "refusing to store grant {} as held: its subject {} is not this agent {}",
+            grant.grant_id,
+            grant.subject,
+            self.owner
+        );
         self.conn().execute(
             "INSERT INTO grants_held
                  (issuer, grant_id, subject, audience, issued_at, expires_at, token)
@@ -137,7 +182,7 @@ impl Store {
         Ok(())
     }
 
-    /// The grant this agent issued with that id, revoked or expired alike.
+    /// The grant the owner issued with that id, revoked or expired alike.
     pub fn grant_issued(&self, grant_id: &str) -> anyhow::Result<Option<SignedGrant>> {
         let token: Option<String> = self
             .conn()
@@ -147,10 +192,10 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?;
-        Ok(token.and_then(|token| rebuild("grants_issued", grant_id, &token)))
+        Ok(token.and_then(|token| self.issued_row(grant_id, &token)))
     }
 
-    /// Every grant this agent issued, revoked or expired alike, newest
+    /// Every grant the owner issued, revoked or expired alike, newest
     /// `issued_at` first.
     pub fn grants_issued(&self) -> anyhow::Result<Vec<SignedGrant>> {
         let conn = self.conn();
@@ -162,11 +207,11 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows
             .iter()
-            .filter_map(|(grant_id, token)| rebuild("grants_issued", grant_id, token))
+            .filter_map(|(grant_id, token)| self.issued_row(grant_id, token))
             .collect())
     }
 
-    /// The grants other agents issued to this one for use against
+    /// The grants other agents issued to the owner for use against
     /// `audience`, unexpired at `now_unix`, newest `issued_at` first.
     pub fn grants_held_for(
         &self,
@@ -176,24 +221,25 @@ impl Store {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT grant_id, token FROM grants_held
-             WHERE audience = ?1 AND expires_at + ?2 > ?3
+             WHERE audience = ?1 AND subject = ?2 AND expires_at + ?3 > ?4
              ORDER BY issued_at DESC, grant_id, issuer",
         )?;
         let rows = stmt
-            .query_map(params![audience, CLOCK_SKEW_S, now_unix], |r| {
+            .query_map(params![audience, self.owner, CLOCK_SKEW_S, now_unix], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows
             .iter()
-            .filter_map(|(grant_id, token)| rebuild("grants_held", grant_id, token))
+            .filter_map(|(grant_id, token)| self.held_row(grant_id, token))
             .filter(|g| g.grant.audience == *audience && !expired(g, now_unix))
             .collect())
     }
 
-    /// A grant this agent issued to `subject` that allows `op` on `resource`
-    /// at `now_unix` and is not revoked, as [`SignedGrant::check`] judges it;
-    /// the newest `issued_at` first when several do.
+    /// A grant the owner issued to `subject`, for use against the owner,
+    /// that allows `op` on `resource` at `now_unix` and is not revoked, as
+    /// [`SignedGrant::check`] judges it; the newest `issued_at` first when
+    /// several do.
     pub fn grant_issued_covering(
         &self,
         subject: &AgentId,
@@ -218,14 +264,12 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows.iter().find_map(|(grant_id, token, revoked)| {
-            let g = rebuild("grants_issued", grant_id, token)?;
-            // Issuer and audience are this agent's own: the grant is checked
-            // for subject, revocation, validity, operation and resource.
+            let g = self.issued_row(grant_id, token)?;
             let check = GrantCheck {
                 now_unix,
-                audience: &g.grant.audience,
+                audience: &self.owner,
                 subject,
-                accepted_issuers: &[g.grant.issuer],
+                accepted_issuers: &[self.owner],
                 operation: op,
                 resource,
                 revoked: *revoked,
@@ -234,7 +278,7 @@ impl Store {
         }))
     }
 
-    /// Revokes a grant this agent issued; `false` when it issued no grant with
+    /// Revokes a grant the owner issued; `false` when it issued no grant with
     /// that id. Revoking twice keeps the first instant.
     pub fn revoke(&self, grant_id: &str, now_unix: i64) -> anyhow::Result<bool> {
         let conn = self.conn();
@@ -271,13 +315,20 @@ mod tests {
     /// 2026-11-14T12:00:00Z.
     const NOW: i64 = 1_794_657_600;
 
-    fn blob_grant(issuer: &AgentKey, grant_id: &str, subject: AgentId) -> SignedGrant {
+    /// A grant of `issuer` that lets `subject` fetch `blob:01` from
+    /// `audience`.
+    fn blob_grant_for(
+        issuer: &AgentKey,
+        grant_id: &str,
+        subject: AgentId,
+        audience: AgentId,
+    ) -> SignedGrant {
         let grant = Grant {
             schema: GRANT_SCHEMA.to_owned(),
             grant_id: grant_id.to_owned(),
             issuer: issuer.id(),
             subject,
-            audience: issuer.id(),
+            audience,
             project: "demo".to_owned(),
             resources: vec!["blob:01".to_owned()],
             operations: vec![Operation::BlobFetch],
@@ -287,22 +338,127 @@ mod tests {
         SignedGrant::issue(issuer, grant).unwrap()
     }
 
+    /// A grant of `issuer` that lets `subject` fetch `blob:01` from the
+    /// issuer.
+    fn blob_grant(issuer: &AgentKey, grant_id: &str, subject: AgentId) -> SignedGrant {
+        blob_grant_for(issuer, grant_id, subject, issuer.id())
+    }
+
+    fn covering(store: &Store, subject: &AgentId) -> Option<SignedGrant> {
+        store
+            .grant_issued_covering(subject, Operation::BlobFetch, "blob:01", NOW)
+            .unwrap()
+    }
+
     #[test]
     fn a_grant_whose_signature_does_not_verify_is_not_stored() {
-        let store = Store::open_in_memory().unwrap();
-        let key = AgentKey::generate();
-        let mut forged = blob_grant(&key, "g-1", AgentKey::generate().id());
-        forged.grant.project = "other".to_owned();
-        assert!(store.grant_issued_put(&forged).is_err());
-        assert!(store.grant_held_put(&forged).is_err());
+        let me = AgentKey::generate();
+        let store = Store::open_in_memory(me.id()).unwrap();
+        let peer = AgentKey::generate();
+
+        let mut issued = blob_grant(&me, "g-1", AgentKey::generate().id());
+        issued.grant.project = "other".to_owned();
+        let err = store.grant_issued_put(&issued).unwrap_err();
+        assert!(format!("{err:#}").contains("bad signature"), "{err:#}");
+
+        let mut held = blob_grant(&peer, "g-2", me.id());
+        held.grant.project = "other".to_owned();
+        let err = store.grant_held_put(&held).unwrap_err();
+        assert!(format!("{err:#}").contains("bad signature"), "{err:#}");
+
         assert!(store.grants_issued().unwrap().is_empty());
-        assert!(store.grants_held_for(&key.id(), NOW).unwrap().is_empty());
+        assert!(store.grants_held_for(&peer.id(), NOW).unwrap().is_empty());
+    }
+
+    #[test]
+    fn grant_issued_put_refuses_a_foreign_issuer() {
+        let me = AgentKey::generate();
+        let store = Store::open_in_memory(me.id()).unwrap();
+        let alice = AgentKey::generate().id();
+        // Validly signed, and even for use against this agent, but issued by
+        // another one.
+        let foreign = blob_grant_for(&AgentKey::generate(), "g-foreign", alice, me.id());
+        let err = store.grant_issued_put(&foreign).unwrap_err();
+        assert!(err.to_string().contains("is not this agent"), "{err}");
+        assert!(store.grants_issued().unwrap().is_empty());
+        assert_eq!(covering(&store, &alice), None);
+    }
+
+    #[test]
+    fn grant_held_put_refuses_a_grant_for_another_subject() {
+        let me = AgentKey::generate();
+        let store = Store::open_in_memory(me.id()).unwrap();
+        let peer = AgentKey::generate();
+        let not_mine = blob_grant(&peer, "g-other", AgentKey::generate().id());
+        let err = store.grant_held_put(&not_mine).unwrap_err();
+        assert!(err.to_string().contains("is not this agent"), "{err}");
+        assert!(store.grants_held_for(&peer.id(), NOW).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_foreign_token_in_grants_issued_never_covers() {
+        let me = AgentKey::generate();
+        let store = Store::open_in_memory(me.id()).unwrap();
+        let attacker = AgentKey::generate();
+        let alice = AgentKey::generate().id();
+        // Signed by a fresh key, issued to itself and for use against itself,
+        // for every blob.
+        let forged = |grant_id: &str| {
+            let mut grant = blob_grant(&attacker, grant_id, attacker.id()).grant;
+            grant.resources = vec!["blob:*".to_owned()];
+            SignedGrant::issue(&attacker, grant).unwrap().to_token()
+        };
+
+        // A row inserted around grant_issued_put.
+        store
+            .conn()
+            .execute(
+                "INSERT INTO grants_issued
+                     (grant_id, issuer, subject, audience, issued_at, expires_at, token)
+                 VALUES ('g-forged', ?1, ?1, ?1, ?2, ?3, ?4)",
+                params![attacker.id(), NOW - 3600, NOW + 3600, forged("g-forged")],
+            )
+            .unwrap();
+        assert_eq!(covering(&store, &attacker.id()), None);
+        assert_eq!(store.grant_issued("g-forged").unwrap(), None);
+        assert!(store.grants_issued().unwrap().is_empty());
+
+        // The token of a grant this agent issued, replaced.
+        store
+            .grant_issued_put(&blob_grant(&me, "g-alice", alice))
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE grants_issued SET subject = ?1, token = ?2 WHERE grant_id = 'g-alice'",
+                params![attacker.id(), forged("g-alice")],
+            )
+            .unwrap();
+        assert_eq!(covering(&store, &attacker.id()), None);
+        assert_eq!(store.grant_issued("g-alice").unwrap(), None);
+    }
+
+    #[test]
+    fn an_issued_grant_for_another_audience_never_covers() {
+        let me = AgentKey::generate();
+        let store = Store::open_in_memory(me.id()).unwrap();
+        let alice = AgentKey::generate().id();
+        let elsewhere = AgentKey::generate().id();
+        let g = blob_grant_for(&me, "g-elsewhere", alice, elsewhere);
+        store.grant_issued_put(&g).unwrap();
+        assert_eq!(store.grant_issued("g-elsewhere").unwrap(), Some(g));
+        assert_eq!(covering(&store, &alice), None);
+
+        // The same grant for use against this agent covers.
+        let here = blob_grant(&me, "g-here", alice);
+        store.grant_issued_put(&here).unwrap();
+        assert_eq!(covering(&store, &alice), Some(here));
     }
 
     #[test]
     fn an_issued_grant_id_is_never_reused() {
-        let store = Store::open_in_memory().unwrap();
         let key = AgentKey::generate();
+        let store = Store::open_in_memory(key.id()).unwrap();
         let first = blob_grant(&key, "g-1", AgentKey::generate().id());
         store.grant_issued_put(&first).unwrap();
         store.grant_issued_put(&first).unwrap();
@@ -314,8 +470,8 @@ mod tests {
 
     #[test]
     fn held_grant_ids_are_unique_per_issuer() {
-        let store = Store::open_in_memory().unwrap();
         let me = AgentKey::generate().id();
+        let store = Store::open_in_memory(me).unwrap();
         let peer = AgentKey::generate();
         let other_peer = AgentKey::generate();
         store.grant_held_put(&blob_grant(&peer, "g-1", me)).unwrap();
@@ -341,16 +497,11 @@ mod tests {
 
     #[test]
     fn edited_rows_never_widen_a_grant() {
-        let store = Store::open_in_memory().unwrap();
         let me = AgentKey::generate();
+        let store = Store::open_in_memory(me.id()).unwrap();
         let alice = AgentKey::generate().id();
         let stranger = AgentKey::generate().id();
         let sql = |statement: &str| store.conn().execute(statement, []).unwrap();
-        let covering = |subject: &AgentId| {
-            store
-                .grant_issued_covering(subject, Operation::BlobFetch, "blob:01", NOW)
-                .unwrap()
-        };
 
         store
             .grant_issued_put(&blob_grant(&me, "g-alice", alice))
@@ -358,7 +509,7 @@ mod tests {
         sql(&format!(
             "UPDATE grants_issued SET subject = '{stranger}' WHERE grant_id = 'g-alice'"
         ));
-        assert_eq!(covering(&stranger), None);
+        assert_eq!(covering(&store, &stranger), None);
 
         // A valid token of another grant under this grant's id.
         let stranger_grant = blob_grant(&me, "g-stranger", stranger);
@@ -370,7 +521,7 @@ mod tests {
         sql("UPDATE grants_issued SET grant_id = 'g-moved' WHERE grant_id = 'g-stranger'");
         assert_eq!(store.grant_issued("g-alice").unwrap(), None);
         assert_eq!(store.grant_issued("g-moved").unwrap(), None);
-        assert_eq!(covering(&stranger), None);
+        assert_eq!(covering(&store, &stranger), None);
         assert!(store.grants_issued().unwrap().is_empty());
 
         // A held grant moved to another audience.
@@ -383,8 +534,17 @@ mod tests {
         ));
         assert!(store.grants_held_for(&stranger, NOW).unwrap().is_empty());
 
+        // A held grant's token replaced by the same grant for another subject.
+        sql("UPDATE grants_held SET audience = issuer");
+        assert_eq!(store.grants_held_for(&peer.id(), NOW).unwrap().len(), 1);
+        sql(&format!(
+            "UPDATE grants_held SET token = '{}'",
+            blob_grant(&peer, "g-held", stranger).to_token()
+        ));
+        assert!(store.grants_held_for(&peer.id(), NOW).unwrap().is_empty());
+
         // A token that no longer parses.
-        sql("UPDATE grants_held SET audience = issuer, token = 'not-a-token'");
+        sql("UPDATE grants_held SET token = 'not-a-token'");
         assert!(store.grants_held_for(&peer.id(), NOW).unwrap().is_empty());
     }
 }

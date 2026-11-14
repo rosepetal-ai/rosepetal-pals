@@ -334,7 +334,7 @@ mod tests {
             ),
         ];
         for (column, value, expected) in cases {
-            let store = Store::open_in_memory().unwrap();
+            let store = Store::open_in_memory(key.id()).unwrap();
             append_three(&store, &key);
             let changed = store
                 .conn()
@@ -348,7 +348,7 @@ mod tests {
         }
 
         // Another event's valid signature.
-        let store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory(key.id()).unwrap();
         let events = append_three(&store, &key);
         store
             .conn()
@@ -364,7 +364,7 @@ mod tests {
 
         // An event of another author moved to the end of this chain, linked
         // correctly: only its signature gives it away.
-        let store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory(key.id()).unwrap();
         let events = append_three(&store, &key);
         let last = &events[2];
         let link = hash_hex(&canonical(&header(
@@ -396,11 +396,11 @@ mod tests {
     fn appends_through_two_connections_get_contiguous_seq() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pals.db");
-        let stores = [
-            Arc::new(Store::open(&path).unwrap()),
-            Arc::new(Store::open(&path).unwrap()),
-        ];
         let key = Arc::new(AgentKey::generate());
+        let stores = [
+            Arc::new(Store::open(&path, key.id()).unwrap()),
+            Arc::new(Store::open(&path, key.id()).unwrap()),
+        ];
         let threads: Vec<_> = stores
             .iter()
             .cycle()
