@@ -4,8 +4,9 @@
 use std::collections::HashMap;
 
 use a2a::{
-    AgentCapabilities, AgentCard, AgentInterface, AgentSkill, HttpAuthSecurityScheme,
-    SecurityScheme, TRANSPORT_PROTOCOL_HTTP_JSON, TRANSPORT_PROTOCOL_JSONRPC,
+    AgentCapabilities, AgentCard, AgentExtension, AgentInterface, AgentSkill,
+    HttpAuthSecurityScheme, SecurityScheme, TRANSPORT_PROTOCOL_HTTP_JSON,
+    TRANSPORT_PROTOCOL_JSONRPC,
 };
 use pals_core::grant::GRANT_SCHEMA;
 use pals_core::identity::AgentId;
@@ -18,6 +19,14 @@ use crate::config::Config;
 pub const BINDING_URI: &str =
     "https://github.com/rosepetal-ai/rosepetal-pals/bindings/http-over-iroh/v1";
 
+/// The A2A extension that makes `SendMessage` and `SendStreamingMessage`
+/// idempotent by `messageId` (`docs/extensions/idempotency-v1.md`). A
+/// request activates it with the `A2A-Extensions` service parameter;
+/// without it the agent treats every message as new, as the reference SDKs
+/// do.
+pub const IDEMPOTENCY_EXTENSION: &str =
+    "https://github.com/rosepetal-ai/rosepetal-pals/extensions/idempotency/v1";
+
 /// The name of the card's security scheme: a grant token presented as an
 /// HTTP bearer token.
 pub const SECURITY_SCHEME: &str = "agentnetGrant";
@@ -26,14 +35,25 @@ pub const SECURITY_SCHEME: &str = "agentnetGrant";
 ///
 /// It declares only what the daemon serves: the JSON-RPC binding over Iroh
 /// at `iroh://<agent id>/jsonrpc`, streaming, no push notifications, no
-/// extended card, text and files of any media type as input (`*/*`: a
+/// extended card, the optional [`IDEMPOTENCY_EXTENSION`], text and files
+/// of any media type as input (`*/*`: a
 /// question comes with any files, sent as blobs, and a part's media type
 /// never refuses it), the `ask` skill, and grants as bearer tokens.
 pub fn canonical_card(cfg: &Config, id: &AgentId) -> AgentCard {
+    let idempotency = AgentExtension {
+        uri: IDEMPOTENCY_EXTENSION.to_owned(),
+        description: Some(
+            "Opt-in idempotency by messageId: a retry with the same messageId and content \
+             attaches to the first request's task or answer instead of running again."
+                .to_owned(),
+        ),
+        required: Some(false),
+        params: None,
+    };
     let capabilities = AgentCapabilities {
         streaming: Some(true),
         push_notifications: Some(false),
-        extensions: None,
+        extensions: Some(vec![idempotency]),
         extended_agent_card: Some(false),
     };
     let ask = AgentSkill {

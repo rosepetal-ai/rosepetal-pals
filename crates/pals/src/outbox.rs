@@ -46,10 +46,14 @@ use std::time::Duration;
 
 use a2a::{
     A2AError, CancelTaskRequest, GetTaskRequest, Message, Part, PartContent, Role,
-    SendMessageRequest, StreamResponse, SubscribeToTaskRequest, Task, TaskState, error_code,
+    SVC_PARAM_EXTENSIONS, SendMessageRequest, StreamResponse, SubscribeToTaskRequest, Task,
+    TaskState, error_code,
 };
 use a2a_client::A2AClient;
+use a2a_client::middleware::CallInterceptor;
 use a2a_client::rest::RestTransport;
+use a2a_client::transport::ServiceParams;
+use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use pals_core::identity::AgentId;
@@ -58,7 +62,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::time::Instant;
 
-use crate::a2a::is_safe_task_id;
+use crate::a2a::{IDEMPOTENCY_EXTENSION, is_safe_task_id};
 
 /// How many times an ask retries an attempt that failed on the way, after
 /// waiting 1 s, 2 s and 4 s.
@@ -560,10 +564,13 @@ impl Outbox {
             .with_media_type(media_type(path)))
     }
 
-    /// The A2A client for `peer`, through the gateway.
+    /// The A2A client for `peer`, through the gateway. Every request it
+    /// sends activates the [idempotency extension](IDEMPOTENCY_EXTENSION),
+    /// which the resends of an ask rely on.
     fn client(&self, peer: &AgentId) -> Client {
         let base_url = format!("{}/peers/{peer}/rest", self.gateway_url);
         A2AClient::new(RestTransport::new(self.http.clone(), base_url))
+            .with_interceptors(vec![Arc::new(Idempotent)])
     }
 
     /// The row of `message_id`.
@@ -904,6 +911,21 @@ fn new_message_id() -> String {
         &hex[16..20],
         &hex[20..]
     )
+}
+
+/// Activates the [`IDEMPOTENCY_EXTENSION`] on every request, with the
+/// `A2A-Extensions` service parameter.
+struct Idempotent;
+
+#[async_trait]
+impl CallInterceptor for Idempotent {
+    async fn before(&self, _method: &str, params: &mut ServiceParams) -> Result<(), A2AError> {
+        params.insert(
+            SVC_PARAM_EXTENSIONS.to_owned(),
+            vec![IDEMPOTENCY_EXTENSION.to_owned()],
+        );
+        Ok(())
+    }
 }
 
 /// The media type an attachment is sent with, from its extension;

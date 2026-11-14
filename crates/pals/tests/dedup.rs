@@ -1,6 +1,9 @@
-//! Idempotency of A2A messages: the same `(peer, messageId)` runs once, a
-//! retry attaches to the task of the first attempt, and a `messageId` reused
-//! with different content is refused.
+//! Idempotency of A2A messages, the opt-in extension
+//! `https://github.com/rosepetal-ai/rosepetal-pals/extensions/idempotency/v1`:
+//! with it, the same `(peer, messageId)` runs once, a retry attaches to the
+//! task of the first attempt, and a `messageId` reused with different
+//! content is refused; without it, every message is new, as with the
+//! reference SDKs.
 
 mod common;
 
@@ -9,8 +12,8 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::http::{Request, header};
 use common::{
-    CountingExecutor, TestNode, TestResponse, WORKER_CRASHED, bearer, grant, key_in,
-    message_params, now_unix, rpc_request, spawn_node, spawn_node_in_with_executor,
+    CountingExecutor, IDEMPOTENCY_EXTENSION, TestNode, TestResponse, WORKER_CRASHED, bearer, grant,
+    key_in, message_params, now_unix, rpc_request, spawn_node, spawn_node_in_with_executor,
     spawn_node_with_executor, sse_results,
 };
 use pals::config::WorkerCfg;
@@ -86,10 +89,14 @@ async fn same_message_id_sent_twice_runs_once() {
     let (b, a, g, exec) = setup(Duration::ZERO).await;
     let params = message_params("hola", None);
 
-    let first = a.rpc(&b, Some(&g), "SendMessage", params.clone()).await;
+    let first = a
+        .rpc_idempotent(&b, Some(&g), "SendMessage", params.clone())
+        .await;
     let t1 = task_of(&first);
     assert_eq!(t1["status"]["state"], "TASK_STATE_COMPLETED", "{t1}");
-    let second = a.rpc(&b, Some(&g), "SendMessage", params.clone()).await;
+    let second = a
+        .rpc_idempotent(&b, Some(&g), "SendMessage", params.clone())
+        .await;
     let t2 = task_of(&second);
     assert_eq!(exec.runs(), 1);
     assert_eq!(t1["id"], t2["id"]);
@@ -103,6 +110,7 @@ async fn same_message_id_sent_twice_runs_once() {
             "/rest/message:send",
             &[
                 ("a2a-version", "1.0"),
+                ("a2a-extensions", IDEMPOTENCY_EXTENSION),
                 ("authorization", &common::bearer(&g)),
             ],
             Some(&params),
@@ -114,7 +122,7 @@ async fn same_message_id_sent_twice_runs_once() {
 
     // A retry creates nothing: one task, one task.accepted event.
     assert_eq!(b.node.store.events_count("task.accepted").unwrap(), 1);
-    let res = a.rpc(&b, Some(&g), "ListTasks", json!({})).await;
+    let res = a.rpc_idempotent(&b, Some(&g), "ListTasks", json!({})).await;
     assert_eq!(res.json["result"]["totalSize"], 1, "{}", res.json);
 }
 
@@ -127,7 +135,7 @@ async fn retry_while_first_execution_is_running_attaches_to_it() {
         let (a, b, g) = (&a, &b, &g);
         async move {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            a.rpc(b, Some(g), "SendMessage", params).await
+            a.rpc_idempotent(b, Some(g), "SendMessage", params).await
         }
     };
 
@@ -159,10 +167,10 @@ async fn streaming_retry_resubscribes_instead_of_reexecuting() {
     let params = message_params("hola", None);
 
     let (first, retry) = tokio::join!(
-        a.rpc(&b, Some(&g), "SendStreamingMessage", params.clone()),
+        a.rpc_idempotent(&b, Some(&g), "SendStreamingMessage", params.clone()),
         async {
             tokio::time::sleep(Duration::from_millis(200)).await;
-            a.rpc(&b, Some(&g), "SendStreamingMessage", params.clone())
+            a.rpc_idempotent(&b, Some(&g), "SendStreamingMessage", params.clone())
                 .await
         }
     );
@@ -189,7 +197,7 @@ async fn streaming_retry_resubscribes_instead_of_reexecuting() {
 
     // Once the task is terminal, a retry is one event with the task.
     let res = a
-        .rpc(&b, Some(&g), "SendStreamingMessage", params.clone())
+        .rpc_idempotent(&b, Some(&g), "SendStreamingMessage", params.clone())
         .await;
     let events = sse_results(&res);
     assert_eq!(events.len(), 1, "{events:?}");
@@ -201,7 +209,7 @@ async fn streaming_retry_resubscribes_instead_of_reexecuting() {
     );
 
     // A unary retry of the streamed message gets the same task.
-    let res = a.rpc(&b, Some(&g), "SendMessage", params).await;
+    let res = a.rpc_idempotent(&b, Some(&g), "SendMessage", params).await;
     assert_eq!(task_of(&res)["id"], id);
     assert_eq!(exec.runs(), 1);
     assert_eq!(b.node.store.events_count("task.accepted").unwrap(), 1);
@@ -219,13 +227,13 @@ async fn retry_of_a_long_unary_execution_attaches_to_it() {
         async move {
             tokio::time::sleep(after).await;
             let started = Instant::now();
-            let res = a.rpc(b, Some(g), "SendMessage", params).await;
+            let res = a.rpc_idempotent(b, Some(g), "SendMessage", params).await;
             (res, started.elapsed())
         }
     };
 
     let (first, early, late) = tokio::join!(
-        a.rpc(&b, Some(&g), "SendMessage", params.clone()),
+        a.rpc_idempotent(&b, Some(&g), "SendMessage", params.clone()),
         retry(Duration::from_millis(200)),
         retry(Duration::from_secs(DEDUP_INFLIGHT_WAIT_S + 1)),
     );
@@ -256,6 +264,7 @@ async fn retry_after_a_restart_mid_execution_gets_the_failed_task() {
     let request = Request::post("/jsonrpc")
         .header(header::CONTENT_TYPE, "application/json")
         .header("a2a-version", "1.0")
+        .header("a2a-extensions", IDEMPOTENCY_EXTENSION)
         .header(header::AUTHORIZATION, bearer(&g))
         .body(Body::from(
             serde_json::to_vec(&rpc_request("SendMessage", params.clone())).unwrap(),
@@ -269,11 +278,15 @@ async fn retry_after_a_restart_mid_execution_gets_the_failed_task() {
     let b = spawn_node_in_with_executor(dir, exec.clone()).await;
 
     // The retry gets the task the restart failed, not a new run.
-    let res = a.rpc(&b, Some(&g), "SendMessage", params.clone()).await;
+    let res = a
+        .rpc_idempotent(&b, Some(&g), "SendMessage", params.clone())
+        .await;
     let task = task_of(&res);
     assert_eq!(task["status"]["state"], "TASK_STATE_FAILED", "{task}");
     assert_eq!(status_text(task), INTERRUPTED_MESSAGE);
-    let res = a.rpc(&b, Some(&g), "SendStreamingMessage", params).await;
+    let res = a
+        .rpc_idempotent(&b, Some(&g), "SendStreamingMessage", params)
+        .await;
     let events = sse_results(&res);
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0]["task"]["id"], task["id"]);
@@ -288,7 +301,11 @@ async fn unbound_row_left_by_a_crash_is_cleared_at_start() {
     let params = message_params("hola", None);
     let message_id = params["message"]["messageId"].as_str().unwrap();
     let done = message_params("done before", None);
-    let done_task = task_of(&a.rpc(&b, Some(&g), "SendMessage", done.clone()).await).clone();
+    let done_task = task_of(
+        &a.rpc_idempotent(&b, Some(&g), "SendMessage", done.clone())
+            .await,
+    )
+    .clone();
 
     // What a crash after the key was created and before its execution
     // started leaves: a row with no outcome.
@@ -305,13 +322,13 @@ async fn unbound_row_left_by_a_crash_is_cleared_at_start() {
 
     // The retry runs, at once, instead of waiting for a run that never was.
     let started = Instant::now();
-    let res = a.rpc(&b, Some(&g), "SendMessage", params).await;
+    let res = a.rpc_idempotent(&b, Some(&g), "SendMessage", params).await;
     let task = task_of(&res);
     assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED", "{task}");
     assert!(started.elapsed() < Duration::from_secs(DEDUP_INFLIGHT_WAIT_S));
     assert_eq!(exec.runs(), 2);
     // A bound row is kept.
-    let res = a.rpc(&b, Some(&g), "SendMessage", done).await;
+    let res = a.rpc_idempotent(&b, Some(&g), "SendMessage", done).await;
     assert_eq!(task_of(&res)["id"], done_task["id"]);
     assert_eq!(exec.runs(), 2);
 }
@@ -321,15 +338,21 @@ async fn executor_error_fails_the_task_and_a_retry_returns_it() {
     let (b, a, g, exec) = setup_with(CountingExecutor::failing()).await;
     let params = message_params("hola", None);
 
-    let res = a.rpc(&b, Some(&g), "SendMessage", params.clone()).await;
+    let res = a
+        .rpc_idempotent(&b, Some(&g), "SendMessage", params.clone())
+        .await;
     let task = task_of(&res).clone();
     assert_eq!(task["status"]["state"], "TASK_STATE_FAILED", "{task}");
     assert_eq!(status_text(&task), WORKER_CRASHED);
 
-    let res = a.rpc(&b, Some(&g), "SendMessage", params.clone()).await;
+    let res = a
+        .rpc_idempotent(&b, Some(&g), "SendMessage", params.clone())
+        .await;
     assert_eq!(task_of(&res)["id"], task["id"]);
     assert_eq!(task_of(&res)["status"]["state"], "TASK_STATE_FAILED");
-    let res = a.rpc(&b, Some(&g), "SendStreamingMessage", params).await;
+    let res = a
+        .rpc_idempotent(&b, Some(&g), "SendStreamingMessage", params)
+        .await;
     let events = sse_results(&res);
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0]["task"]["id"], task["id"]);
@@ -342,12 +365,18 @@ async fn executor_error_fails_the_task_and_a_retry_returns_it() {
 async fn same_id_with_different_content_is_invalid_params() {
     let (b, a, g, exec) = setup(Duration::ZERO).await;
     let params = message_params("hola", None);
-    let task = task_of(&a.rpc(&b, Some(&g), "SendMessage", params.clone()).await).clone();
+    let task = task_of(
+        &a.rpc_idempotent(&b, Some(&g), "SendMessage", params.clone())
+            .await,
+    )
+    .clone();
 
     let mut changed = params.clone();
     changed["message"]["parts"][0]["text"] = json!("adiós");
     for method in ["SendMessage", "SendStreamingMessage"] {
-        let res = a.rpc(&b, Some(&g), method, changed.clone()).await;
+        let res = a
+            .rpc_idempotent(&b, Some(&g), method, changed.clone())
+            .await;
         let err = &res.json["error"];
         assert_eq!(err["code"], -32602, "{method}: {}", res.json);
         assert_eq!(
@@ -358,12 +387,14 @@ async fn same_id_with_different_content_is_invalid_params() {
     // A change outside the message counts as different content too.
     let mut configured = params.clone();
     configured["configuration"] = json!({"historyLength": 0});
-    let res = a.rpc(&b, Some(&g), "SendMessage", configured).await;
+    let res = a
+        .rpc_idempotent(&b, Some(&g), "SendMessage", configured)
+        .await;
     assert_eq!(res.json["error"]["code"], -32602, "{}", res.json);
 
     assert_eq!(exec.runs(), 1);
     // The original stays as it was.
-    let res = a.rpc(&b, Some(&g), "SendMessage", params).await;
+    let res = a.rpc_idempotent(&b, Some(&g), "SendMessage", params).await;
     assert_eq!(task_of(&res)["id"], task["id"]);
 }
 
@@ -371,16 +402,24 @@ async fn same_id_with_different_content_is_invalid_params() {
 async fn dedup_survives_daemon_restart() {
     let (b, a, g, exec) = setup(Duration::ZERO).await;
     let params = message_params("hola", None);
-    let t1 = task_of(&a.rpc(&b, Some(&g), "SendMessage", params.clone()).await).clone();
+    let t1 = task_of(
+        &a.rpc_idempotent(&b, Some(&g), "SendMessage", params.clone())
+            .await,
+    )
+    .clone();
 
     let TestNode { node, dir } = b;
     node.shutdown().await.unwrap();
     let b = spawn_node_in_with_executor(dir, exec.clone()).await;
 
-    let res = a.rpc(&b, Some(&g), "SendMessage", params.clone()).await;
+    let res = a
+        .rpc_idempotent(&b, Some(&g), "SendMessage", params.clone())
+        .await;
     assert_eq!(task_of(&res)["id"], t1["id"]);
     assert_eq!(task_of(&res)["status"]["state"], "TASK_STATE_COMPLETED");
-    let res = a.rpc(&b, Some(&g), "SendStreamingMessage", params).await;
+    let res = a
+        .rpc_idempotent(&b, Some(&g), "SendStreamingMessage", params)
+        .await;
     let events = sse_results(&res);
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0]["task"]["id"], t1["id"]);
@@ -395,16 +434,24 @@ async fn two_peers_may_use_the_same_message_id() {
     let for_c = grant(&b, &c, &SEND_AND_READ, 3600);
     let params = message_params("hola", None);
 
-    let from_a = a.rpc(&b, Some(&for_a), "SendMessage", params.clone()).await;
-    let from_c = c.rpc(&b, Some(&for_c), "SendMessage", params.clone()).await;
+    let from_a = a
+        .rpc_idempotent(&b, Some(&for_a), "SendMessage", params.clone())
+        .await;
+    let from_c = c
+        .rpc_idempotent(&b, Some(&for_c), "SendMessage", params.clone())
+        .await;
     assert_eq!(exec.runs(), 2);
     let (ta, tc) = (task_of(&from_a), task_of(&from_c));
     assert_ne!(ta["id"], tc["id"]);
 
     // Each peer's retry gets its own task.
-    let res = c.rpc(&b, Some(&for_c), "SendMessage", params.clone()).await;
+    let res = c
+        .rpc_idempotent(&b, Some(&for_c), "SendMessage", params.clone())
+        .await;
     assert_eq!(task_of(&res)["id"], tc["id"]);
-    let res = a.rpc(&b, Some(&for_a), "SendMessage", params).await;
+    let res = a
+        .rpc_idempotent(&b, Some(&for_a), "SendMessage", params)
+        .await;
     assert_eq!(task_of(&res)["id"], ta["id"]);
     assert_eq!(exec.runs(), 2);
 }
@@ -486,4 +533,81 @@ async fn purge_removes_only_old_rows() {
             response_json: None,
         })
     );
+}
+
+#[tokio::test]
+async fn without_the_extension_the_same_message_id_runs_twice() {
+    let (b, a, g, exec) = setup(Duration::ZERO).await;
+    let params = message_params("hola", None);
+    let first = task_of(&a.rpc(&b, Some(&g), "SendMessage", params.clone()).await).clone();
+    let second = task_of(&a.rpc(&b, Some(&g), "SendMessage", params.clone()).await).clone();
+    assert_ne!(first["id"], second["id"]);
+    let res = a.rpc(&b, Some(&g), "SendStreamingMessage", params).await;
+    let events = sse_results(&res);
+    assert_ne!(event_task_id(&events[0]), &first["id"]);
+    assert_eq!(exec.runs(), 3);
+
+    // Each run belongs to the peer that asked: three tasks, all listed.
+    let res = a.rpc(&b, Some(&g), "ListTasks", json!({})).await;
+    assert_eq!(res.json["result"]["totalSize"], 3, "{}", res.json);
+}
+
+#[tokio::test]
+async fn without_the_extension_a_reused_id_with_other_content_is_accepted() {
+    let (b, a, g, exec) = setup(Duration::ZERO).await;
+    let params = message_params("hola", None);
+    let first = task_of(&a.rpc(&b, Some(&g), "SendMessage", params.clone()).await).clone();
+    let mut changed = params.clone();
+    changed["message"]["parts"][0]["text"] = json!("adiós");
+    let res = a.rpc(&b, Some(&g), "SendMessage", changed).await;
+    let second = task_of(&res);
+    assert_ne!(second["id"], first["id"]);
+    assert_eq!(second["artifacts"][0]["parts"][0]["text"], "echo: adiós");
+    assert_eq!(exec.runs(), 2);
+
+    // A request that activates the extension afterwards starts the dedup
+    // record anew: it runs, and its own retry attaches to it.
+    let third = task_of(
+        &a.rpc_idempotent(&b, Some(&g), "SendMessage", params.clone())
+            .await,
+    )
+    .clone();
+    let retry = task_of(&a.rpc_idempotent(&b, Some(&g), "SendMessage", params).await).clone();
+    assert_eq!(retry["id"], third["id"]);
+    assert_eq!(exec.runs(), 3);
+}
+
+#[tokio::test]
+async fn the_extension_reaches_the_peer_through_the_gateway() {
+    // The gateway passes `A2A-Extensions` on unchanged, in both bindings.
+    let (b, a, g, exec) = setup(Duration::ZERO).await;
+    a.add_contact("bob", &b);
+    a.hold(&g);
+    let gw = a.gateway_url();
+    let with = [
+        ("a2a-version", "1.0"),
+        ("a2a-extensions", IDEMPOTENCY_EXTENSION),
+    ];
+    let params = message_params("hola", None);
+    let body = rpc_request("SendMessage", params.clone());
+    let first =
+        common::gateway_request(&gw, "POST", "/peers/bob/jsonrpc", &with, Some(&body)).await;
+    let second = common::gateway_request(
+        &gw,
+        "POST",
+        "/peers/bob/rest/message:send",
+        &with,
+        Some(&params),
+    )
+    .await;
+    assert_eq!(second.status, 200, "{}", second.json);
+    assert_eq!(second.json["task"]["id"], task_of(&first)["id"]);
+    assert_eq!(exec.runs(), 1);
+
+    // Without it, the same message runs again.
+    let without = [("a2a-version", "1.0")];
+    let third =
+        common::gateway_request(&gw, "POST", "/peers/bob/jsonrpc", &without, Some(&body)).await;
+    assert_ne!(task_of(&third)["id"], task_of(&first)["id"]);
+    assert_eq!(exec.runs(), 2);
 }

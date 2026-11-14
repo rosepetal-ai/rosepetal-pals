@@ -47,6 +47,11 @@ use pals_core::store::Contact;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 
+/// The URI of PALS's idempotency extension, which a request activates with
+/// `A2A-Extensions`. A literal, so that the tests pin the wire value.
+pub const IDEMPOTENCY_EXTENSION: &str =
+    "https://github.com/rosepetal-ai/rosepetal-pals/extensions/idempotency/v1";
+
 /// The echo agent as a standard A2A v1.0 server: a static card, the JSON-RPC
 /// binding at `/jsonrpc` and the HTTP+JSON binding at `/rest`.
 pub fn echo_app(agent_name: &str) -> axum::Router {
@@ -548,11 +553,37 @@ impl TestNode {
         method: &str,
         params: Value,
     ) -> TestResponse {
+        self.rpc_with(to, grant, method, params, &[]).await
+    }
+
+    /// [`TestNode::rpc`], activating the idempotency extension with
+    /// `A2A-Extensions`.
+    pub async fn rpc_idempotent(
+        &self,
+        to: &TestNode,
+        grant: Option<&SignedGrant>,
+        method: &str,
+        params: Value,
+    ) -> TestResponse {
+        let extension = [("a2a-extensions", IDEMPOTENCY_EXTENSION)];
+        self.rpc_with(to, grant, method, params, &extension).await
+    }
+
+    /// [`TestNode::rpc`] with `extra` headers.
+    pub async fn rpc_with(
+        &self,
+        to: &TestNode,
+        grant: Option<&SignedGrant>,
+        method: &str,
+        params: Value,
+        extra: &[(&str, &str)],
+    ) -> TestResponse {
         let bearer = grant.map(bearer);
         let mut headers = vec![("a2a-version", "1.0")];
         if let Some(value) = &bearer {
             headers.push(("authorization", value.as_str()));
         }
+        headers.extend_from_slice(extra);
         let body = rpc_request(method, params);
         self.request(to, "POST", "/jsonrpc", &headers, Some(&body))
             .await

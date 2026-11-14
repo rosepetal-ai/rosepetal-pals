@@ -25,6 +25,7 @@ use pals_core::store::{DEDUP_INFLIGHT_WAIT_S, DedupBegin, DedupRow, Store};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, warn};
 
+use super::IDEMPOTENCY_EXTENSION;
 use super::task_store::{a2a_error, blocking};
 use crate::net::PEER_HEADER;
 
@@ -37,6 +38,8 @@ const REUSED_MESSAGE_ID: &str = "messageId reused with different content";
 const STILL_IN_FLIGHT: &str = "the first request with this messageId is still in progress";
 /// How often a repeated request looks again for the outcome of the first.
 const INFLIGHT_POLL: Duration = Duration::from_millis(50);
+/// The service parameter a client activates extensions with (A2A §3.2.6).
+const EXTENSIONS_PARAM: &str = "a2a-extensions";
 /// Events of a first streaming request held for a requester that reads
 /// slower than they come: as many as the SDK holds for each subscriber.
 const EVENT_BUFFER: usize = 32;
@@ -44,7 +47,7 @@ const EVENT_BUFFER: usize = 32;
 type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 
 /// A [`RequestHandler`] that confines each peer to its own tasks and runs
-/// each message once.
+/// each message once when the request asks for it.
 ///
 /// **Ownership.** The owner of a task is the peer, [`PEER_HEADER`], whose
 /// request created it. The [`BindingExecutor`](super::BindingExecutor)
@@ -56,9 +59,13 @@ type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 /// that does not exist. `ListTasks` never reaches the inner handler: it
 /// lists the requesting peer's tasks only.
 ///
-/// **Idempotency.** `SendMessage` and `SendStreamingMessage` are keyed by
-/// `(peer, messageId)`, with the BLAKE3 of the JCS form of the request's
-/// params (the same for both methods and both bindings) as its content:
+/// **Idempotency**, the opt-in [`IDEMPOTENCY_EXTENSION`]. A request that does
+/// not activate it with the `A2A-Extensions` service parameter
+/// ([`idempotency_requested`]) runs as the reference SDK runs it: every
+/// message is new, whatever its `messageId`. A request that activates it is
+/// keyed by `(peer, messageId)`, with the BLAKE3 of the JCS form of the
+/// request's params (the same for both methods and both bindings) as its
+/// content:
 ///
 /// - The first request with a key runs. The key is bound to its task when
 ///   the task's execution starts, by the
@@ -369,6 +376,42 @@ fn single(event: StreamResponse) -> Events {
     Box::pin(stream::iter([Ok(event)]))
 }
 
+/// Whether a request activates the [`IDEMPOTENCY_EXTENSION`]: the
+/// `A2A-Extensions` service parameter, a comma-separated list of extension
+/// URIs (A2A §3.2.6), names it, in any of its values.
+pub(crate) fn idempotency_requested(params: &ServiceParams) -> bool {
+    params
+        .get(EXTENSIONS_PARAM)
+        .into_iter()
+        .flatten()
+        .flat_map(|value| value.split(','))
+        .any(|uri| uri.trim() == IDEMPOTENCY_EXTENSION)
+}
+
+/// `events`, each task they name recorded as `peer`'s before the event goes
+/// out; if that fails, the stream ends with the error.
+fn owning(events: Events, store: Arc<Store>, peer: AgentId) -> Events {
+    let state = (Some(events), store, None::<String>);
+    Box::pin(stream::unfold(
+        state,
+        move |(events, store, owned)| async move {
+            let mut events = events?;
+            let item = events.next().await?;
+            let mut owned = owned;
+            if let Ok(event) = &item
+                && let Some(task_id) = event_task_id(event)
+                && owned.as_deref() != Some(task_id)
+            {
+                if let Err(err) = own(&store, task_id, peer).await {
+                    return Some((Err(err), (None, store, owned)));
+                }
+                owned = Some(task_id.to_owned());
+            }
+            Some((item, (Some(events), store, owned)))
+        },
+    ))
+}
+
 /// The dedup key of a message request, and the hash of its content.
 #[derive(Clone)]
 struct Key {
@@ -579,6 +622,17 @@ impl<H: RequestHandler> RequestHandler for GuardedHandler<H> {
         if let Some(task_id) = &req.message.task_id {
             self.ensure_owner(peer, task_id).await?;
         }
+        if !idempotency_requested(params) {
+            let response = self.inner.send_message(params, req).await?;
+            let task_id = match &response {
+                SendMessageResponse::Task(task) => Some(&task.id),
+                SendMessageResponse::Message(message) => message.task_id.as_ref(),
+            };
+            if let Some(task_id) = task_id {
+                own(&self.store, task_id, peer).await?;
+            }
+            return Ok(response);
+        }
         let key = Key::of(peer, &req)?;
         match self.start_send(params, req.clone(), key).await? {
             Start::Ran(response) => Ok(response),
@@ -594,6 +648,10 @@ impl<H: RequestHandler> RequestHandler for GuardedHandler<H> {
         let peer = peer(params)?;
         if let Some(task_id) = &req.message.task_id {
             self.ensure_owner(peer, task_id).await?;
+        }
+        if !idempotency_requested(params) {
+            let events = self.inner.send_streaming_message(params, req).await?;
+            return Ok(owning(events, Arc::clone(&self.store), peer));
         }
         let key = Key::of(peer, &req)?;
         match self.start_stream(params, req.clone(), key).await? {
@@ -782,7 +840,13 @@ mod tests {
         let inner = DefaultRequestHandler::new(executor(Arc::clone(&store)), tasks);
         let handler = GuardedHandler::new(inner, store, Arc::new(AgentKey::generate()));
         let peer = AgentKey::generate().id().to_string();
-        let params = ServiceParams::from([(PEER_HEADER.to_owned(), vec![peer])]);
+        let params = ServiceParams::from([
+            (PEER_HEADER.to_owned(), vec![peer]),
+            (
+                EXTENSIONS_PARAM.to_owned(),
+                vec![IDEMPOTENCY_EXTENSION.to_owned()],
+            ),
+        ]);
         (handler, params)
     }
 
@@ -797,6 +861,29 @@ mod tests {
 
     async fn collect(events: Events) -> Vec<StreamResponse> {
         events.map(|event| event.unwrap()).collect().await
+    }
+
+    #[test]
+    fn the_extension_is_activated_by_any_value_of_a2a_extensions() {
+        let params = |values: &[&str]| {
+            ServiceParams::from([(
+                EXTENSIONS_PARAM.to_owned(),
+                values.iter().map(|value| (*value).to_owned()).collect(),
+            )])
+        };
+        let listed = format!("https://example.com/ext/v1, {IDEMPOTENCY_EXTENSION}");
+        for on in [
+            &[IDEMPOTENCY_EXTENSION][..],
+            &[listed.as_str()],
+            &["https://example.com/ext/v1", IDEMPOTENCY_EXTENSION],
+        ] {
+            assert!(idempotency_requested(&params(on)), "{on:?}");
+        }
+        let longer = format!("{IDEMPOTENCY_EXTENSION}/2");
+        for off in [&[][..], &["https://example.com/ext/v1"], &[longer.as_str()]] {
+            assert!(!idempotency_requested(&params(off)), "{off:?}");
+        }
+        assert!(!idempotency_requested(&ServiceParams::new()));
     }
 
     #[tokio::test]
@@ -1077,7 +1164,13 @@ mod tests {
         };
         let handler = GuardedHandler::new(inner, store, Arc::new(AgentKey::generate()));
         let peer = AgentKey::generate().id().to_string();
-        let params = ServiceParams::from([(PEER_HEADER.to_owned(), vec![peer])]);
+        let params = ServiceParams::from([
+            (PEER_HEADER.to_owned(), vec![peer]),
+            (
+                EXTENSIONS_PARAM.to_owned(),
+                vec![IDEMPOTENCY_EXTENSION.to_owned()],
+            ),
+        ]);
 
         for streaming in [false, true] {
             let req = request(if streaming { "streamed" } else { "unary" });

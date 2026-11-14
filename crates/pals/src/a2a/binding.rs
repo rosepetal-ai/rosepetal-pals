@@ -12,7 +12,7 @@ use futures::stream::{self, BoxStream};
 use pals_core::store::Store;
 use tracing::{error, warn};
 
-use super::guard::peer;
+use super::guard::{idempotency_requested, peer};
 use super::task_store::blocking;
 
 type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
@@ -21,12 +21,14 @@ type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 /// starts.
 ///
 /// Before the inner executor runs, the requesting peer, the
-/// `x-agentnet-peer` service param, is recorded as the owner of the task,
-/// and the request's `(peer, messageId)` dedup key is bound to the task.
-/// From then on a retry of the request attaches to the task, however long
-/// it runs, even after a restart fails it (see
-/// [`GuardedHandler`](super::GuardedHandler)). If that record fails, the
-/// inner executor does not run and the execution ends with the error.
+/// `x-agentnet-peer` service param, is recorded as the owner of the task;
+/// and, when the request activates the
+/// [idempotency extension](super::IDEMPOTENCY_EXTENSION), the request's
+/// `(peer, messageId)` dedup key is bound to the task. From then on a retry
+/// of the request attaches to the task, however long it runs, even after a
+/// restart fails it (see [`GuardedHandler`](super::GuardedHandler)). If
+/// that record fails, the inner executor does not run and the execution
+/// ends with the error.
 ///
 /// An error from the inner executor would leave the task in its last state,
 /// with no execution left to move it, and a retry would attach to it for
@@ -67,8 +69,8 @@ impl<E: AgentExecutor> AgentExecutor for BindingExecutor<E> {
     }
 }
 
-/// Records the peer of `ctx` as the owner of its task, and binds the dedup
-/// key of its message to the task.
+/// Records the peer of `ctx` as the owner of its task, and, when the
+/// request is idempotent, binds the dedup key of its message to the task.
 async fn bind(store: &Arc<Store>, ctx: &ExecutorContext) -> Result<(), A2AError> {
     let peer = peer(&ctx.service_params)?;
     let Some(message) = &ctx.message else {
@@ -76,10 +78,13 @@ async fn bind(store: &Arc<Store>, ctx: &ExecutorContext) -> Result<(), A2AError>
         return Err(A2AError::internal("Internal error"));
     };
     let task_id = ctx.task_id.clone();
-    let message_id = message.message_id.clone();
+    let message_id = idempotency_requested(&ctx.service_params).then(|| message.message_id.clone());
     blocking(store, move |store| {
         store.task_owner_put(&task_id, &peer)?;
-        store.dedup_bind(&peer, &message_id, Some(&task_id), None)
+        match message_id {
+            Some(message_id) => store.dedup_bind(&peer, &message_id, Some(&task_id), None),
+            None => Ok(()),
+        }
     })
     .await
 }
@@ -182,7 +187,13 @@ mod tests {
             context_id: "c-1".to_owned(),
             metadata: None,
             user: None,
-            service_params: ServiceParams::from([(PEER_HEADER.to_owned(), vec![peer.to_string()])]),
+            service_params: ServiceParams::from([
+                (PEER_HEADER.to_owned(), vec![peer.to_string()]),
+                (
+                    "a2a-extensions".to_owned(),
+                    vec![crate::a2a::IDEMPOTENCY_EXTENSION.to_owned()],
+                ),
+            ]),
             tenant: None,
         }
     }
@@ -223,6 +234,19 @@ mod tests {
         let events: Vec<_> = executor.execute(ctx).collect().await;
         assert!(matches!(events.as_slice(), [Err(_)]), "{events:?}");
         assert!(seen.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn without_idempotency_an_execution_records_its_owner_only() {
+        // No dedup row for the message, and none needed.
+        let (_store, peer, seen, executor) = probed(None);
+        let mut ctx = context(peer);
+        ctx.service_params.remove("a2a-extensions");
+        let events: Vec<_> = executor.execute(ctx).collect().await;
+        assert!(events.is_empty(), "{events:?}");
+        let (owner, row) = seen.lock().unwrap().take().expect("the executor ran");
+        assert_eq!(owner, Some(peer));
+        assert_eq!(row, DedupBegin::New);
     }
 
     #[tokio::test]
