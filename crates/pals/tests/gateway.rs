@@ -782,12 +782,19 @@ async fn browser_requests_are_403_and_every_response_is_sandboxed() {
     let refused = json!({"error": "browser requests are not accepted"});
 
     // Fetch Metadata marks a browser's request, a navigation included, even
-    // where it sends no Origin.
-    for header in [
+    // where it sends no Origin: what a browser sends navigating to the
+    // gateway, and either of the headers that only browsers send.
+    let navigation = [
+        ("sec-fetch-site", "cross-site"),
         ("sec-fetch-mode", "navigate"),
-        ("sec-fetch-site", "same-origin"),
         ("sec-fetch-dest", "document"),
-    ] {
+    ];
+    let marks: [&[(&str, &str)]; 3] = [
+        &navigation,
+        &[("sec-fetch-dest", "document")],
+        &[("sec-fetch-site", "same-origin")],
+    ];
+    for headers in marks {
         for (method, path) in [
             ("GET", "/healthz".to_owned()),
             ("GET", format!("/peers/{}/rest/tasks", b.id())),
@@ -796,16 +803,11 @@ async fn browser_requests_are_403_and_every_response_is_sandboxed() {
         ] {
             let body = (method == "POST")
                 .then(|| rpc_request("SendMessage", message_params("hola", None)));
-            let res = gateway_request(
-                &gw,
-                method,
-                &path,
-                &[header, ("a2a-version", "1.0")],
-                body.as_ref(),
-            )
-            .await;
-            assert_eq!(res.status, 403, "{header:?} {path}: {}", res.json);
-            assert_eq!(res.json, refused, "{header:?} {path}");
+            let mut all = headers.to_vec();
+            all.push(("a2a-version", "1.0"));
+            let res = gateway_request(&gw, method, &path, &all, body.as_ref()).await;
+            assert_eq!(res.status, 403, "{headers:?} {path}: {}", res.json);
+            assert_eq!(res.json, refused, "{headers:?} {path}");
             assert_sandboxed(&res, path.as_str());
         }
     }
@@ -831,6 +833,61 @@ async fn browser_requests_are_403_and_every_response_is_sandboxed() {
     assert_eq!(res.status, 200, "{}", String::from_utf8_lossy(&res.body));
     assert_eq!(res.header("content-type"), "text/html");
     assert_sandboxed(&res, "a peer's page");
+}
+
+#[tokio::test]
+async fn node_fetch_clients_with_only_sec_fetch_mode_are_served() {
+    // Node's built-in fetch (undici), the default transport of the A2A JS
+    // SDK, sends `sec-fetch-mode: cors` on every request, and neither
+    // `sec-fetch-site` nor `sec-fetch-dest`.
+    let (a, b, _) = connected_pair().await;
+    let gw = a.gateway_url();
+    let node_fetch = [
+        ("sec-fetch-mode", "cors"),
+        ("accept", "*/*"),
+        ("accept-language", "*"),
+        ("user-agent", "node"),
+        ("a2a-version", "1.0"),
+    ];
+
+    let res = gateway_request(
+        &gw,
+        "GET",
+        &format!("/peers/{}/.well-known/agent-card.json", b.id()),
+        &node_fetch,
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(
+        res.json["supportedInterfaces"][0]["url"],
+        format!("{gw}/peers/{}/jsonrpc", b.id())
+    );
+
+    let res = gateway_request(
+        &gw,
+        "POST",
+        "/peers/bob/jsonrpc",
+        &node_fetch,
+        Some(&rpc_request("SendMessage", message_params("hola", None))),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let task = &res.json["result"]["task"];
+    assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED", "{task}");
+    assert_eq!(task["artifacts"][0]["parts"][0]["text"], "echo: hola");
+    assert_sandboxed(&res, "a Node fetch client");
+
+    let res = gateway_request(
+        &gw,
+        "POST",
+        "/peers/bob/rest/message:send",
+        &node_fetch,
+        Some(&message_params("por rest", None)),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["task"]["status"]["state"], "TASK_STATE_COMPLETED");
 }
 
 #[tokio::test]

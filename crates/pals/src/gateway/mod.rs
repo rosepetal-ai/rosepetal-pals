@@ -34,15 +34,15 @@
 //! error"}`.
 //!
 //! Every request, to any route, first passes the local guard: one with an
-//! `Origin` header (a web page), with a Fetch Metadata header
-//! (`Sec-Fetch-Site`, `Sec-Fetch-Mode` or `Sec-Fetch-Dest`: a browser, even
-//! navigating, where it sends no `Origin`), or with a `Host` other than
-//! `127.0.0.1`, `localhost` or `[::1]` with the gateway's port (DNS
-//! rebinding) gets `403`. Every response, whoever wrote it, carries
-//! `Content-Security-Policy: sandbox` and `X-Content-Type-Options: nosniff`,
-//! so that a browser never runs what a peer sends at the gateway's origin: a
-//! sandboxed page has an opaque origin, and its requests carry
-//! `Origin: null`.
+//! `Origin` header (a web page), with `Sec-Fetch-Site` or `Sec-Fetch-Dest`
+//! (Fetch Metadata that only a browser sends, navigating too, where it sends
+//! no `Origin`; `Sec-Fetch-Mode` alone is Node's `fetch`, and passes), or
+//! with a `Host` other than `127.0.0.1`, `localhost` or `[::1]` with the
+//! gateway's port (DNS rebinding) gets `403`. Every response, whoever wrote
+//! it, carries `Content-Security-Policy: sandbox` and
+//! `X-Content-Type-Options: nosniff`, so that a browser never runs what a
+//! peer sends at the gateway's origin: a sandboxed page has an opaque
+//! origin, and its requests carry `Origin: null`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -81,8 +81,10 @@ const MAX_CARD_BYTES: usize = 1024 * 1024;
 const CARD_TIMEOUT: Duration = Duration::from_secs(20);
 /// The prefix of the headers only PALS sets.
 const OWN_HEADER_PREFIX: &str = "x-agentnet-";
-/// The Fetch Metadata headers a browser adds to its requests.
-const FETCH_METADATA: [&str; 3] = ["sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest"];
+/// The Fetch Metadata headers only a browser adds to its requests. Not
+/// `Sec-Fetch-Mode`: Node's built-in `fetch` sends it alone on every request,
+/// and A2A clients use it.
+const FETCH_METADATA: [&str; 2] = ["sec-fetch-site", "sec-fetch-dest"];
 /// Response headers of a peer that would apply to every peer, since they all
 /// share the gateway's origin.
 const PEER_COOKIES: [&str; 2] = ["set-cookie", "set-cookie2"];
