@@ -1,8 +1,6 @@
 //! Signed direct grants: token format, signature, validity rules and the
 //! frozen vector.
 
-use std::os::unix::fs::PermissionsExt;
-
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use pals_core::grant::{
@@ -20,11 +18,7 @@ const EXPIRES_AT: i64 = 1_794_700_800;
 
 /// The key whose secret is 32 bytes of `byte`.
 fn fixed_key(byte: u8) -> AgentKey {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("agent.key");
-    std::fs::write(&path, [byte; 32]).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    AgentKey::load_or_create(&path).unwrap()
+    AgentKey::from_bytes(&[byte; 32])
 }
 
 struct Parties {

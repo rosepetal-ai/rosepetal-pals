@@ -106,6 +106,12 @@ impl AgentKey {
         Self(SigningKey::from_bytes(&secret))
     }
 
+    /// The key whose secret is these 32 bytes, as [`AgentKey::to_bytes`]
+    /// returns them.
+    pub fn from_bytes(bytes: &[u8; 32]) -> Self {
+        Self(SigningKey::from_bytes(bytes))
+    }
+
     /// Loads the key at `path`, or creates it there when the file does not
     /// exist.
     ///
@@ -204,6 +210,14 @@ mod tests {
         let second = AgentKey::load_or_create(&path).unwrap();
         assert_eq!(first.id(), second.id());
         assert_eq!(first.to_bytes(), second.to_bytes());
+    }
+
+    #[test]
+    fn from_bytes_rebuilds_the_key() {
+        let key = AgentKey::generate();
+        let rebuilt = AgentKey::from_bytes(&key.to_bytes());
+        assert_eq!(rebuilt.id(), key.id());
+        assert_eq!(rebuilt.sign(b"msg"), key.sign(b"msg"));
     }
 
     #[test]
