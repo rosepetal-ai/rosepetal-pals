@@ -807,8 +807,10 @@ fn expired_peer_record_no_longer_blocks_a_lower_seq() {
         RecordAccept::New
     );
 
-    // Its new first record, valid from an hour after NOW for a day.
-    let reissued_at = NOW + 3600;
+    // Its new first record, issued a whole lifetime after the known one
+    // expired, and valid for a day from then.
+    let forget_at = EXPIRES_AT + RECORD_TTL_S + CLOCK_SKEW_S;
+    let reissued_at = forget_at - 3600;
     let fresh = ContactRecord {
         issued_at: ts(reissued_at),
         expires_at: ts(reissued_at + RECORD_TTL_S),
@@ -828,24 +830,33 @@ fn expired_peer_record_no_longer_blocks_a_lower_seq() {
             .unwrap()
     };
 
-    // While the known record is valid, within the clock skew, a lower seq
-    // is a regression and is not stored...
-    assert_eq!(
-        accept_at(EXPIRES_AT + CLOCK_SKEW_S - 1),
-        RecordAccept::Regression { known_seq: 50 }
-    );
+    // A lower seq is a regression, and is not stored, while the known
+    // record is valid, within the clock skew, and for a whole lifetime more:
+    // a record issued before the known one, replayed, may still be valid
+    // until then...
+    for now in [
+        EXPIRES_AT + CLOCK_SKEW_S - 1,
+        EXPIRES_AT + CLOCK_SKEW_S,
+        forget_at - 1,
+    ] {
+        assert_eq!(
+            accept_at(now),
+            RecordAccept::Regression { known_seq: 50 },
+            "{now}"
+        );
+    }
     assert_eq!(
         store.peer_record(&peer.id(), "contact").unwrap(),
         Some((50, old))
     );
-    // ...and once it has expired beyond the skew, it counts as none.
-    assert_eq!(accept_at(EXPIRES_AT + CLOCK_SKEW_S), RecordAccept::New);
+    // ...and from then on the known record counts as none.
+    assert_eq!(accept_at(forget_at), RecordAccept::New);
     assert_eq!(
         store.peer_record(&peer.id(), "contact").unwrap(),
         Some((1, fresh.clone()))
     );
     // From then on the new sequence is the one compared.
-    assert_eq!(accept_at(EXPIRES_AT + 2 * CLOCK_SKEW_S), RecordAccept::Same);
+    assert_eq!(accept_at(forget_at + CLOCK_SKEW_S), RecordAccept::Same);
 }
 
 #[test]

@@ -12,12 +12,14 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use super::Store;
 use crate::grant::CLOCK_SKEW_S;
 use crate::identity::AgentId;
+use crate::records::RECORD_TTL_S;
 
 /// What [`Store::peer_record_accept`] made of a record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordAccept {
     /// The first of its agent and kind, one with a higher `seq` than the one
-    /// known, or any once the known one has expired: stored, in its place.
+    /// known, or any once the known one expired more than
+    /// [`RECORD_TTL_S`] + [`CLOCK_SKEW_S`] ago: stored, in its place.
     New,
     /// The one known, byte for byte.
     Same,
@@ -95,14 +97,20 @@ impl Store {
     /// The caller has verified the record: its signature, that `agent`
     /// signed it, and its validity. A lower `seq`, or the same with other
     /// bytes, is a [`RecordAccept::Regression`] and is not stored; a higher
-    /// one replaces the known record. A known record that expired more than
-    /// [`CLOCK_SKEW_S`] ago counts as none, as it does for every receiver:
-    /// an agent that lost its sequence (a new database, the same key) is
-    /// accepted again once its last record has expired. No record outlives
-    /// its issue by more than [`crate::records::RECORD_TTL_S`], and an agent
-    /// issues each with that whole lifetime, in `seq` order, so by then every
-    /// older record has expired too. One `IMMEDIATE` transaction, so
-    /// concurrent calls see each other's records.
+    /// one replaces the known record.
+    ///
+    /// The known record counts as none once `now_unix` reaches its
+    /// `expires_at` + [`RECORD_TTL_S`] + [`CLOCK_SKEW_S`]: an agent that lost
+    /// its sequence (a new database, the same key) is accepted again then.
+    /// Not before: every older record was issued no later than the known
+    /// one, as long as the agent's `issued_at` never goes back, and lives at
+    /// most [`RECORD_TTL_S`] from its issue (checked on receipt), so it
+    /// expired by the known record's `expires_at` + [`RECORD_TTL_S`], and
+    /// any receiver refuses it [`CLOCK_SKEW_S`] later. Forgetting earlier
+    /// would let a replayed older record in whenever its issuer gave the
+    /// known one a shorter life than the whole [`RECORD_TTL_S`]. One
+    /// `IMMEDIATE` transaction, so concurrent calls see each other's
+    /// records.
     pub fn peer_record_accept(
         &self,
         agent: &AgentId,
@@ -125,7 +133,10 @@ impl Store {
             .optional()?;
         let known = known
             .filter(|(.., known_expires_at)| {
-                now_unix < known_expires_at.saturating_add(CLOCK_SKEW_S)
+                now_unix
+                    < known_expires_at
+                        .saturating_add(RECORD_TTL_S)
+                        .saturating_add(CLOCK_SKEW_S)
             })
             .map(|(known_seq, record, _)| (known_seq, record));
         let accept = match known {

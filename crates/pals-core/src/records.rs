@@ -10,12 +10,14 @@
 //!
 //! Each carries a `seq` its agent never repeats for that kind
 //! ([`crate::store::Store::own_seq_next`]) and expires at most
-//! [`RECORD_TTL_S`] after it was issued; the agent issues a new one when less
-//! than [`RECORD_RENEW_BEFORE_S`] remain, or when its content changes. A
-//! receiver refuses one outside its validity window, with
+//! [`RECORD_TTL_S`] after it was issued; the agent issues every record, in
+//! `seq` order, with that whole lifetime, and a new one when less than
+//! [`RECORD_RENEW_BEFORE_S`] remain, or when its content changes.
+//! A receiver refuses one outside its validity window, with
 //! [`crate::grant::CLOCK_SKEW_S`] of tolerance ([`check_validity`]), and one
-//! that goes back from the valid record it already knows of that agent and
-//! kind ([`crate::store::Store::peer_record_accept`]). In milestone 2 they travel
+//! that goes back from the record it knows of that agent and kind, until a
+//! whole [`RECORD_TTL_S`] after that one expired
+//! ([`crate::store::Store::peer_record_accept`]). In milestone 2 they travel
 //! in every discovery response; the DHT will publish them later.
 //!
 //! [`check_validity`]: crate::signed::check_validity
@@ -163,8 +165,12 @@ impl SignedDoc for AnnounceRecord {
 }
 
 /// The `seq` range and the lifetime both records share: no record outlives
-/// its issue by more than [`RECORD_TTL_S`], which is what lets a receiver
-/// forget a sequence once its last record has expired.
+/// its issue by more than [`RECORD_TTL_S`]. That cap is necessary for a
+/// receiver to forget a sequence ever, but not sufficient on its own: it
+/// bounds when an older record expires only together with an `issued_at`
+/// that never goes back, which is why the receiver waits a whole
+/// [`RECORD_TTL_S`] past the known record's expiry
+/// ([`crate::store::Store::peer_record_accept`]).
 fn check_common(seq: u64, issued_at: &str, expires_at: &str) -> Result<(), SignedError> {
     match (parse_timestamp(issued_at), parse_timestamp(expires_at)) {
         (Some(issued_at), Some(expires_at))
