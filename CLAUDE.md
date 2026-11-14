@@ -58,6 +58,7 @@ crates/pals/             daemon and CLI (binary `pals`)
   src/mcp.rs               the six MCP tools
   tests/                   integration tests over real nodes
 tests/interop/           run_tck.sh, python_client.py, requirements.txt (pinned)
+tests/exit/              exit-test harness: Docker container as machine A, the host as B (run.sh, Dockerfile)
 docs/                    Spanish: design, plans, binding and extension specs, conformance, runbooks
 ```
 
@@ -84,5 +85,5 @@ Module headers (`//!`) document each component's contract in detail; read them b
 | Peer bindings | `docs/bindings/http-over-iroh-v1.md` |
 | Idempotency extension | `docs/extensions/idempotency-v1.md` |
 | Conformance evidence and the exact claim | `docs/conformance/hito-1/README.md`, `sdk-issues.md` |
-| Exit test | `docs/runbooks/hito-1-dos-maquinas.md`, `docs/conformance/hito-1/exit-test.md` |
+| Exit test | `docs/runbooks/hito-1-dos-maquinas.md`, `docs/conformance/hito-1/exit-test.md`, `tests/exit/` |
 | Known hito 1 limitations | `README.md`, section "Limitaciones conocidas del hito 1" |
