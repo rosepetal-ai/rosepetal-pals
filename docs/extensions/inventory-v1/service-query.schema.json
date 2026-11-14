@@ -43,7 +43,7 @@
     "project": {
       "type": "string",
       "pattern": "^[!-~]+$",
-      "description": "Uno de los proyectos que cubre el grant presentado. Nunca amplía el ámbito: si no es el del grant, o no hay grant, la consulta se contesta como pública."
+      "description": "Uno de los proyectos que cubre el grant presentado, en ASCII imprimible sin espacios. Nunca amplía el ámbito: si no es el del grant, o no hay grant, la consulta se contesta como pública."
     },
     "execution_authorized": {
       "const": false,
@@ -82,7 +82,8 @@
     },
     "requirements": {
       "type": "object",
-      "description": "Todos obligatorios, salvo inventory.preferred. Una clave que el candidato no conoce no se da nunca por cumplida: va en unknown_requirements de la oferta.",
+      "description": "Todos obligatorios, salvo inventory.preferred. Una clave que el candidato no conoce no se da nunca por cumplida: va en unknown_requirements de la oferta, que repite su nombre; por eso toda clave es de 1 a 255 caracteres ASCII imprimibles.",
+      "propertyNames": { "$ref": "#/$defs/token" },
       "properties": {
         "language": {
           "$ref": "#/$defs/token",
@@ -102,7 +103,8 @@
     },
     "inventoryRequirements": {
       "type": "object",
-      "description": "Requisitos sobre el inventario (diseño §9). Sus ids solo se envían a candidatos con un grant del proyecto.",
+      "description": "Requisitos sobre el inventario (diseño §9). Sus ids solo se envían a candidatos con un grant del proyecto. Si no se pide nada del inventario, se omite: nunca es {}.",
+      "minProperties": 1,
       "properties": {
         "required": { "$ref": "#/$defs/requirementSet" },
         "preferred": {
@@ -114,6 +116,9 @@
     },
     "requirementSet": {
       "type": "object",
+      "description": "Un conjunto que no pide nada se omite: nunca es {}. Una clave que el candidato no conoce es de 1 a 255 caracteres ASCII imprimibles.",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/token" },
       "properties": {
         "mcp_integration_ids": {
           "$ref": "#/$defs/ids",

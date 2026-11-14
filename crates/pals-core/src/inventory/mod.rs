@@ -1138,6 +1138,6 @@ fn is_tool_name(name: &str) -> bool {
 
 /// A project name as the configuration and grants carry it: not empty,
 /// printable ASCII without spaces.
-fn is_project_name(name: &str) -> bool {
+pub(crate) fn is_project_name(name: &str) -> bool {
     !name.is_empty() && name.bytes().all(|b| b.is_ascii_graphic())
 }

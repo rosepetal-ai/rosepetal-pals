@@ -994,6 +994,11 @@ fn invalid_queries_are_bad_requests_that_quote_nothing() {
     with_null["project"] = Value::Null;
     let mut unknown = base.clone();
     unknown["peers"] = json!(["carol"]);
+    let with_project = |project: &str| {
+        let mut query = base.clone();
+        query["project"] = json!(project);
+        jcs::canonical(&query)
+    };
     for (name, bytes) in [
         ("not JSON", b"{\"query".to_vec()),
         ("not canonical", not_canonical),
@@ -1041,11 +1046,54 @@ fn invalid_queries_are_bad_requests_that_quote_nothing() {
                 json!({"inventory": {"preferred": {"accelerators": many(33, "gpu")}}}),
             ),
         ),
+        // Unknown requirements are echoed in signed offers: never as an
+        // empty name, nor one that is not printable ASCII.
+        (
+            "an empty requirement",
+            with("/requirements", json!({"": true})),
+        ),
+        (
+            "a requirement with a control character",
+            with("/requirements", json!({"tier\u{7}": true})),
+        ),
+        (
+            "an empty required inventory requirement",
+            with("/requirements", json!({"inventory": {"required": {"": 1}}})),
+        ),
+        (
+            "an empty preferred inventory requirement",
+            with(
+                "/requirements",
+                json!({"inventory": {"preferred": {"": 1}}}),
+            ),
+        ),
+        (
+            "a long requirement",
+            with("/requirements", json!({"q".repeat(256): true})),
+        ),
+        // A project is a project name, as the schema says.
+        ("an empty project", with_project("")),
+        ("a project with spaces", with_project("two words")),
+        ("a project not in ASCII", with_project("diseño")),
+        // No inventory requirements are left out, never `{}`.
+        (
+            "empty inventory requirements",
+            with("/requirements", json!({"inventory": {}})),
+        ),
     ] {
         let error = ask(&ctx, &peer, bytes.clone()).unwrap_err();
         assert_eq!(error.code(), ErrorCode::BadRequest, "{name}: {error:?}");
         assert!(error.message.len() <= 256, "{name}");
-        for echo in ["carol", "qqqq", "ssss", "vision ocr", "png\""] {
+        for echo in [
+            "carol",
+            "qqqq",
+            "ssss",
+            "vision ocr",
+            "png\"",
+            "two words",
+            "diseño",
+            "tier",
+        ] {
             assert!(!error.message.contains(echo), "{name}: {}", error.message);
         }
         assert!(ServiceQuery::from_jcs(&bytes).is_err(), "{name}");
@@ -1265,6 +1313,19 @@ fn query_fields_have_one_spelling() {
     let mut spelled = base.clone();
     spelled["requirements"]["language"] = Value::Null;
     assert!(ServiceQuery::from_jcs(&jcs::canonical(&spelled)).is_err());
+    // No inventory requirements are left out: `{}` is no second spelling of
+    // them, read or written.
+    for inventory in [json!({}), json!({"required": {}}), json!({"preferred": {}})] {
+        let mut spelled = base.clone();
+        spelled["requirements"]["inventory"] = inventory.clone();
+        assert!(
+            ServiceQuery::from_jcs(&jcs::canonical(&spelled)).is_err(),
+            "{inventory}"
+        );
+    }
+    let mut empty = query("vision.ocr");
+    empty.requirements.inventory = Some(InventoryRequirements::default());
+    assert!(empty.validate().is_err());
 }
 
 #[test]

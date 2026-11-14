@@ -12,11 +12,15 @@
 //! of 1 to [`MAX_QUERY_ID_CHARS`] characters `[A-Za-z0-9_-]`, a capability
 //! as the inventory writes them, at most [`MAX_MEDIA_TYPES`] media types
 //! per list and [`MAX_REQUIREMENT_IDS`] ids per list of requirements, a
-//! `summary` of at most [`MAX_SUMMARY_BYTES`], and `execution_authorized`
-//! `false`: a query never authorizes execution. A `reply_timeout_ms` over
-//! [`MAX_REPLY_TIMEOUT_MS`] is no error: it counts as that
-//! ([`ServiceQuery::reply_timeout`]). Requirements this agent does not know
-//! are kept, as `other`: mandatory ones are never met (§9.1).
+//! `summary` of at most [`MAX_SUMMARY_BYTES`], a `project` that is a
+//! project name, and `execution_authorized` `false`: a query never
+//! authorizes execution. A `reply_timeout_ms` over [`MAX_REPLY_TIMEOUT_MS`]
+//! is no error: it counts as that ([`ServiceQuery::reply_timeout`]).
+//! Requirements this agent does not know are kept, as `other`, named by 1
+//! to 255 printable ASCII characters, since an offer repeats their names:
+//! mandatory ones are never met (§9.1). No inventory requirements are left
+//! out: `"inventory": {}` is refused, so that it is no second spelling of
+//! them.
 //!
 //! **Offer** ([`ServiceOffer`]). The candidate's answer, made from the
 //! matching of the query against its inventory and load
@@ -43,7 +47,7 @@ use super::matching::Evaluation;
 use crate::card_jws::CardHash;
 use crate::grant::{format_timestamp, parse_timestamp};
 use crate::identity::{AgentId, AgentKey};
-use crate::inventory::{Scope, Section, capability_tag, is_service_id};
+use crate::inventory::{Scope, Section, capability_tag, is_project_name, is_service_id};
 use crate::jcs::canonical;
 use crate::signed::{Signed, SignedDoc, SignedError, check_validity};
 
@@ -255,9 +259,11 @@ impl ServiceQuery {
     /// schema, `execution_authorized` `false`, the `query_id`, the
     /// capability, the media types (at most [`MAX_MEDIA_TYPES`] per list,
     /// each `type/subtype` in printable ASCII), the `summary`, the sections
-    /// asked for, and the requirements (no empty text, at most
-    /// [`MAX_REQUIREMENT_IDS`] ids per list and unknown requirements per
-    /// group).
+    /// asked for, the `project` (printable ASCII without spaces), and the
+    /// requirements (no empty text, at most [`MAX_REQUIREMENT_IDS`] ids per
+    /// list and unknown requirements per group, each unknown one named by 1
+    /// to 255 printable ASCII characters, and no `inventory` that asks for
+    /// nothing).
     pub fn validate(&self) -> Result<(), QueryError> {
         let invalid = |why| Err(QueryError::Invalid(why));
         if self.schema != QUERY_SCHEMA {
@@ -290,6 +296,9 @@ impl ServiceQuery {
         if self.requested_inventory_sections.len() > MAX_REQUIREMENT_IDS {
             return invalid("too many sections");
         }
+        if !self.project.as_deref().is_none_or(is_project_name) {
+            return invalid("invalid project: printable ASCII without spaces");
+        }
         let requirements = &self.requirements;
         let texts = [&requirements.language, &requirements.required_region];
         if !texts
@@ -301,6 +310,16 @@ impl ServiceQuery {
         if requirements.other.len() > MAX_REQUIREMENT_IDS {
             return invalid("too many requirements");
         }
+        // An offer repeats the names of the requirements it does not know.
+        let unknown_name = "invalid requirement name: 1 to 255 printable ASCII characters";
+        if !requirements.other.keys().all(|name| is_token(name)) {
+            return invalid(unknown_name);
+        }
+        if requirements.inventory.as_ref().is_some_and(|inventory| {
+            inventory.required.is_empty() && inventory.preferred.is_empty()
+        }) {
+            return invalid("inventory requirements that ask for nothing: leave them out");
+        }
         let sets = requirements
             .inventory
             .iter()
@@ -308,6 +327,9 @@ impl ServiceQuery {
         for set in sets {
             if set.other.len() > MAX_REQUIREMENT_IDS {
                 return invalid("too many requirements");
+            }
+            if !set.other.keys().all(|name| is_token(name)) {
+                return invalid(unknown_name);
             }
             for list in set.lists() {
                 if list.len() > MAX_REQUIREMENT_IDS {
