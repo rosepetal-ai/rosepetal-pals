@@ -6,7 +6,7 @@
 
 **Architecture:** Cada daemon es un servidor A2A v1.0 completo construido con el SDK oficial de Rust (`a2a-server-lf`: bindings JSON-RPC y HTTP+JSON, SSE). Entre pares, ese HTTP/1.1 viaja sin modificar dentro de streams QUIC de Iroh (identidad Ed25519 del endpoint = identidad del agente). Cada daemon expone además un gateway HTTP en loopback: cualquier cliente A2A estándar habla con cualquier par PALS por `http://127.0.0.1:7420/peers/<agent_id>/…` con los bindings estándar, y el gateway añade el grant, tuneliza por Iroh y traduce las referencias a blobs. SQLite guarda tareas, contactos, grants, revocaciones, deduplicación y el log firmado; iroh-blobs mueve los ficheros con autorización por grant en quien los tiene.
 
-**Tech Stack:** Rust 2024 (MSRV 1.85), tokio, iroh 1.4.1, iroh-blobs 0.105.0, `a2a-lf` 0.4.2 / `a2a-server-lf` 0.5.3 / `a2a-client-lf` 0.2.9 (SDK oficial `a2aproject/a2a-rs`), axum 0.8 + hyper 1, rmcp 3.10.0 (MCP), rusqlite 0.42 (SQLite embebido), ed25519-dalek 3, serde_json_canonicalizer 0.4 (JCS), blake3, clap. Conformidad: `a2aproject/a2a-tck` (commit `104a7b4ae0d8`) y el SDK oficial de Python.
+**Tech Stack:** Rust 2024 (MSRV 1.91), tokio, iroh 1.4.1, iroh-blobs 0.105.0, `a2a-lf` 0.4.2 / `a2a-server-lf` 0.5.3 / `a2a-client-lf` 0.2.9 (SDK oficial `a2aproject/a2a-rs`), axum 0.8 + hyper 1, rmcp 3.10.0 (MCP), rusqlite 0.42 (SQLite embebido), ed25519-dalek 3, serde_json_canonicalizer 0.4 (JCS), blake3, clap. Conformidad: `a2aproject/a2a-tck` (commit `104a7b4ae0d8`) y el SDK oficial de Python.
 
 **Spec:** [`docs/plans/initial.md`](../../plans/initial.md) (revisión 3). Este plan cubre su hito 1 (§14) más el requisito añadido por el responsable del proyecto el 2026-11-14: **«tiene que ser completamente compatible con A2A en su intercambio final»**. Los hitos 2 a 4 están en [`2026-11-14-hoja-de-ruta-hitos-2-4.md`](2026-11-14-hoja-de-ruta-hitos-2-4.md).
 
@@ -153,7 +153,7 @@ Reglas del túnel, que son el contenido normativo del binding: cada stream bidir
 
 - [ ] **Step 1: Crear el workspace con las versiones fijadas**
 
-`Cargo.toml` raíz con `[workspace.dependencies]` y los pines exactos de Global Constraints. `a2a-server-lf` y `a2a-client-lf` con `default-features = false`. `rust-version = "1.85"`, `edition = "2024"`.
+`Cargo.toml` raíz con `[workspace.dependencies]` y los pines exactos de Global Constraints. `a2a-server-lf` y `a2a-client-lf` con `default-features = false`. `rust-version = "1.91"`, `edition = "2024"`.
 
 Run: `cargo check --workspace`
 Expected: compila sin errores y genera `Cargo.lock`.

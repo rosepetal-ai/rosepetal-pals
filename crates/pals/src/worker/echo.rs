@@ -67,10 +67,10 @@ fn working_task(ctx: &ExecutorContext) -> Task {
     let mut history = stored
         .and_then(|task| task.history.clone())
         .unwrap_or_default();
-    if let Some(message) = &ctx.message {
-        if !history.iter().any(|m| m.message_id == message.message_id) {
-            history.push(message.clone());
-        }
+    if let Some(message) = &ctx.message
+        && !history.iter().any(|m| m.message_id == message.message_id)
+    {
+        history.push(message.clone());
     }
     Task {
         id: ctx.task_id.clone(),

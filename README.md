@@ -49,7 +49,7 @@ La compatibilidad se dará por demostrada cuando el agente pase el kit de confor
 
 ## Tecnología
 
-Rust (edición 2024, versión mínima 1.85), iroh 1.4.1, iroh-blobs 0.105.0, el SDK oficial de A2A para Rust ([`a2aproject/a2a-rs`](https://github.com/a2aproject/a2a-rs)), rmcp 3.10.0 para MCP y SQLite embebido. Las versiones están fijadas; subir cualquiera es un cambio explícito que obliga a repetir las pruebas de conformidad.
+Rust (edición 2024, versión mínima 1.91), iroh 1.4.1, iroh-blobs 0.105.0, el SDK oficial de A2A para Rust ([`a2aproject/a2a-rs`](https://github.com/a2aproject/a2a-rs)), rmcp 3.10.0 para MCP y SQLite embebido. Las versiones están fijadas; subir cualquiera es un cambio explícito que obliga a repetir las pruebas de conformidad.
 
 > **Aviso de madurez:** iroh-blobs 0.105.0 indica en su README que todavía no se considera calidad de producción. Se usa porque la versión recomendada para producción, la 0.35, no es compatible con iroh 1.x.
 
