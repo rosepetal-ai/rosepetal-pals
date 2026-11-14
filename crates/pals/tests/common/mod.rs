@@ -29,7 +29,7 @@ use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Request, Response, header};
 use axum::routing::post;
 use futures::StreamExt;
-use futures::stream::BoxStream;
+use futures::stream::{self, BoxStream};
 use http_body_util::BodyExt;
 use iroh::endpoint::{PortmapperConfig, presets};
 use iroh::protocol::Router;
@@ -297,6 +297,9 @@ pub async fn spawn_node_in_with_executor(
     TestNode { node, dir }
 }
 
+/// The text of the error a [`CountingExecutor::failing`] run ends with.
+pub const WORKER_CRASHED: &str = "the worker crashed";
+
 /// The echo executor, counting how many times it runs, that takes `delay`
 /// between its first event (the task in `WORKING`) and the rest. Clones
 /// share the count.
@@ -304,6 +307,7 @@ pub async fn spawn_node_in_with_executor(
 pub struct CountingExecutor {
     runs: Arc<AtomicUsize>,
     delay: Duration,
+    fail: bool,
 }
 
 impl CountingExecutor {
@@ -311,6 +315,16 @@ impl CountingExecutor {
         Self {
             runs: Arc::new(AtomicUsize::new(0)),
             delay,
+            fail: false,
+        }
+    }
+
+    /// An executor whose runs fail right after their first event: the task
+    /// in `WORKING`, then an error, [`WORKER_CRASHED`].
+    pub fn failing() -> Self {
+        Self {
+            fail: true,
+            ..Self::new(Duration::ZERO)
         }
     }
 
@@ -326,6 +340,15 @@ impl AgentExecutor for CountingExecutor {
         ctx: ExecutorContext,
     ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         self.runs.fetch_add(1, Ordering::SeqCst);
+        if self.fail {
+            let crashed = Err(A2AError::internal(WORKER_CRASHED));
+            return Box::pin(
+                EchoExecutor
+                    .execute(ctx)
+                    .take(1)
+                    .chain(stream::iter([crashed])),
+            );
+        }
         let delay = self.delay;
         Box::pin(
             EchoExecutor

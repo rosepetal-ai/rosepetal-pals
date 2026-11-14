@@ -3,11 +3,12 @@
 //! arrives.
 //!
 //! A row is created by the first request with its key ([`Store::dedup_begin`],
-//! [`DedupBegin::New`]) and bound once to that request's outcome
-//! ([`Store::dedup_bind`]): the task it created or continued, or the message
-//! the agent answered with when there is no task. Until it is bound, the
-//! first request is still in flight. The daemon's task guard decides what a
-//! repeated request gets from the row; this module only keeps it.
+//! [`DedupBegin::New`]) and bound to that request's outcome
+//! ([`Store::dedup_bind`]): the task it created or continued, bound when its
+//! execution starts, and the message the agent answered with when it
+//! answered with no task. Until it is bound, the first request is still on
+//! its way to an execution. The daemon decides what a repeated request gets
+//! from the row; this module only keeps it.
 
 use anyhow::ensure;
 use rusqlite::{TransactionBehavior, params};
@@ -82,10 +83,12 @@ impl Store {
     }
 
     /// Binds the row of `peer`'s `message_id` to the outcome of its first
-    /// request: `task_id`, the task it created or continued, or
-    /// `response_json`, the response when there is no task to return. A row
-    /// is bound once; binding a row that is bound already, or that does not
-    /// exist, fails.
+    /// request: `task_id`, the task it created or continued, and
+    /// `response_json`, the response when the agent answered with no task.
+    ///
+    /// Each of the two is written once: binding one again to the same value
+    /// changes nothing, and binding one already set to another value fails,
+    /// as does binding a row that does not exist.
     pub fn dedup_bind(
         &self,
         peer: &AgentId,
@@ -98,21 +101,24 @@ impl Store {
             "a dedup row is bound to a task or to a response"
         );
         let changed = self.conn().execute(
-            "UPDATE dedup SET task_id = ?3, response_json = ?4
+            "UPDATE dedup
+             SET task_id = COALESCE(task_id, ?3), response_json = COALESCE(response_json, ?4)
              WHERE peer = ?1 AND message_id = ?2
-               AND task_id IS NULL AND response_json IS NULL",
+               AND (?3 IS NULL OR task_id IS NULL OR task_id = ?3)
+               AND (?4 IS NULL OR response_json IS NULL OR response_json = ?4)",
             params![peer, message_id, task_id, response_json],
         )?;
         ensure!(
             changed == 1,
-            "no unbound dedup row for message {message_id} of {peer}"
+            "the dedup row for message {message_id} of {peer} is missing or bound to another \
+             outcome"
         );
         Ok(())
     }
 
     /// Deletes the row of `peer`'s `message_id` if it is still unbound, so
-    /// that a request that failed before it had an outcome does not hold its
-    /// key: the next request with it runs. Returns whether a row was
+    /// that a request that failed before any execution started does not hold
+    /// its key: the next request with it runs. Returns whether a row was
     /// deleted; a bound row is never deleted here.
     pub fn dedup_release(&self, peer: &AgentId, message_id: &str) -> anyhow::Result<bool> {
         let deleted = self.conn().execute(
@@ -173,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn a_key_begins_once_and_binds_once() {
+    fn a_key_begins_once_and_each_outcome_is_written_once() {
         let store = Store::open_in_memory(AgentKey::generate().id()).unwrap();
         let peer = AgentKey::generate().id();
 
@@ -192,11 +198,28 @@ mod tests {
             store.dedup_begin(&peer, "m-1", "h1", 12).unwrap(),
             DedupBegin::Existing(row(Some("t-1"), None))
         );
+        // The same task again changes nothing; another task is refused.
+        store.dedup_bind(&peer, "m-1", Some("t-1"), None).unwrap();
         assert!(store.dedup_bind(&peer, "m-1", Some("t-2"), None).is_err());
-        assert!(store.dedup_bind(&peer, "m-1", None, Some("{}")).is_err());
         assert_eq!(store.dedup_row(&peer, "m-1"), Some(row(Some("t-1"), None)));
 
-        // A response instead of a task.
+        // The response is added beside the task, once.
+        store.dedup_bind(&peer, "m-1", None, Some("{}")).unwrap();
+        store
+            .dedup_bind(&peer, "m-1", Some("t-1"), Some("{}"))
+            .unwrap();
+        assert!(store.dedup_bind(&peer, "m-1", None, Some("[]")).is_err());
+        assert!(
+            store
+                .dedup_bind(&peer, "m-1", Some("t-2"), Some("{}"))
+                .is_err()
+        );
+        assert_eq!(
+            store.dedup_row(&peer, "m-1"),
+            Some(row(Some("t-1"), Some("{}")))
+        );
+
+        // A response with no task.
         store.dedup_begin(&peer, "m-2", "h1", 10).unwrap();
         assert!(store.dedup_bind(&peer, "m-2", None, None).is_err());
         store

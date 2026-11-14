@@ -45,8 +45,10 @@ type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 /// each message once.
 ///
 /// **Ownership.** The owner of a task is the peer, [`PEER_HEADER`], whose
-/// request created it: the guard records it with the first task the inner
-/// handler returns or streams, before the peer sees the task's id. Getting,
+/// request created it. The [`BindingExecutor`](super::BindingExecutor)
+/// records it when the task's execution starts; the guard records it again,
+/// a no-op then, with the first task the inner handler returns or streams,
+/// before the peer sees the task's id. Getting,
 /// canceling or subscribing to a task of another peer, or continuing one
 /// with `SendMessage`, fails with `TaskNotFoundError`, exactly as for a task
 /// that does not exist. `ListTasks` never reaches the inner handler: it
@@ -56,21 +58,28 @@ type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 /// `(peer, messageId)`, with the BLAKE3 of the JCS form of the request's
 /// params (the same for both methods and both bindings) as its content:
 ///
-/// - The first request with a key runs, and the key is bound to its
-///   outcome: the first task it returns or streams, or the message it
-///   answers with when there is no task. It runs detached from the
-///   requester, so the key is bound even if the requester goes away.
+/// - The first request with a key runs. The key is bound to its task when
+///   the task's execution starts, by the
+///   [`BindingExecutor`](super::BindingExecutor), so a retry attaches to it
+///   however long it runs, and after a restart that failed it. When the
+///   agent answers with a message and no task, the guard binds the key to
+///   that message as well, and the message is the outcome; with a task, the
+///   guard's binding of the first task returned or streamed is a no-op. The
+///   request runs detached from the requester, so that binding is made even
+///   if the requester goes away.
 /// - A repeated request with the same content gets that outcome without
 ///   running again. A unary one gets the task as it is now; a streaming one
 ///   follows the task's execution with `SubscribeToTask`, or gets one event
 ///   with the task when it is terminal or has no execution to follow. A
 ///   message is returned, or streamed as the one event, as it was.
-/// - A repeated request whose first one has no outcome yet waits up to
-///   [`DEDUP_INFLIGHT_WAIT_S`] for it, and then fails with `InternalError`.
+/// - A repeated request whose first one has no outcome yet, its execution
+///   not started, waits up to [`DEDUP_INFLIGHT_WAIT_S`] for it, and then
+///   fails with `InternalError`.
 /// - A request whose `messageId` came before with other content fails with
 ///   `InvalidParamsError`, `messageId reused with different content`.
-/// - A first request that fails before it has an outcome frees its key, so
-///   that a retry runs.
+/// - A first request refused before any execution started frees its key,
+///   so that a retry runs. Once the execution started, the key stays bound
+///   to its task whatever happens to it.
 ///
 /// Push notification configs and the extended card go to the inner handler
 /// unchecked, and it refuses them because the agent card declares neither.
@@ -137,8 +146,8 @@ impl<H: RequestHandler> GuardedHandler<H> {
         }
     }
 
-    /// Runs the first `SendMessage` with `key` and binds the key to its
-    /// response.
+    /// Runs the first `SendMessage` with `key`, and binds the key to its
+    /// response: the message when there is no task, a no-op otherwise.
     async fn first_send(
         &self,
         params: &ServiceParams,
@@ -149,11 +158,13 @@ impl<H: RequestHandler> GuardedHandler<H> {
         let store = Arc::clone(&self.store);
         let params = params.clone();
         // Detached: should the requester go away, the run still binds the
-        // key, and a retry finds its task.
+        // key, and a retry finds its outcome.
         let run = tokio::spawn(async move {
             let response = match inner.send_message(&params, req).await {
                 Ok(response) => response,
                 Err(err) => {
+                    // Frees the key only if no execution started and bound
+                    // it.
                     release(&store, &key).await;
                     return Err(err);
                 }
@@ -289,7 +300,7 @@ impl<H: RequestHandler> GuardedHandler<H> {
 
 /// The authenticated peer of a request, set by the tunnel and required by the
 /// authentication layer before any request reaches the handler.
-fn peer(params: &ServiceParams) -> Result<AgentId, A2AError> {
+pub(super) fn peer(params: &ServiceParams) -> Result<AgentId, A2AError> {
     match params.get(PEER_HEADER).map(Vec::as_slice) {
         Some([peer]) => peer.parse().map_err(|_| no_peer()),
         _ => Err(no_peer()),
@@ -409,8 +420,9 @@ async fn bind(store: &Arc<Store>, key: &Key, outcome: &Outcome) -> Result<(), A2
     .await
 }
 
-/// Frees `key` after its first request failed with no outcome, so that a
-/// retry runs. Should that fail too, retries wait out
+/// Frees `key` after its first request failed, so that a retry runs, unless
+/// an execution started and bound it: [`Store::dedup_release`] deletes only
+/// an unbound row. Should that fail too, retries wait out
 /// [`DEDUP_INFLIGHT_WAIT_S`] until the row is purged.
 async fn release(store: &Arc<Store>, key: &Key) {
     let released = {
@@ -426,7 +438,8 @@ async fn release(store: &Arc<Store>, key: &Key) {
 }
 
 /// The bookkeeping of a first streaming request: the owner of each task its
-/// events name, and its key's outcome.
+/// events name, and its key's outcome as its first event reveals it (a
+/// no-op for a task, which the execution bound when it started).
 struct Settler {
     store: Arc<Store>,
     key: Key,
@@ -462,7 +475,8 @@ impl Settler {
         Ok(())
     }
 
-    /// Frees the key if the request fails, or ends, with no outcome.
+    /// Frees the key if the request fails, or ends, with no outcome, unless
+    /// an execution bound it.
     async fn no_outcome(&mut self) {
         if !self.settled {
             release(&self.store, &self.key).await;
@@ -629,24 +643,21 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
-    use a2a::{Part, Role, TaskState, TaskStatus, TaskStatusUpdateEvent, error_code};
+    use a2a::{Part, Role, TaskState, TaskStatus, error_code};
     use a2a_server::{AgentExecutor, DefaultRequestHandler, ExecutorContext};
 
     use super::*;
-    use crate::a2a::SqliteTaskStore;
+    use crate::a2a::{BindingExecutor, SqliteTaskStore};
 
     /// What [`Scripted`] does when it runs.
     #[derive(Clone, Copy)]
     enum Script {
         /// Answers with a bare message, no task.
         Answer,
-        /// Fails its first run with `UnsupportedOperationError`, then
-        /// answers.
-        FailFirst,
+        /// Answers with a bare message 300 ms after it starts.
+        SlowAnswer,
         /// Streams the task in `WORKING` and never ends.
         Hang,
-        /// Streams the task in `WORKING`, and `COMPLETED` 300 ms later.
-        Slow,
     }
 
     /// An executor that follows its script and counts its runs.
@@ -675,37 +686,25 @@ mod tests {
             let mut answer = Message::new(Role::Agent, vec![Part::text(format!("pong {run}"))]);
             answer.context_id = Some(ctx.context_id.clone());
             match self.script {
-                Script::FailFirst if run == 0 => Box::pin(stream::iter([Err(
-                    A2AError::unsupported_operation("not this time"),
-                )])),
-                Script::Answer | Script::FailFirst => single(StreamResponse::Message(answer)),
-                Script::Hang | Script::Slow => {
-                    let status = |state| TaskStatus {
-                        state,
-                        message: None,
-                        timestamp: None,
-                    };
-                    let working = single(StreamResponse::Task(Task {
-                        id: ctx.task_id.clone(),
-                        context_id: ctx.context_id.clone(),
-                        status: status(TaskState::Working),
+                Script::Answer => single(StreamResponse::Message(answer)),
+                Script::SlowAnswer => Box::pin(stream::once(async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    Ok(StreamResponse::Message(answer))
+                })),
+                Script::Hang => {
+                    let working = StreamResponse::Task(Task {
+                        id: ctx.task_id,
+                        context_id: ctx.context_id,
+                        status: TaskStatus {
+                            state: TaskState::Working,
+                            message: None,
+                            timestamp: None,
+                        },
                         artifacts: None,
                         history: None,
                         metadata: None,
-                    }));
-                    if matches!(self.script, Script::Hang) {
-                        return Box::pin(working.chain(stream::pending()));
-                    }
-                    let completed = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
-                        task_id: ctx.task_id,
-                        context_id: ctx.context_id,
-                        status: status(TaskState::Completed),
-                        metadata: None,
                     });
-                    Box::pin(working.chain(stream::once(async move {
-                        tokio::time::sleep(Duration::from_millis(300)).await;
-                        Ok(completed)
-                    })))
+                    Box::pin(single(working).chain(stream::pending()))
                 }
             }
         }
@@ -715,11 +714,27 @@ mod tests {
         }
     }
 
-    /// A guard around the SDK's handler with `executor`, and the params of
-    /// a request from one peer.
-    fn guarded(executor: Scripted) -> (GuardedHandler<DefaultRequestHandler>, ServiceParams) {
+    type Guarded = GuardedHandler<DefaultRequestHandler>;
+
+    /// A guard around the SDK's handler with `executor` behind a
+    /// [`BindingExecutor`], as a node has it, and the params of a request
+    /// from one peer.
+    fn guarded(executor: Scripted) -> (Guarded, ServiceParams) {
+        guarded_with(|store| BindingExecutor::new(executor, store))
+    }
+
+    /// [`guarded`] with `executor` alone, so that no execution binds its
+    /// key: as if none ever started.
+    fn guarded_unbound(executor: Scripted) -> (Guarded, ServiceParams) {
+        guarded_with(|_| executor)
+    }
+
+    fn guarded_with<E: AgentExecutor>(
+        executor: impl FnOnce(Arc<Store>) -> E,
+    ) -> (Guarded, ServiceParams) {
         let store = Arc::new(Store::open_in_memory(AgentKey::generate().id()).unwrap());
-        let inner = DefaultRequestHandler::new(executor, SqliteTaskStore::new(Arc::clone(&store)));
+        let tasks = SqliteTaskStore::new(Arc::clone(&store));
+        let inner = DefaultRequestHandler::new(executor(Arc::clone(&store)), tasks);
         let handler = GuardedHandler::new(inner, store, Arc::new(AgentKey::generate()));
         let peer = AgentKey::generate().id().to_string();
         let params = ServiceParams::from([(PEER_HEADER.to_owned(), vec![peer])]);
@@ -774,46 +789,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_first_attempt_frees_its_message_id() {
-        let executor = Scripted::new(Script::FailFirst);
+    async fn a_request_refused_before_it_runs_frees_its_message_id() {
+        let executor = Scripted::new(Script::Answer);
         let (handler, params) = guarded(executor.clone());
-
-        let req = request("ping");
-        let err = handler
-            .send_message(&params, req.clone())
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, error_code::UNSUPPORTED_OPERATION, "{err}");
-        // The retry runs at once, instead of waiting for an outcome that
-        // will never come.
-        let started = Instant::now();
-        let retry = handler.send_message(&params, req).await.unwrap();
-        assert!(
-            matches!(retry, SendMessageResponse::Message(_)),
-            "{retry:?}"
-        );
-        assert!(started.elapsed() < Duration::from_secs(DEDUP_INFLIGHT_WAIT_S));
-        assert_eq!(executor.runs(), 2);
-
-        // A streaming request that is refused before it starts frees its
-        // messageId too.
-        let mut req = request("ping");
-        req.message.task_id = Some("no-such-task".to_owned());
-        let (handler, params) = guarded(Scripted::new(Script::Answer));
+        // A continuation of a task the peer owns but that is not stored.
         let peer: AgentId = params[PEER_HEADER][0].parse().unwrap();
         handler.store.task_owner_put("no-such-task", &peer).unwrap();
+        let mut req = request("ping");
+        req.message.task_id = Some("no-such-task".to_owned());
+
+        // Each try is refused as the first was, at once, instead of waiting
+        // for an outcome that will never come.
+        let started = Instant::now();
         for _ in 0..2 {
+            let err = handler
+                .send_message(&params, req.clone())
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, error_code::TASK_NOT_FOUND, "{err}");
             let err = match handler.send_streaming_message(&params, req.clone()).await {
                 Ok(_) => panic!("a continuation of a missing task started"),
                 Err(err) => err,
             };
             assert_eq!(err.code, error_code::TASK_NOT_FOUND, "{err}");
         }
+        assert!(started.elapsed() < Duration::from_secs(DEDUP_INFLIGHT_WAIT_S));
+        assert_eq!(executor.runs(), 0);
     }
 
     #[tokio::test]
-    async fn an_abandoned_first_attempt_still_binds_its_message_id() {
-        let executor = Scripted::new(Script::Slow);
+    async fn an_abandoned_first_attempt_still_records_its_answer() {
+        let executor = Scripted::new(Script::SlowAnswer);
         let (handler, params) = guarded(executor.clone());
 
         // The requester goes away before the unary answer.
@@ -828,13 +834,11 @@ mod tests {
             "the request answered before it was abandoned"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let started = Instant::now();
-        let SendMessageResponse::Task(task) = handler.send_message(&params, req).await.unwrap()
-        else {
-            panic!("expected the task");
-        };
-        assert_eq!(task.status.state, TaskState::Completed);
-        assert!(started.elapsed() < Duration::from_secs(1));
+        let retry = handler.send_message(&params, req).await.unwrap();
+        assert!(
+            matches!(&retry, SendMessageResponse::Message(m) if m.parts[0].as_text() == Some("pong 0")),
+            "{retry:?}"
+        );
 
         // The requester drops the stream before reading any event.
         let req = request("ping again");
@@ -845,23 +849,21 @@ mod tests {
                 .unwrap(),
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let started = Instant::now();
         let events = handler.send_streaming_message(&params, req).await.unwrap();
         let events = collect(events).await;
-        let [StreamResponse::Task(task)] = events.as_slice() else {
-            panic!("expected one task: {events:?}");
+        let [StreamResponse::Message(answer)] = events.as_slice() else {
+            panic!("expected one message: {events:?}");
         };
-        assert_eq!(task.status.state, TaskState::Completed);
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(answer.parts[0].as_text(), Some("pong 1"));
         assert_eq!(executor.runs(), 2);
     }
 
     #[tokio::test]
     async fn a_retry_gives_up_on_a_first_attempt_with_no_outcome() {
-        let (handler, params) = guarded(Scripted::new(Script::Hang));
+        let (handler, params) = guarded_unbound(Scripted::new(Script::Hang));
         let req = request("ping");
         let started = Instant::now();
-        // The unary request never ends, so its messageId is never bound.
+        // The unary request never ends, and nothing binds its messageId.
         let retry = tokio::select! {
             _ = handler.send_message(&params, req.clone()) => panic!("the hanging request ended"),
             retry = async {

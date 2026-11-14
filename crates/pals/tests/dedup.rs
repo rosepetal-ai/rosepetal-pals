@@ -4,18 +4,23 @@
 
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use axum::body::Body;
+use axum::http::{Request, header};
 use common::{
-    CountingExecutor, TestNode, TestResponse, grant, key_in, message_params, now_unix, spawn_node,
-    spawn_node_in_with_executor, spawn_node_with_executor, sse_results,
+    CountingExecutor, TestNode, TestResponse, WORKER_CRASHED, bearer, grant, key_in,
+    message_params, now_unix, rpc_request, spawn_node, spawn_node_in_with_executor,
+    spawn_node_with_executor, sse_results,
 };
 use pals::config::WorkerCfg;
 use pals::node::STORE_FILE;
 use pals_core::grant::Operation::{TaskRead, TaskSend};
 use pals_core::grant::{Operation, SignedGrant};
 use pals_core::identity::AgentKey;
-use pals_core::store::{DEDUP_RETENTION_S, DedupBegin, DedupRow, Store};
+use pals_core::store::{
+    DEDUP_INFLIGHT_WAIT_S, DEDUP_RETENTION_S, DedupBegin, DedupRow, INTERRUPTED_MESSAGE, Store,
+};
 use serde_json::{Value, json};
 
 const SEND_AND_READ: [Operation; 2] = [TaskSend, TaskRead];
@@ -23,11 +28,29 @@ const SEND_AND_READ: [Operation; 2] = [TaskSend, TaskRead];
 /// A serving node B whose executor counts its runs and takes `delay`, a
 /// requesting node A, and the grant that lets A use B.
 async fn setup(delay: Duration) -> (TestNode, TestNode, SignedGrant, CountingExecutor) {
-    let exec = CountingExecutor::new(delay);
+    setup_with(CountingExecutor::new(delay)).await
+}
+
+/// [`setup`] with `exec` as B's executor.
+async fn setup_with(exec: CountingExecutor) -> (TestNode, TestNode, SignedGrant, CountingExecutor) {
     let b = spawn_node_with_executor(exec.clone()).await;
     let a = spawn_node(WorkerCfg::Echo).await;
     let g = grant(&b, &a, &SEND_AND_READ, 3600);
     (b, a, g, exec)
+}
+
+/// Waits up to 10 s for `done`.
+async fn wait_until(mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The text of a task's status message.
+fn status_text(task: &Value) -> &Value {
+    &task["status"]["message"]["parts"][0]["text"]
 }
 
 /// The task a unary `SendMessage` answered with.
@@ -105,11 +128,18 @@ async fn retry_while_first_execution_is_running_attaches_to_it() {
     let id = &task_of(&first)["id"];
     assert_eq!(&task_of(&twin)["id"], id);
     assert_eq!(&task_of(&retry)["id"], id);
+    // The retry gets the task as it is then, running; the request that ran
+    // it gets it completed.
     assert_eq!(
         task_of(&retry)["status"]["state"],
-        "TASK_STATE_COMPLETED",
+        "TASK_STATE_WORKING",
         "{}",
         retry.json
+    );
+    let states = [&first, &twin].map(|res| task_of(res)["status"]["state"].clone());
+    assert!(
+        states.contains(&json!("TASK_STATE_COMPLETED")),
+        "{states:?}"
     );
     assert_eq!(b.node.store.events_count("task.accepted").unwrap(), 1);
 }
@@ -166,6 +196,103 @@ async fn streaming_retry_resubscribes_instead_of_reexecuting() {
     assert_eq!(task_of(&res)["id"], id);
     assert_eq!(exec.runs(), 1);
     assert_eq!(b.node.store.events_count("task.accepted").unwrap(), 1);
+}
+
+#[tokio::test]
+async fn retry_of_a_long_unary_execution_attaches_to_it() {
+    // The first request runs for longer than a retry would wait for it.
+    let run = Duration::from_secs(DEDUP_INFLIGHT_WAIT_S + 2);
+    let (b, a, g, exec) = setup(run).await;
+    let params = message_params("hola", None);
+    let retry = |after: Duration| {
+        let params = params.clone();
+        let (a, b, g) = (&a, &b, &g);
+        async move {
+            tokio::time::sleep(after).await;
+            let started = Instant::now();
+            let res = a.rpc(b, Some(g), "SendMessage", params).await;
+            (res, started.elapsed())
+        }
+    };
+
+    let (first, early, late) = tokio::join!(
+        a.rpc(&b, Some(&g), "SendMessage", params.clone()),
+        retry(Duration::from_millis(200)),
+        retry(Duration::from_secs(DEDUP_INFLIGHT_WAIT_S + 1)),
+    );
+    let task = task_of(&first);
+    assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED", "{task}");
+    // Both retries get the running task at once, not an error after the wait.
+    for (res, took) in [&early, &late] {
+        let retried = task_of(res);
+        assert_eq!(retried["id"], task["id"]);
+        assert_eq!(
+            retried["status"]["state"], "TASK_STATE_WORKING",
+            "{retried}"
+        );
+        assert!(
+            took < &Duration::from_secs(DEDUP_INFLIGHT_WAIT_S),
+            "{took:?}"
+        );
+    }
+    assert_eq!(exec.runs(), 1);
+}
+
+#[tokio::test]
+async fn retry_after_a_restart_mid_execution_gets_the_failed_task() {
+    let (b, a, g, exec) = setup(Duration::from_secs(60)).await;
+    let params = message_params("hola", None);
+
+    // A unary request still running when B goes down.
+    let request = Request::post("/jsonrpc")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("a2a-version", "1.0")
+        .header(header::AUTHORIZATION, bearer(&g))
+        .body(Body::from(
+            serde_json::to_vec(&rpc_request("SendMessage", params.clone())).unwrap(),
+        ))
+        .unwrap();
+    let (http, addr) = (a.node.peer_http.clone(), b.node.addr());
+    let first = tokio::spawn(async move { http.send(addr, request).await });
+    wait_until(|| exec.runs() == 1).await;
+    let TestNode { node, dir } = b;
+    node.shutdown().await.unwrap();
+    let b = spawn_node_in_with_executor(dir, exec.clone()).await;
+
+    // The retry gets the task the restart failed, not a new run.
+    let res = a.rpc(&b, Some(&g), "SendMessage", params.clone()).await;
+    let task = task_of(&res);
+    assert_eq!(task["status"]["state"], "TASK_STATE_FAILED", "{task}");
+    assert_eq!(status_text(task), INTERRUPTED_MESSAGE);
+    let res = a.rpc(&b, Some(&g), "SendStreamingMessage", params).await;
+    let events = sse_results(&res);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["task"]["id"], task["id"]);
+    assert_eq!(events[0]["task"]["status"]["state"], "TASK_STATE_FAILED");
+    assert_eq!(exec.runs(), 1);
+    first.abort();
+}
+
+#[tokio::test]
+async fn executor_error_fails_the_task_and_a_retry_returns_it() {
+    let (b, a, g, exec) = setup_with(CountingExecutor::failing()).await;
+    let params = message_params("hola", None);
+
+    let res = a.rpc(&b, Some(&g), "SendMessage", params.clone()).await;
+    let task = task_of(&res).clone();
+    assert_eq!(task["status"]["state"], "TASK_STATE_FAILED", "{task}");
+    assert_eq!(status_text(&task), WORKER_CRASHED);
+
+    let res = a.rpc(&b, Some(&g), "SendMessage", params.clone()).await;
+    assert_eq!(task_of(&res)["id"], task["id"]);
+    assert_eq!(task_of(&res)["status"]["state"], "TASK_STATE_FAILED");
+    let res = a.rpc(&b, Some(&g), "SendStreamingMessage", params).await;
+    let events = sse_results(&res);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["task"]["id"], task["id"]);
+    assert_eq!(events[0]["task"]["status"]["state"], "TASK_STATE_FAILED");
+    assert_eq!(exec.runs(), 1);
+    assert_eq!(b.node.store.events_count("task.terminal").unwrap(), 1);
 }
 
 #[tokio::test]

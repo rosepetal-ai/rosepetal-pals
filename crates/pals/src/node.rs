@@ -18,7 +18,7 @@ use pals_core::store::{DEDUP_RETENTION_S, Store};
 use tokio::task::JoinHandle;
 
 use crate::a2a::auth::{Authenticator, JSONRPC_PATH, REST_PATH};
-use crate::a2a::{GuardedHandler, SqliteTaskStore, canonical_card};
+use crate::a2a::{BindingExecutor, GuardedHandler, SqliteTaskStore, canonical_card};
 use crate::config::{Config, DataDirLock, WorkerCfg};
 use crate::net::{ALPN_A2A_HTTP, PeerHttp, TunnelLimits, TunnelServer};
 use crate::worker::echo::EchoExecutor;
@@ -224,6 +224,8 @@ fn app(
     let id = key.id();
     let card = canonical_card(cfg, &id);
     let tasks = SqliteTaskStore::new(Arc::clone(store)).with_events(Arc::clone(key));
+    // Each execution is bound to its request before it runs.
+    let executor = BindingExecutor::new(executor, Arc::clone(store));
     // The SDK refuses what the card does not declare (push notifications,
     // the extended card).
     let inner =
