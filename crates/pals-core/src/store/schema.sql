@@ -67,7 +67,10 @@ CREATE TABLE task_owners (
 ) STRICT;
 CREATE INDEX task_owners_by_owner ON task_owners (owner);
 
--- Idempotency of A2A messages, keyed by (peer, messageId).
+-- Idempotency of A2A messages, keyed by (peer, messageId). `request_hash`
+-- is the BLAKE3 of the JCS form of the request; `task_id` or `response_json`
+-- is the outcome of the first request with the key, set once (both NULL
+-- while it is in flight); `created_at` is when that request arrived.
 CREATE TABLE dedup (
     peer          TEXT NOT NULL,
     message_id    TEXT NOT NULL,
@@ -77,6 +80,7 @@ CREATE TABLE dedup (
     created_at    INTEGER NOT NULL,
     PRIMARY KEY (peer, message_id)
 ) STRICT;
+CREATE INDEX dedup_by_created_at ON dedup (created_at);
 
 -- The signed, hash-chained event log. `payload` is the JCS text of the
 -- payload; the other columns are the signed header and its signature.

@@ -2458,6 +2458,7 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "axum",
+ "blake3",
  "chrono",
  "clap",
  "futures",

@@ -16,10 +16,12 @@ use rusqlite::{Connection, ToSql, TransactionBehavior};
 use crate::identity::AgentId;
 
 mod contacts;
+mod dedup;
 mod grants;
 mod tasks;
 
 pub use contacts::Contact;
+pub use dedup::{DEDUP_INFLIGHT_WAIT_S, DEDUP_RETENTION_S, DedupBegin, DedupRow};
 pub use tasks::INTERRUPTED_MESSAGE;
 
 /// The schema this build writes and reads.

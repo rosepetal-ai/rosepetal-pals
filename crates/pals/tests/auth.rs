@@ -503,6 +503,44 @@ async fn list_tasks_returns_only_own_tasks() {
 }
 
 #[tokio::test]
+async fn streamed_task_is_owned_by_its_creator() {
+    let (b, a) = pair().await;
+    let c = spawn_node(WorkerCfg::Echo).await;
+    let for_a = grant(&b, &a, &SEND_AND_READ, 3600);
+    let for_c = grant(&b, &c, &SEND_AND_READ, 3600);
+
+    let res = a
+        .rpc(
+            &b,
+            Some(&for_a),
+            "SendStreamingMessage",
+            message_params("streamed", None),
+        )
+        .await;
+    let events = common::sse_results(&res);
+    let id = events[0]["task"]["id"].as_str().expect("a task first");
+
+    let res = a.rpc(&b, Some(&for_a), "GetTask", json!({"id": id})).await;
+    assert_eq!(res.json["result"]["id"], id, "{}", res.json);
+    assert_eq!(
+        res.json["result"]["status"]["state"],
+        "TASK_STATE_COMPLETED"
+    );
+
+    let res = c.rpc(&b, Some(&for_c), "GetTask", json!({"id": id})).await;
+    assert_eq!(rpc_error(&res)["code"], -32001);
+
+    let res = a.rpc(&b, Some(&for_a), "ListTasks", json!({})).await;
+    let listed: Vec<&str> = res.json["result"]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(task_id)
+        .collect();
+    assert_eq!(listed, [id]);
+}
+
+#[tokio::test]
 async fn push_config_call_reports_not_supported() {
     let (b, a) = pair().await;
     let g = grant(&b, &a, &SEND_AND_READ, 3600);

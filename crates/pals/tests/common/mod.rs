@@ -1,7 +1,8 @@
 //! Shared helpers for the integration tests: Iroh endpoints on loopback with
 //! no relay, an echo agent served through the tunnel, a client that goes
-//! through the production `PeerHttp`, and complete PALS nodes ([`TestNode`])
-//! with the grants that let them talk to each other.
+//! through the production `PeerHttp`, complete PALS nodes ([`TestNode`])
+//! with the grants that let them talk to each other, and an executor that
+//! counts its runs ([`CountingExecutor`]).
 
 // Each test binary uses a different subset of these helpers.
 #![allow(dead_code)]
@@ -10,20 +11,25 @@ use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use a2a::{
-    AgentCapabilities, AgentCard, AgentInterface, AgentSkill, TRANSPORT_PROTOCOL_HTTP_JSON,
-    TRANSPORT_PROTOCOL_JSONRPC,
+    A2AError, AgentCapabilities, AgentCard, AgentInterface, AgentSkill, StreamResponse,
+    TRANSPORT_PROTOCOL_HTTP_JSON, TRANSPORT_PROTOCOL_JSONRPC,
 };
 use a2a_server::agent_card::agent_card_router;
 use a2a_server::jsonrpc::jsonrpc_router;
 use a2a_server::rest::rest_router;
-use a2a_server::{DefaultRequestHandler, InMemoryTaskStore, StaticAgentCard};
+use a2a_server::{
+    AgentExecutor, DefaultRequestHandler, ExecutorContext, InMemoryTaskStore, StaticAgentCard,
+};
 use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Request, Response, header};
 use axum::routing::post;
+use futures::StreamExt;
+use futures::stream::BoxStream;
 use http_body_util::BodyExt;
 use iroh::endpoint::{PortmapperConfig, presets};
 use iroh::protocol::Router;
@@ -272,6 +278,73 @@ pub async fn spawn_node_in(
     TestNode { node, dir }
 }
 
+/// A node whose work `executor` does, on a fresh data directory.
+pub async fn spawn_node_with_executor(executor: impl AgentExecutor) -> TestNode {
+    let dir = tempfile::tempdir().expect("create a data directory");
+    spawn_node_in_with_executor(dir, executor).await
+}
+
+/// A node whose work `executor` does, on `dir`, which may already hold a key
+/// and a store.
+pub async fn spawn_node_in_with_executor(
+    dir: tempfile::TempDir,
+    executor: impl AgentExecutor,
+) -> TestNode {
+    let cfg = test_config(dir.path(), WorkerCfg::Echo);
+    let node = Node::spawn_with_executor(cfg, executor)
+        .await
+        .expect("spawn the node");
+    TestNode { node, dir }
+}
+
+/// The echo executor, counting how many times it runs, that takes `delay`
+/// between its first event (the task in `WORKING`) and the rest. Clones
+/// share the count.
+#[derive(Clone)]
+pub struct CountingExecutor {
+    runs: Arc<AtomicUsize>,
+    delay: Duration,
+}
+
+impl CountingExecutor {
+    pub fn new(delay: Duration) -> Self {
+        Self {
+            runs: Arc::new(AtomicUsize::new(0)),
+            delay,
+        }
+    }
+
+    /// How many times `execute` has been called.
+    pub fn runs(&self) -> usize {
+        self.runs.load(Ordering::SeqCst)
+    }
+}
+
+impl AgentExecutor for CountingExecutor {
+    fn execute(
+        &self,
+        ctx: ExecutorContext,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        let delay = self.delay;
+        Box::pin(
+            EchoExecutor
+                .execute(ctx)
+                .enumerate()
+                .then(move |(n, event)| async move {
+                    if n == 1 {
+                        tokio::time::sleep(delay).await;
+                    }
+                    event
+                }),
+        )
+    }
+
+    fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        EchoExecutor.cancel(ctx)
+    }
+}
+
 /// The key of the agent whose data directory is `dir`, created if missing.
 pub fn key_in(dir: &Path) -> AgentKey {
     AgentKey::load_or_create(&dir.join(KEY_FILE)).expect("load the agent key")
@@ -440,4 +513,22 @@ impl TestNode {
 /// The `Authorization` value that presents `grant`.
 pub fn bearer(grant: &SignedGrant) -> String {
     format!("Bearer {}", grant.to_token())
+}
+
+/// The `result` of every JSON-RPC response in the `data:` lines of an SSE
+/// body, in order; a response that carries an `error` instead fails the test.
+pub fn sse_results(res: &TestResponse) -> Vec<Value> {
+    assert_eq!(res.status, 200, "{}", String::from_utf8_lossy(&res.body));
+    String::from_utf8_lossy(&res.body)
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(|data| {
+            let response: Value = serde_json::from_str(data.trim()).expect("an SSE event is JSON");
+            assert!(
+                response.get("error").is_none(),
+                "an SSE event is an error: {response}"
+            );
+            response["result"].clone()
+        })
+        .collect()
 }
