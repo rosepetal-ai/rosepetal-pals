@@ -10,13 +10,14 @@ use anyhow::{Context, ensure};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use super::Store;
+use crate::grant::CLOCK_SKEW_S;
 use crate::identity::AgentId;
 
 /// What [`Store::peer_record_accept`] made of a record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordAccept {
-    /// The first of its agent and kind, or with a higher `seq` than the one
-    /// known: stored, in its place.
+    /// The first of its agent and kind, one with a higher `seq` than the one
+    /// known, or any once the known one has expired: stored, in its place.
     New,
     /// The one known, byte for byte.
     Same,
@@ -47,7 +48,10 @@ impl Store {
     /// `seq`, at `now_unix`.
     ///
     /// `seq` must be the last [`Store::own_seq_next`] handed out for `kind`:
-    /// an older one would go back, a newer one was never handed out.
+    /// an older one would go back, a newer one was never handed out. One
+    /// `seq` carries one record: once stored, only the same bytes can be
+    /// stored again under it, since a peer that saw the first would take any
+    /// other for a regression.
     pub fn own_record_put(
         &self,
         kind: &str,
@@ -56,12 +60,14 @@ impl Store {
         now_unix: i64,
     ) -> anyhow::Result<()> {
         let updated = self.conn().execute(
-            "UPDATE own_records SET record = ?3, updated_at = ?4 WHERE kind = ?1 AND seq = ?2",
+            "UPDATE own_records SET record = ?3, updated_at = ?4
+             WHERE kind = ?1 AND seq = ?2 AND (record IS NULL OR record = ?3)",
             params![kind, to_sql(seq)?, json, now_unix],
         )?;
         ensure!(
             updated == 1,
-            "seq {seq} is not the last one handed out for own {kind} records"
+            "seq {seq} is not the last one handed out for own {kind} records, or already \
+             carries another record"
         );
         Ok(())
     }
@@ -84,13 +90,18 @@ impl Store {
 
     /// Takes `json`, `agent`'s signed record of `kind`, which carries `seq`
     /// and expires at `expires_at`, received at `now_unix`, and compares it
-    /// with the newest one known of that agent and kind, whether or not
-    /// that one has expired.
+    /// with the newest one known of that agent and kind.
     ///
     /// The caller has verified the record: its signature, that `agent`
     /// signed it, and its validity. A lower `seq`, or the same with other
     /// bytes, is a [`RecordAccept::Regression`] and is not stored; a higher
-    /// one replaces the known record. One `IMMEDIATE` transaction, so
+    /// one replaces the known record. A known record that expired more than
+    /// [`CLOCK_SKEW_S`] ago counts as none, as it does for every receiver:
+    /// an agent that lost its sequence (a new database, the same key) is
+    /// accepted again once its last record has expired. No record outlives
+    /// its issue by more than [`crate::records::RECORD_TTL_S`], and an agent
+    /// issues each with that whole lifetime, in `seq` order, so by then every
+    /// older record has expired too. One `IMMEDIATE` transaction, so
     /// concurrent calls see each other's records.
     pub fn peer_record_accept(
         &self,
@@ -104,13 +115,19 @@ impl Store {
         let sql_seq = to_sql(seq)?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let known: Option<(i64, Vec<u8>)> = tx
+        let known: Option<(i64, Vec<u8>, i64)> = tx
             .query_row(
-                "SELECT seq, record FROM peer_records WHERE agent_id = ?1 AND kind = ?2",
+                "SELECT seq, record, expires_at FROM peer_records
+                 WHERE agent_id = ?1 AND kind = ?2",
                 params![agent, kind],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
+        let known = known
+            .filter(|(.., known_expires_at)| {
+                now_unix < known_expires_at.saturating_add(CLOCK_SKEW_S)
+            })
+            .map(|(known_seq, record, _)| (known_seq, record));
         let accept = match known {
             Some((known_seq, _)) if known_seq > sql_seq => RecordAccept::Regression {
                 known_seq: from_sql(known_seq)?,
@@ -146,7 +163,7 @@ impl Store {
     }
 
     /// The newest record of `kind` known of `agent`, with its `seq`, whether
-    /// or not it has expired.
+    /// or not it has expired: the caller checks its validity.
     pub fn peer_record(
         &self,
         agent: &AgentId,

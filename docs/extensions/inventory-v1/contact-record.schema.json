@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Registro de contacto firmado, agentnet.contact/1",
-  "description": "Cómo llegar al endpoint Iroh de un agente, firmado por el propio agente. Viaja como el JCS (RFC 8785) de este objeto. La firma es Ed25519 de la clave de record.agent_id sobre \"agentnet.contact/1\\n\" seguido del JCS de record, en base64url sin relleno, y se comprueba sobre el record recibido antes de leerlo. El documento firmado ocupa como mucho 4096 bytes. Caduca a las 24 h de emitirse; quien lo recibe admite 60 s de desfase de reloj, solo para rechazarlo, y rechaza un registro con seq menor que el último que conoce de ese agente, o con el mismo seq y otros bytes.",
+  "description": "Cómo llegar al endpoint Iroh de un agente, firmado por el propio agente. Viaja como el JCS (RFC 8785) de este objeto. La firma es Ed25519 de la clave de record.agent_id sobre \"agentnet.contact/1\\n\" seguido del JCS de record, en base64url sin relleno, y se comprueba sobre el record recibido antes de leerlo. El documento firmado ocupa como mucho 4096 bytes. Caduca como mucho a las 24 h de emitirse; quien lo recibe admite 60 s de desfase de reloj, solo para rechazarlo, y rechaza un registro con seq menor que el último vigente que conoce de ese agente, o con el mismo seq y otros bytes.",
   "type": "object",
   "properties": {
     "record": { "$ref": "#/$defs/record" },
@@ -23,7 +23,7 @@
         "issued_at": { "$ref": "#/$defs/timestamp" },
         "expires_at": {
           "$ref": "#/$defs/timestamp",
-          "description": "Posterior a issued_at."
+          "description": "Posterior a issued_at, y como mucho 86400 s (24 h) después. Este esquema no puede expresarlo; PALS rechaza el registro que lo incumple."
         }
       },
       "required": ["schema", "agent_id", "iroh", "seq", "issued_at", "expires_at"],

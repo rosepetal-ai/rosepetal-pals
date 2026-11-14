@@ -791,3 +791,148 @@ fn same_seq_with_other_content_is_a_regression() {
         Some((6, renewed))
     );
 }
+
+#[test]
+fn expired_peer_record_no_longer_blocks_a_lower_seq() {
+    // An agent that lost its database but kept its key starts again at seq 1.
+    let store = Store::open_in_memory(AgentKey::generate().id()).unwrap();
+    let peer = AgentKey::generate();
+    let old = Signed::issue(&peer, contact(peer.id(), 50))
+        .unwrap()
+        .to_json();
+    assert_eq!(
+        store
+            .peer_record_accept(&peer.id(), "contact", 50, &old, EXPIRES_AT, NOW)
+            .unwrap(),
+        RecordAccept::New
+    );
+
+    // Its new first record, valid from an hour after NOW for a day.
+    let reissued_at = NOW + 3600;
+    let fresh = ContactRecord {
+        issued_at: ts(reissued_at),
+        expires_at: ts(reissued_at + RECORD_TTL_S),
+        ..contact(peer.id(), 1)
+    };
+    let fresh = Signed::issue(&peer, fresh).unwrap().to_json();
+    let accept_at = |now| {
+        store
+            .peer_record_accept(
+                &peer.id(),
+                "contact",
+                1,
+                &fresh,
+                reissued_at + RECORD_TTL_S,
+                now,
+            )
+            .unwrap()
+    };
+
+    // While the known record is valid, within the clock skew, a lower seq
+    // is a regression and is not stored...
+    assert_eq!(
+        accept_at(EXPIRES_AT + CLOCK_SKEW_S - 1),
+        RecordAccept::Regression { known_seq: 50 }
+    );
+    assert_eq!(
+        store.peer_record(&peer.id(), "contact").unwrap(),
+        Some((50, old))
+    );
+    // ...and once it has expired beyond the skew, it counts as none.
+    assert_eq!(accept_at(EXPIRES_AT + CLOCK_SKEW_S), RecordAccept::New);
+    assert_eq!(
+        store.peer_record(&peer.id(), "contact").unwrap(),
+        Some((1, fresh.clone()))
+    );
+    // From then on the new sequence is the one compared.
+    assert_eq!(accept_at(EXPIRES_AT + 2 * CLOCK_SKEW_S), RecordAccept::Same);
+}
+
+#[test]
+fn record_lifetime_is_at_most_the_ttl() {
+    let key = AgentKey::generate();
+    let contact_for = |span: i64| ContactRecord {
+        expires_at: ts(ISSUED_AT + span),
+        ..contact(key.id(), 1)
+    };
+    let announce_for = |span: i64| AnnounceRecord {
+        expires_at: ts(ISSUED_AT + span),
+        ..announce(key.id(), 1)
+    };
+    let contact_bytes = |span| {
+        let doc = serde_json::to_value(contact_for(span)).unwrap();
+        sign_as::<ContactRecord>(&key, CONTACT_SIG_DOMAIN, &doc)
+    };
+    let announce_bytes = |span| {
+        let doc = serde_json::to_value(announce_for(span)).unwrap();
+        sign_as::<AnnounceRecord>(&key, ANNOUNCE_SIG_DOMAIN, &doc)
+    };
+
+    // RECORD_TTL_S from issued_at to expires_at, at most.
+    assert!(Signed::issue(&key, contact_for(RECORD_TTL_S)).is_ok());
+    assert!(Signed::<ContactRecord>::from_json(&contact_bytes(RECORD_TTL_S)).is_ok());
+    assert!(Signed::issue(&key, announce_for(RECORD_TTL_S)).is_ok());
+    assert!(Signed::<AnnounceRecord>::from_json(&announce_bytes(RECORD_TTL_S)).is_ok());
+
+    // One second more is refused, on issue and on receipt.
+    for span in [RECORD_TTL_S + 1, 365 * 24 * 3600] {
+        assert_eq!(
+            Signed::issue(&key, contact_for(span)),
+            Err(SignedError::Malformed)
+        );
+        assert_eq!(
+            Signed::<ContactRecord>::from_json(&contact_bytes(span)),
+            Err(SignedError::Malformed)
+        );
+        assert_eq!(
+            Signed::issue(&key, announce_for(span)),
+            Err(SignedError::Malformed)
+        );
+        assert_eq!(
+            Signed::<AnnounceRecord>::from_json(&announce_bytes(span)),
+            Err(SignedError::Malformed)
+        );
+    }
+}
+
+#[test]
+fn own_seq_carries_one_record() {
+    let me = AgentKey::generate();
+    let store = Store::open_in_memory(me.id()).unwrap();
+    let moved = |seq| {
+        let record = ContactRecord {
+            iroh: IrohContact {
+                direct_addrs: vec!["198.51.100.7:4433".to_owned()],
+                ..contact(me.id(), seq).iroh
+            },
+            ..contact(me.id(), seq)
+        };
+        Signed::issue(&me, record).unwrap().to_json()
+    };
+
+    let seq = store.own_seq_next("contact").unwrap();
+    let first = Signed::issue(&me, contact(me.id(), seq)).unwrap().to_json();
+    store.own_record_put("contact", seq, &first, NOW).unwrap();
+    // The same record again is harmless.
+    store
+        .own_record_put("contact", seq, &first, NOW + 1)
+        .unwrap();
+    // Another record under the same seq is refused: a peer that saw the
+    // first would take it for a regression.
+    assert!(
+        store
+            .own_record_put("contact", seq, &moved(seq), NOW + 2)
+            .is_err()
+    );
+    assert_eq!(store.own_record("contact").unwrap(), Some((seq, first)));
+
+    // A new seq carries the new content.
+    let next = store.own_seq_next("contact").unwrap();
+    store
+        .own_record_put("contact", next, &moved(next), NOW + 3)
+        .unwrap();
+    assert_eq!(
+        store.own_record("contact").unwrap(),
+        Some((next, moved(next)))
+    );
+}

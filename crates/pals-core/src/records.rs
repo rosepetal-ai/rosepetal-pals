@@ -9,13 +9,13 @@
 //! Both travel as `{"record": …, "signature": …}`.
 //!
 //! Each carries a `seq` its agent never repeats for that kind
-//! ([`crate::store::Store::own_seq_next`]) and expires [`RECORD_TTL_S`]
-//! after it was issued; the agent issues a new one when less than
-//! [`RECORD_RENEW_BEFORE_S`] remain, or when its content changes. A receiver
-//! refuses one outside its validity window, with
+//! ([`crate::store::Store::own_seq_next`]) and expires at most
+//! [`RECORD_TTL_S`] after it was issued; the agent issues a new one when less
+//! than [`RECORD_RENEW_BEFORE_S`] remain, or when its content changes. A
+//! receiver refuses one outside its validity window, with
 //! [`crate::grant::CLOCK_SKEW_S`] of tolerance ([`check_validity`]), and one
-//! that goes back from the record it already knows of that agent and kind
-//! ([`crate::store::Store::peer_record_accept`]). In milestone 2 they travel
+//! that goes back from the valid record it already knows of that agent and
+//! kind ([`crate::store::Store::peer_record_accept`]). In milestone 2 they travel
 //! in every discovery response; the DHT will publish them later.
 //!
 //! [`check_validity`]: crate::signed::check_validity
@@ -54,8 +54,8 @@ pub const MAX_RECORD_SEQ: u64 = (1 << 53) - 1;
 
 /// How to reach an agent: its Iroh endpoint.
 ///
-/// Timestamps are in the form [`crate::grant::format_timestamp`] writes,
-/// and `issued_at` comes before `expires_at`.
+/// Timestamps are in the form [`crate::grant::format_timestamp`] writes;
+/// `expires_at` comes after `issued_at`, by at most [`RECORD_TTL_S`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContactRecord {
@@ -162,11 +162,15 @@ impl SignedDoc for AnnounceRecord {
     }
 }
 
-/// The `seq` range and the timestamps both records share.
+/// The `seq` range and the lifetime both records share: no record outlives
+/// its issue by more than [`RECORD_TTL_S`], which is what lets a receiver
+/// forget a sequence once its last record has expired.
 fn check_common(seq: u64, issued_at: &str, expires_at: &str) -> Result<(), SignedError> {
     match (parse_timestamp(issued_at), parse_timestamp(expires_at)) {
         (Some(issued_at), Some(expires_at))
-            if issued_at < expires_at && (1..=MAX_RECORD_SEQ).contains(&seq) =>
+            if issued_at < expires_at
+                && expires_at - issued_at <= RECORD_TTL_S
+                && (1..=MAX_RECORD_SEQ).contains(&seq) =>
         {
             Ok(())
         }

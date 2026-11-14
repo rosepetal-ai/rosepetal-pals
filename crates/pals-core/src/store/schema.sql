@@ -149,7 +149,7 @@ CREATE TABLE own_records (
 ) STRICT;
 
 -- The newest signed record of each kind received from each peer, the one
--- a later record is compared with to detect a regression.
+-- a later record is compared with to detect a regression until it expires.
 CREATE TABLE peer_records (
     agent_id   TEXT NOT NULL,
     kind       TEXT NOT NULL,
