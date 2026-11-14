@@ -66,10 +66,22 @@ arranca() {     # arranca el daemon en segundo plano; PID y registro en ~/pals-s
     sleep 5
     grep 'pals daemon:' ~/pals-salida/daemon.log | tail -n 1
 }
-para() {        # SIGTERM al daemon, y espera a que termine
-    local pid; pid=$(cat ~/pals-salida/daemon.pid)
+para() {        # SIGTERM al daemon, si su PID sigue siendo un `pals daemon`, y espera a que termine
+    local pid i=0; pid=$(cat ~/pals-salida/daemon.pid 2>/dev/null) || { echo "no hay daemon.pid"; return 0; }
+    case "$(ps -o args= -p "$pid" 2>/dev/null)" in
+        *"pals daemon") ;;
+        *) echo "el PID $pid ya no es un pals daemon: no se toca"; rm -f ~/pals-salida/daemon.pid; return 0 ;;
+    esac
     kill "$pid"
-    while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
+    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 300 ]; do sleep 0.2; i=$((i + 1)); done
+    if kill -0 "$pid" 2>/dev/null; then echo "el daemon $pid sigue vivo 60 s después"; return 1; fi
+    rm -f ~/pals-salida/daemon.pid
+}
+grupos_prueba() {   # en B: el grupo de procesos de cada orden viva del worker de pruebas, con sus procesos
+    local pid
+    for pid in $(pgrep -f "^sh $HOME/pals-salida/pals-prueba\.sh( |\$)"); do
+        ps -eo pid,pgid,etime,args | awk -v g="$(ps -o pgid= -p "$pid")" '$2 == g + 0'
+    done
 }
 reglas_como_antes() {     # en A: las reglas del cortafuegos como se guardaron en el caso 3
     diff <($SUDO iptables-save | grep -- '^-') ~/pals-salida/iptables.antes \
@@ -80,7 +92,7 @@ EOF
 . ~/pals-salida/funciones.sh
 ```
 
-`arranca` debe imprimir `pals daemon: agent <id> serving, gateway at http://127.0.0.1:7420`. `para` envía `SIGTERM` y espera a que el daemon termine, lo que puede llevar unos segundos: hasta entonces conserva el bloqueo de su directorio de datos, y un `arranca` inmediato fallaría con `a pals daemon is already running on this data directory`. El daemon usa `~/.pals` (o `$PALS_HOME`) para su configuración, su clave y su almacén.
+`arranca` debe imprimir `pals daemon: agent <id> serving, gateway at http://127.0.0.1:7420`. `para` comprueba que el PID guardado sigue siendo un `pals daemon` (tras un reinicio podría ser otro proceso), le envía `SIGTERM` y espera a que termine, como mucho 60 s, lo que puede llevar unos segundos: hasta entonces conserva el bloqueo de su directorio de datos, y un `arranca` inmediato fallaría con `a pals daemon is already running on this data directory`. El daemon usa `~/.pals` (o `$PALS_HOME`) para su configuración, su clave y su almacén.
 
 El registro, `~/pals-salida/daemon.log`, recoge además los diagnósticos del daemon desde el nivel `INFO`, como la descarga fallida de un fichero de entrada o un error al comprobar el grant de una petición de blobs. Si un caso falla sin explicación, para el daemon, ejecuta `export RUST_LOG=pals=debug` en esa terminal y vuelve a `arranca`: el registro detallará cada intento (`RUST_LOG` sigue la sintaxis de `tracing-subscriber`, p. ej. `RUST_LOG=pals=debug,iroh=info`).
 
@@ -143,6 +155,7 @@ pals init
 Antes de arrancar, comprueba que `claude` funciona en el entorno que le dará el worker, en el directorio del proyecto:
 
 ```bash
+. ~/pals-salida/funciones.sh            # $PROYECTO
 cd "$PROYECTO"
 echo '¿Qué hace este proyecto? Responde en una frase.' \
     | env -i PATH="$PATH" HOME="$HOME" LANG="${LANG:-C.UTF-8}" claude -p --output-format text
@@ -164,6 +177,7 @@ chmod +x ~/pals-salida/claude-con-clave.sh
 El daemon pasa a la orden su propio `PATH`: arráncalo desde una terminal donde `claude` esté en el `PATH`.
 
 ```bash
+. ~/pals-salida/funciones.sh
 arranca
 ```
 
@@ -252,7 +266,9 @@ case "$pregunta" in
 esac
 EOF
 . ~/pals-salida/funciones.sh            # $PROYECTO, para y arranca, si es una terminal nueva
-: "${PROYECTO:?falta ~/pals-salida/proyecto, del paso 2}"
+if [ -z "$PROYECTO" ]; then
+    echo "falta ~/pals-salida/proyecto, del paso 2: no se cambia nada"
+else
 para
 cat > ~/.pals/config.toml <<EOF
 [agent]
@@ -275,6 +291,7 @@ blob_fetch_timeout_s = 1800
 path = "$PROYECTO"
 EOF
 arranca
+fi
 ```
 
 En A: `pals ask b hola` debe responder `eco: hola` con código 0. B ha cambiado de puerto al rearrancar; si A no lo alcanza (código 3), anótalo (con `relay = true` no debería pasar), vuelve a guardar el ticket nuevo de B con `pals contact add '<TICKET_B>' --name b` y retoma la pregunta con `pals task resume <messageId>`.
@@ -333,7 +350,7 @@ anota "red restablecida"
 EOF
 ```
 
-`caso3.sh` lanza una transferencia de 256 MiB, espera a que lleve 32 MiB, corta la red de A 10 s y espera a que termine. Informa además de los bytes que han pasado por las conexiones del daemon a los relays (TCP 443): si al terminar han crecido en unos 268 MB, el camino fue por relay; si apenas cambian, fue directo (UDP). PALS no informa por sí mismo del camino de Iroh.
+`caso3.sh` lanza una transferencia de 256 MiB, espera a que lleve 32 MiB, corta la red de A 10 s y espera a que termine. Informa además de los bytes que han pasado por las conexiones del daemon a los relays (TCP 443): si al terminar han crecido en unos 268 MB, el camino fue por relay; si apenas cambian, fue directo (UDP). Esas líneas `relay:` solo cuentan las conexiones que siguen abiertas al medir: si el daemon cierra una y abre otra (por ejemplo, tras el corte), su total puede crecer menos que el fichero, o incluso bajar. PALS no informa por sí mismo del camino de Iroh.
 
 ```bash
 cat > ~/pals-salida/caso3.sh <<'EOF'
@@ -408,7 +425,7 @@ bash ~/pals-salida/caso3.sh subida
 reglas_como_antes
 ```
 
-**Esperado en `bajada`:** `curl: código 0, 200 268435456` y un `sha256sum` de `caso3.bin` igual al que B escribió en su respuesta. **En `subida`:** `pals ask: código 0` y, en `caso3.out`, el `sha256` que B recibió, igual al que se imprimió al principio. En los dos: las dos líneas `durante el corte` muestran la transferencia parada por debajo de 268435456 bytes, la línea `tras el corte` muestra que siguió (y su hora, cuándo: QUIC vuelve a probar el camino unos segundos después de que vuelva la red), y la diferencia entre las dos líneas `relay:` dice el camino. Si la transferencia acaba antes del corte (`durante el corte` ya da el tamaño completo, o el guion dice que terminó antes), limita la subida de la máquina que envía durante la prueba (`sudo tc qdisc add dev <iface> root tbf rate 50mbit burst 64kb latency 400ms`, y después `sudo tc qdisc del dev <iface> root`) y repite.
+**Esperado en `bajada`:** `curl: código 0, 200 268435456` y un `sha256sum` de `caso3.bin` igual al que B escribió en su respuesta. **En `subida`:** `pals ask: código 0` y, en `caso3.out`, el `sha256` que B recibió, igual al que se imprimió al principio. En los dos: las dos líneas `durante el corte` muestran la transferencia parada por debajo de 268435456 bytes, la línea `tras el corte` muestra que siguió (y su hora, cuándo: QUIC vuelve a probar el camino unos segundos después de que vuelva la red), y la diferencia entre las dos líneas `relay:` dice el camino. Si la transferencia acaba antes del corte (`durante el corte` ya da el tamaño completo, o el guion dice que terminó antes), limita la subida de la máquina que envía durante la prueba (`$SUDO tc qdisc add dev <iface> root tbf rate 50mbit burst 64kb latency 400ms`, y después `$SUDO tc qdisc del dev <iface> root`) y repite.
 
 **3b. Por relay.** Pon las máquinas en redes distintas y repite `bajada` y `subida`. Si Iroh encuentra igualmente camino directo (las líneas `relay:` apenas cambian), fuerza el relay bloqueando el UDP saliente de A salvo DNS y loopback, y rearranca su daemon. La excepción de loopback deja pasar las consultas al resolvedor local: el de systemd (`127.0.0.53`) recibe en el puerto 53, pero el de Docker (`127.0.0.11`) las recibe en otro puerto, al que las redirige el propio contenedor, y sin ella A se queda sin DNS y sin relay.
 
@@ -419,9 +436,14 @@ for t in iptables ip6tables; do
     $SUDO $t -I OUTPUT 1 -o lo -j ACCEPT
 done
 para; arranca
-bash ~/pals-salida/caso3.sh bajada
-bash ~/pals-salida/caso3.sh subida
-# deshacer:
+bash ~/pals-salida/caso3.sh bajada      # unos 20 min por relay
+bash ~/pals-salida/caso3.sh subida      # otros 20 min
+```
+
+Después, aunque alguna de las dos haya fallado, deshaz las reglas y rearranca A:
+
+```bash
+. ~/pals-salida/funciones.sh
 for t in iptables ip6tables; do
     $SUDO $t -D OUTPUT -o lo -j ACCEPT
     $SUDO $t -D OUTPUT -p udp --dport 53 -j ACCEPT; $SUDO $t -D OUTPUT -p udp -j DROP
@@ -430,7 +452,7 @@ para; arranca
 reglas_como_antes
 ```
 
-**Esperado:** lo mismo que en 3a, con las líneas `relay:` creciendo en unos 268 MB. Anota en cada repetición el camino observado y cómo se dedujo. Por los relays públicos de n0 la transferencia es lenta: limitan el tráfico de cada endpoint, y el daemon que envía lo avisa en su registro (`The relay is rate-limiting this endpoint; outbound relay traffic is being throttled`). En la prueba con Docker del 2026-11-14 fue de unos 2 Mbit/s: 256 MiB tardan cerca de 20 min en cada sentido. Por eso `caso3.sh subida` espera la respuesta hasta 30 min (`--wait 30m`, como `blob_fetch_timeout_s`), en lugar de los 600 s por defecto de `pals ask`.
+**Esperado:** lo mismo que en 3a, con las líneas `relay:` creciendo en unos 268 MB (o algo menos, si el daemon abrió otra conexión al relay durante la transferencia). Anota en cada repetición el camino observado y cómo se dedujo. Por los relays públicos de n0 la transferencia es lenta: limitan el tráfico de cada endpoint, y el daemon que envía lo avisa en su registro (`The relay is rate-limiting this endpoint; outbound relay traffic is being throttled`). En la prueba con Docker del 2026-11-14 fue de unos 2 Mbit/s: 256 MiB tardan cerca de 20 min en cada sentido. Por eso `caso3.sh subida` espera la respuesta hasta 30 min (`--wait 30m`, como `blob_fetch_timeout_s`), en lugar de los 600 s por defecto de `pals ask`.
 
 ### Caso 4. Reintento sin duplicar
 
@@ -489,9 +511,14 @@ sleep 15; pals task ls | tail -n 1     # anota el messageId
 En B, durante la tarea:
 
 ```bash
-kill -9 "$(cat ~/pals-salida/daemon.pid)"
-ps -eo pid,pgid,etime,args | grep '[p]als-prueba'     # limitación conocida: la orden sigue viva; anota su PGID
+. ~/pals-salida/funciones.sh
+pid=$(cat ~/pals-salida/daemon.pid)
+if [ "$(ps -o args= -p "$pid")" = "pals daemon" ]; then kill -9 "$pid"
+else echo "el PID $pid no es el pals daemon: no se mata nada"; fi
+grupos_prueba     # limitación conocida: la orden sigue viva
 ```
+
+`grupos_prueba` busca solo el `sh` que ejecuta `~/pals-salida/pals-prueba.sh` (un `grep pals-prueba` sobre `ps` encuentra también cualquier otro proceso cuya línea contenga ese texto, como la propia terminal). Debe listar un grupo con dos procesos, el `sh` y su `sleep 300`; la segunda columna es su PGID.
 
 En A, `pals ask` reintenta y termina con código 3 (`b could not be reached; the question is kept`) si B no vuelve antes; en el ensayo tardó algo más de un minuto. Rearranca B y retoma la pregunta en A:
 
@@ -504,7 +531,10 @@ arranca
 # En A
 pals task resume <messageId>; echo $?
 pals ask b "hola tras el rearranque"; echo $?
-# En B: termina la orden que sobrevivió al kill -9
+# En B: termina la orden que sobrevivió al kill -9. Busca otra vez su grupo, y mátalo
+# solo si lista el sh de pals-prueba.sh y su sleep 300
+. ~/pals-salida/funciones.sh
+grupos_prueba
 kill -- -<PGID>
 ```
 
@@ -681,7 +711,7 @@ HTTP+JSON: CancelTask -> TASK_STATE_CANCELED
 caso 8 superado
 ```
 
-En B, después, `ps -eo args | grep -c '[p]als-prueba'` debe dar `0`: cancelar la tarea larga terminó su orden.
+En B, después, `grupos_prueba` (con `funciones.sh` cargado) no debe imprimir nada: cancelar la tarea larga terminó su orden.
 
 ## 5. Registro
 
@@ -701,7 +731,7 @@ Un caso que falla es un defecto: se corrige, se repite el caso y se anota todo. 
 . ~/pals-salida/funciones.sh
 para
 # En B: ninguna orden viva
-ps -eo pid,pgid,args | grep '[p]als-prueba'
+grupos_prueba     # nada
 # En A: ninguna regla de los cortes (reglas_como_antes, del caso 3)
 reglas_como_antes
 rm -rf ~/.pals-c
