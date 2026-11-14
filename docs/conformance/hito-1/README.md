@@ -9,7 +9,7 @@ Evidencia de la compatibilidad con A2A v1.0 del intercambio final de PALS: el TC
 | Dato | Valor |
 |-|-|
 | Fecha | 2026-11-14 |
-| Commit de `pals` | `2cb3520` (el código; este informe y los de TCK llegan en el commit siguiente, sin tocar código) |
+| Commit de `pals` | `2f4d1cc` (el código; este informe y los del TCK llegan en el commit siguiente, sin tocar código) |
 | TCK | `a2aproject/a2a-tck` en `104a7b4ae0d83f65c075e3793e322953a830eaba`, Python 3.15.2, dependencias de su `uv.lock` (`uv sync --frozen`, uv 0.13.8) |
 | Transportes | `jsonrpc`, `http_json` (el TCK no prueba gRPC: PALS no lo ofrece) |
 | `TCK_STREAMING_TIMEOUT` | `2.0` (el valor por defecto) |
@@ -23,7 +23,7 @@ Evidencia de la compatibilidad con A2A v1.0 del intercambio final de PALS: el TC
 --sut-host http://127.0.0.1:<puerto del gateway>/peers/<id del proveedor>
 ```
 
-Cada petición del TCK sale del gateway con el grant, viaja por Iroh con el binding [`http-over-iroh/v1`](../../bindings/http-over-iroh-v1.md) y llega al servidor A2A del proveedor. El TCK no activa la extensión de idempotencia de PALS, así que el proveedor se comporta como los SDK de referencia ante un `messageId` repetido (ver [`idempotency-v1`](../../extensions/idempotency-v1.md)).
+Cada petición del TCK sale del gateway con el grant, viaja por Iroh con los bindings propios [`http-over-iroh/v1`](../../bindings/http-over-iroh-v1.md) (`…/v1/jsonrpc` o `…/v1/http-json`, según el binding estándar que lleve dentro) y llega al servidor A2A del proveedor. El TCK no activa la extensión de idempotencia de PALS, así que el proveedor se comporta como los SDK de referencia ante un `messageId` repetido (ver [`idempotency-v1`](../../extensions/idempotency-v1.md)).
 
 **Reproducir** (desde la raíz del repo, con Rust, Python 3 y acceso a GitHub y PyPI):
 
@@ -65,7 +65,7 @@ El TCK no los puede comprobar desde fuera; no cuentan como superados.
 | `AUTH-TLS-001` (tráfico cifrado en producción) | MUST | **Pendiente de aceptación del responsable.** Entre pares, QUIC de Iroh (TLS 1.3). El gateway local es HTTP sin TLS y solo escucha en loopback: el tráfico no sale de la máquina |
 | `AUTH-TLS-002` (TLS moderno) | SHOULD | Entre pares, TLS 1.3 de QUIC. No aplica al gateway de loopback |
 | `AUTH-SERVER-001` (el cliente valida el certificado contra CA de confianza) | SHOULD | Desviación deliberada: la identidad del par es su clave Ed25519, comprobada en el handshake de QUIC, no un certificado de una CA |
-| `BIND-CUSTOM-002` (un cambio incompatible del binding usa URI nueva) | MUST | Comprometido en la [especificación del binding](../../bindings/http-over-iroh-v1.md#1-identificación): `v1` no cambia de significado; un cambio incompatible será `v2` |
+| `BIND-CUSTOM-002` (un cambio incompatible del binding usa URI nueva) | MUST | Comprometido en la [especificación de los bindings](../../bindings/http-over-iroh-v1.md#1-identificación): las URI de `v1` no cambian de significado; un cambio incompatible será `v2` |
 
 ## Cliente independiente con el SDK oficial de Python
 
@@ -87,6 +87,8 @@ Del propio PALS:
 - El gateway acepta `.../peers/<id>/jsonrpc/` (con barra final) como el endpoint JSON-RPC: el cliente JSON-RPC del TCK, como cualquier cliente `httpx` con `base_url`, envía `POST /` relativo a la URL de la interfaz.
 - La card declara `defaultInputModes: ["text/plain", "*/*"]`: el agente acepta partes de cualquier tipo (los ficheros van como blobs) y antes declaraba solo `text/plain`.
 - La idempotencia por `messageId` pasa a ser la extensión opcional [`idempotency/v1`](../../extensions/idempotency-v1.md), que el cliente activa con `A2A-Extensions`. Sin ella, un `messageId` repetido es un mensaje nuevo, como en los SDK de referencia; el TCK reutiliza el mismo `messageId` con contenidos distintos entre requisitos, y antes recibía `-32602` en cinco de ellos. El cliente de PALS la activa siempre.
+- La respuesta a una petición que activa la extensión la nombra en su cabecera `A2A-Extensions`, como A2A recomienda para las extensiones activadas; el gateway la devuelve sin cambios.
+- La card canónica que el agente sirve a sus pares declara sus dos interfaces entre pares (A2A §5.2): `iroh://<id>/jsonrpc` con `…/bindings/http-over-iroh/v1/jsonrpc` y `iroh://<id>/rest` con `…/bindings/http-over-iroh/v1/http-json`. Antes solo declaraba la primera. La vista del gateway no cambia.
 - La vista de la card en el gateway lleva `Cache-Control: max-age=300` y un `ETag` fuerte, y responde `304` a un `If-None-Match` que lo nombra (A2A §8.6; `CARD-CACHE-001`, `CARD-CACHE-002`).
 
 Rodeos de defectos del SDK oficial de Rust fijado, cada uno en una capa propia de PALS y con su prueba en `crates/pals/tests/conformance.rs`; los textos para comunicarlos aguas arriba están en [`sdk-issues.md`](sdk-issues.md):
@@ -94,12 +96,12 @@ Rodeos de defectos del SDK oficial de Rust fijado, cada uno en una capa propia d
 | Requisito | Defecto del SDK | Rodeo en PALS |
 |-|-|-|
 | `CORE-ERR-002` | `a2a-pb 0.3.2`, `from_proto_send_message_request`: un `SendMessage` sin `message` se convierte en un mensaje vacío con `messageId` nuevo, y nada valida los campos obligatorios | El guardián rechaza con `InvalidParamsError` un mensaje sin `messageId`, sin `role` o sin partes |
-| `VER-SERVER-002`, `HTTP_JSON-STATUS-001` | `a2a-server-lf 0.5.3`: el router HTTP+JSON no comprueba `A2A-Version` | Una capa delante del router HTTP+JSON la comprueba como el router JSON-RPC del SDK (sin cabecera cuenta como `0.3`) y responde `VersionNotSupportedError` con `400` y `google.rpc.Status` |
+| `VER-SERVER-002`, `HTTP_JSON-STATUS-001` | `a2a-server-lf 0.5.3`: el router HTTP+JSON no comprueba `A2A-Version`, y el de JSON-RPC solo la lee de la cabecera | Una capa delante del router HTTP+JSON la comprueba como el router JSON-RPC del SDK y responde `VersionNotSupportedError` con `400` y `google.rpc.Status`. En los dos bindings, si falta la cabecera, la versión se toma del parámetro de la petición `A2A-Version` (A2A §3.6.1); sin ninguno de los dos cuenta como `0.3` |
 | `HTTP_JSON-ERR-001` | `a2a-server-lf 0.5.3`, `rest_error_response`: errores con `Content-Type: application/problem+json` | La misma capa los sirve como `application/json`; el cuerpo ya era el `google.rpc.Status` de §11.6 |
 | `STREAM-SUB-001`, `STREAM-SUB-002`, `STREAM-ORDER-002` a `004` | `a2a-server-lf 0.5.3`, `subscribe_to_task`: `TaskNotFoundError` para una tarea no terminal sin ejecución viva (p. ej. esperando entrada) | El guardián emite la tarea como está y la sigue, con las ejecuciones que reciba, hasta un estado terminal |
 
 ## Lo que queda respaldado
 
-> **A2A v1.0 con los bindings JSON-RPC y HTTP+JSON a través del gateway local; entre pares, el binding propio `http-over-iroh/v1`, que transporta esos mismos bindings.**
+> **A2A v1.0 con los bindings JSON-RPC y HTTP+JSON a través del gateway local; entre pares, el binding propio `http-over-iroh/v1` (`…/v1/jsonrpc` y `…/v1/http-json`), que transporta esos mismos bindings.**
 
 En concreto: todos los requisitos MUST que el TCK en `104a7b4ae0d8` comprueba de forma automática para esos dos bindings se superan, salvo los de capacidades que la card no declara (notificaciones *push*, card extendida) y los de gRPC, que PALS no ofrece; y el SDK oficial de Python opera con PALS por los dos bindings. No queda respaldado: los 16 requisitos MUST sin prueba automática en el TCK, los `MANUAL` (entre ellos `AUTH-TLS-001`, pendiente de aceptación) y el SHOULD `HTTP_JSON-SVC-001`.
