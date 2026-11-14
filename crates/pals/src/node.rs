@@ -24,7 +24,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::a2a::auth::{Authenticator, JSONRPC_PATH, REST_PATH};
-use crate::a2a::{BindingExecutor, GuardedHandler, SqliteTaskStore, canonical_card, rest_shim};
+use crate::a2a::{
+    BindingExecutor, GuardedHandler, SqliteTaskStore, canonical_card, jsonrpc_shim, rest_shim,
+};
 use crate::blobs::{BLOBS_DIR, BlobService};
 use crate::config::{Config, DataDirLock, WorkerCfg};
 use crate::gateway::{self, GatewayParts, GatewayState};
@@ -55,8 +57,9 @@ const GATEWAY_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 /// [gateway](crate::gateway) on `gateway.listen`.
 ///
 /// The server is the SDK's, with the [canonical card](canonical_card) at
-/// `/.well-known/agent-card.json`, JSON-RPC at `/jsonrpc` and HTTP+JSON at
-/// `/rest` (behind [`rest_shim`]), behind grant authentication
+/// `/.well-known/agent-card.json`, JSON-RPC at `/jsonrpc` (behind
+/// [`jsonrpc_shim`]) and HTTP+JSON at `/rest` (behind [`rest_shim`]),
+/// behind grant authentication
 /// ([`crate::a2a::auth`]) and the ownership of tasks and idempotency of
 /// messages ([`GuardedHandler`]), on the durable task store.
 pub struct Node {
@@ -484,7 +487,10 @@ fn app(
     ));
     let app = axum::Router::new()
         .merge(agent_card_router(Arc::new(StaticAgentCard::new(card))))
-        .nest(JSONRPC_PATH, jsonrpc_router(Arc::clone(&handler)))
+        .nest(
+            JSONRPC_PATH,
+            jsonrpc_router(Arc::clone(&handler)).layer(axum::middleware::from_fn(jsonrpc_shim)),
+        )
         .nest(
             REST_PATH,
             rest_router(handler).layer(axum::middleware::from_fn(rest_shim)),

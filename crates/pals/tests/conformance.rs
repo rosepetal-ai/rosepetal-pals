@@ -181,6 +181,78 @@ async fn the_rest_binding_checks_the_protocol_version_as_json_rpc_does() {
     assert_eq!(res.json["task"]["status"]["state"], "TASK_STATE_COMPLETED");
 }
 
+#[tokio::test]
+async fn the_protocol_version_may_come_as_a_query_parameter() {
+    // A2A §3.6.1: a client MAY send `A2A-Version` as a request parameter
+    // instead of a header; the key is case-insensitive (§3.2.6).
+    let (b, a, g) = setup().await;
+    let res = a
+        .rpc(
+            &b,
+            Some(&g),
+            "SendMessage",
+            message("tck-complete-task-1", None),
+        )
+        .await;
+    let id = res.json["result"]["task"]["id"]
+        .as_str()
+        .expect("a task")
+        .to_owned();
+
+    for query in ["A2A-Version=1.0", "a2a-version=1.0", "A2A-VERSION=1&x=y"] {
+        let path = format!("/rest/tasks/{id}?{query}");
+        let res = rest(&a, &b, &g, "GET", &path, &[], None).await;
+        assert_eq!(res.status, 200, "{query}: {}", res.json);
+        assert_eq!(res.json["id"], id.as_str(), "{query}");
+    }
+    let body = rpc_request("GetTask", json!({ "id": id }));
+    let res = a
+        .request(
+            &b,
+            "POST",
+            "/jsonrpc?a2a-version=1.0",
+            &[("authorization", &bearer(&g))],
+            Some(&body),
+        )
+        .await;
+    assert_eq!(res.json["result"]["id"], id.as_str(), "{}", res.json);
+
+    // An unsupported version in the query is refused like one in a header,
+    // and a header wins over the query.
+    let path = format!("/rest/tasks/{id}?A2A-Version=0.3");
+    let res = rest(&a, &b, &g, "GET", &path, &[], None).await;
+    assert_rest_error(&res, 400, "VERSION_NOT_SUPPORTED");
+    let path = format!("/rest/tasks/{id}?A2A-Version=1.0");
+    let res = rest(&a, &b, &g, "GET", &path, &[("a2a-version", "0.3")], None).await;
+    assert_rest_error(&res, 400, "VERSION_NOT_SUPPORTED");
+    let res = a
+        .request(
+            &b,
+            "POST",
+            "/jsonrpc?a2a-version=0.3",
+            &[("authorization", &bearer(&g))],
+            Some(&body),
+        )
+        .await;
+    assert_eq!(res.json["error"]["code"], -32009, "{}", res.json);
+
+    // Through the gateway, which passes the query on as sent.
+    a.add_contact("bob", &b);
+    a.hold(&g);
+    let path = format!("/peers/bob/rest/tasks/{id}?A2A-Version=1.0");
+    let res = gateway_request(&a.gateway_url(), "GET", &path, &[], None).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let res = gateway_request(
+        &a.gateway_url(),
+        "POST",
+        "/peers/bob/jsonrpc/?A2A-Version=1.0",
+        &[],
+        Some(&body),
+    )
+    .await;
+    assert_eq!(res.json["result"]["id"], id.as_str(), "{}", res.json);
+}
+
 /// `SubscribeToTask` of `task_id` over JSON-RPC, with its body still
 /// streaming.
 async fn subscribe(a: &TestNode, b: &TestNode, g: &SignedGrant, task_id: &str) -> Body {
