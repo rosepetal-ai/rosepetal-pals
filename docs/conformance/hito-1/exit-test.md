@@ -322,7 +322,7 @@ La sección 6 del runbook: `para` en A y en B, `reglas_como_antes` en A (`reglas
 
 ### Camino de los casos 5 a 8
 
-**Qué arnés dio qué resultado.** La ejecución completa (todos los resultados de arriba salvo el camino de los casos 5 a 8) se hizo con el arnés de `040bc01`. El camino de los casos 5 a 8 viene de una ejecución parcial con el arnés del commit siguiente, `5a1cb38`. Las correcciones posteriores del arnés (la «ronda de correcciones 1»: ficheros de PID comprobados, directorio marcado, etiquetas de Docker, desmontaje al interrumpir, camino del caso 3 comprobado) solo se han probado por partes, no de principio a fin; el `run.sh` de `5a1cb38` tampoco se ejecutó entero, ni su limpieza ni su desmontaje nuevos.
+**Qué arnés dio qué resultado.** La ejecución completa (todos los resultados de arriba salvo el camino de los casos 5 a 8) se hizo con el arnés de `040bc01`. El camino de los casos 5 a 8 viene de una ejecución parcial con el arnés del commit siguiente, `5a1cb38`. Las correcciones posteriores del arnés, tras dos revisiones (ficheros de PID comprobados, directorio marcado, etiquetas de Docker, desmontaje al interrumpir con Ctrl-C o `SIGTERM` también a mitad de un paso largo, camino del caso 3 comprobado), solo se han probado por partes, no de principio a fin; el `run.sh` de `5a1cb38` tampoco se ejecutó entero, ni su limpieza ni su desmontaje nuevos.
 
 El arnés de `040bc01` solo medía los contadores en los casos 1 a 4. Para los demás se añadió la medida, y una ejecución parcial (de 16:59 a 17:03 UTC, sin `claude`: preparación y casos 2 y 5 a 8) repitió los casos 5 a 8. Los cuatro se superaron otra vez, todos por camino directo:
 

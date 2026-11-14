@@ -45,7 +45,9 @@ Las fases también se pueden ejecutar sueltas, siempre en orden y con el mismo `
 
 El registro completo queda en `$PALS_EXIT_DIR/registro/run.log` y los resultados en `registro/resultados.txt`. Al desmontar se copian ahí los registros de los tres daemons. El registro contiene ids de agente y hashes, pero no los tokens de los grants ni los tickets: el arnés los pasa de una máquina a otra sin imprimirlos.
 
-**Si una ejecución se interrumpe.** Con Ctrl-C o `SIGTERM`, el arnés desmonta antes de salir. `todo` desmonta también cuando una fase falla. Después de cualquier otro final (un fallo en fases sueltas, `kill -9`, un reinicio), ejecuta `tests/exit/run.sh desmontar` con el mismo `PALS_EXIT_DIR`.
+**Si una ejecución se interrumpe.** Con Ctrl-C o `SIGTERM` (al proceso o a su grupo), el arnés desmonta antes de salir. Lo hace en el acto también durante los pasos largos (las transferencias del caso 3, de hasta 20 min, y los casos 1, 2, 4 y 8), que corren en segundo plano mientras el arnés espera; un paso corto, de unos segundos, termina antes. `todo` desmonta también cuando una fase falla. Después de cualquier otro final (un fallo en fases sueltas, `kill -9`, un reinicio), ejecuta `tests/exit/run.sh desmontar` con el mismo `PALS_EXIT_DIR`. Si ese directorio ya no existe y quedan el contenedor o la red, comprueba antes su etiqueta (`docker inspect -f '{{ index .Config.Labels "pals-exit.dir" }}' pals-exit-a`, `docker network inspect -f '{{ index .Labels "pals-exit.dir" }}' pals-exit-net`) y bórralos a mano: `docker rm -f pals-exit-a; docker network rm pals-exit-net`.
+
+`desmontar` no borra los ficheros de B mientras su daemon siga vivo: si no termina 60 s después de `SIGTERM`, le envía `SIGKILL`, y si aun así sigue, avisa y los conserva.
 
 ## Qué crea y qué toca
 

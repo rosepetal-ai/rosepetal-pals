@@ -107,7 +107,11 @@ elif [ ! -f "$MARKER" ]; then
 fi
 
 mkdir -p "$LOGS"
-exec > >(tee -a "$LOGS/run.log") 2>&1
+# The log's tee ignores SIGINT and SIGTERM: Ctrl-C reaches the whole process
+# group, and a dead tee would kill this script with SIGPIPE at its next
+# line of output, before the teardown in on_interrupt.
+exec > >(trap '' INT TERM; exec tee -a "$LOGS/run.log") 2>&1
+TEE_PID=$!
 
 # --- helpers ---------------------------------------------------------------
 
@@ -143,6 +147,12 @@ en_a() {
     docker exec -i "$A" bash -c \
         'cd; [ ! -f ~/pals-salida/funciones.sh ] || . ~/pals-salida/funciones.sh; eval "$(cat)"'
 }
+# en_a_wait FILE: en_a, with its output (stdout and stderr) in FILE, run in
+# the background and waited for. A trapped signal interrupts `wait` at once,
+# where a foreground step, such as a 20 min transfer, would delay the trap
+# until it ended. The script's stdin goes to en_a explicitly: a background
+# command's stdin is otherwise /dev/null.
+en_a_wait() { en_a <&0 > "$1" 2>&1 & wait $!; }
 # Copies stdin to the file $1 in A; a leading ~ is A's home.
 a_write() { docker exec -i "$A" sh -c "cat > $1"; }
 
@@ -162,11 +172,20 @@ b_daemon_pid() {
     local pid
     pid=$(cat "$B_SAL/daemon.pid" 2> /dev/null) && is_b_daemon "$pid" && echo "$pid"
 }
+# b_daemon_pids: every process that is this run's B daemon, whatever the pid
+# file says (a run cut short may have left one it no longer names).
+b_daemon_pids() {
+    local p
+    for p in $(pgrep -f "^$(ere_quote "$PALS") daemon\$"); do
+        if is_b_daemon "$p"; then echo "$p"; fi
+    done
+}
 
 # Starts B's daemon in its own session, so that it outlives this script, with
 # the environment of a clean terminal.
 arranca_b() {
-    if b_daemon_pid > /dev/null; then die "B's daemon is already running ($(b_daemon_pid))"; fi
+    local running; running=$(b_daemon_pids | tr '\n' ' ')
+    if [ -n "$running" ]; then die "B's daemon is already running ($running)"; fi
     env -i PATH="$B_PATH" HOME="$HOME" LANG="$B_LANG" PALS_HOME="$B_HOME" \
         ${RUST_LOG:+RUST_LOG="$RUST_LOG"} \
         setsid "$PALS" daemon >> "$B_SAL/daemon.log" 2>&1 < /dev/null &
@@ -183,21 +202,24 @@ arranca_b() {
     sleep 5   # the runbook: wait a few seconds, so that the ticket carries the relay
     grep 'pals daemon:' "$B_SAL/daemon.log" | tail -n 1
 }
-# Stops B's daemon, if its pid file names it: SIGTERM, then up to 60 s for it
-# to end. Removes the pid file once it has.
+# Stops B's daemon, any process b_daemon_pids finds: SIGTERM, then up to 60 s
+# for it to end. Removes the pid file once none is left; returns 1 if one is.
 para_b() {
-    local pid _
-    if ! pid=$(b_daemon_pid); then
-        rm -f "$B_SAL/daemon.pid"
-        return 0
+    local pids _
+    pids=$(b_daemon_pids)
+    if [ -n "$pids" ]; then
+        kill $pids
+        for _ in $(seq 1 300); do
+            [ -n "$(b_daemon_pids)" ] || break
+            sleep 0.2
+        done
+        pids=$(b_daemon_pids)
+        if [ -n "$pids" ]; then
+            note "AVISO: el daemon de B ($(echo $pids)) sigue vivo 60 s después de SIGTERM"
+            return 1
+        fi
     fi
-    kill "$pid"
-    for _ in $(seq 1 300); do
-        is_b_daemon "$pid" || { rm -f "$B_SAL/daemon.pid"; return 0; }
-        sleep 0.2
-    done
-    note "AVISO: el daemon de B ($pid) sigue vivo 60 s después de SIGTERM"
-    return 1
+    rm -f "$B_SAL/daemon.pid"
 }
 
 # A string as a literal in an extended regular expression.
@@ -250,7 +272,7 @@ elapsed() { echo $(( $(date +%s) - $1 )) s; }
 
 # The PALS_EXIT_DIR of the run that made container $A or network $NET, from
 # its label; empty when it does not exist.
-container_dir() { docker inspect -f '{{ index .Config.Labels "pals-exit.dir" }}' "$A" 2> /dev/null; }
+container_dir() { docker inspect --type container -f '{{ index .Config.Labels "pals-exit.dir" }}' "$A" 2> /dev/null; }
 network_dir() { docker network inspect -f '{{ index .Labels "pals-exit.dir" }}' "$NET" 2> /dev/null; }
 container_exists() { docker ps -a --format '{{.Names}}' | grep -qx "$A"; }
 network_exists() { docker network ls --format '{{.Name}}' | grep -qx "$NET"; }
@@ -265,13 +287,17 @@ preparar() {
         command -v claude > /dev/null || die "case 1 needs claude on PATH (or PALS_EXIT_CASO1=omitir)"
     fi
     local owner
+    # What to do with a container or network left by another run: its
+    # `desmontar`, or, if that directory is gone, by hand after checking the
+    # label.
+    local manual="if that directory no longer exists, check the label (docker inspect -f '{{ index .Config.Labels \"pals-exit.dir\" }}' $A; docker network inspect -f '{{ index .Labels \"pals-exit.dir\" }}' $NET) and remove them by hand: docker rm -f $A; docker network rm $NET"
     if container_exists; then
         owner=$(container_dir)
-        die "the container $A exists, made by the run in ${owner:-an unknown directory}: another run may be in progress; if not, run \`desmontar\` with that PALS_EXIT_DIR"
+        die "the container $A exists, made by the run in ${owner:-an unknown directory}: another run may be in progress; if not, run \`desmontar\` with that PALS_EXIT_DIR; $manual"
     fi
     if network_exists; then
         owner=$(network_dir)
-        die "the network $NET exists, made by the run in ${owner:-an unknown directory}: another run may be in progress; if not, run \`desmontar\` with that PALS_EXIT_DIR"
+        die "the network $NET exists, made by the run in ${owner:-an unknown directory}: another run may be in progress; if not, run \`desmontar\` with that PALS_EXIT_DIR; $manual"
     fi
 
     note "fecha: $(date -u '+%F %T') UTC"
@@ -422,7 +448,7 @@ caso1() {
     note "pregunta a B, que responde con claude -p en el proyecto (llamada 2 de 2)"
     local before t0 code=0
     before=$(counters); t0=$(date +%s)
-    en_a > "$LOGS/caso1.out" 2>&1 <<'EOS' || code=$?
+    en_a_wait "$LOGS/caso1.out" <<'EOS' || code=$?
 time pals ask b "Lee el README y los ficheros de configuración de este proyecto. ¿Cómo se arranca y qué dependencias principales tiene? Cita los ficheros."
 EOS
     cat "$LOGS/caso1.out"
@@ -462,7 +488,7 @@ caso2() {
     say "Caso 2. Transferencia autorizada"
     local before t0 out
     before=$(counters); t0=$(date +%s)
-    out=$(en_a <<'EOS'
+    en_a_wait "$LOGS/paso.out" <<'EOS'
 cd ~/pals-salida
 head -c 256M /dev/urandom > grande.bin
 sha256sum grande.bin
@@ -473,7 +499,7 @@ URL=$(sed -n 's/^file grande.bin: //p' caso2.out); echo "$URL"
 curl -sS -o devuelto.bin -w '%{http_code} %{size_download}\n' "$URL"
 sha256sum grande.bin devuelto.bin
 EOS
-)
+    out=$(cat "$LOGS/paso.out")
     echo "$out"
     path "caso 2, de A a B (y la vuelta)" "$before"
     local sent b_got back
@@ -486,7 +512,7 @@ EOS
     result "caso 2 (A -> B -> A)" "$ok" "sha256 enviado ${sent:0:8}…, recibido por B ${b_got:0:8}…, devuelto ${back:0:8}…; $(elapsed "$t0")"
 
     before=$(counters); t0=$(date +%s)
-    out=$(en_a <<'EOS'
+    en_a_wait "$LOGS/paso.out" <<'EOS'
 cd ~/pals-salida
 pals ask b "genera 256" | tee caso2b.out; echo "código ${PIPESTATUS[0]}"
 URL=$(sed -n 's/^file generado.bin: //p' caso2b.out)
@@ -495,7 +521,7 @@ curl -sS -o generado.bin -w '%{http_code} %{size_download}\n' "$URL"
 echo "curl: $(( ($(date +%s%N) - t0) / 1000000 )) ms"
 sha256sum generado.bin
 EOS
-)
+    out=$(cat "$LOGS/paso.out")
     echo "$out"
     path "caso 2, de B a A" "$before"
     local made got
@@ -530,7 +556,8 @@ limit_a() {
 # `before`, and prints the output and the path.
 caso3_try() {
     before=$(counters); t0=$(date +%s)
-    out=$(en_a <<< "bash ~/pals-salida/caso3.sh $1" 2>&1)
+    en_a_wait "$LOGS/paso.out" <<< "bash ~/pals-salida/caso3.sh $1"
+    out=$(cat "$LOGS/paso.out")
     echo "$out"
     path "caso 3 $label $1" "$before"
 }
@@ -620,7 +647,7 @@ caso4() {
     say "Caso 4. Reintento sin duplicar: tarea de 120 s y, a los 15 s, corte de red de 45 s en A"
     local before t0 out msg code
     before=$(counters); t0=$(date +%s)
-    out=$(en_a <<'EOS' 2>&1
+    en_a_wait "$LOGS/paso.out" <<'EOS'
 [ -z "$SUDO" ] || sudo -v
 echo "$(date -u +%T) pals ask b 'espera 120'"
 pals ask b "espera 120" & ASK=$!
@@ -629,13 +656,14 @@ wait $ASK; echo "código $?"
 echo "$(date -u +%T) fin"
 pals task ls | tail -n 1        # messageId, estado, par, tarea, intentos
 EOS
-)
+    out=$(cat "$LOGS/paso.out")
     echo "$out"
     msg=$(echo "$out" | tail -n 1 | cut -f1)
     code=$(echo "$out" | sed -n 's/^código //p')
     if [ "$code" = 3 ]; then
         note "pals ask terminó con código 3: pals task resume $msg"
-        out=$(en_a <<< "pals task resume $msg; echo \"código \$?\"; pals task ls | tail -n 1" 2>&1)
+        en_a_wait "$LOGS/paso.out" <<< "pals task resume $msg; echo \"código \$?\"; pals task ls | tail -n 1"
+        out=$(cat "$LOGS/paso.out")
         echo "$out"
         code=$(echo "$out" | sed -n 's/^código //p')
     fi
@@ -709,8 +737,7 @@ EOS
             && [ "$hello" = "eco: hola tras el rearranque" ] && [ "$hcode" = 0 ]; then ok=ok; fi
     fi
     # Looked up again: the group seen 80 s ago may be gone, and its id reused.
-    if worker=$(b_worker_of "$task"); then
-        pgid=$(group_of "$worker")
+    if worker=$(b_worker_of "$task") && pgid=$(group_of "$worker") && [ -n "$pgid" ]; then
         note "En B: se termina la orden que sobrevivió al kill -9 (tarea $task, grupo $pgid)"
         ps_groups "$pgid"
         kill -- "-$pgid"
@@ -805,17 +832,18 @@ EOS
 caso8() {
     say "Caso 8. Cliente estándar: el SDK oficial de Python en A, contra el gateway de A, con B como par"
     local out code=0 before
-    en_a <<'EOS' 2>&1
+    en_a_wait "$LOGS/paso.out" <<'EOS'
 cd "$REPO"
 python3 -m venv ~/pals-salida/venv
 ~/pals-salida/venv/bin/pip install -q -r tests/interop/requirements.txt
 ~/pals-salida/venv/bin/pip list 2>/dev/null | grep '^a2a-sdk '
 EOS
+    cat "$LOGS/paso.out"
     before=$(counters)
-    out=$(en_a <<'EOS' 2>&1
+    en_a_wait "$LOGS/paso.out" <<'EOS' || code=$?
 ~/pals-salida/venv/bin/python ~/pals-salida/caso8.py http://127.0.0.1:7420 "$(pals contact ls | awk '$1 == "b" {print $2}')"
 EOS
-)  || code=$?
+    out=$(cat "$LOGS/paso.out")
     echo "$out"
     note "código $code"
     path "caso 8" "$before"
@@ -886,12 +914,34 @@ desmontar() {
     else
         note "la imagen $IMAGE se conserva (PALS_EXIT_KEEP_IMAGE=0 la elimina)"
     fi
-    para_b
+    # B's daemon: SIGTERM, and SIGKILL if it outlives para_b's 60 s, both only
+    # to a PID checked as this run's daemon. Its files stay while it lives.
+    local pids _ keep_b=0
+    if ! para_b; then
+        pids=$(b_daemon_pids)
+        if [ -n "$pids" ]; then
+            note "AVISO: SIGKILL al daemon de B ($(echo $pids))"
+            kill -9 $pids
+            for _ in $(seq 1 50); do [ -n "$(b_daemon_pids)" ] || break; sleep 0.2; done
+        fi
+        if [ -n "$(b_daemon_pids)" ]; then
+            note "AVISO: el daemon de B sigue vivo: no se borran sus ficheros"
+            keep_b=1
+        else
+            rm -f "$B_SAL/daemon.pid"
+        fi
+    fi
     # Any test-worker command still alive, from B's directory only.
+    local g
     for p in $(b_workers); do
-        kill -- "-$(group_of "$p")" && note "grupo de procesos de la orden $p terminado"
+        g=$(group_of "$p")
+        [ -n "$g" ] && kill -- "-$g" && note "grupo de procesos de la orden $p terminado"
     done
     [ ! -f "$B_SAL/daemon.log" ] || cp "$B_SAL/daemon.log" "$LOGS/b-daemon.log"
+    if [ "$keep_b" = 1 ]; then
+        note "se conservan $B_HOME y $B_SAL: vuelve a ejecutar desmontar cuando el daemon de B haya terminado"
+        return 1
+    fi
     # Inside the marked PALS_EXIT_DIR (checked at start); the project copy only
     # if preparar cloned it there.
     rm -rf -- "$B_HOME" "$B_SAL"
@@ -909,6 +959,10 @@ desmontar() {
 # early; single phases leave the setup for the next phase.
 on_interrupt() {
     trap - INT TERM
+    # Should the tee be gone anyway, write on to the log file, never to a
+    # closed pipe.
+    trap '' PIPE
+    kill -0 "$TEE_PID" 2> /dev/null || exec >> "$LOGS/run.log" 2>&1
     note "interrumpido: se desmonta"
     [ "$DESMONTADO" = 1 ] || desmontar
     exit 130
