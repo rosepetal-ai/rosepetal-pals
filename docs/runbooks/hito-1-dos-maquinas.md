@@ -78,9 +78,11 @@ para() {        # SIGTERM al daemon, si su PID sigue siendo un `pals daemon`, y 
     rm -f ~/pals-salida/daemon.pid
 }
 grupos_prueba() {   # en B: el grupo de procesos de cada orden viva del worker de pruebas, con sus procesos
-    local pid
+    local pid g
     for pid in $(pgrep -f "^sh $HOME/pals-salida/pals-prueba\.sh( |\$)"); do
-        ps -eo pid,pgid,etime,args | awk -v g="$(ps -o pgid= -p "$pid")" '$2 == g + 0'
+        g=$(ps -o pgid= -p "$pid" | tr -d ' ')
+        [ -n "$g" ] || continue     # la orden terminó entre pgrep y ps
+        ps -eo pid,pgid,etime,args | awk -v g="$g" '$2 == g'
     done
 }
 reglas_como_antes() {     # en A: las reglas del cortafuegos como se guardaron en el caso 3
