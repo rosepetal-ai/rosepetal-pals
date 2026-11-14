@@ -291,7 +291,7 @@ fn revoke_unknown_grant_returns_false() {
 }
 
 #[test]
-fn reopen_keeps_data_and_schema_version_is_1() {
+fn reopen_keeps_data_and_schema_version_is_2() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pals.db");
     let me = AgentKey::generate();
@@ -324,7 +324,7 @@ fn reopen_keeps_data_and_schema_version_is_1() {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
     let journal_mode: String = conn
         .pragma_query_value(None, "journal_mode", |row| row.get(0))
         .unwrap();
@@ -339,15 +339,25 @@ fn reopen_keeps_data_and_schema_version_is_1() {
     assert_eq!(
         tables,
         [
+            "a2a_contacts",
+            "benchmark_reports",
             "contacts",
             "dedup",
             "events",
             "grants_held",
             "grants_issued",
+            "inventory_cache",
+            "inventory_observations",
+            "offers_issued",
+            "offers_received",
             "outbox",
+            "own_records",
+            "peer_cards",
+            "peer_records",
             "revocations",
             "task_owners",
             "tasks",
+            "view_revisions",
         ]
     );
 }

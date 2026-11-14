@@ -1,0 +1,40 @@
+{
+  "agent_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+  "canonical_hex": "7b226167656e745f6964223a2238613838653364643734303966313935666435326462326433636261356437326361363730396266316439343132316266333734383830316234306636663563222c22657870697265735f6174223a22323032362d31312d31355430303a30303a30305a222c2269726f68223a7b226469726563745f6164647273223a5b223139322e302e322e31303a34343333222c225b323030313a6462383a3a31305d3a34343333225d2c22656e64706f696e745f6964223a2238613838653364643734303966313935666435326462326433636261356437326361363730396266316439343132316266333734383830316234306636663563222c2272656c61795f75726c223a2268747470733a2f2f72656c61792e6578616d706c652e6f72672f227d2c226973737565645f6174223a22323032362d31312d31345430303a30303a30305a222c22736368656d61223a226167656e746e65742e636f6e746163742f31222c22736571223a317d",
+  "description": "agentnet.contact/1 test vector. The agent's Ed25519 secret key is 32 bytes of 0x01 (signing_key_hex); agent_id is its public key in hex, the record's agent_id and iroh.endpoint_id. canonical_hex is JCS (RFC 8785) of record; signature is Ed25519 over \"agentnet.contact/1\\n\" followed by those bytes, base64url without padding; signed is the signed record as it travels, whose JCS is the exact bytes: {\"record\": record, \"signature\": signature}.",
+  "record": {
+    "agent_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "expires_at": "2026-11-15T00:00:00Z",
+    "iroh": {
+      "direct_addrs": [
+        "192.0.2.10:4433",
+        "[2001:db8::10]:4433"
+      ],
+      "endpoint_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "relay_url": "https://relay.example.org/"
+    },
+    "issued_at": "2026-11-14T00:00:00Z",
+    "schema": "agentnet.contact/1",
+    "seq": 1
+  },
+  "signature": "Tvc67aetiMyEhUq79UJwriTqz0IHJtuDkFxnX9pVIdW1RpC4Q1rmWBpjGNHcwPFRz-0OYAOMvW29gY-COgyoDA",
+  "signed": {
+    "record": {
+      "agent_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "expires_at": "2026-11-15T00:00:00Z",
+      "iroh": {
+        "direct_addrs": [
+          "192.0.2.10:4433",
+          "[2001:db8::10]:4433"
+        ],
+        "endpoint_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+        "relay_url": "https://relay.example.org/"
+      },
+      "issued_at": "2026-11-14T00:00:00Z",
+      "schema": "agentnet.contact/1",
+      "seq": 1
+    },
+    "signature": "Tvc67aetiMyEhUq79UJwriTqz0IHJtuDkFxnX9pVIdW1RpC4Q1rmWBpjGNHcwPFRz-0OYAOMvW29gY-COgyoDA"
+  },
+  "signing_key_hex": "0101010101010101010101010101010101010101010101010101010101010101"
+}
