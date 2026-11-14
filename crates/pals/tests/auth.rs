@@ -65,7 +65,8 @@ async fn card_is_public_and_declares_only_what_is_served() {
     assert_eq!(card["capabilities"]["streaming"], true);
     assert_eq!(card["capabilities"]["pushNotifications"], false);
     assert_eq!(card["capabilities"]["extendedAgentCard"], false);
-    assert_eq!(card["defaultInputModes"], json!(["text/plain"]));
+    // Text, and files of any media type.
+    assert_eq!(card["defaultInputModes"], json!(["text/plain", "*/*"]));
     assert_eq!(
         card["defaultOutputModes"],
         json!(["text/plain", "application/octet-stream"])
@@ -563,6 +564,28 @@ async fn push_config_call_reports_not_supported() {
     // The extended card is not offered either.
     let res = a.rpc(&b, Some(&g), "GetExtendedAgentCard", json!({})).await;
     assert_eq!(rpc_error(&res)["code"], -32004);
+}
+
+#[tokio::test]
+async fn parts_of_any_media_type_are_taken() {
+    // As the card's `*/*` says: a part's media type never refuses it.
+    let (b, a) = pair().await;
+    let g = grant(&b, &a, &SEND_AND_READ, 3600);
+    for part in [
+        json!({"raw": "dGNr", "mediaType": "application/x-unsupported-tck-type"}),
+        json!({"text": "hola", "mediaType": "text/x-anything"}),
+        json!({"text": "hola"}),
+    ] {
+        let mut params = message_params("hola", None);
+        params["message"]["parts"] = json!([part]);
+        let res = a.rpc(&b, Some(&g), "SendMessage", params).await;
+        assert_eq!(res.status, 200, "{}", res.json);
+        assert_eq!(
+            res.json["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+            "{part}: {}",
+            res.json
+        );
+    }
 }
 
 #[tokio::test]

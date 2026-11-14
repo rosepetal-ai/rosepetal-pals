@@ -26,7 +26,9 @@ pub const SECURITY_SCHEME: &str = "agentnetGrant";
 ///
 /// It declares only what the daemon serves: the JSON-RPC binding over Iroh
 /// at `iroh://<agent id>/jsonrpc`, streaming, no push notifications, no
-/// extended card, the `ask` skill, and grants as bearer tokens.
+/// extended card, text and files of any media type as input (`*/*`: a
+/// question comes with any files, sent as blobs, and a part's media type
+/// never refuses it), the `ask` skill, and grants as bearer tokens.
 pub fn canonical_card(cfg: &Config, id: &AgentId) -> AgentCard {
     let capabilities = AgentCapabilities {
         streaming: Some(true),
@@ -59,7 +61,7 @@ pub fn canonical_card(cfg: &Config, id: &AgentId) -> AgentCard {
             BINDING_URI,
         )],
         capabilities,
-        default_input_modes: vec!["text/plain".to_owned()],
+        default_input_modes: vec!["text/plain".to_owned(), "*/*".to_owned()],
         default_output_modes: vec![
             "text/plain".to_owned(),
             "application/octet-stream".to_owned(),
