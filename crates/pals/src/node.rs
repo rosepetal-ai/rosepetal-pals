@@ -1,7 +1,8 @@
-//! [`Node`]: one running agent, the A2A server its peers reach over Iroh and
-//! the local gateway standard A2A clients reach its peers through.
+//! [`Node`]: one running agent, the A2A server its peers reach over Iroh, the
+//! blobs it serves them, and the local gateway standard A2A clients reach its
+//! peers through.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,8 +24,9 @@ use tokio::task::JoinHandle;
 
 use crate::a2a::auth::{Authenticator, JSONRPC_PATH, REST_PATH};
 use crate::a2a::{BindingExecutor, GuardedHandler, SqliteTaskStore, canonical_card};
+use crate::blobs::{BLOBS_DIR, BlobService};
 use crate::config::{Config, DataDirLock, WorkerCfg};
-use crate::gateway::{self, GatewayState};
+use crate::gateway::{self, GatewayParts, GatewayState};
 use crate::net::{ALPN_A2A_HTTP, PeerHttp, TunnelLimits, TunnelServer};
 use crate::worker::TASKS_DIR;
 use crate::worker::echo::EchoExecutor;
@@ -45,7 +47,8 @@ const DEDUP_PURGE_INTERVAL: Duration = Duration::from_secs(3600);
 const GATEWAY_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A running agent: its A2A server, served to peers over Iroh on
-/// [`ALPN_A2A_HTTP`], the client it reaches peers with, and its local
+/// [`ALPN_A2A_HTTP`], its blobs, served on [`iroh_blobs::ALPN`] to the peers
+/// it shared them with, the client it reaches peers with, and its local
 /// [gateway](crate::gateway) on `gateway.listen`.
 ///
 /// The server is the SDK's, with the [canonical card](canonical_card) at
@@ -58,6 +61,8 @@ pub struct Node {
     pub store: Arc<Store>,
     /// Requests to peers, from this agent's own endpoint and identity.
     pub peer_http: PeerHttp,
+    /// The agent's files, in `<data_dir>/`[`BLOBS_DIR`].
+    pub blobs: BlobService,
     router: Router,
     gateway: GatewayServer,
     /// Purges old dedup rows every [`DEDUP_PURGE_INTERVAL`] while the node
@@ -80,23 +85,30 @@ impl Node {
     /// left with no execution behind them, and purges the dedup rows older
     /// than [`DEDUP_RETENTION_S`]; binds the gateway's
     /// listener on `gateway.listen`, which must be a loopback address (port
-    /// 0 picks a free one, see [`Node::gateway_url`]); and only then binds
-    /// the Iroh endpoint with the agent's key, serves [`ALPN_A2A_HTTP`] on it
-    /// and starts the gateway. With `net.relay` the endpoint uses Iroh's N0
-    /// preset and its public relays; without it, it has no relay and is
-    /// bound to 127.0.0.1 only. While it runs, the node purges the dedup
-    /// rows again every hour.
+    /// 0 picks a free one, see [`Node::gateway_url`]); binds the Iroh
+    /// endpoint with the agent's key and opens the blob store in
+    /// `<data_dir>/`[`BLOBS_DIR`]; and only then serves [`ALPN_A2A_HTTP`]
+    /// and [`iroh_blobs::ALPN`] on the endpoint and starts the gateway. With
+    /// `net.relay` the endpoint uses Iroh's N0 preset and its public relays;
+    /// without it, it has no relay and is bound to 127.0.0.1 only. While it
+    /// runs, the node purges the dedup rows again every hour.
     pub async fn spawn(cfg: Config) -> anyhow::Result<Node> {
+        #[cfg(not(unix))]
+        if matches!(cfg.worker, WorkerCfg::Exec(_)) {
+            anyhow::bail!("the exec worker adapter needs a Unix system");
+        }
+        let opened = Opened::open(&cfg).await?;
         match &cfg.worker {
-            WorkerCfg::Echo => Self::spawn_with_executor(cfg, EchoExecutor).await,
+            WorkerCfg::Echo => Ok(opened.start(&cfg, EchoExecutor)),
             #[cfg(unix)]
             WorkerCfg::Exec(exec) => {
                 let adapter = Arc::new(ExecAdapter::new(exec.clone(), &cfg.projects));
-                let executor = WorkerExecutor::new(adapter, &cfg, Capacity::from(exec));
-                Self::spawn_with_executor(cfg, executor).await
+                let executor =
+                    WorkerExecutor::new(adapter, &cfg, Capacity::from(exec), opened.blobs.clone());
+                Ok(opened.start(&cfg, executor))
             }
             #[cfg(not(unix))]
-            WorkerCfg::Exec(_) => anyhow::bail!("the exec worker adapter needs a Unix system"),
+            WorkerCfg::Exec(_) => unreachable!("refused above"),
         }
     }
 
@@ -106,83 +118,7 @@ impl Node {
         cfg: Config,
         executor: impl AgentExecutor,
     ) -> anyhow::Result<Node> {
-        ensure!(
-            cfg.gateway.listen.ip().is_loopback(),
-            "gateway.listen must be a loopback address, not {}",
-            cfg.gateway.listen
-        );
-        let data_dir = cfg.data_dir.clone();
-        let key_path = cfg.key_path();
-        let (lock, key, store) = tokio::task::spawn_blocking(move || {
-            let lock = DataDirLock::acquire(&data_dir)?;
-            let key = AgentKey::load_or_create(&key_path)
-                .with_context(|| format!("cannot load {}", key_path.display()))?;
-            let store = Store::open(&data_dir.join(STORE_FILE), key.id())?;
-            let interrupted = store
-                .tasks_fail_interrupted(chrono::Utc::now().timestamp())
-                .context("cannot fail the tasks a restart interrupted")?;
-            if interrupted > 0 {
-                tracing::info!(interrupted, "failed the tasks a restart interrupted");
-            }
-            remove_task_dirs(&data_dir);
-            // An unbound key belongs to a request that never ran: free it,
-            // so that its retry runs instead of waiting for nothing.
-            let unbound = store
-                .dedup_clear_unbound()
-                .context("cannot free the dedup keys a restart left unbound")?;
-            if unbound > 0 {
-                tracing::info!(unbound, "freed the dedup keys a restart left unbound");
-            }
-            purge_dedup(&store).context("cannot purge the old dedup rows")?;
-            anyhow::Ok((lock, key, store))
-        })
-        .await??;
-        let key = Arc::new(key);
-        let store = Arc::new(store);
-        let id = key.id();
-
-        let listener = TcpListener::bind(cfg.gateway.listen)
-            .await
-            .with_context(|| format!("cannot listen on {} for the gateway", cfg.gateway.listen))?;
-        let gateway_addr = listener
-            .local_addr()
-            .context("the gateway listener has no address")?;
-
-        let endpoint = bind_endpoint(&cfg, &key).await?;
-        ensure!(
-            endpoint.id().as_bytes() == id.as_bytes(),
-            "the Iroh endpoint id is not the agent id"
-        );
-        let limits = TunnelLimits {
-            max_body_bytes: cfg.limits.max_body_bytes,
-            ..TunnelLimits::default()
-        };
-        let app = app(&cfg, &key, &store, executor);
-        let router = Router::builder(endpoint.clone())
-            .accept(ALPN_A2A_HTTP, TunnelServer::new(app, limits))
-            .spawn();
-        let peer_http = PeerHttp::new(endpoint.clone());
-        let gateway = GatewayServer::start(
-            listener,
-            GatewayState::new(
-                id,
-                cfg.agent.name.clone(),
-                Arc::clone(&store),
-                peer_http.clone(),
-                endpoint,
-                gateway_addr,
-            ),
-        );
-        let dedup_purge = AbortOnDrop(tokio::spawn(purge_dedup_hourly(Arc::clone(&store))));
-        Ok(Node {
-            id,
-            store,
-            peer_http,
-            router,
-            gateway,
-            dedup_purge,
-            _lock: lock,
-        })
+        Ok(Opened::open(&cfg).await?.start(&cfg, executor))
     }
 
     /// The address peers dial this node at: its id and the direct addresses
@@ -228,6 +164,136 @@ impl Node {
             tracing::debug!("dropping the gateway connections still open");
         }
         stopped
+    }
+}
+
+/// What a node runs on, open and bound, before it serves anything.
+struct Opened {
+    lock: DataDirLock,
+    key: Arc<AgentKey>,
+    store: Arc<Store>,
+    listener: TcpListener,
+    gateway_addr: SocketAddr,
+    endpoint: Endpoint,
+    blobs: BlobService,
+}
+
+impl Opened {
+    /// Everything [`Node::spawn`] does before it serves.
+    async fn open(cfg: &Config) -> anyhow::Result<Self> {
+        ensure!(
+            cfg.gateway.listen.ip().is_loopback(),
+            "gateway.listen must be a loopback address, not {}",
+            cfg.gateway.listen
+        );
+        let data_dir = cfg.data_dir.clone();
+        let key_path = cfg.key_path();
+        let (lock, key, store) = tokio::task::spawn_blocking(move || {
+            let lock = DataDirLock::acquire(&data_dir)?;
+            let key = AgentKey::load_or_create(&key_path)
+                .with_context(|| format!("cannot load {}", key_path.display()))?;
+            let store = Store::open(&data_dir.join(STORE_FILE), key.id())?;
+            let interrupted = store
+                .tasks_fail_interrupted(chrono::Utc::now().timestamp())
+                .context("cannot fail the tasks a restart interrupted")?;
+            if interrupted > 0 {
+                tracing::info!(interrupted, "failed the tasks a restart interrupted");
+            }
+            remove_task_dirs(&data_dir);
+            // An unbound key belongs to a request that never ran: free it,
+            // so that its retry runs instead of waiting for nothing.
+            let unbound = store
+                .dedup_clear_unbound()
+                .context("cannot free the dedup keys a restart left unbound")?;
+            if unbound > 0 {
+                tracing::info!(unbound, "freed the dedup keys a restart left unbound");
+            }
+            purge_dedup(&store).context("cannot purge the old dedup rows")?;
+            anyhow::Ok((lock, key, store))
+        })
+        .await??;
+        let key = Arc::new(key);
+        let store = Arc::new(store);
+
+        let listener = TcpListener::bind(cfg.gateway.listen)
+            .await
+            .with_context(|| format!("cannot listen on {} for the gateway", cfg.gateway.listen))?;
+        let gateway_addr = listener
+            .local_addr()
+            .context("the gateway listener has no address")?;
+
+        let endpoint = bind_endpoint(cfg, &key).await?;
+        ensure!(
+            endpoint.id().as_bytes() == key.id().as_bytes(),
+            "the Iroh endpoint id is not the agent id"
+        );
+        let blobs = BlobService::open(
+            &cfg.data_dir.join(BLOBS_DIR),
+            endpoint.clone(),
+            Arc::clone(&store),
+            Arc::clone(&key),
+        )
+        .await?;
+        Ok(Self {
+            lock,
+            key,
+            store,
+            listener,
+            gateway_addr,
+            endpoint,
+            blobs,
+        })
+    }
+
+    /// Serves the A2A server with `executor` and the blobs on the endpoint,
+    /// and starts the gateway.
+    fn start(self, cfg: &Config, executor: impl AgentExecutor) -> Node {
+        let Self {
+            lock,
+            key,
+            store,
+            listener,
+            gateway_addr,
+            endpoint,
+            blobs,
+        } = self;
+        let id = key.id();
+        let limits = TunnelLimits {
+            max_body_bytes: cfg.limits.max_body_bytes,
+            ..TunnelLimits::default()
+        };
+        let app = app(cfg, &key, &store, executor);
+        let router = Router::builder(endpoint.clone())
+            .accept(ALPN_A2A_HTTP, TunnelServer::new(app, limits))
+            .accept(iroh_blobs::ALPN, blobs.protocol())
+            .spawn();
+        let peer_http = PeerHttp::new(endpoint.clone());
+        let gateway = GatewayServer::start(
+            listener,
+            GatewayState::new(
+                GatewayParts {
+                    id,
+                    name: cfg.agent.name.clone(),
+                    store: Arc::clone(&store),
+                    peer_http: peer_http.clone(),
+                    endpoint,
+                    blobs: blobs.clone(),
+                    limits: cfg.limits.clone(),
+                },
+                gateway_addr,
+            ),
+        );
+        let dedup_purge = AbortOnDrop(tokio::spawn(purge_dedup_hourly(Arc::clone(&store))));
+        Node {
+            id,
+            store,
+            peer_http,
+            blobs,
+            router,
+            gateway,
+            dedup_purge,
+            _lock: lock,
+        }
     }
 }
 

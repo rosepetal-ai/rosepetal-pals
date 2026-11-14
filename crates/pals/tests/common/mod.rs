@@ -135,7 +135,8 @@ pub struct TestResponse {
 }
 
 impl TestResponse {
-    async fn read(response: Response<Body>) -> Self {
+    /// Reads `response` to the end.
+    pub async fn read(response: Response<Body>) -> Self {
         let (parts, body) = response.into_parts();
         let body = body
             .collect()
@@ -226,7 +227,8 @@ pub async fn spawn_echo_pair() -> (TestServer, TestClient) {
     spawn_pair(echo_app("echo")).await
 }
 
-async fn loopback_endpoint() -> Endpoint {
+/// An Iroh endpoint on 127.0.0.1 with no relay and a random key.
+pub async fn loopback_endpoint() -> Endpoint {
     Endpoint::builder(presets::Minimal)
         .relay_mode(RelayMode::Disabled)
         .portmapper_config(PortmapperConfig::Disabled)
@@ -603,6 +605,23 @@ pub async fn gateway_send(
     headers: &[(&str, &str)],
     body: Option<&Value>,
 ) -> Response<Body> {
+    let body = body.map(|body| {
+        (
+            "application/json",
+            serde_json::to_vec(body).expect("serializable body"),
+        )
+    });
+    gateway_send_raw(base, method, path, headers, body).await
+}
+
+/// [`gateway_send`] with a body of any type: `(content type, bytes)`.
+pub async fn gateway_send_raw(
+    base: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<(&str, Vec<u8>)>,
+) -> Response<Body> {
     let authority = base.strip_prefix("http://").expect("an http:// base URL");
     let stream = TcpStream::connect(authority)
         .await
@@ -622,9 +641,9 @@ pub async fn gateway_send(
         request = request.header(*name, *value);
     }
     let body = match body {
-        Some(body) => {
-            request = request.header(header::CONTENT_TYPE, "application/json");
-            Body::from(serde_json::to_vec(body).expect("serializable body"))
+        Some((content_type, bytes)) => {
+            request = request.header(header::CONTENT_TYPE, content_type);
+            Body::from(bytes)
         }
         None => Body::empty(),
     };

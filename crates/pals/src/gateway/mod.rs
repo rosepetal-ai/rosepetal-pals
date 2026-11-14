@@ -10,11 +10,13 @@
 //! | `GET /peers/{peer}/.well-known/agent-card.json` | the peer's card, as [`gateway_view`] |
 //! | `POST /peers/{peer}/jsonrpc` | the peer's `/jsonrpc` |
 //! | any method, `/peers/{peer}/rest/{*rest}` | the peer's `/rest/{rest}` |
+//! | `POST /blobs` | stores the raw body as a blob: `201 {"url", "hash", "size"}` |
+//! | `GET /blobs/{holder}/{hash}` | the blob, fetched from its holder first if need be |
 //!
 //! A request to a peer travels through [`PeerHttp`], never to the node's own
 //! app: method, path after `/peers/{peer}` and query exactly as received,
-//! end-to-end headers and the body, streamed; the response streams back the
-//! same way, Server-Sent Events included. The gateway drops the hop-by-hop
+//! end-to-end headers and the body; the response comes back the same way,
+//! Server-Sent Events streamed as they come. The gateway drops the hop-by-hop
 //! headers, `Host` and any `x-agentnet-*` header the client sent, which only
 //! the peer's tunnel sets, and the cookies a peer sets: every peer shares the
 //! gateway's origin. A2A bindings never redirect, so a peer's `3xx` is a
@@ -26,6 +28,27 @@
 //! itself, without contacting the peer, when it holds none; a client's own
 //! `Authorization` passes intact. It does not choose between projects: the
 //! newest such grant wins.
+//!
+//! Files travel as blobs ([`crate::blobs`]), and a stock client sees them as
+//! plain URLs of the gateway, `<gateway>/blobs/<holder>/<hash>`. The body of
+//! a request, read whole up to `limits.max_body_bytes` (beyond, `413`), goes
+//! to the peer with those URLs as `iroh-blob://` ones ([`rewrite::to_wire`]);
+//! a file part that names a blob of this agent's must name one it holds
+//! (else `400`), gets the blob's hash and size as its metadata, and the blob
+//! is [shared](BlobService::share) with the peer for [`BLOB_SHARE_TTL_S`]
+//! before the request leaves. A JSON response, read whole up to 16 MiB
+//! (beyond, `502`), and each `data:` line of an event stream, as it comes,
+//! go back to the client with the `iroh-blob://` URLs as gateway ones
+//! ([`rewrite::to_gateway`]); nothing else in them changes.
+//!
+//! `POST /blobs` takes the body as it is, up to `limits.max_blob_bytes`
+//! (beyond, `413`), into the agent's store, and answers with the blob's
+//! gateway URL. `GET /blobs/{holder}/{hash}` serves the blob from the store
+//! as `application/octet-stream`, whatever it is; when the store lacks it,
+//! the gateway first fetches it from `holder` within
+//! `limits.blob_fetch_timeout_s`: `403` when the holder refuses, `502` when
+//! it cannot be reached or the blob is larger than `limits.max_blob_bytes`,
+//! `404` when this agent is the holder and has no such blob.
 //!
 //! A `<peer>` that is neither a contact nor an agent id gets
 //! `404 {"error":"unknown peer"}`; a peer that cannot be reached, within the
@@ -44,32 +67,41 @@
 //! peer sends at the gateway's origin: a sandboxed page has an opaque
 //! origin, and its requests carry `Origin: null`.
 
+pub mod rewrite;
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use a2a::AgentCard;
 use a2a_server::WELL_KNOWN_AGENT_CARD_PATH;
-use axum::body::Body;
+use axum::body::{Body, BodyDataStream, Bytes};
 use axum::extract::{Path, Request, State};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
+use futures::StreamExt;
 use http::header::{
-    AUTHORIZATION, CONNECTION, CONTENT_SECURITY_POLICY, HOST, HeaderMap, HeaderName, HeaderValue,
-    ORIGIN, X_CONTENT_TYPE_OPTIONS,
+    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST,
+    HeaderMap, HeaderName, HeaderValue, ORIGIN, X_CONTENT_TYPE_OPTIONS,
 };
 use http::{StatusCode, Uri};
-use http_body_util::{BodyExt, Limited};
+use http_body_util::{BodyExt, LengthLimitError, Limited};
 use iroh::{Endpoint, EndpointAddr};
+use iroh_blobs::Hash;
 use pals_core::grant::{Grant, Operation};
 use pals_core::identity::AgentId;
 use pals_core::store::Store;
-use serde_json::json;
+use serde_json::{Map, Value, json};
 
 use crate::a2a::auth::ASK_RESOURCE;
 use crate::a2a::gateway_view;
+use crate::blobs::{BLOB_META_KEY, BLOB_SHARE_TTL_S, BlobError, BlobRef, BlobService, parse_hash};
+use crate::config::LimitsCfg;
 use crate::net::{PeerHttp, TunnelError, peer_addr};
 use crate::node::ticket_of;
 
@@ -88,6 +120,10 @@ const FETCH_METADATA: [&str; 2] = ["sec-fetch-site", "sec-fetch-dest"];
 /// Response headers of a peer that would apply to every peer, since they all
 /// share the gateway's origin.
 const PEER_COOKIES: [&str; 2] = ["set-cookie", "set-cookie2"];
+/// The largest JSON response, or event of a stream, the gateway rewrites.
+const MAX_REWRITE_BYTES: usize = 16 * 1024 * 1024;
+/// The type of every blob the gateway serves, whatever its content.
+const OCTET_STREAM: &str = "application/octet-stream";
 
 /// Headers that describe one connection, not the request (RFC 9110 §7.6.1),
 /// and are never forwarded, in either direction.
@@ -105,7 +141,8 @@ const HOP_BY_HOP: [&str; 10] = [
 ];
 
 /// What the gateway works with: this agent, its store (contacts and held
-/// grants), its client for peers and the address it listens on.
+/// grants), its client for peers, its blobs, its limits and the address it
+/// listens on.
 ///
 /// Cloning is cheap.
 #[derive(Clone)]
@@ -120,22 +157,36 @@ struct Inner {
     peer_http: PeerHttp,
     /// This agent's endpoint, whose ticket `/healthz` reports.
     endpoint: Endpoint,
+    blobs: BlobService,
+    limits: LimitsCfg,
     /// Where the gateway listens.
     local_addr: SocketAddr,
 }
 
+/// What the gateway of an agent works with besides its listener.
+pub struct GatewayParts {
+    pub id: AgentId,
+    pub name: String,
+    pub store: Arc<Store>,
+    pub peer_http: PeerHttp,
+    /// The agent's own endpoint.
+    pub endpoint: Endpoint,
+    pub blobs: BlobService,
+    pub limits: LimitsCfg,
+}
+
 impl GatewayState {
-    /// The gateway of agent `id`, called `name`, with `store` and
-    /// `peer_http`, `endpoint` being the agent's own, listening on
-    /// `local_addr`.
-    pub fn new(
-        id: AgentId,
-        name: String,
-        store: Arc<Store>,
-        peer_http: PeerHttp,
-        endpoint: Endpoint,
-        local_addr: SocketAddr,
-    ) -> Self {
+    /// The gateway of the agent `parts` describe, listening on `local_addr`.
+    pub fn new(parts: GatewayParts, local_addr: SocketAddr) -> Self {
+        let GatewayParts {
+            id,
+            name,
+            store,
+            peer_http,
+            endpoint,
+            blobs,
+            limits,
+        } = parts;
         Self {
             inner: Arc::new(Inner {
                 id,
@@ -143,6 +194,8 @@ impl GatewayState {
                 store,
                 peer_http,
                 endpoint,
+                blobs,
+                limits,
                 local_addr,
             }),
         }
@@ -215,6 +268,8 @@ pub fn router(state: GatewayState) -> Router {
         .route("/peers/{peer}/.well-known/agent-card.json", get(peer_card))
         .route("/peers/{peer}/jsonrpc", post(forward_jsonrpc))
         .route("/peers/{peer}/rest/{*rest}", any(forward_rest))
+        .route("/blobs", post(upload_blob))
+        .route("/blobs/{holder}/{hash}", get(download_blob))
         .layer(middleware::from_fn_with_state(state.clone(), local_guard))
         // Outermost, so that it covers the guard's refusals too.
         .layer(middleware::from_fn(sandbox))
@@ -375,6 +430,10 @@ async fn forward(state: GatewayState, peer: String, request: Request) -> Respons
             Err(failure) => return failure.into_response(),
         }
     }
+    let body = match state.outgoing_body(&target.id, &mut headers, body).await {
+        Ok(body) => body,
+        Err(refused) => return refused.into_response(),
+    };
     let mut outgoing = http::Request::builder()
         .method(parts.method)
         .uri(target_uri)
@@ -393,10 +452,346 @@ async fn forward(state: GatewayState, peer: String, request: Request) -> Respons
         Ok(response) => {
             let (mut parts, body) = response.into_parts();
             parts.headers = incoming_headers(&parts.headers);
-            Response::from_parts(parts, body)
+            match state.incoming_body(&mut parts.headers, body).await {
+                Ok(body) => Response::from_parts(parts, body),
+                Err(failure) => tunnel_failure(&target.id, &failure),
+            }
         }
         Err(error) => tunnel_failure(&target.id, &error),
     }
+}
+
+impl GatewayState {
+    /// The body of a client's request as it goes to `peer`: its blob URLs as
+    /// `iroh-blob://` ones, the file parts that name a blob of this agent's
+    /// declaring its hash and size, and those blobs shared with `peer`.
+    /// `headers` get the new `Content-Length`.
+    async fn outgoing_body(
+        &self,
+        peer: &AgentId,
+        headers: &mut HeaderMap,
+        body: Body,
+    ) -> Result<Body, Refusal> {
+        let limit = self.inner.limits.max_body_bytes;
+        let bytes = match Limited::new(body, limit).collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(err) if err.downcast_ref::<LengthLimitError>().is_some() => {
+                return Err(Refusal::new(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("request body larger than {limit} bytes"),
+                ));
+            }
+            Err(_) => {
+                return Err(Refusal::new(
+                    StatusCode::BAD_REQUEST,
+                    "cannot read the request body",
+                ));
+            }
+        };
+        // Not JSON: nothing of it is a file part.
+        let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) else {
+            return Ok(Body::from(bytes));
+        };
+        let rewritten = rewrite::rewrite_to_wire(&mut value, &self.base_url());
+        let declared = self.declare_own_blobs(&mut value, peer).await?;
+        if !rewritten && !declared {
+            return Ok(Body::from(bytes));
+        }
+        let bytes = serde_json::to_vec(&value).expect("a JSON value serializes");
+        headers.insert(CONTENT_LENGTH, HeaderValue::from(bytes.len()));
+        Ok(Body::from(bytes))
+    }
+
+    /// Gives every file part of `value` that names a blob of this agent's
+    /// that blob's hash and size, and shares those blobs with `peer`;
+    /// whether there were any.
+    async fn declare_own_blobs(&self, value: &mut Value, peer: &AgentId) -> Result<bool, Refusal> {
+        let own = self.inner.id;
+        let mut hashes = BTreeSet::new();
+        rewrite::for_each_blob_part(value, &mut |_, holder, hash| {
+            if holder == own {
+                hashes.insert(hash);
+            }
+        });
+        let mut declared = BTreeMap::new();
+        for hash in hashes {
+            let Some(size) = self.inner.blobs.complete_size(hash).await else {
+                return Err(Refusal::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("no blob {hash} to send"),
+                ));
+            };
+            let blob = BlobRef {
+                holder: own,
+                hash,
+                size,
+            };
+            if let Err(err) = self.inner.blobs.share(&blob, peer, BLOB_SHARE_TTL_S).await {
+                tracing::warn!(error = %format!("{err:#}"), "cannot share a blob");
+                return Err(Refusal::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error",
+                ));
+            }
+            declared.insert(hash, blob);
+        }
+        rewrite::for_each_blob_part(value, &mut |part, holder, hash| {
+            if holder == own
+                && let Some(blob) = declared.get(&hash)
+            {
+                declare(part, blob);
+            }
+        });
+        Ok(!declared.is_empty())
+    }
+
+    /// The body of a peer's response as it goes to the client: a JSON one,
+    /// and each `data:` line of an event stream, with the blob URLs as
+    /// gateway ones. `headers` lose a `Content-Length` that no longer holds.
+    async fn incoming_body(
+        &self,
+        headers: &mut HeaderMap,
+        body: Body,
+    ) -> Result<Body, TunnelError> {
+        let media_type = headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        if media_type == "text/event-stream" {
+            headers.remove(CONTENT_LENGTH);
+            return Ok(rewrite_event_stream(body, self.base_url()));
+        }
+        if media_type != "application/json" && !media_type.ends_with("+json") {
+            return Ok(body);
+        }
+        let bytes = Limited::new(body, MAX_REWRITE_BYTES)
+            .collect()
+            .await
+            .map_err(|err| TunnelError::Protocol(format!("unreadable JSON response: {err}")))?
+            .to_bytes();
+        let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) else {
+            return Ok(Body::from(bytes));
+        };
+        if !rewrite::rewrite_to_gateway(&mut value, &self.base_url()) {
+            return Ok(Body::from(bytes));
+        }
+        let bytes = serde_json::to_vec(&value).expect("a JSON value serializes");
+        headers.insert(CONTENT_LENGTH, HeaderValue::from(bytes.len()));
+        Ok(Body::from(bytes))
+    }
+}
+
+/// Sets the hash and size of `blob` as the metadata of `part`, a file part.
+fn declare(part: &mut Map<String, Value>, blob: &BlobRef) {
+    let metadata = part
+        .entry("metadata")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !metadata.is_object() {
+        *metadata = Value::Object(Map::new());
+    }
+    if let Value::Object(metadata) = metadata {
+        metadata.insert(BLOB_META_KEY.to_owned(), blob.meta());
+    }
+}
+
+/// `body`, an event stream, with each `data:` line that is JSON and names a
+/// blob rewritten by [`rewrite::to_gateway`], line by line as it arrives.
+/// A line longer than [`MAX_REWRITE_BYTES`] ends the stream with an error.
+fn rewrite_event_stream(body: Body, base_url: String) -> Body {
+    struct Lines {
+        body: BodyDataStream,
+        pending: Vec<u8>,
+        /// How much of `pending` holds no line end.
+        scanned: usize,
+        ended: bool,
+        base_url: String,
+    }
+    let lines = Lines {
+        body: body.into_data_stream(),
+        pending: Vec::new(),
+        scanned: 0,
+        ended: false,
+        base_url,
+    };
+    let stream = futures::stream::unfold(lines, |mut lines| async move {
+        loop {
+            if let Some(last) = lines.pending[lines.scanned..]
+                .iter()
+                .rposition(|&byte| byte == b'\n')
+            {
+                let end = lines.scanned + last + 1;
+                let complete: Vec<u8> = lines.pending.drain(..end).collect();
+                lines.scanned = 0;
+                let rewritten = rewrite_event_lines(&complete, &lines.base_url);
+                return Some((Ok(rewritten), lines));
+            }
+            lines.scanned = lines.pending.len();
+            if lines.ended {
+                if lines.pending.is_empty() {
+                    return None;
+                }
+                let rest = std::mem::take(&mut lines.pending);
+                lines.scanned = 0;
+                let rewritten = rewrite_event_lines(&rest, &lines.base_url);
+                return Some((Ok(rewritten), lines));
+            }
+            if lines.pending.len() > MAX_REWRITE_BYTES {
+                lines.ended = true;
+                lines.pending.clear();
+                lines.scanned = 0;
+                let failure = io::Error::other("an event too large to rewrite");
+                return Some((Err(failure), lines));
+            }
+            match lines.body.next().await {
+                Some(Ok(chunk)) => lines.pending.extend_from_slice(&chunk),
+                Some(Err(err)) => {
+                    lines.ended = true;
+                    lines.pending.clear();
+                    lines.scanned = 0;
+                    return Some((Err(io::Error::other(err)), lines));
+                }
+                None => lines.ended = true,
+            }
+        }
+    });
+    Body::from_stream(stream)
+}
+
+/// `text`, whole lines of an event stream, with the `data:` lines that are
+/// JSON and name a blob rewritten by [`rewrite::to_gateway`].
+fn rewrite_event_lines(text: &[u8], base_url: &str) -> Bytes {
+    let mut out = Vec::with_capacity(text.len());
+    for line in text.split_inclusive(|&byte| byte == b'\n') {
+        let body_len = line
+            .iter()
+            .rposition(|&byte| byte != b'\n' && byte != b'\r')
+            .map_or(0, |last| last + 1);
+        let (content, ending) = line.split_at(body_len);
+        let rewritten = content.strip_prefix(b"data:").and_then(|data| {
+            let data = data.strip_prefix(b" ").unwrap_or(data);
+            let mut value = serde_json::from_slice::<Value>(data).ok()?;
+            rewrite::rewrite_to_gateway(&mut value, base_url)
+                .then(|| serde_json::to_vec(&value).expect("a JSON value serializes"))
+        });
+        match rewritten {
+            Some(json) => {
+                out.extend_from_slice(b"data: ");
+                out.extend_from_slice(&json);
+                out.extend_from_slice(ending);
+            }
+            None => out.extend_from_slice(line),
+        }
+    }
+    Bytes::from(out)
+}
+
+/// Stores the request's body as a blob, up to `limits.max_blob_bytes`, as it
+/// arrives: `201 {"url", "hash", "size"}`, its URL being the gateway's.
+async fn upload_blob(State(state): State<GatewayState>, request: Request) -> Response {
+    let limit = state.inner.limits.max_blob_bytes;
+    let declared = request
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared.is_some_and(|length| length > limit) {
+        return too_large_blob(limit);
+    }
+    let too_large = Arc::new(AtomicBool::new(false));
+    let unreadable = Arc::new(AtomicBool::new(false));
+    let (over, broken) = (Arc::clone(&too_large), Arc::clone(&unreadable));
+    let mut received: u64 = 0;
+    let body = request.into_body().into_data_stream().map(move |chunk| {
+        let chunk = chunk.map_err(|err| {
+            broken.store(true, Ordering::SeqCst);
+            io::Error::other(err)
+        })?;
+        received = received.saturating_add(chunk.len() as u64);
+        if received > limit {
+            over.store(true, Ordering::SeqCst);
+            return Err(io::Error::other("blob too large"));
+        }
+        Ok(chunk)
+    });
+    match state.inner.blobs.add_stream(body).await {
+        Ok(blob) => {
+            let url = rewrite::gateway_url(&state.base_url(), &blob.holder, &blob.hash);
+            let created = json!({"url": url, "hash": blob.hash.to_hex(), "size": blob.size});
+            (StatusCode::CREATED, Json(created)).into_response()
+        }
+        Err(_) if too_large.load(Ordering::SeqCst) => too_large_blob(limit),
+        Err(_) if unreadable.load(Ordering::SeqCst) => {
+            error(StatusCode::BAD_REQUEST, "cannot read the request body")
+        }
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "cannot store an uploaded blob");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+    }
+}
+
+fn too_large_blob(limit: u64) -> Response {
+    error(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        format!("blob larger than {limit} bytes"),
+    )
+}
+
+/// Serves blob `hash`, fetching it from `holder` first when the store lacks
+/// it.
+async fn download_blob(
+    State(state): State<GatewayState>,
+    Path((holder, hash)): Path<(String, String)>,
+) -> Response {
+    let (Ok(holder), Some(hash)) = (holder.parse::<AgentId>(), parse_hash(&hash)) else {
+        return error(StatusCode::NOT_FOUND, "not a blob URL");
+    };
+    let blobs = &state.inner.blobs;
+    if let Some(size) = blobs.complete_size(hash).await {
+        return serve_blob(blobs, hash, size);
+    }
+    if holder == state.inner.id {
+        return error(StatusCode::NOT_FOUND, "blob not found");
+    }
+    let limits = &state.inner.limits;
+    // The URL declares no size: the limit bounds the download.
+    let blob = BlobRef {
+        holder,
+        hash,
+        size: limits.max_blob_bytes,
+    };
+    let addr = blobs.holder_addr(&holder).await;
+    let timeout = Duration::from_secs(limits.blob_fetch_timeout_s);
+    let fetched = tokio::time::timeout(timeout, blobs.fetch(&blob, addr, None))
+        .await
+        .unwrap_or(Err(BlobError::Timeout));
+    if let Err(failure) = fetched {
+        tracing::debug!(%holder, %hash, error = %failure, "the gateway could not fetch a blob");
+        return match failure {
+            BlobError::Denied => error(StatusCode::FORBIDDEN, "the holder denied the blob"),
+            BlobError::Unreachable | BlobError::Timeout => {
+                error(StatusCode::BAD_GATEWAY, "peer unreachable")
+            }
+            BlobError::TooLarge => error(StatusCode::BAD_GATEWAY, "blob too large"),
+            BlobError::Other(_) => error(StatusCode::BAD_GATEWAY, "blob transfer failed"),
+        };
+    }
+    match blobs.complete_size(hash).await {
+        Some(size) => serve_blob(blobs, hash, size),
+        None => error(StatusCode::BAD_GATEWAY, "blob transfer failed"),
+    }
+}
+
+/// `200` with the `size` bytes of `hash`, streamed from the store.
+fn serve_blob(blobs: &BlobService, hash: Hash, size: u64) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, OCTET_STREAM)
+        .header(CONTENT_LENGTH, size)
+        .body(Body::from_stream(blobs.read(hash, size)))
+        .expect("a valid response")
 }
 
 /// The path and query that a request for `/peers/<peer>/<rest>` is forwarded
@@ -480,6 +875,21 @@ fn unknown_peer() -> Response {
 /// `status` with `{"error": message}`.
 fn error(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({ "error": message.into() }))).into_response()
+}
+
+/// A request the gateway answers itself: `status` with `{"error": message}`.
+struct Refusal(StatusCode, String);
+
+impl Refusal {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self(status, message.into())
+    }
+}
+
+impl IntoResponse for Refusal {
+    fn into_response(self) -> Response {
+        error(self.0, self.1)
+    }
 }
 
 /// The store could not be read; the gateway answers `500`.
@@ -678,6 +1088,90 @@ mod tests {
             vec![Operation::TaskSend],
             "skill:other"
         )));
+    }
+
+    /// A blob URL between peers, and the same blob at the gateway `base`.
+    fn blob_urls(base: &str) -> (String, String) {
+        let holder = pals_core::identity::AgentKey::generate().id();
+        let hash = Hash::new(b"a file");
+        (
+            crate::blobs::wire_url(&holder, &hash),
+            rewrite::gateway_url(base, &holder, &hash),
+        )
+    }
+
+    #[test]
+    fn event_lines_rewrite_only_json_data_that_names_a_blob() {
+        let base = "http://127.0.0.1:7420";
+        let (wire, local) = blob_urls(base);
+        let event = |url: &str| json!({"result": {"artifact": {"parts": [{"url": url}]}}});
+        let text = format!(
+            "event: message\r\ndata:{}\r\n\ndata: {}\n: comment {wire}\ndata: not json {wire}\nid: 7\n\n",
+            event(&wire),
+            json!({"result": {"text": wire}}),
+        );
+        let rewritten = rewrite_event_lines(text.as_bytes(), base);
+        let expected = format!(
+            "event: message\r\ndata: {}\r\n\ndata: {}\n: comment {wire}\ndata: not json {wire}\nid: 7\n\n",
+            event(&local),
+            json!({"result": {"text": wire}}),
+        );
+        assert_eq!(String::from_utf8(rewritten.to_vec()).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn event_streams_are_rewritten_across_chunks_as_they_come() {
+        let base = "http://127.0.0.1:7420";
+        let (wire, local) = blob_urls(base);
+        let line = |url: &str| format!("data: {}\n\n", json!({"parts": [{"url": url}]}));
+        let sent = format!("{}{}", line(&wire), line("https://example.com/x"));
+        // Cut in chunks of 7 bytes, splitting lines and the URL.
+        let chunks: Vec<Result<Bytes, io::Error>> = sent
+            .as_bytes()
+            .chunks(7)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect();
+        let body = Body::from_stream(futures::stream::iter(chunks));
+        let received = rewrite_event_stream(body, base.to_owned())
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let expected = format!("{}{}", line(&local), line("https://example.com/x"));
+        assert_eq!(String::from_utf8(received.to_vec()).unwrap(), expected);
+
+        // A last line without its end comes through too.
+        let body = Body::from(format!("data: {}", json!({"url": wire})));
+        let received = rewrite_event_stream(body, base.to_owned())
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(
+            String::from_utf8(received.to_vec()).unwrap(),
+            format!("data: {}", json!({"url": local}))
+        );
+    }
+
+    #[test]
+    fn declaring_a_blob_keeps_the_rest_of_the_metadata() {
+        let blob = BlobRef {
+            holder: pals_core::identity::AgentKey::generate().id(),
+            hash: Hash::new(b"a file"),
+            size: 6,
+        };
+        let mut part = json!({"url": blob.to_url(), "metadata": {"other": 1}});
+        declare(part.as_object_mut().unwrap(), &blob);
+        assert_eq!(part["metadata"]["other"], 1);
+        assert_eq!(part["metadata"][BLOB_META_KEY], blob.meta());
+        for metadata in [json!(null), json!("x"), json!([1])] {
+            let mut part = json!({"url": blob.to_url(), "metadata": metadata});
+            declare(part.as_object_mut().unwrap(), &blob);
+            assert_eq!(part["metadata"], json!({ BLOB_META_KEY: blob.meta() }));
+        }
+        let mut part = json!({"url": blob.to_url()});
+        declare(part.as_object_mut().unwrap(), &blob);
+        assert_eq!(part["metadata"], json!({ BLOB_META_KEY: blob.meta() }));
     }
 
     #[test]

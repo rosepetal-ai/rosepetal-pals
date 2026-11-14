@@ -40,6 +40,7 @@ const REAP_WAIT: Duration = Duration::from_secs(10);
 /// | Input | The text on stdin; `PALS_TASK_ID`, `PALS_PEER`, `PALS_PROJECT`, `PALS_IN_DIR`, `PALS_OUT_DIR` |
 /// | Environment | Nothing else but [`PASSED_ENV`] |
 /// | Output | stdout as UTF-8, invalid bytes replaced; beyond `max_output_bytes`, cut and followed by [`TRUNCATED`] |
+/// | Files | The regular files the command left directly in `PALS_OUT_DIR`, by name; not symbolic links, nor what is in subdirectories |
 /// | Exit code other than 0 | `Failed` with the last [`STDERR_TAIL_BYTES`] of stderr |
 /// | Time | Beyond `timeout_s`, the process group is killed: `Failed("timeout after <n>s")` |
 /// | Cancellation | The process group is killed |
@@ -113,6 +114,7 @@ impl Adapter for ExecAdapter {
         let stderr = running.child.stderr.take();
 
         let max_output_bytes = self.cfg.max_output_bytes;
+        let out_dir = input.out_dir;
         let text = input.text;
         let exited = async {
             let write = async {
@@ -167,9 +169,13 @@ impl Adapter for ExecAdapter {
                     return Err(AdapterError::Failed(failure(status, &stderr)));
                 }
                 let (head, cut) = stdout;
+                let files = output_files(&out_dir).await.map_err(|err| {
+                    warn!(dir = %out_dir.display(), error = %err, "cannot list the output files");
+                    AdapterError::Failed("cannot read the output directory".to_owned())
+                })?;
                 Ok(AdapterOutput {
                     text: answer_text(&head, cut, max_output_bytes),
-                    files: Vec::new(),
+                    files,
                 })
             }
             Ended::TimedOut => {
@@ -275,6 +281,21 @@ async fn exited_unreaped(pid: libc::pid_t) -> io::Result<()> {
     })
     .await
     .map_err(io::Error::other)?
+}
+
+/// The regular files directly in `dir`, sorted by name. Symbolic links are
+/// left out: a file to send is one the command wrote there.
+async fn output_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        // `file_type` does not follow symbolic links.
+        if entry.file_type().await?.is_file() {
+            files.push(entry.path());
+        }
+    }
+    files.sort();
+    Ok(files)
 }
 
 /// The reason a command could not be started.

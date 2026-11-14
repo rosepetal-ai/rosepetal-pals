@@ -6,7 +6,7 @@ pub mod echo;
 #[cfg(unix)]
 pub mod exec;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use a2a::{
-    A2AError, Artifact, Message, Part, Role, StreamResponse, Task, TaskArtifactUpdateEvent,
-    TaskState, TaskStatus, TaskStatusUpdateEvent, new_artifact_id,
+    A2AError, Artifact, Message, Part, PartContent, Role, StreamResponse, Task,
+    TaskArtifactUpdateEvent, TaskState, TaskStatus, TaskStatusUpdateEvent, new_artifact_id,
 };
 use a2a_server::{AgentExecutor, ExecutorContext, ServiceParams};
 use async_trait::async_trait;
@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
 use crate::a2a::auth::PROJECT_HEADER;
+use crate::blobs::{BLOB_SCHEME, BLOB_SHARE_TTL_S, BlobError, BlobRef, BlobService};
 use crate::config::{Config, ExecCfg};
 use crate::net::PEER_HEADER;
 
@@ -41,6 +42,10 @@ pub const ANSWER_ARTIFACT: &str = "answer";
 /// over before it reports the task `CANCELED` anyway.
 const CANCEL_WAIT: Duration = Duration::from_secs(10);
 
+/// The media type of the files an answer comes with: the worker does not
+/// guess what they hold.
+const FILE_MEDIA_TYPE: &str = "application/octet-stream";
+
 type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 
 /// What an [`Adapter`] gets to answer one task.
@@ -53,7 +58,8 @@ pub struct TaskInput {
     pub project: String,
     /// The text parts of the message, one per line.
     pub text: String,
-    /// A new, empty directory for the files the question comes with.
+    /// A new directory that holds the files the question comes with, and
+    /// nothing else.
     pub in_dir: PathBuf,
     /// A new, empty directory for files to answer with.
     pub out_dir: PathBuf,
@@ -63,7 +69,8 @@ pub struct TaskInput {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AdapterOutput {
     pub text: String,
-    /// Files to answer with. The worker does not send files yet.
+    /// Files to answer with, each sent as a blob that the requester may
+    /// fetch, named after its last path component.
     pub files: Vec<PathBuf>,
 }
 
@@ -112,12 +119,32 @@ impl From<&ExecCfg> for Capacity {
 /// Answers every task by running an [`Adapter`], and always with a task.
 ///
 /// The events, in order: the task in `WORKING`; then the `answer` artifact,
-/// with the adapter's text, and `COMPLETED`; or, instead of both, `FAILED`
-/// or `REJECTED` (per [`AdapterError`]) with the reason as the status
-/// message. A task beyond the [`Capacity`] is `REJECTED` at once as `busy`.
+/// with the adapter's text and then one file part per file it answered
+/// with, and `COMPLETED`; or, instead of both, `FAILED` or `REJECTED` (per
+/// [`AdapterError`]) with the reason as the status message. A task beyond
+/// the [`Capacity`] is `REJECTED` at once as `busy`.
 ///
-/// Each run gets a new, empty `<data_dir>/tasks/<task id>/in` and `out`
+/// Each run gets a new `<data_dir>/tasks/<task id>/in` and `out`
 /// ([`TASKS_DIR`]), removed when the run ends, whatever its outcome.
+///
+/// Files come and go as blobs ([`crate::blobs`]). Before the adapter runs,
+/// each file part of the message being answered whose URL is an
+/// `iroh-blob://` one is fetched into `in`, and any that cannot be fails the
+/// task, with the adapter never run:
+///
+/// | Rule | Reason the task fails with |
+/// |-|-|
+/// | The part declares its blob's hash and size ([`BlobRef::from_part`]) | `invalid blob reference` |
+/// | The blob's holder is the peer that asks: no one else's files are fetched on its behalf | `blob holder must be the requester` |
+/// | The declared size is at most `limits.max_blob_bytes`, checked before fetching; the download stops if the blob turns out larger than declared | `blob too large` |
+/// | Each download ends within `limits.blob_fetch_timeout_s` | `blob fetch timed out` |
+/// | The holder lets it be fetched, and can be reached | `blob fetch denied by its holder`, `blob holder unreachable` |
+/// | The file's name is the last component of the part's `filename` (the hash, without one), neither empty, `.` nor `..`, and no other file's | `invalid file name`, `duplicate file name` |
+///
+/// After the adapter, each file it answered with is added to the agent's
+/// store and [shared](BlobService::share) with the peer for
+/// [`BLOB_SHARE_TTL_S`], and becomes a file part
+/// ([`BlobRef::to_part`], `application/octet-stream`).
 ///
 /// `cancel` stops the task's run, through the [`CancellationToken`] the
 /// adapter got, and waits up to 10 s for the run to be over,
@@ -133,13 +160,27 @@ pub struct WorkerExecutor {
     /// One permit per running adapter.
     running: Arc<Semaphore>,
     runs: Arc<Runs>,
+    files: Files,
+}
+
+/// How a run gets and sends files.
+#[derive(Clone)]
+struct Files {
+    blobs: BlobService,
+    max_blob_bytes: u64,
+    fetch_timeout: Duration,
 }
 
 impl WorkerExecutor {
     /// An executor running `adapter` for the agent of `cfg`, whose data
     /// directory holds the tasks' working directories, taking `capacity`
-    /// tasks at once.
-    pub fn new(adapter: Arc<dyn Adapter>, cfg: &Config, capacity: Capacity) -> Self {
+    /// tasks at once, with the files of its tasks in `blobs`.
+    pub fn new(
+        adapter: Arc<dyn Adapter>,
+        cfg: &Config,
+        capacity: Capacity,
+        blobs: BlobService,
+    ) -> Self {
         Self {
             adapter,
             tasks_dir: cfg.data_dir.join(TASKS_DIR),
@@ -148,11 +189,16 @@ impl WorkerExecutor {
             )),
             running: Arc::new(Semaphore::new(capacity.max_concurrent)),
             runs: Arc::default(),
+            files: Files {
+                blobs,
+                max_blob_bytes: cfg.limits.max_blob_bytes,
+                fetch_timeout: Duration::from_secs(cfg.limits.blob_fetch_timeout_s),
+            },
         }
     }
 
     /// The adapter's input for the execution `ctx`, without its directories
-    /// made yet.
+    /// made yet, and the files it comes with.
     ///
     /// Only the message being answered is read. The worker never loads
     /// other tasks, the history of the context or the `referenceTaskIds` of
@@ -160,7 +206,7 @@ impl WorkerExecutor {
     /// [`GuardedHandler`](crate::a2a::GuardedHandler)), and a context id or
     /// a task id is just a string any peer can send, so following one would
     /// hand another peer's work to this one.
-    fn input(&self, ctx: &ExecutorContext) -> Result<TaskInput, AdapterError> {
+    fn input(&self, ctx: &ExecutorContext) -> Result<(TaskInput, Vec<InputFile>), AdapterError> {
         if !is_safe_task_id(&ctx.task_id) {
             error!(task_id = %ctx.task_id, "a task id unfit for a directory name");
             return Err(AdapterError::Failed("invalid task id".to_owned()));
@@ -173,26 +219,91 @@ impl WorkerExecutor {
         // The grant's project; without one, a project no adapter knows.
         let project = single(&ctx.service_params, PROJECT_HEADER).unwrap_or_default();
         let text = ctx.message.as_ref().map(message_text).unwrap_or_default();
+        let inputs = match &ctx.message {
+            Some(message) => input_files(message, &peer, self.files.max_blob_bytes)?,
+            None => Vec::new(),
+        };
         let task_dir = self.tasks_dir.join(&ctx.task_id);
-        Ok(TaskInput {
+        let input = TaskInput {
             task_id: ctx.task_id.clone(),
             peer,
             project: project.to_owned(),
             text,
             in_dir: task_dir.join("in"),
             out_dir: task_dir.join("out"),
-        })
+        };
+        Ok((input, inputs))
     }
+}
+
+/// A file a question comes with: a blob of the requester's, and the name it
+/// gets in `in_dir`.
+struct InputFile {
+    blob: BlobRef,
+    name: String,
+}
+
+/// The files `message`, from `peer`, comes with: one per part whose URL is
+/// an `iroh-blob://` one, checked as [`WorkerExecutor`] says.
+fn input_files(
+    message: &Message,
+    peer: &AgentId,
+    max_blob_bytes: u64,
+) -> Result<Vec<InputFile>, AdapterError> {
+    let failed = |reason: &str| AdapterError::Failed(reason.to_owned());
+    let mut files = Vec::new();
+    let mut names = HashSet::new();
+    for part in &message.parts {
+        let PartContent::Url(url) = &part.content else {
+            continue;
+        };
+        if !is_blob_url(url) {
+            continue;
+        }
+        let blob = BlobRef::from_part(part).ok_or_else(|| failed("invalid blob reference"))?;
+        if blob.holder != *peer {
+            return Err(failed("blob holder must be the requester"));
+        }
+        if blob.size > max_blob_bytes {
+            return Err(failed("blob too large"));
+        }
+        let name = match &part.filename {
+            Some(filename) => {
+                safe_file_name(filename).ok_or_else(|| failed("invalid file name"))?
+            }
+            None => blob.hash.to_hex(),
+        };
+        if !names.insert(name.clone()) {
+            return Err(failed("duplicate file name"));
+        }
+        files.push(InputFile { blob, name });
+    }
+    Ok(files)
+}
+
+/// Whether `url` has the blob scheme, in any case.
+fn is_blob_url(url: &str) -> bool {
+    url.split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case(BLOB_SCHEME))
+}
+
+/// The name a file named `filename` by a peer gets in `in_dir`: its last
+/// path component, with `/` or `\` as separator; `None` when that is empty,
+/// `.` or `..`, or holds a NUL.
+fn safe_file_name(filename: &str) -> Option<String> {
+    let last = filename.rsplit(['/', '\\']).next().unwrap_or_default();
+    let unfit = last.is_empty() || last == "." || last == ".." || last.contains('\0');
+    (!unfit).then(|| last.to_owned())
 }
 
 impl AgentExecutor for WorkerExecutor {
     fn execute(&self, ctx: ExecutorContext) -> Events {
         let working = StreamResponse::Task(working_task(&ctx));
         let (task_id, context_id) = ctx.task_info();
-        let end = move |outcome: Result<AdapterOutput, AdapterError>| {
+        let end = move |outcome: Result<Answer, AdapterError>| {
             outcome_events(task_id, context_id, outcome)
         };
-        let input = match self.input(&ctx) {
+        let (input, inputs) = match self.input(&ctx) {
             Ok(input) => input,
             Err(err) => return events(working, end(Err(err))),
         };
@@ -213,6 +324,7 @@ impl AgentExecutor for WorkerExecutor {
                 run: Arc::clone(&run),
             },
             input,
+            (self.files.clone(), inputs),
         ));
         // Should these events be dropped before the run ends, the run stops.
         let stop_if_dropped = run.cancel.clone().drop_guard();
@@ -312,14 +424,24 @@ impl Drop for RunSlot {
     }
 }
 
+/// What a task ends with: the adapter's text and the file parts of its
+/// files.
+struct Answer {
+    text: String,
+    files: Vec<Part>,
+}
+
 /// Waits for a turn to run, unless canceled first, and runs `adapter` on
-/// `input` in new working directories, removed afterwards.
+/// `input` in new working directories, with the `inputs` fetched into
+/// `in_dir` first and the files it answers with published after; the
+/// directories are removed afterwards.
 async fn run_task(
     adapter: Arc<dyn Adapter>,
     running: Arc<Semaphore>,
     slot: RunSlot,
     input: TaskInput,
-) -> Result<AdapterOutput, AdapterError> {
+    (files, inputs): (Files, Vec<InputFile>),
+) -> Result<Answer, AdapterError> {
     let cancel = slot.run.cancel.clone();
     let outcome = async {
         let _turn = tokio::select! {
@@ -343,6 +465,16 @@ async fn run_task(
                 "cannot prepare the task's working directories".to_owned(),
             ));
         }
+        let fetched = tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(canceled()),
+            fetched = files.fetch_inputs(&inputs, &input.in_dir) => fetched,
+        };
+        if let Err(err) = fetched {
+            remove_dir(&task_dir).await;
+            return Err(err);
+        }
+        let peer = input.peer;
         let outcome = AssertUnwindSafe(adapter.run(input, cancel.clone()))
             .catch_unwind()
             .await
@@ -350,8 +482,12 @@ async fn run_task(
                 error!("the worker adapter panicked");
                 Err(AdapterError::Failed("the worker crashed".to_owned()))
             });
+        let answer = match outcome {
+            Ok(output) => files.publish(output, &peer).await,
+            Err(err) => Err(err),
+        };
         remove_dir(&task_dir).await;
-        outcome
+        answer
     }
     .await;
     // Directories removed and turn given back: now the place, then done.
@@ -361,6 +497,71 @@ async fn run_task(
 
 fn canceled() -> AdapterError {
     AdapterError::Failed("canceled".to_owned())
+}
+
+impl Files {
+    /// Fetches each of `inputs` from its holder, the requester, into
+    /// `in_dir`, each within the fetch timeout.
+    async fn fetch_inputs(&self, inputs: &[InputFile], in_dir: &Path) -> Result<(), AdapterError> {
+        for input in inputs {
+            let blob = &input.blob;
+            let holder = self.blobs.holder_addr(&blob.holder).await;
+            let fetched =
+                tokio::time::timeout(self.fetch_timeout, self.blobs.fetch(blob, holder, None))
+                    .await
+                    .unwrap_or(Err(BlobError::Timeout));
+            fetched.map_err(|err| fetch_failure(&err))?;
+            let dest = in_dir.join(&input.name);
+            if let Err(err) = self.blobs.export(blob.hash, &dest).await {
+                error!(dest = %dest.display(), error = %format!("{err:#}"), "cannot write an input file");
+                return Err(AdapterError::Failed(
+                    "cannot write an input file".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `output`, with each of its files added to the store, shared with
+    /// `peer` and turned into a file part.
+    async fn publish(&self, output: AdapterOutput, peer: &AgentId) -> Result<Answer, AdapterError> {
+        let mut parts = Vec::with_capacity(output.files.len());
+        for path in &output.files {
+            let published = async {
+                let blob = self.blobs.add_path(path).await?;
+                self.blobs.share(&blob, peer, BLOB_SHARE_TTL_S).await?;
+                anyhow::Ok(blob)
+            };
+            let blob = published.await.map_err(|err| {
+                error!(file = %path.display(), error = %format!("{err:#}"), "cannot send a file");
+                AdapterError::Failed("cannot send the answer's files".to_owned())
+            })?;
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| blob.hash.to_hex());
+            parts.push(blob.to_part(&name, FILE_MEDIA_TYPE));
+        }
+        Ok(Answer {
+            text: output.text,
+            files: parts,
+        })
+    }
+}
+
+/// The reason a task fails with when one of its files cannot be fetched.
+fn fetch_failure(err: &BlobError) -> AdapterError {
+    let reason = match err {
+        BlobError::Denied => "blob fetch denied by its holder",
+        BlobError::Unreachable => "blob holder unreachable",
+        BlobError::Timeout => "blob fetch timed out",
+        BlobError::TooLarge => "blob too large",
+        BlobError::Other(detail) => {
+            warn!(error = %detail, "a blob fetch failed");
+            "blob fetch failed"
+        }
+    };
+    AdapterError::Failed(reason.to_owned())
 }
 
 /// Makes `task_dir` anew, with the input's empty `in` and `out` in it.
@@ -415,10 +616,10 @@ fn events(first: StreamResponse, rest: Vec<StreamResponse>) -> Events {
 fn outcome_events(
     task_id: String,
     context_id: String,
-    outcome: Result<AdapterOutput, AdapterError>,
+    outcome: Result<Answer, AdapterError>,
 ) -> Vec<StreamResponse> {
     match outcome {
-        Ok(output) => vec![
+        Ok(answer) => vec![
             StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
                 task_id: task_id.clone(),
                 context_id: context_id.clone(),
@@ -426,7 +627,9 @@ fn outcome_events(
                     artifact_id: new_artifact_id(),
                     name: Some(ANSWER_ARTIFACT.to_owned()),
                     description: None,
-                    parts: vec![Part::text(output.text)],
+                    parts: std::iter::once(Part::text(answer.text))
+                        .chain(answer.files)
+                        .collect(),
                     metadata: None,
                     extensions: None,
                 },
