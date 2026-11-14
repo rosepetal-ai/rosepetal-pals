@@ -297,6 +297,40 @@ fn record_naming_another_agent_is_bad_signature() {
 }
 
 #[test]
+fn contact_naming_another_endpoint_is_refused() {
+    // An agent's Iroh endpoint key is its own key: A cannot advertise B's
+    // endpoint as its own, though A signs the record validly.
+    let a = AgentKey::generate();
+    let b = AgentKey::generate();
+    let elsewhere = ContactRecord {
+        iroh: IrohContact {
+            endpoint_id: b.id(),
+            ..contact(a.id(), 1).iroh
+        },
+        ..contact(a.id(), 1)
+    };
+
+    assert_eq!(
+        Signed::issue(&a, elsewhere.clone()),
+        Err(SignedError::Malformed)
+    );
+    let doc = serde_json::to_value(&elsewhere).unwrap();
+    let bytes = sign_as::<ContactRecord>(&a, CONTACT_SIG_DOMAIN, &doc);
+    assert_eq!(
+        Signed::<ContactRecord>::from_json(&bytes),
+        Err(SignedError::Malformed)
+    );
+
+    // Its own endpoint, signed the same way, is accepted.
+    let own = serde_json::to_value(contact(a.id(), 1)).unwrap();
+    let bytes = sign_as::<ContactRecord>(&a, CONTACT_SIG_DOMAIN, &own);
+    assert_eq!(
+        Signed::<ContactRecord>::from_json(&bytes).unwrap(),
+        Signed::issue(&a, contact(a.id(), 1)).unwrap()
+    );
+}
+
+#[test]
 fn expired_record_is_refused_beyond_skew() {
     assert_eq!(CLOCK_SKEW_S, 60);
     assert_eq!(RECORD_TTL_S, 24 * 3600);

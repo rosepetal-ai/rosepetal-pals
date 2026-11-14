@@ -34,7 +34,7 @@
       "properties": {
         "endpoint_id": {
           "$ref": "#/$defs/agentId",
-          "description": "El id del endpoint Iroh; en PALS, el del propio agente."
+          "description": "El id del endpoint Iroh, que en PALS es el del propio agente: debe ser igual a record.agent_id (este esquema no puede expresar esa igualdad; PALS rechaza el registro que la incumple)."
         },
         "relay_url": {
           "type": "string",

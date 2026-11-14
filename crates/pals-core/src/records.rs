@@ -75,7 +75,8 @@ pub struct ContactRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IrohContact {
-    /// The endpoint's id; in PALS, the agent's own id.
+    /// The endpoint's id, which in PALS is the agent's own id: a record
+    /// naming any other endpoint is malformed.
     pub endpoint_id: AgentId,
     /// The home relay, as Iroh writes its URL; left out when there is none,
     /// never empty.
@@ -122,7 +123,10 @@ impl SignedDoc for ContactRecord {
     fn validate(&self) -> Result<(), SignedError> {
         check_common(self.seq, &self.issued_at, &self.expires_at)?;
         let iroh = &self.iroh;
-        if iroh.relay_url.as_deref() == Some("")
+        // The agent's key is its endpoint's key: no agent speaks for
+        // another's endpoint.
+        if iroh.endpoint_id != self.agent_id
+            || iroh.relay_url.as_deref() == Some("")
             || iroh.direct_addrs.len() > MAX_DIRECT_ADDRS
             || iroh
                 .direct_addrs
