@@ -200,8 +200,8 @@ struct Inner {
     local_addr: SocketAddr,
     /// The questions this agent asks its peers, through this gateway.
     outbox: Outbox,
-    /// The only directory `pals_fetch` writes to.
-    download_dir: PathBuf,
+    /// The only directory `pals_fetch` writes to, when configured.
+    download_dir: Option<PathBuf>,
     /// Cancelled when the gateway stops: ends the MCP sessions.
     stopping: CancellationToken,
 }
@@ -218,8 +218,9 @@ pub struct GatewayParts {
     pub limits: LimitsCfg,
     /// The agent's data directory, whose files are never sent.
     pub data_dir: PathBuf,
-    /// The only directory `pals_fetch` writes to.
-    pub download_dir: PathBuf,
+    /// The only directory `pals_fetch` writes to, when configured; else
+    /// the default, resolved when it is needed.
+    pub download_dir: Option<PathBuf>,
 }
 
 impl GatewayState {
@@ -265,9 +266,14 @@ impl GatewayState {
         &self.inner.outbox
     }
 
-    /// The only directory `pals_fetch` writes to.
-    pub(crate) fn download_dir(&self) -> &std::path::Path {
-        &self.inner.download_dir
+    /// The only directory `pals_fetch` writes to: the configured one, else
+    /// the default; why there is none when the default has no home
+    /// directory to be in.
+    pub(crate) fn download_dir(&self) -> Result<PathBuf, String> {
+        match &self.inner.download_dir {
+            Some(dir) => Ok(dir.clone()),
+            None => crate::config::default_download_dir().map_err(|err| format!("{err:#}")),
+        }
     }
 
     /// Cancelled when the gateway stops.

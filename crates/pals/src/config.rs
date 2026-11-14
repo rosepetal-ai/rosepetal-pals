@@ -267,10 +267,21 @@ impl Default for NetCfg {
 pub struct McpCfg {
     /// The only directory `pals_fetch` writes to, created on first use with
     /// mode `0700`; never inside the data directory. After [`Config::load`]
-    /// it is absolute: [`default_download_dir`] when the file does not set
-    /// it, and resolved against the configuration file's directory when it
-    /// is relative.
-    pub download_dir: PathBuf,
+    /// a configured one is absolute, resolved against the configuration
+    /// file's directory when it is relative; `None` means
+    /// [`default_download_dir`], resolved only when `pals_fetch` needs it,
+    /// so that no other command depends on a home directory.
+    pub download_dir: Option<PathBuf>,
+}
+
+impl McpCfg {
+    /// The download directory: the configured one, else the default.
+    pub fn resolved_download_dir(&self) -> anyhow::Result<PathBuf> {
+        match &self.download_dir {
+            Some(dir) => Ok(dir.clone()),
+            None => default_download_dir(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -309,20 +320,18 @@ impl Config {
         } else {
             dir.join(&cfg.data_dir)
         };
-        cfg.mcp.download_dir = if cfg.mcp.download_dir.as_os_str().is_empty() {
-            default_download_dir().with_context(|| format!("invalid {}", path.display()))?
-        } else {
-            dir.join(&cfg.mcp.download_dir)
-        };
-        let downloads = lexically_normal(&cfg.mcp.download_dir);
-        if downloads.starts_with(lexically_normal(&cfg.data_dir)) {
-            bail!(
-                "invalid {}: mcp.download_dir {} is inside the data directory {}, which holds \
-                 the agent's key and grants: pals_fetch must never write there",
-                path.display(),
-                cfg.mcp.download_dir.display(),
-                cfg.data_dir.display()
-            );
+        if let Some(downloads) = cfg.mcp.download_dir.take() {
+            let downloads = dir.join(downloads);
+            if lexically_normal(&downloads).starts_with(lexically_normal(&cfg.data_dir)) {
+                bail!(
+                    "invalid {}: mcp.download_dir {} is inside the data directory {}, which \
+                     holds the agent's key and grants: pals_fetch must never write there",
+                    path.display(),
+                    downloads.display(),
+                    cfg.data_dir.display()
+                );
+            }
+            cfg.mcp.download_dir = Some(downloads);
         }
         if !cfg.gateway.listen.ip().is_loopback() {
             bail!(
@@ -367,7 +376,12 @@ pub fn is_header_safe(text: &str) -> bool {
 /// Where `pals_fetch` writes when `mcp.download_dir` is not set:
 /// `~/Downloads/pals`.
 pub fn default_download_dir() -> anyhow::Result<PathBuf> {
-    let home = std::env::home_dir()
+    default_download_dir_in(std::env::home_dir())
+}
+
+/// [`default_download_dir`] for the home directory `home`, if any.
+fn default_download_dir_in(home: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    let home = home
         .filter(|home| home.is_absolute())
         .context("there is no home directory for the default mcp.download_dir: set it")?;
     Ok(home.join("Downloads").join("pals"))
@@ -484,14 +498,27 @@ mod tests {
     #[test]
     fn download_dir_defaults_to_downloads_and_stays_out_of_the_data_dir() {
         let dir = tempfile::tempdir().unwrap();
+        // Unset, it is resolved only when used: loading needs no home.
         let cfg = Config::load(&write_config(dir.path(), "")).unwrap();
+        assert_eq!(cfg.mcp.download_dir, None);
         let home = std::env::home_dir().unwrap();
-        assert_eq!(cfg.mcp.download_dir, home.join("Downloads").join("pals"));
+        assert_eq!(
+            cfg.mcp.resolved_download_dir().unwrap(),
+            home.join("Downloads").join("pals")
+        );
+        assert_eq!(
+            default_download_dir_in(Some(PathBuf::from("/h"))).unwrap(),
+            PathBuf::from("/h/Downloads/pals")
+        );
+        for no_home in [None, Some(PathBuf::from("relative"))] {
+            let err = default_download_dir_in(no_home).unwrap_err();
+            assert!(format!("{err:#}").contains("mcp.download_dir"), "{err:#}");
+        }
 
         // Relative to the configuration file's directory, as data_dir.
         let text = "data_dir = \"state\"\n[mcp]\ndownload_dir = \"incoming\"\n";
         let cfg = Config::load(&write_config(dir.path(), text)).unwrap();
-        assert_eq!(cfg.mcp.download_dir, dir.path().join("incoming"));
+        assert_eq!(cfg.mcp.download_dir, Some(dir.path().join("incoming")));
 
         // Never inside the data directory, however it is spelled.
         for download_dir in [

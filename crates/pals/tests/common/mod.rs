@@ -275,7 +275,7 @@ pub fn test_config(data_dir: &Path, worker: WorkerCfg) -> Config {
         limits: LimitsCfg::default(),
         net: NetCfg { relay: false },
         mcp: McpCfg {
-            download_dir: std::env::temp_dir().join("pals-test-downloads"),
+            download_dir: Some(std::env::temp_dir().join("pals-test-downloads")),
         },
         trusted_issuers: Vec::new(),
     }
@@ -306,7 +306,7 @@ pub async fn spawn_node_in(
 ) -> TestNode {
     let downloads = tempfile::tempdir().expect("create a downloads directory");
     let mut cfg = test_config(dir.path(), worker);
-    cfg.mcp.download_dir = download_dir_in(&downloads);
+    cfg.mcp.download_dir = Some(download_dir_in(&downloads));
     edit(&mut cfg);
     let node = Node::spawn(cfg).await.expect("spawn the node");
     TestNode {
@@ -330,7 +330,7 @@ pub async fn spawn_node_in_with_executor(
 ) -> TestNode {
     let downloads = tempfile::tempdir().expect("create a downloads directory");
     let mut cfg = test_config(dir.path(), WorkerCfg::Echo);
-    cfg.mcp.download_dir = download_dir_in(&downloads);
+    cfg.mcp.download_dir = Some(download_dir_in(&downloads));
     let node = Node::spawn_with_executor(cfg, executor)
         .await
         .expect("spawn the node");

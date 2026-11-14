@@ -36,6 +36,10 @@
 //!   `.git/hooks/…`.
 //! - The file must be new: the caller creates it with `create_new`, so
 //!   nothing is ever written over, nor through a symbolic link.
+//! - Nothing is created for a call that is refused anyway: the caller
+//!   checks what it can first ([`check_dest`], the blob to write), and
+//!   [`download_path`] checks a relative `dest`'s parts before it creates
+//!   any directory.
 
 use std::fs::{File, Metadata};
 use std::path::{Component, Path, PathBuf};
@@ -129,6 +133,20 @@ fn same_file(a: &Metadata, b: &Metadata) -> bool {
     a.len() == b.len()
 }
 
+/// Refuses, without touching the disk, a `dest` the writing rule refuses
+/// whatever is on the disk: a relative one with a part that is not a plain
+/// name or starts with a dot, or a path that names no file.
+pub(crate) fn check_dest(dest: &str) -> Result<(), String> {
+    let path = Path::new(dest);
+    if path.is_absolute() {
+        return match path.file_name() {
+            Some(_) => Ok(()),
+            None => Err(format!("dest {dest} names no file")),
+        };
+    }
+    check_components(dest, path)
+}
+
 /// Where `pals_fetch` writes the file `dest` names, as the writing rule
 /// says: inside `download_dir`, created first if missing, which must not be
 /// inside `data_dir` (resolved). Creates the missing directories of a
@@ -138,6 +156,7 @@ pub(crate) fn download_path(
     data_dir: Option<&Path>,
     dest: &str,
 ) -> Result<PathBuf, String> {
+    check_dest(dest)?;
     let root = open_download_dir(download_dir, data_dir)?;
     let outside = || {
         format!(

@@ -306,6 +306,28 @@ async fn pals_fetch_refuses_to_overwrite_and_rejects_non_gateway_urls() {
         assert!(text.contains("blob URL of this gateway"), "{bad}: {text}");
     }
 
+    // A blob the gateway cannot get, and a hidden name: refused too.
+    let missing = format!("{gw}/blobs/{holder}/{}", "0".repeat(64));
+    let refused = call(
+        &client,
+        "pals_fetch",
+        json!({"url": missing, "dest": "nested/out.bin"}),
+    )
+    .await;
+    let text = error_text(&refused);
+    assert!(text.contains("not found"), "{text}");
+    let refused = call(
+        &client,
+        "pals_fetch",
+        json!({"url": url, "dest": ".bashrc"}),
+    )
+    .await;
+    let text = error_text(&refused);
+    assert!(text.contains("dot"), "{text}");
+    // Nothing was written for any refused call: not even the download
+    // directory.
+    assert!(!a.download_dir().exists());
+
     // A file name lands in the download directory, created on first use.
     let out = ok_json(
         &call(
@@ -429,7 +451,7 @@ async fn pals_fetch_refuses_a_download_dir_that_resolves_into_the_data_dir() {
         let inbox = cfg.data_dir.join("inbox");
         std::fs::create_dir(&inbox).unwrap();
         std::os::unix::fs::symlink(&inbox, &link).unwrap();
-        cfg.mcp.download_dir = link.clone();
+        cfg.mcp.download_dir = Some(link.clone());
     })
     .await;
     let client = mcp_client(&a).await;
