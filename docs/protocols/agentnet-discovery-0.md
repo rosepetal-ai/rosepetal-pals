@@ -85,7 +85,7 @@ Toda respuesta, también las de error, lleva `version = 0`, `limits` y los regis
 
 Los mensajes de error son textos fijos de 256 bytes como mucho. Nunca repiten lo que envió el solicitante ni dicen si existe algo que el solicitante no puede ver: un error no distingue «no existe» de «no lo puedes ver».
 
-**Lo que comprueba el cliente.** Antes de usar una respuesta, el cliente de PALS comprueba los dos registros: que verifican (`Signed::from_json`), que los firma el par de la conexión y que están en vigor, con 60 s de desfase. Luego los compara con los más recientes que conoce de ese par: un registro con `seq` menor que el conocido, o el mismo `seq` con otros bytes, es una regresión, y la respuesta entera se descarta. Los registros aceptados se guardan; el conocido se olvida solo un `RECORD_TTL_S` entero después de caducar. La página la verifica quien la usa, con su propia identidad como `audience`.
+**Lo que comprueba el cliente.** Lee un solo frame de respuesta y después exige el final del stream: cualquier byte más invalida la respuesta. Antes de usarla, el cliente de PALS comprueba los dos registros: que verifican (`Signed::from_json`), que los firma el par de la conexión y que están en vigor, con 60 s de desfase. Luego los compara con los más recientes que conoce de ese par: un registro con `seq` menor que el conocido, o el mismo `seq` con otros bytes, es una regresión, y la respuesta entera se descarta. Los registros aceptados se guardan; el conocido se olvida solo un `RECORD_TTL_S` entero después de caducar. La página la verifica quien la usa, con su propia identidad como `audience`. Del mensaje de un error del par usa como mucho 256 bytes, cortados al final de un carácter, como los envía un servidor de este protocolo.
 
 ## 7. Cuotas y plazos
 
@@ -97,8 +97,9 @@ Por stream, antes de leer nada de la petición:
 | Peticiones de un par por minuto | 60, en una ventana de 60 s del reloj del nodo | `RATE_LIMITED`, `retry_after_ms` hasta que la más antigua sale de la ventana |
 | Streams de todos los pares a la vez | 64 | `RATE_LIMITED`, `retry_after_ms = 1000` |
 | Petición entera (prefijo, cuerpo y FIN) | 5 s | `BAD_REQUEST` «request timed out» |
+| Respuesta entera (frame y FIN) | 5 s | el stream se reinicia (`RESET_STREAM`) |
 
-Lo que pasa de una cuota se rechaza, no se encola. «Un par» es un `AgentId`, con todas sus conexiones. La conexión concede crédito para cuatro streams más que la cuota del par, para que el que la supera reciba su `RATE_LIMITED` en vez de quedarse esperando crédito.
+Lo que pasa de una cuota se rechaza, no se encola. El plazo de la respuesta cubre también las de rechazo: un par que no concede crédito de control de flujo para leerla, o que no la lee, no retiene más de ese plazo ni un stream de su cuota ni uno del total. «Un par» es un `AgentId`, con todas sus conexiones. La conexión concede crédito para cuatro streams más que la cuota del par, para que el que la supera reciba su `RATE_LIMITED` en vez de quedarse esperando crédito.
 
 ## 8. Lo que el protocolo nunca hace
 

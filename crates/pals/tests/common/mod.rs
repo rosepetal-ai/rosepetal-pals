@@ -2,9 +2,10 @@
 //! no relay, an echo agent served through the tunnel, a client that goes
 //! through the production `PeerHttp`, complete PALS nodes ([`TestNode`])
 //! with the grants that let them talk to each other, an executor that counts
-//! its runs ([`CountingExecutor`]), peers that speak only the discovery
-//! protocol, as the tests script them ([`stub_discovery_peer`]), and a plain
-//! HTTP client for a node's loopback gateway ([`gateway_request`]).
+//! its runs ([`CountingExecutor`]), nodes whose worker reports a fixed load
+//! ([`spawn_node_with_load`]), peers that speak only the discovery protocol,
+//! as the tests script them ([`stub_discovery_peer`]), and a plain HTTP
+//! client for a node's loopback gateway ([`gateway_request`]).
 
 // Each test binary uses a different subset of these helpers.
 #![allow(dead_code)]
@@ -47,7 +48,8 @@ use pals::net::{ALPN_A2A_HTTP, PEER_HEADER, PeerHttp, TunnelLimits, TunnelServer
 use pals::node::{Node, NodeOptions};
 use pals::worker::echo::EchoExecutor;
 use pals_core::discovery::{
-    ALPN_DISCOVERY, MAX_REQUEST_FRAME_BYTES, decode, encode_frame, frame_len, wire,
+    ALPN_DISCOVERY, DISCOVERY_VERSION, LoadProbe, MAX_REQUEST_FRAME_BYTES, decode, encode_frame,
+    frame_len, server_limits, wire,
 };
 use pals_core::grant::{GRANT_SCHEMA, Grant, Operation, SignedGrant, format_timestamp};
 use pals_core::identity::{AgentId, AgentKey};
@@ -378,6 +380,30 @@ pub async fn spawn_node_in_with_options(
     }
 }
 
+/// A node whose work `executor` does and whose worker reports `load` to the
+/// service queries it answers, on a fresh data directory.
+pub async fn spawn_node_with_load(
+    executor: impl AgentExecutor,
+    load: Arc<dyn LoadProbe>,
+) -> TestNode {
+    let dir = tempfile::tempdir().expect("create a data directory");
+    spawn_node_in_with_load(dir, executor, load).await
+}
+
+/// [`spawn_node_with_load`] on `dir`, which may already hold a key, a store
+/// and an inventory.
+pub async fn spawn_node_in_with_load(
+    dir: tempfile::TempDir,
+    executor: impl AgentExecutor,
+    load: Arc<dyn LoadProbe>,
+) -> TestNode {
+    let opts = NodeOptions {
+        load: Some(load),
+        ..NodeOptions::default()
+    };
+    spawn_node_in_with_options(dir, executor, opts).await
+}
+
 /// Shuts `node` down and waits until nothing holds its store any more, as
 /// when its process exits, so that a node spawned on its data directory
 /// next opens the database alone.
@@ -550,8 +576,39 @@ pub enum StubMode {
     /// Keeps the request and answers the response given. Its contact and
     /// announce records, when left empty, are the stub's own, valid now.
     Record(Arc<Mutex<Vec<wire::Request>>>, wire::Response),
+    /// Answers each request with the bytes the function makes of it: all
+    /// that the stub sends on the stream before it ends it, frames and
+    /// anything else ([`stub_response`] for one response frame).
+    Answer(StubAnswer),
     /// Reads the request and never answers.
     Silent,
+}
+
+/// What a [`StubMode::Answer`] stub sends on a stream, from what it was
+/// asked.
+pub type StubAnswer = Arc<dyn Fn(&StubAsked<'_>) -> Vec<u8> + Send + Sync>;
+
+/// What a [`StubMode::Answer`] stub answers from: its own key and signed
+/// records, the agent whose connection asks, and the request, when it is
+/// one.
+pub struct StubAsked<'a> {
+    pub key: &'a AgentKey,
+    /// The stub's signed contact and announce records, valid now.
+    pub records: &'a (Vec<u8>, Vec<u8>),
+    pub requester: AgentId,
+    pub request: Option<&'a wire::Request>,
+}
+
+/// One response frame of `asked`'s stub, with `result`, its limits and its
+/// own records.
+pub fn stub_response(asked: &StubAsked<'_>, result: wire::response::Result) -> Vec<u8> {
+    encode_frame(&wire::Response {
+        version: DISCOVERY_VERSION,
+        limits: Some(server_limits()),
+        contact_record: asked.records.0.clone(),
+        announce_record: asked.records.1.clone(),
+        result: Some(result),
+    })
 }
 
 /// A peer that serves only `agentnet-discovery/0`, as the test scripts it
@@ -606,8 +663,9 @@ impl StubPeer {
 struct StubDiscovery {
     mode: Arc<StubMode>,
     seen: Arc<StubSeen>,
+    key: Arc<AgentKey>,
     /// The stub's own signed contact and announce records.
-    records: (Vec<u8>, Vec<u8>),
+    records: Arc<(Vec<u8>, Vec<u8>)>,
 }
 
 impl std::fmt::Debug for StubDiscovery {
@@ -619,17 +677,18 @@ impl std::fmt::Debug for StubDiscovery {
 impl ProtocolHandler for StubDiscovery {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         self.seen.connections.fetch_add(1, Ordering::SeqCst);
+        let requester = agent_id_of(&connection.remote_id());
         let mut streams = tokio::task::JoinSet::new();
         while let Ok((send, recv)) = connection.accept_bi().await {
             let stub = self.clone();
-            streams.spawn(async move { stub.serve(send, recv).await });
+            streams.spawn(async move { stub.serve(requester, send, recv).await });
         }
         Ok(())
     }
 }
 
 impl StubDiscovery {
-    async fn serve(&self, mut send: SendStream, mut recv: RecvStream) {
+    async fn serve(&self, requester: AgentId, mut send: SendStream, mut recv: RecvStream) {
         let mut prefix = [0u8; 4];
         if recv.read_exact(&mut prefix).await.is_err() {
             return;
@@ -664,6 +723,17 @@ impl StubDiscovery {
                 // Until the requester has read it all.
                 let _ = send.stopped().await;
             }
+            StubMode::Answer(answer) => {
+                let asked = StubAsked {
+                    key: &self.key,
+                    records: &self.records,
+                    requester,
+                    request: request.as_ref().ok(),
+                };
+                let _ = send.write_all(&answer(&asked)).await;
+                let _ = send.finish();
+                let _ = send.stopped().await;
+            }
             StubMode::Silent => std::future::pending::<()>().await,
         }
     }
@@ -685,7 +755,17 @@ impl ProtocolHandler for StubRefusal {
 /// in `a` as contact `name` with its address, and a grant of it to send,
 /// read and cancel tasks that `a` holds, as [`stub_peer`] does.
 pub async fn stub_discovery_peer(a: &TestNode, name: &str, mode: StubMode) -> StubPeer {
-    let key = AgentKey::generate();
+    stub_discovery_peer_with_key(a, name, AgentKey::generate(), mode).await
+}
+
+/// [`stub_discovery_peer`] with `key`'s identity, so that the test can sign
+/// what the stub answers before it runs.
+pub async fn stub_discovery_peer_with_key(
+    a: &TestNode,
+    name: &str,
+    key: AgentKey,
+    mode: StubMode,
+) -> StubPeer {
     let endpoint = Endpoint::builder(presets::Minimal)
         .secret_key(SecretKey::from_bytes(&key.to_bytes()))
         .relay_mode(RelayMode::Disabled)
@@ -739,7 +819,8 @@ pub async fn stub_discovery_peer(a: &TestNode, name: &str, mode: StubMode) -> St
     let discovery = StubDiscovery {
         mode: Arc::new(mode),
         seen: Arc::clone(&seen),
-        records,
+        key: Arc::new(AgentKey::from_bytes(&key.to_bytes())),
+        records: Arc::new(records),
     };
     let ops = [
         Operation::TaskSend,

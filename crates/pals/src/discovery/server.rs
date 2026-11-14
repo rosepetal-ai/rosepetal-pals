@@ -16,7 +16,10 @@
 //!    `BAD_REQUEST`; one late, `BAD_REQUEST` too.
 //! 3. **The answer**: [`answer`], off the async threads, at the node's
 //!    [`Clock`]. Every response, refusals included, carries the node's
-//!    signed records.
+//!    signed records, and is written within [`Quotas::write_timeout`]: a
+//!    peer that gives no flow-control credit for it, or does not read it,
+//!    gets its stream reset then, so it never holds a stream of its quota
+//!    or of the node's for longer.
 //!
 //! The server holds the [`DiscoveryContext`] and nothing else of the node:
 //! no client for peers, no worker, no blob store, no adapter. It cannot run
@@ -55,6 +58,9 @@ const STREAM_HEADROOM: usize = 4;
 const PEERS_KEPT: usize = 1024;
 /// The code a stream is stopped with when its request is not read whole.
 const NOT_READ: u32 = 0;
+/// The code a stream is reset with when its response is not written in
+/// time.
+const NOT_WRITTEN: u32 = 0;
 
 /// What one peer, and all of them, may make the server do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,17 +73,20 @@ pub struct Quotas {
     pub global_concurrent: usize,
     /// Time a request has to arrive whole.
     pub read_timeout: Duration,
+    /// Time a response has to be written whole, end of stream included.
+    pub write_timeout: Duration,
 }
 
 impl Default for Quotas {
     /// 4 streams and 60 requests a minute per peer, 64 streams in all, 5 s
-    /// to send a request.
+    /// to send a request and 5 s to take its response.
     fn default() -> Self {
         Self {
             peer_concurrent: 4,
             peer_per_minute: 60,
             global_concurrent: 64,
             read_timeout: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -186,13 +195,28 @@ impl DiscoveryServer {
                 wire::Error::new(ErrorCode::Internal, "internal error"),
             )
         });
-        write_response(&mut send, &response).await;
+        self.write(&mut send, &response).await;
         drop(slot);
     }
 
     /// Sends `error`, with the node's records, as the response.
     async fn reply(&self, send: &mut SendStream, error: wire::Error) {
-        write_response(send, &error_response(&self.inner.ctx, error)).await;
+        self.write(send, &error_response(&self.inner.ctx, error))
+            .await;
+    }
+
+    /// Sends `response` as the stream's one frame, and its end, within
+    /// [`Quotas::write_timeout`]; past it, resets the stream.
+    async fn write(&self, send: &mut SendStream, response: &wire::Response) {
+        let written = tokio::time::timeout(
+            self.inner.quotas.write_timeout,
+            write_response(send, response),
+        )
+        .await;
+        if written.is_err() {
+            tracing::debug!("a discovery response was not taken in time: stream reset");
+            let _ = send.reset(VarInt::from_u32(NOT_WRITTEN));
+        }
     }
 
     /// A stream of `peer`'s, within the quotas at the clock's time now; the
@@ -332,7 +356,8 @@ async fn read_request(recv: &mut RecvStream) -> Result<wire::Request, wire::Erro
     })
 }
 
-/// Sends `response` as the stream's one frame, and its end.
+/// Sends `response` as the stream's one frame, and its end, however long
+/// it takes: [`DiscoveryServer::write`] bounds it.
 async fn write_response(send: &mut SendStream, response: &wire::Response) {
     if let Err(error) = send.write_all(&encode_frame(response)).await {
         tracing::debug!(%error, "a discovery response was not delivered");

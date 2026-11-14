@@ -3,7 +3,8 @@
 //! One exchange per stream, on one cached Iroh connection per peer on
 //! [`ALPN_DISCOVERY`]: the request frame, closed with FIN, and then the
 //! response frame, read only once its length prefix is within the smaller
-//! of the request's `max_response_bytes` and [`MAX_RESPONSE_FRAME_BYTES`].
+//! of the request's `max_response_bytes` and [`MAX_RESPONSE_FRAME_BYTES`],
+//! and followed by the stream's end and nothing else.
 //!
 //! Every response carries the peer's signed contact and announce records,
 //! and the client takes none without them: each must verify
@@ -13,7 +14,7 @@
 //! of that peer ([`Store::peer_record_accept`]). A record that goes back is
 //! [`DiscoveryError::Regression`], and the whole response is discarded.
 //! A response that refuses is [`DiscoveryError::Remote`], once its records
-//! passed.
+//! passed, with the peer's message cut to [`MAX_ERROR_MESSAGE_BYTES`].
 //!
 //! [`CLOCK_SKEW_S`]: pals_core::grant::CLOCK_SKEW_S
 
@@ -27,8 +28,8 @@ use iroh::{Endpoint, EndpointAddr, EndpointId};
 use pals_core::clock::{Clock, SystemClock};
 use pals_core::discovery::wire::{self, response};
 use pals_core::discovery::{
-    ALPN_DISCOVERY, MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES, decode, encode_frame,
-    frame_len,
+    ALPN_DISCOVERY, MAX_ERROR_MESSAGE_BYTES, MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES,
+    decode, encode_frame, frame_len,
 };
 use pals_core::grant::parse_timestamp;
 use pals_core::identity::AgentId;
@@ -79,7 +80,8 @@ pub enum DiscoveryError {
     /// is discarded.
     #[error("the peer's record goes back to before seq {known_seq}")]
     Regression { known_seq: u64 },
-    /// The peer refused the request. Its message is the peer's, quoted.
+    /// The peer refused the request. Its message is the peer's, quoted, at
+    /// most [`MAX_ERROR_MESSAGE_BYTES`].
     #[error("the peer refused: {:?} ({:?})", .0.message, .0.code())]
     Remote(wire::Error),
 }
@@ -153,7 +155,7 @@ impl DiscoveryClient {
         }
         let (contact, announce) = self.accept_records(peer, &response).await?;
         match response.result {
-            Some(response::Result::Error(error)) => Err(DiscoveryError::Remote(error)),
+            Some(response::Result::Error(error)) => Err(DiscoveryError::Remote(bounded(error))),
             Some(_) => Ok(Reply {
                 response,
                 announce,
@@ -213,6 +215,17 @@ impl DiscoveryClient {
         recv.read_exact(&mut body)
             .await
             .map_err(|error| broken(format!("a response cut short: {error}")))?;
+        // One frame, then the stream's end: anything else is no response.
+        match recv.read(&mut [0u8; 1]).await {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                let _ = recv.stop(VarInt::from_u32(NOT_READ));
+                return Err(DiscoveryError::Protocol(
+                    "bytes after the response frame".to_owned(),
+                ));
+            }
+            Err(error) => return Err(broken(format!("no end after the response: {error}"))),
+        }
         let response = decode::<wire::Response>(&body)
             .map_err(|_| DiscoveryError::Protocol("not a response".to_owned()))?;
         Ok((response, 4 + len as u64))
@@ -383,6 +396,17 @@ impl DiscoveryClient {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// `error` with its message cut to [`MAX_ERROR_MESSAGE_BYTES`], at a
+/// character's end, as a server of this protocol sends it.
+fn bounded(mut error: wire::Error) -> wire::Error {
+    let mut end = error.message.len().min(MAX_ERROR_MESSAGE_BYTES);
+    while !error.message.is_char_boundary(end) {
+        end -= 1;
+    }
+    error.message.truncate(end);
+    error
 }
 
 /// The record of `kind` in `json`, verified, signed by `peer` and in force

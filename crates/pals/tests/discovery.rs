@@ -1,7 +1,8 @@
 //! `agentnet-discovery/0` between real nodes: its own ALPN, framed protobuf,
-//! version negotiation, limits, quotas, the inventory views a grant gives,
-//! the signed records every answer carries, and what answering never does:
-//! run work, or reach another peer.
+//! version negotiation, limits, quotas, deadlines on both halves of an
+//! exchange, the inventory views a grant gives, the signed records every
+//! answer carries and what the client takes of an answer, and what
+//! answering never does: run work, or reach another peer.
 
 mod common;
 
@@ -10,12 +11,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{
-    CountingExecutor, StubMode, TestNode, gateway_request, grant, issue_grant, key_in, now_unix,
-    spawn_node, spawn_node_in_with_options, spawn_node_with_options, stub_discovery_peer,
+    CountingExecutor, StubAsked, StubMode, TestNode, gateway_request, grant, issue_grant, key_in,
+    now_unix, spawn_node, spawn_node_in_with_options, spawn_node_with_options, stub_discovery_peer,
+    stub_discovery_peer_with_key, stub_response,
 };
 use futures::future::BoxFuture;
 use iroh::Endpoint;
-use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::endpoint::{
+    ConnectOptions, Connection, QuicTransportConfig, RecvStream, SendStream, VarInt,
+};
 use pals::a2a::IDEMPOTENCY_EXTENSION;
 use pals::config::{INVENTORY_FILE, WorkerCfg};
 use pals::discovery::{DiscoveryError, DiscoveryHook, Quotas, Reply};
@@ -34,7 +38,10 @@ use pals_core::grant::{SignedGrant, format_timestamp, parse_timestamp};
 use pals_core::identity::{AgentId, AgentKey};
 use pals_core::inventory::INVENTORY_EXTENSION;
 use pals_core::inventory::view::{INVENTORY_SECTIONS, ViewError, ViewPage, verify_page};
-use pals_core::records::{ContactRecord, RECORD_RENEW_BEFORE_S, RECORD_TTL_S};
+use pals_core::records::{
+    ANNOUNCE_SCHEMA, AnnounceRecord, CONTACT_SCHEMA, ContactRecord, IrohContact,
+    RECORD_RENEW_BEFORE_S, RECORD_TTL_S,
+};
 use pals_core::signed::Signed;
 use pals_core::store::RecordAccept;
 use serde_json::{Value, json};
@@ -1021,4 +1028,284 @@ async fn inventory_get_cli_prints_the_verified_pages() {
     let (code, _, stderr) = pals(&home, &["inventory", "get", "bob", "--sections", "tasks"]).await;
     assert_ne!(code, 0);
     assert!(stderr.contains("unknown section"), "{stderr}");
+}
+
+/// A contact record of `agent`'s, signed by `signer`, valid from
+/// `issued_at` to `expires_at`.
+fn contact_record(signer: &AgentKey, issued_at: i64, expires_at: i64) -> Vec<u8> {
+    let id = signer.id();
+    let record = ContactRecord {
+        schema: CONTACT_SCHEMA.to_owned(),
+        agent_id: id,
+        iroh: IrohContact {
+            endpoint_id: id,
+            relay_url: None,
+            direct_addrs: Vec::new(),
+        },
+        seq: 1,
+        issued_at: format_timestamp(issued_at).unwrap(),
+        expires_at: format_timestamp(expires_at).unwrap(),
+    };
+    Signed::issue(signer, record).unwrap().to_json()
+}
+
+/// An announce record of `signer`'s, valid from `issued_at` to
+/// `expires_at`.
+fn announce_record(signer: &AgentKey, issued_at: i64, expires_at: i64) -> Vec<u8> {
+    let record = AnnounceRecord {
+        schema: ANNOUNCE_SCHEMA.to_owned(),
+        agent_id: signer.id(),
+        seq: 1,
+        agent_card_hash: format!("blake3:{}", "0".repeat(64)).parse().unwrap(),
+        capabilities: Vec::new(),
+        discovery_alpn: "agentnet-discovery/0".to_owned(),
+        issued_at: format_timestamp(issued_at).unwrap(),
+        expires_at: format_timestamp(expires_at).unwrap(),
+    };
+    Signed::issue(signer, record).unwrap().to_json()
+}
+
+/// A response with a page, whatever its bytes: the client checks the
+/// records before it looks at the result.
+fn any_page() -> Response {
+    Response {
+        result: Some(response::Result::InventoryPage(b"{}".to_vec())),
+        ..Response::default()
+    }
+}
+
+#[tokio::test]
+async fn client_refuses_records_that_are_foreign_expired_or_missing() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let now = now_unix();
+    let stranger = AgentKey::generate();
+    let (expired_from, expired_to) = (now - 2 * 3600, now - 3600);
+
+    // Each stub answers with one record of its own replaced: signed by
+    // another agent, or expired beyond the skew.
+    let mut cases = Vec::new();
+    for (name, contact, announce) in [
+        ("foreign contact", true, false),
+        ("foreign announce", false, true),
+    ] {
+        let key = AgentKey::generate();
+        let foreign = |make: fn(&AgentKey, i64, i64) -> Vec<u8>, on: bool| {
+            if on {
+                make(&stranger, now, now + 3600)
+            } else {
+                Vec::new()
+            }
+        };
+        let response = Response {
+            contact_record: foreign(contact_record, contact),
+            announce_record: foreign(announce_record, announce),
+            ..any_page()
+        };
+        cases.push((name, key, StubMode::Record(Arc::default(), response)));
+    }
+    let key = AgentKey::generate();
+    let expired_contact = Response {
+        contact_record: contact_record(&key, expired_from, expired_to),
+        ..any_page()
+    };
+    cases.push((
+        "expired contact",
+        key,
+        StubMode::Record(Arc::default(), expired_contact),
+    ));
+    let key = AgentKey::generate();
+    let expired_announce = Response {
+        announce_record: announce_record(&key, expired_from, expired_to),
+        ..any_page()
+    };
+    cases.push((
+        "expired announce",
+        key,
+        StubMode::Record(Arc::default(), expired_announce),
+    ));
+    // Or without one of them.
+    for missing in [0, 1] {
+        let answer = Arc::new(move |asked: &StubAsked<'_>| {
+            let (mut contact, mut announce) = asked.records.clone();
+            if missing == 0 {
+                contact.clear();
+            } else {
+                announce.clear();
+            }
+            encode_frame(&Response {
+                contact_record: contact,
+                announce_record: announce,
+                ..any_page()
+            })
+        });
+        let name = ["missing contact", "missing announce"][missing];
+        cases.push((name, AgentKey::generate(), StubMode::Answer(answer)));
+    }
+
+    for (name, key, mode) in cases {
+        let stub = stub_discovery_peer_with_key(&a, name, key, mode).await;
+        let result = a
+            .node
+            .discovery()
+            .call(&stub.id, stub.addr(), get_inventory(&[], "", None), CALL)
+            .await;
+        match result {
+            Err(DiscoveryError::BadRecord(why)) => {
+                let kind = name.split(' ').nth(1).unwrap();
+                assert!(why.starts_with(kind), "{name}: {why}");
+            }
+            other => panic!("{name}: a bad record, not {other:?}"),
+        }
+        assert_eq!(stub.requests(), 1, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn the_request_deadline_covers_the_whole_request_however_it_trickles() {
+    let opts = NodeOptions {
+        quotas: Quotas {
+            read_timeout: Duration::from_secs(1),
+            ..Quotas::default()
+        },
+        ..NodeOptions::default()
+    };
+    let b = provider(INVENTORY, opts).await;
+
+    // A frame of 1000 bytes announced, then a byte every 100 ms: never a
+    // second without one, and 100 s before the frame is whole.
+    let (_endpoint, _connection, mut send, mut recv) = raw_stream(&b).await;
+    send.write_all(&1000u32.to_be_bytes()).await.unwrap();
+    let trickle = tokio::spawn(async move {
+        let mut sent = 0;
+        while sent < 1000 && send.write_all(&[0]).await.is_ok() {
+            sent += 1;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        sent
+    });
+    // The answer comes once the request's time is up, not each read's.
+    let response = tokio::time::timeout(Duration::from_secs(60), read_response(&mut recv))
+        .await
+        .expect("answered long before the frame could be whole");
+    let error = error_of(&response);
+    assert_eq!(error.code(), ErrorCode::BadRequest, "{error:?}");
+    assert_eq!(error.message, "request timed out");
+    // The sender is cut off, the frame never whole.
+    let sent = trickle.await.unwrap();
+    assert!(sent < 1000, "{sent}");
+}
+
+#[tokio::test]
+async fn client_takes_one_response_and_cuts_the_peer_message() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    // What the stub answers depends on the cursor asked for.
+    let long = "é".repeat(2048);
+    let message = long.clone();
+    let answer = Arc::new(move |asked: &StubAsked<'_>| {
+        let page = stub_response(asked, response::Result::InventoryPage(b"{}".to_vec()));
+        let cursor = match asked.request.and_then(|request| request.op.as_ref()) {
+            Some(request::Op::GetInventory(get)) => get.cursor.clone(),
+            _ => String::new(),
+        };
+        match cursor.as_str() {
+            "trailing" => [page, vec![0]].concat(),
+            "twice" => [page.clone(), page].concat(),
+            "long" => {
+                let mut error = wire::Error::new(ErrorCode::BadRequest, "");
+                error.message = message.clone();
+                stub_response(asked, response::Result::Error(error))
+            }
+            _ => page,
+        }
+    });
+    let stub = stub_discovery_peer(&a, "stub", StubMode::Answer(answer)).await;
+    let ask = |cursor: &str| {
+        let client = a.node.discovery().clone();
+        let (id, addr) = (stub.id, stub.addr());
+        let req = get_inventory(&[], cursor, None);
+        async move { client.call(&id, addr, req, CALL).await }
+    };
+
+    // Anything after the response frame and before the stream's end makes
+    // it no response.
+    for cursor in ["trailing", "twice"] {
+        match ask(cursor).await {
+            Err(DiscoveryError::Protocol(_)) => {}
+            other => panic!("{cursor}: a protocol error, not {other:?}"),
+        }
+    }
+    // A peer's message is cut to 256 bytes, at a character's end.
+    match ask("long").await {
+        Err(DiscoveryError::Remote(error)) => {
+            assert_eq!(error.code(), ErrorCode::BadRequest);
+            assert_eq!(error.message.len(), 256);
+            assert!(long.starts_with(&error.message));
+        }
+        other => panic!("a refusal, not {other:?}"),
+    }
+    // The same stub's plain answer is taken.
+    ask("").await.unwrap();
+}
+
+#[tokio::test]
+async fn response_never_read_is_reset_and_frees_its_stream() {
+    // One stream at a time for the whole node, and a second to write.
+    let hook = HoldingHook::new();
+    hook.release();
+    let opts = NodeOptions {
+        discovery_hook: Some(Arc::new(hook.clone())),
+        quotas: Quotas {
+            global_concurrent: 1,
+            write_timeout: Duration::from_secs(1),
+            ..Quotas::default()
+        },
+        ..NodeOptions::default()
+    };
+    let b = provider(&plugins(100), opts).await;
+    let a = spawn_node(WorkerCfg::Echo).await;
+
+    // A peer that gives a stream 64 bytes of credit and never reads: b's
+    // answer, a page of 100 plugins, cannot be sent.
+    let endpoint = common::loopback_endpoint().await;
+    let stingy = QuicTransportConfig::builder()
+        .stream_receive_window(VarInt::from_u32(64))
+        .build();
+    let connection = endpoint
+        .connect_with_opts(
+            b.node.addr(),
+            ALPN_DISCOVERY,
+            ConnectOptions::new().with_transport_config(stingy),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut send, mut recv) = connection.open_bi().await.unwrap();
+    send.write_all(&encode_frame(&get_inventory(&[], "", None)))
+        .await
+        .unwrap();
+    send.finish().unwrap();
+    hook.wait_for(1).await;
+
+    // b gives up once its time to write is up: the stream is reset, never
+    // finished, and without the peer reading a byte.
+    let code = tokio::time::timeout(Duration::from_secs(60), recv.received_reset())
+        .await
+        .expect("the stream that is never read is reset")
+        .unwrap();
+    assert!(code.is_some(), "reset, not finished");
+    // And b's only place is free again, at most a moment later.
+    let mut tries = 0;
+    loop {
+        match call(&a, &b, get_inventory(&["plugins"], "", None)).await {
+            Ok(_) => break,
+            Err(DiscoveryError::Remote(error))
+                if error.code() == ErrorCode::RateLimited && tries < 50 =>
+            {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(other) => panic!("served, not {other}"),
+        }
+    }
 }

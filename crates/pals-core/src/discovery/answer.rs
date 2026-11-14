@@ -378,6 +378,44 @@ mod tests {
     }
 
     #[test]
+    fn a_grant_whose_project_is_no_project_name_is_unauthenticated() {
+        let key = Arc::new(AgentKey::generate());
+        let ctx = hidden(&key);
+        let peer = AgentKey::generate().id();
+        let grant_for = |project: &str| {
+            SignedGrant::issue(
+                &key,
+                Grant {
+                    schema: GRANT_SCHEMA.to_owned(),
+                    grant_id: format!("g-{}", project.len()),
+                    issuer: key.id(),
+                    subject: peer,
+                    audience: key.id(),
+                    project: project.to_owned(),
+                    resources: vec!["skill:ask".to_owned()],
+                    operations: vec![Operation::TaskSend],
+                    issued_at: format_timestamp(NOW).unwrap(),
+                    expires_at: format_timestamp(NOW + 3600).unwrap(),
+                },
+            )
+            .unwrap()
+            .to_token()
+        };
+        // A valid grant, whose project no signed page or offer could name.
+        for project in ["two words", "diseño", ""] {
+            let response = answer(&ctx, &peer, get(&grant_for(project)), NOW);
+            let Some(response::Result::Error(error)) = response.result else {
+                panic!("{project:?}: an error, not {:?}", response.result);
+            };
+            assert_eq!(error.code(), ErrorCode::Unauthenticated, "{project:?}");
+            assert_eq!(error.message, "malformed", "{project:?}");
+        }
+        // A project name is served.
+        let page = page_of(&ctx, &peer, get(&grant_for("demo")));
+        assert_eq!(page.scope, "task:demo");
+    }
+
+    #[test]
     fn every_response_carries_the_records_in_force_and_the_limits() {
         let key = Arc::new(AgentKey::generate());
         let ctx = hidden(&key);
