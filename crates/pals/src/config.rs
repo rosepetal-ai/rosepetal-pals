@@ -42,7 +42,18 @@ description = "A PALS agent"
 listen = "127.0.0.1:7420"
 
 [worker]
+# Who answers the questions peers ask. "echo" replies with the text it
+# receives. "exec" runs `command` with `args` in the project's directory for
+# each question, with the question on stdin, and answers with its stdout.
 adapter = "echo"
+# To answer with Claude Code instead:
+# adapter = "exec"
+# command = "claude"
+# args = ["-p", "--output-format", "text"]
+# timeout_s = 600                # the command's process group is killed after it
+# max_concurrent = 2             # commands running at the same time
+# max_queue = 8                  # questions waiting; more are rejected as busy
+# max_output_bytes = 1048576     # 1 MiB; a longer answer is cut
 
 [net]
 # true: Iroh's public relays (the N0 preset); false: direct addresses only.
@@ -115,13 +126,96 @@ impl Default for GatewayCfg {
     }
 }
 
-/// The executor behind the A2A server, selected by `adapter`.
+/// The executor behind the A2A server, selected by `adapter`. A key the
+/// selected adapter does not take is an error.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(tag = "adapter", rename_all = "lowercase")]
 pub enum WorkerCfg {
     /// Replies with the text it receives.
     #[default]
+    #[serde(deserialize_with = "no_settings")]
     Echo,
+    /// Runs a command for each task, see [`ExecCfg`].
+    Exec(ExecCfg),
+}
+
+/// The `exec` adapter: each task runs `command` with `args` in its project's
+/// directory, with the question on stdin; its stdout is the answer.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecCfg {
+    /// The program: a path, or a name looked up on `PATH`.
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Seconds a run may take before its process group is killed.
+    #[serde(default = "ExecCfg::default_timeout_s")]
+    pub timeout_s: u64,
+    /// Runs at the same time.
+    #[serde(default = "ExecCfg::default_max_concurrent")]
+    pub max_concurrent: usize,
+    /// Tasks waiting for a run; a task beyond them is rejected as busy.
+    #[serde(default = "ExecCfg::default_max_queue")]
+    pub max_queue: usize,
+    /// Longest answer, in bytes; a longer stdout is cut.
+    #[serde(default = "ExecCfg::default_max_output_bytes")]
+    pub max_output_bytes: usize,
+}
+
+/// Reads an adapter that takes no settings, refusing any key besides
+/// `adapter`: serde ignores the keys under a unit variant of an internally
+/// tagged enum.
+fn no_settings<'de, D: serde::Deserializer<'de>>(settings: D) -> Result<(), D::Error> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct NoSettings {}
+    NoSettings::deserialize(settings).map(|NoSettings {}| ())
+}
+
+impl ExecCfg {
+    /// Running `command` with `args`, with the default limits: 600 s, 2 runs
+    /// at a time, 8 waiting, 1 MiB of answer.
+    pub fn new(command: &str, args: &[&str]) -> Self {
+        Self {
+            command: command.to_owned(),
+            args: args.iter().map(|&arg| arg.to_owned()).collect(),
+            timeout_s: Self::default_timeout_s(),
+            max_concurrent: Self::default_max_concurrent(),
+            max_queue: Self::default_max_queue(),
+            max_output_bytes: Self::default_max_output_bytes(),
+        }
+    }
+
+    fn default_timeout_s() -> u64 {
+        600
+    }
+
+    fn default_max_concurrent() -> usize {
+        2
+    }
+
+    fn default_max_queue() -> usize {
+        8
+    }
+
+    fn default_max_output_bytes() -> usize {
+        1024 * 1024
+    }
+
+    /// Why these settings cannot run a task, if they cannot.
+    fn problem(&self) -> Option<&'static str> {
+        if self.command.is_empty() {
+            Some("worker.command must not be empty")
+        } else if self.timeout_s == 0 {
+            Some("worker.timeout_s must be at least 1")
+        } else if self.max_concurrent == 0 {
+            Some("worker.max_concurrent must be at least 1")
+        } else if self.max_output_bytes == 0 {
+            Some("worker.max_output_bytes must be at least 1")
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -193,6 +287,11 @@ impl Config {
                  because it travels in an HTTP header",
                 path.display()
             );
+        }
+        if let WorkerCfg::Exec(exec) = &cfg.worker
+            && let Some(problem) = exec.problem()
+        {
+            bail!("invalid {}: {problem}", path.display());
         }
         Ok(cfg)
     }
@@ -395,5 +494,116 @@ path = "/srv/demo"
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(dir.path(), "[gatway]\nlisten = \"127.0.0.1:7420\"\n");
         assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn exec_worker_takes_the_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[worker]\nadapter = \"exec\"\ncommand = \"claude\"\n";
+        let cfg = Config::load(&write_config(dir.path(), text)).unwrap();
+        assert_eq!(
+            cfg.worker,
+            WorkerCfg::Exec(ExecCfg {
+                command: "claude".to_owned(),
+                args: Vec::new(),
+                timeout_s: 600,
+                max_concurrent: 2,
+                max_queue: 8,
+                max_output_bytes: 1024 * 1024,
+            })
+        );
+        assert_eq!(WorkerCfg::Exec(ExecCfg::new("claude", &[])), cfg.worker);
+    }
+
+    #[test]
+    fn exec_worker_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = r#"
+[worker]
+adapter = "exec"
+command = "sh"
+args = ["-c", "cat"]
+timeout_s = 5
+max_concurrent = 1
+max_queue = 0
+max_output_bytes = 10
+"#;
+        let cfg = Config::load(&write_config(dir.path(), text)).unwrap();
+        assert_eq!(
+            cfg.worker,
+            WorkerCfg::Exec(ExecCfg {
+                command: "sh".to_owned(),
+                args: vec!["-c".to_owned(), "cat".to_owned()],
+                timeout_s: 5,
+                max_concurrent: 1,
+                max_queue: 0,
+                max_output_bytes: 10,
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_worker_keys_are_rejected_for_every_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        for (text, word) in [
+            // A key only `exec` knows, under `echo`.
+            (
+                "[worker]\nadapter = \"echo\"\ncommand = \"claude\"\n",
+                "unknown field `command`",
+            ),
+            (
+                "[worker]\nadapter = \"echo\"\ntypo = 1\n",
+                "unknown field `typo`",
+            ),
+            (
+                "[worker]\nadapter = \"exec\"\ncommand = \"claude\"\ntimeout = 5\n",
+                "unknown field `timeout`",
+            ),
+            ("[worker]\nadapter = \"exec\"\n", "missing field `command`"),
+            ("[worker]\nadapter = \"nope\"\n", "unknown variant `nope`"),
+        ] {
+            let err = Config::load(&write_config(dir.path(), text)).unwrap_err();
+            assert!(format!("{err:#}").contains(word), "{text}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn exec_worker_limits_must_be_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        for (setting, word) in [
+            ("command = \"\"", "command"),
+            ("command = \"sh\"\nmax_concurrent = 0", "max_concurrent"),
+            ("command = \"sh\"\ntimeout_s = 0", "timeout_s"),
+            ("command = \"sh\"\nmax_output_bytes = 0", "max_output_bytes"),
+        ] {
+            let text = format!("[worker]\nadapter = \"exec\"\n{setting}\n");
+            let err = Config::load(&write_config(dir.path(), &text)).unwrap_err();
+            assert!(format!("{err:#}").contains(word), "{setting}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn init_template_documents_the_exec_adapter() {
+        // Uncommenting the example turns the worker into `claude -p`.
+        let mut text = String::new();
+        let mut in_worker = false;
+        for line in INIT_TEMPLATE.lines() {
+            if line.starts_with('[') {
+                in_worker = line == "[worker]";
+            }
+            let line = match line.strip_prefix("# ") {
+                Some(setting) if in_worker && setting.contains(" = ") => setting,
+                _ if in_worker && line == "adapter = \"echo\"" => continue,
+                _ => line,
+            };
+            text.push_str(line);
+            text.push('\n');
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load(&write_config(dir.path(), &text)).unwrap();
+        assert_eq!(
+            cfg.worker,
+            WorkerCfg::Exec(ExecCfg::new("claude", &["-p", "--output-format", "text"]))
+        );
     }
 }

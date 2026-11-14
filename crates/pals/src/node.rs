@@ -2,6 +2,7 @@
 //! the local gateway standard A2A clients reach its peers through.
 
 use std::net::Ipv4Addr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,7 +26,12 @@ use crate::a2a::{BindingExecutor, GuardedHandler, SqliteTaskStore, canonical_car
 use crate::config::{Config, DataDirLock, WorkerCfg};
 use crate::gateway::{self, GatewayState};
 use crate::net::{ALPN_A2A_HTTP, PeerHttp, TunnelLimits, TunnelServer};
+use crate::worker::TASKS_DIR;
 use crate::worker::echo::EchoExecutor;
+#[cfg(unix)]
+use crate::worker::exec::ExecAdapter;
+#[cfg(unix)]
+use crate::worker::{Capacity, WorkerExecutor};
 
 /// The agent's SQLite store, in the data directory.
 pub const STORE_FILE: &str = "pals.db";
@@ -62,14 +68,17 @@ pub struct Node {
 }
 
 impl Node {
-    /// Starts the agent of `cfg.data_dir`, which must exist.
+    /// Starts the agent of `cfg.data_dir`, which must exist, with the
+    /// executor `cfg.worker` selects: [`EchoExecutor`], or a
+    /// `WorkerExecutor` running the `exec` adapter.
     ///
     /// In order: takes the data directory's lock, failing with
     /// [`AlreadyRunning`](crate::config::AlreadyRunning) when another daemon
     /// holds it; loads the agent's key, creating it if missing; opens the
-    /// store; fails the tasks a previous run left in progress; frees the
-    /// dedup keys it left with no execution behind them, and purges the
-    /// dedup rows older than [`DEDUP_RETENTION_S`]; binds the gateway's
+    /// store; fails the tasks a previous run left in progress and removes
+    /// their working directories ([`TASKS_DIR`]); frees the dedup keys it
+    /// left with no execution behind them, and purges the dedup rows older
+    /// than [`DEDUP_RETENTION_S`]; binds the gateway's
     /// listener on `gateway.listen`, which must be a loopback address (port
     /// 0 picks a free one, see [`Node::gateway_url`]); and only then binds
     /// the Iroh endpoint with the agent's key, serves [`ALPN_A2A_HTTP`] on it
@@ -78,10 +87,17 @@ impl Node {
     /// bound to 127.0.0.1 only. While it runs, the node purges the dedup
     /// rows again every hour.
     pub async fn spawn(cfg: Config) -> anyhow::Result<Node> {
-        let executor = match cfg.worker {
-            WorkerCfg::Echo => EchoExecutor,
-        };
-        Self::spawn_with_executor(cfg, executor).await
+        match &cfg.worker {
+            WorkerCfg::Echo => Self::spawn_with_executor(cfg, EchoExecutor).await,
+            #[cfg(unix)]
+            WorkerCfg::Exec(exec) => {
+                let adapter = Arc::new(ExecAdapter::new(exec.clone(), &cfg.projects));
+                let executor = WorkerExecutor::new(adapter, &cfg, Capacity::from(exec));
+                Self::spawn_with_executor(cfg, executor).await
+            }
+            #[cfg(not(unix))]
+            WorkerCfg::Exec(_) => anyhow::bail!("the exec worker adapter needs a Unix system"),
+        }
     }
 
     /// [`Node::spawn`], with `executor` doing the work instead of the
@@ -108,6 +124,7 @@ impl Node {
             if interrupted > 0 {
                 tracing::info!(interrupted, "failed the tasks a restart interrupted");
             }
+            remove_task_dirs(&data_dir);
             // An unbound key belongs to a request that never ran: free it,
             // so that its retry runs instead of waiting for nothing.
             let unbound = store
@@ -261,6 +278,22 @@ impl GatewayServer {
             stop,
             task: AbortOnDrop(task),
         }
+    }
+}
+
+/// Removes the working directories that tasks a previous run interrupted
+/// left in `data_dir` ([`TASKS_DIR`]). Failing to is not fatal: each task
+/// makes its own directory anew.
+fn remove_task_dirs(data_dir: &Path) {
+    let tasks = data_dir.join(TASKS_DIR);
+    match std::fs::remove_dir_all(&tasks) {
+        Ok(()) => tracing::info!("removed the working directories of interrupted tasks"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => tracing::warn!(
+            dir = %tasks.display(),
+            error = %err,
+            "cannot remove the working directories of interrupted tasks"
+        ),
     }
 }
 

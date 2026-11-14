@@ -32,15 +32,20 @@ thiserror.workspace = true
 tokio = { workspace = true, features = [
     "io-util",
     "net",
+    "process",
     "rt",
     "rt-multi-thread",
     "signal",
     "sync",
     "time",
 ] }
+tokio-util.workspace = true
 toml.workspace = true
 tower = { workspace = true, features = ["util"] }
 tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 # The stock A2A client, to talk to peers through the gateway as any client would.
