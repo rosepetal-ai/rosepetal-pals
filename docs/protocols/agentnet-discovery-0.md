@@ -1,6 +1,6 @@
 # Protocolo `agentnet-discovery/0`
 
-Especificación del protocolo con el que un agente PALS pregunta a otro qué ofrece antes de encargarle ninguna tarea: su inventario, filtrado según el permiso de quien pregunta, y, en tareas posteriores del hito 2, sus informes de benchmark y si puede atender un caso concreto (diseño §7, §9.8 y §10). Es un protocolo propio de PALS, no una parte de A2A: la tarea elegida se envía después, como en el hito 1, con los bindings estándar de A2A v1.0.
+Especificación del protocolo con el que un agente PALS pregunta a otro qué ofrece antes de encargarle ninguna tarea: su inventario, filtrado según el permiso de quien pregunta, si puede atender un caso concreto (una consulta de servicio, que se contesta con una oferta firmada) y, en una tarea posterior del hito 2, sus informes de benchmark (diseño §7, §9.8 y §10). Es un protocolo propio de PALS, no una parte de A2A: la tarea elegida se envía después, como en el hito 1, con los bindings estándar de A2A v1.0.
 
 Los valores que aparecen aquí son los del código: `crates/pals-core/src/discovery/` (mensajes, frames y respuesta) y `crates/pals/src/discovery/{server,client}.rs` (transporte, cuotas y cliente). Los mensajes están en [`agentnet-discovery-0.proto`](agentnet-discovery-0.proto), y el vector `crates/pals-core/tests/vectors/discovery-v0.json` congela su codificación.
 
@@ -63,9 +63,19 @@ Una página firmada de la vista del ámbito (`agentnet.inventory-view/1`, ver [V
 
 Una página privada lleva en `audience` al solicitante; una pública no lleva `audience`. `seq` es la revisión del ámbito sobre todas sus secciones, y `agent_card_hash` el hash de la card de ese ámbito (la pública si el ámbito no tiene card propia). El agente guarda las páginas que firma por todo lo que las distingue, solicitante incluido, durante la mitad de su vida (150 s): una página servida desde la caché siempre tiene al menos la mitad de su vida por delante, y nunca se sirve a otro solicitante. Una entrada que no cabe sola en una página es `TOO_LARGE`.
 
-### `GetBenchmarkReport` y `ServiceQuery`
+### `ServiceQuery`
 
-`UNSUPPORTED_OPERATION` en esta versión del daemon; las tareas 7 y 8 del hito 2 las implementan. Una petición sin operación es `BAD_REQUEST`.
+Una consulta de servicio (`agentnet.service-query/1`, esquema [`service-query.schema.json`](../extensions/inventory-v1/service-query.schema.json)) en `query`, como su JCS, y una oferta firmada (`agentnet.service-offer/1`, esquema [`service-offer.schema.json`](../extensions/inventory-v1/service-offer.schema.json)) en `service_offer`. Las reglas de la consulta, del matching y de la oferta están en [Consultas de servicio y ofertas](../extensions/inventory-v1.md#consultas-de-servicio-y-ofertas); aquí, lo que toca al protocolo:
+
+- **Consulta.** De 8 KiB como mucho (`TOO_LARGE` si no, sin leerla), en su JCS y con una sola grafía: lo ausente se omite, nunca es `null` ni `[]`. Una que no lo es, o que incumple sus reglas, es `BAD_REQUEST` con un motivo fijo que nunca la repite; entre ellas, `execution_authorized` tiene que ser `false` («a query never authorizes execution»).
+- **Ámbito.** El del grant presentado (§4). `project` solo elige entre los proyectos que ese grant ya cubre: como un grant v1 cubre uno, si coincide con el del grant el ámbito es el del grant, y si no, o sin grant, la consulta se contesta como pública. Nunca amplía lo que se ve.
+- **Contestar no ejecuta nada.** El matching es una función pura sobre el inventario tal como lo muestra el ámbito, sus observaciones y los contadores de carga del worker: ningún LLM, herramienta, adaptador ni par.
+- **Oferta.** Firmada con el dominio `agentnet.offer/1\n`, de 16 KiB como mucho (si no cabe, se recortan por el final las limitaciones, luego los resultados de requisitos y luego los requisitos desconocidos, y termina en la limitación `truncated`), para el par de la conexión (`requester`) y vinculada a la consulta (`query_hash`, BLAKE3 de los bytes recibidos). Lleva el ámbito, el hash de la card de ese ámbito (la pública si no tiene card propia) y la revisión de la vista del ámbito, que cambia con todo cambio de lo que muestra, también con las fechas de una observación. Dura `[discovery] offer_valid_for_ms` (15000 por defecto, como mucho 300000), redondeado al segundo por arriba: `expires_at = issued_at + ⌈valid_for_ms / 1000⌉` s, con el reloj del agente. El agente guarda cada oferta que emite (`offers_issued`) y purga cada hora las que caducaron hace más de un día.
+- **Misma forma.** Si el ámbito no muestra ningún servicio de la capacidad, la oferta es `not_offered`, sin servicio, sin resultados de requisitos, sin tiempos ni limitaciones: la misma exista o no un servicio que el solicitante no puede ver.
+
+### `GetBenchmarkReport`
+
+`UNSUPPORTED_OPERATION` en esta versión del daemon; la tarea 8 del hito 2 la implementa. Una petición sin operación es `BAD_REQUEST`.
 
 ## 6. Respuestas y errores
 
@@ -74,18 +84,20 @@ Toda respuesta, también las de error, lleva `version = 0`, `limits` y los regis
 | `ErrorCode` | Cuándo |
 |-|-|
 | `UNSUPPORTED_VERSION` | `version` distinta de `0`; con `supported_versions` |
-| `BAD_REQUEST` | frame que no es una petición, cortado, seguido de más bytes, que no llega entero a tiempo («request timed out»), sin operación, o con secciones desconocidas o demasiadas |
-| `TOO_LARGE` | frame de petición de más de 20 KiB, respuesta mayor que `max_response_bytes`, o entrada que no cabe en una página |
+| `BAD_REQUEST` | frame que no es una petición, cortado, seguido de más bytes, que no llega entero a tiempo («request timed out»), sin operación, con secciones desconocidas o demasiadas, o con una consulta de servicio inválida |
+| `TOO_LARGE` | frame de petición de más de 20 KiB, consulta de servicio de más de 8 KiB, respuesta mayor que `max_response_bytes`, o entrada que no cabe en una página |
 | `RATE_LIMITED` | cuota superada; con `retry_after_ms` |
 | `NOT_FOUND` | reservado (informes de benchmark, tarea 8) |
 | `INVALID_CURSOR` | cursor que no sirve, sea cual sea el motivo |
 | `UNAUTHENTICATED` | grant no aceptado; el mensaje es el motivo |
-| `UNSUPPORTED_OPERATION` | `GetBenchmarkReport` y `ServiceQuery` en esta versión |
-| `INTERNAL` | el almacén no se puede leer, o no se puede firmar |
+| `UNSUPPORTED_OPERATION` | `GetBenchmarkReport` en esta versión |
+| `INTERNAL` | el almacén no se puede leer o escribir, o no se puede firmar |
 
 Los mensajes de error son textos fijos de 256 bytes como mucho. Nunca repiten lo que envió el solicitante ni dicen si existe algo que el solicitante no puede ver: un error no distingue «no existe» de «no lo puedes ver».
 
 **Lo que comprueba el cliente.** Lee un solo frame de respuesta y después exige el final del stream: cualquier byte más invalida la respuesta. Antes de usarla, el cliente de PALS comprueba los dos registros: que verifican (`Signed::from_json`), que los firma el par de la conexión y que están en vigor, con 60 s de desfase. Luego los compara con los más recientes que conoce de ese par: un registro con `seq` menor que el conocido, o el mismo `seq` con otros bytes, es una regresión, y la respuesta entera se descarta. Los registros aceptados se guardan; el conocido se olvida solo un `RECORD_TTL_S` entero después de caducar. La página la verifica quien la usa, con su propia identidad como `audience`. Del mensaje de un error del par usa como mucho 256 bytes, cortados al final de un carácter, como los envía un servidor de este protocolo.
+
+Una oferta la acepta el cliente con una sola función, `pals_core::discovery::accept_offer`, solo si, en este orden: cabe en 16 KiB (sin leerla si no), es una oferta firmada válida, la firma el par al que preguntó, es para él mismo (`requester`), es de su consulta (`query_id` y `query_hash`) y no ha caducado, con 60 s de desfase solo para rechazar. Entonces la guarda (`offers_received`) con la clave (proveedor, `offer_id`): dos proveedores pueden usar el mismo `offer_id`. Las caducadas se purgan cada hora. Si una oferta guardada sigue sirviendo para preguntar lo decide quien pregunta con su propio reloj, sin desfase.
 
 ## 7. Cuotas y plazos
 
@@ -105,9 +117,10 @@ Lo que pasa de una cuota se rechaza, no se encola. El plazo de la respuesta cubr
 
 - **Ejecutar trabajo.** La respuesta la construye `pals_core::discovery::answer`, en un crate que no abre sockets ni tiene endpoint, worker, ejecutor ni adaptador: lee el inventario, el almacén y los registros del agente, y firma con su clave. Ninguna petición crea una tarea, llama al worker, invoca una herramienta MCP ni ejecuta nada que venga en ella (diseño §7.3 y §13).
 - **Reenviar.** El servidor (`DiscoveryServer`) solo tiene el contexto de descubrimiento: ni el cliente HTTP de pares, ni el de descubrimiento, ni los blobs, ni el worker. No pregunta a otros pares, y no hay ninguna opción que lo haga.
-- **Autorizar.** Una página no es un grant: la ejecución vuelve a comprobar el grant del hito 1 al aceptar la tarea.
+- **Autorizar.** Ni una página ni una oferta son un grant: una oferta no reserva capacidad, y la ejecución vuelve a comprobar el grant del hito 1 al aceptar la tarea.
 
 ## 9. Interfaz local
 
 - **Gateway** (solo loopback, detrás del guardia local): `GET /discovery/inventory/{peer}?sections=a,b&cursor=…` pide una página al par con el grant más reciente que este agente tiene para él y que sirve tareas (la misma regla con la que el gateway presenta grants a la interfaz A2A del par), o sin grant si no tiene ninguno. Devuelve la página tal como la firmó el par, recodificada en ASCII, una vez verificada con este agente como `audience`. La guarda por par, por contexto de autorización (`public` o `grant:<emisor>/<grant_id>`) y por petición mientras está en vigor, y solo la vuelve a servir a una petición del mismo contexto.
-- **CLI:** `pals inventory get <par> [--sections a,b] [--all]` imprime cada página tal como la firmó el par, seguida de `verified: <agent id> <ámbito> seq <revisión>`; con `--all` sigue los cursores hasta el final de la cadena.
+- **Gateway:** `POST /discovery/query/{peer}` con una consulta de servicio en JSON (64 KiB de cuerpo como mucho; su JCS, 8 KiB, si no `413`; una consulta inválida es `400` con el motivo, sin preguntar al par) se la pregunta al par con el grant que este agente tiene para el `project` de la consulta si lo tiene, si no con el que presentaría a la interfaz A2A del par, o sin grant. Devuelve la oferta tal como la firmó el par, recodificada en ASCII, una vez aceptada (y guardada) por el cliente; una oferta rechazada es `502` con el motivo.
+- **CLI:** `pals inventory get <par> [--sections a,b] [--all]` imprime cada página tal como la firmó el par, seguida de `verified: <agent id> <ámbito> seq <revisión>`; con `--all` sigue los cursores hasta el final de la cadena. `pals query <par> --capability <id> [--input <mime>]… [--output <mime>]… [--requirements-file <json>] [--project <p>]` comprueba la consulta antes de preguntar, imprime la oferta tal como la firmó el par y después `verified: <agent id> <offer_id> <estado>`.

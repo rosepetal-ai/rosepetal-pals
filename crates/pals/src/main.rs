@@ -2,8 +2,8 @@
 //!
 //! Only `pals daemon` takes the data directory's lock; every other command
 //! opens the store directly, which a running daemon shares. `pals ask`,
-//! `pals task resume|cancel`, `pals card show <peer>` and `pals inventory
-//! get` reach peers through the running daemon's gateway.
+//! `pals task resume|cancel`, `pals card show <peer>`, `pals inventory get`
+//! and `pals query` reach peers through the running daemon's gateway.
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -28,6 +28,9 @@ use pals::net::agent_id_of;
 use pals::node::{Node, STORE_FILE};
 use pals::outbox::{AskError, AskOutcome, AskRequest, Outbox};
 use pals_core::card_jws::{CardSigner, verify_card};
+use pals_core::discovery::query::{
+    MAX_QUERY_BYTES, MAX_REPLY_TIMEOUT_MS, QUERY_SCHEMA, Requirements, ServiceQuery, accept_offer,
+};
 use pals_core::grant::{
     GRANT_SCHEMA, Grant, GrantError, MAX_TOKEN_BYTES, Operation, SignedGrant, format_timestamp,
     parse_timestamp,
@@ -101,6 +104,34 @@ enum Command {
     /// This agent's inventory
     #[command(subcommand)]
     Inventory(InventoryCommand),
+    /// Ask a peer whether it can serve a case, over agentnet-discovery/0
+    /// through the running daemon's gateway, which keeps its offer: print
+    /// the offer as the peer signed it for this agent, then `verified:
+    /// <agent id> <offer id> <status>`. Asking runs nothing on the peer, and
+    /// an offer authorizes nothing
+    Query {
+        /// The peer, by contact name or agent id
+        peer: String,
+        /// The capability: one of the common vocabulary, as vision.ocr, or
+        /// of its provider's namespace, as example:ocr
+        #[arg(long)]
+        capability: String,
+        /// A media type the peer must accept; repeat for more
+        #[arg(long = "input", value_name = "MIME")]
+        inputs: Vec<String>,
+        /// A media type the peer must produce; repeat for more
+        #[arg(long = "output", value_name = "MIME")]
+        outputs: Vec<String>,
+        /// A JSON file with the requirements: language,
+        /// external_cloud_allowed, required_region and inventory, with its
+        /// required and preferred ids and resources
+        #[arg(long, value_name = "JSON")]
+        requirements_file: Option<PathBuf>,
+        /// The project to be answered for, among those of the grant this
+        /// agent holds for the peer; another is answered as public
+        #[arg(long)]
+        project: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -284,6 +315,23 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             sections,
             all,
         }) => inventory_get(&home, &peer, &sections, all),
+        Command::Query {
+            peer,
+            capability,
+            inputs,
+            outputs,
+            requirements_file,
+            project,
+        } => {
+            let asked = Asked {
+                capability,
+                inputs,
+                outputs,
+                requirements_file,
+                project,
+            };
+            query(&home, &peer, asked)
+        }
     };
     done.map(|()| ExitCode::SUCCESS)
 }
@@ -575,6 +623,86 @@ fn inventory_get(home: &Path, peer: &str, sections: &[String], all: bool) -> any
         }
         bail!("{peer} keeps sending pages: stopped after {MAX_PAGES}")
     })
+}
+
+/// What `pals query` asks.
+struct Asked {
+    capability: String,
+    inputs: Vec<String>,
+    outputs: Vec<String>,
+    requirements_file: Option<PathBuf>,
+    project: Option<String>,
+}
+
+/// Asks `peer`, through the running daemon's gateway, for an offer for the
+/// query `asked` makes, and prints it as the peer signed it once it is
+/// accepted here too ([`accept_offer`]), then `verified: <agent id> <offer
+/// id> <status>`. The query is checked before anything is asked.
+fn query(home: &Path, peer: &str, asked: Asked) -> anyhow::Result<()> {
+    let requirements = match &asked.requirements_file {
+        Some(path) => {
+            let text = fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+            serde_json::from_slice::<Requirements>(&text)
+                .with_context(|| format!("invalid requirements in {}", path.display()))?
+        }
+        None => Requirements::default(),
+    };
+    let query = ServiceQuery {
+        schema: QUERY_SCHEMA.to_owned(),
+        query_id: new_query_id(),
+        capability: asked.capability,
+        input_media_types: asked.inputs,
+        output_media_types: asked.outputs,
+        requirements,
+        summary: None,
+        reply_timeout_ms: Some(MAX_REPLY_TIMEOUT_MS),
+        requested_inventory_sections: Vec::new(),
+        project: asked.project,
+        execution_authorized: false,
+    };
+    query
+        .validate()
+        .map_err(|err| anyhow!("invalid query: {err}"))?;
+    ensure!(
+        query.to_jcs().len() <= MAX_QUERY_BYTES,
+        "the query is larger than {MAX_QUERY_BYTES} bytes: ask for fewer things"
+    );
+    let (cfg, key) = load_agent(home)?;
+    let store = open_store(&cfg, &key)?;
+    let peer_id = peer_id(&store, peer)?;
+    let (listen, own) = (cfg.gateway.listen, key.id());
+    runtime(false)?.block_on(async move {
+        this_daemon(listen, &own).await?;
+        let path = format!("/discovery/query/{peer_id}");
+        let body = serde_json::to_value(&query)?;
+        let (status, _, answer) =
+            gateway_call(listen, http::Method::POST, &path, Some(&body)).await?;
+        let signed = gateway_json(status, &answer)?;
+        // The JCS of what the gateway re-encoded is what the peer signed.
+        let offer = accept_offer(
+            &pals_core::jcs::canonical(&signed),
+            &peer_id,
+            &own,
+            &query,
+            now_unix(),
+        )
+        .map_err(|err| anyhow!("the offer of {peer} is refused: {err}"))?;
+        let status = match serde_json::to_value(offer.doc.status)? {
+            Value::String(status) => status,
+            other => unreachable!("a status is named by a string, not {other}"),
+        };
+        println!("{}", serde_json::to_string_pretty(&signed)?);
+        println!("verified: {peer_id} {} {status}", offer.doc.offer_id);
+        Ok(())
+    })
+}
+
+/// A new query id: `q-` and 16 random hex characters.
+fn new_query_id() -> String {
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).expect("the OS random number generator failed");
+    let hex: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    format!("q-{hex}")
 }
 
 /// Prints `card`, then `verified: <signer> <hash>`.

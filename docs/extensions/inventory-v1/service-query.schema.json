@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Consulta de servicio, agentnet.service-query/1",
+  "description": "Lo que un solicitante pregunta a un candidato antes de encargarle nada (diseño §7.1): una capacidad, los formatos que entran y salen, y requisitos. Viaja como su JCS (RFC 8785), de 8192 bytes como mucho, en el campo ServiceQuery.query de agentnet-discovery/0, con una sola grafía: lo ausente se omite, nunca es null ni []. query_hash, el BLAKE3 de esos bytes, la vincula con la oferta que la contesta. Contestarla nunca ejecuta trabajo: el candidato la compara con los metadatos de su inventario y con los contadores de su worker.",
+  "type": "object",
+  "properties": {
+    "schema": { "const": "agentnet.service-query/1" },
+    "query_id": {
+      "$ref": "#/$defs/id",
+      "description": "El identificador que el solicitante da a la consulta; la oferta lo repite."
+    },
+    "capability": {
+      "type": "string",
+      "pattern": "^([a-z0-9._-]{1,128}|(?!agentnet:)[a-z0-9._-]{1,64}:[A-Za-z0-9._/-]{1,128})$",
+      "description": "Una capacidad del vocabulario común (vision.ocr) o del espacio de nombres de su proveedor (example:ocr), nunca del espacio agentnet."
+    },
+    "input_media_types": {
+      "$ref": "#/$defs/mediaTypes",
+      "description": "Cada uno tiene que aceptarlo el servicio (*/* y tipo/* lo cubren)."
+    },
+    "output_media_types": {
+      "$ref": "#/$defs/mediaTypes",
+      "description": "Cada uno tiene que producirlo el servicio."
+    },
+    "requirements": { "$ref": "#/$defs/requirements" },
+    "summary": {
+      "type": "string",
+      "maxLength": 1024,
+      "description": "El contexto mínimo del caso, de 1024 bytes como mucho (este esquema solo puede contar caracteres): nunca datos con los que trabajar."
+    },
+    "reply_timeout_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295,
+      "description": "Lo que el solicitante espera; por encima de 3000 cuenta como 3000."
+    },
+    "requested_inventory_sections": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/section" }
+    },
+    "project": {
+      "type": "string",
+      "pattern": "^[!-~]+$",
+      "description": "Uno de los proyectos que cubre el grant presentado. Nunca amplía el ámbito: si no es el del grant, o no hay grant, la consulta se contesta como pública."
+    },
+    "execution_authorized": {
+      "const": false,
+      "description": "Una consulta nunca autoriza ejecución."
+    }
+  },
+  "required": ["schema", "query_id", "capability", "requirements", "execution_authorized"],
+  "additionalProperties": false,
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,64}$"
+    },
+    "mediaTypes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": {
+        "type": "string",
+        "pattern": "^[ -~]{1,255}$",
+        "description": "tipo/subtipo, con parámetros si los hay."
+      }
+    },
+    "token": {
+      "type": "string",
+      "pattern": "^[ -~]{1,255}$"
+    },
+    "ids": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/token" }
+    },
+    "section": {
+      "enum": ["services", "skills", "plugins", "mcp", "runtime", "models", "information", "hardware", "network", "benchmarks"]
+    },
+    "requirements": {
+      "type": "object",
+      "description": "Todos obligatorios, salvo inventory.preferred. Una clave que el candidato no conoce no se da nunca por cumplida: va en unknown_requirements de la oferta.",
+      "properties": {
+        "language": {
+          "$ref": "#/$defs/token",
+          "description": "Un idioma en que trabaja el servicio (BCP 47)."
+        },
+        "external_cloud_allowed": {
+          "type": "boolean",
+          "description": "false: el servicio tiene que declarar que no usa nube externa."
+        },
+        "required_region": {
+          "$ref": "#/$defs/token",
+          "description": "La región en que el servicio tiene que declarar que procesa."
+        },
+        "inventory": { "$ref": "#/$defs/inventoryRequirements" }
+      },
+      "maxProperties": 36
+    },
+    "inventoryRequirements": {
+      "type": "object",
+      "description": "Requisitos sobre el inventario (diseño §9). Sus ids solo se envían a candidatos con un grant del proyecto.",
+      "properties": {
+        "required": { "$ref": "#/$defs/requirementSet" },
+        "preferred": {
+          "$ref": "#/$defs/requirementSet",
+          "description": "Preferencias: nunca hacen incompatible una oferta; las claves desconocidas se ignoran."
+        }
+      },
+      "additionalProperties": false
+    },
+    "requirementSet": {
+      "type": "object",
+      "properties": {
+        "mcp_integration_ids": {
+          "$ref": "#/$defs/ids",
+          "description": "Conexiones MCP: cumplidas solo con una observación en vigor que las da por operativas."
+        },
+        "information_source_ids": { "$ref": "#/$defs/ids" },
+        "skill_package_ids": { "$ref": "#/$defs/ids" },
+        "plugin_ids": { "$ref": "#/$defs/ids" },
+        "model_ids": { "$ref": "#/$defs/ids" },
+        "execution_external_cloud_allowed": {
+          "type": "boolean",
+          "description": "false: ningún modelo del servicio se ejecuta en un proveedor externo, y el servicio declara que no usa nube externa."
+        },
+        "min_offered_ram_mib": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Contra la RAM ofrecida, nunca contra la instalada."
+        },
+        "min_offered_vram_mib": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Contra la memoria ofrecida de cada acelerador."
+        },
+        "accelerators": {
+          "$ref": "#/$defs/ids",
+          "description": "Cada uno entre los aceleradores ofrecidos, por tipo o modelo."
+        }
+      },
+      "maxProperties": 41
+    }
+  }
+}

@@ -22,6 +22,7 @@ mod contacts;
 mod dedup;
 mod grants;
 mod migrate;
+mod offers;
 mod outbox;
 mod records;
 mod tasks;

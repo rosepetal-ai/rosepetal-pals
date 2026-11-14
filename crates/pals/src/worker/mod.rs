@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,6 +25,7 @@ use async_trait::async_trait;
 use futures::FutureExt;
 use futures::stream::{self, BoxStream, StreamExt};
 use iroh_blobs::Hash;
+use pals_core::discovery::{Load, LoadProbe};
 use pals_core::identity::AgentId;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -175,6 +177,10 @@ impl From<&ExecCfg> for Capacity {
 /// `CANCELED`. A canceled run adds nothing to the task: the SDK has made it
 /// `CANCELED` already, and that stays. A run whose events are dropped before
 /// it ends is stopped the same way.
+///
+/// It counts its tasks running and waiting for a turn, which service
+/// offers report ([`WorkerExecutor::load_probe`]): reading them never runs,
+/// queues or waits for anything.
 pub struct WorkerExecutor {
     adapter: Arc<dyn Adapter>,
     tasks_dir: PathBuf,
@@ -184,6 +190,44 @@ pub struct WorkerExecutor {
     running: Arc<Semaphore>,
     runs: Arc<Runs>,
     files: Files,
+    load: Arc<WorkerLoad>,
+}
+
+/// The tasks a [`WorkerExecutor`] has with a turn (`running`) and taken but
+/// waiting for one (`queued`), out of its [`Capacity`].
+#[derive(Debug)]
+pub struct WorkerLoad {
+    running: Arc<AtomicU32>,
+    queued: Arc<AtomicU32>,
+    capacity: Capacity,
+}
+
+impl LoadProbe for WorkerLoad {
+    fn load(&self) -> Load {
+        let limit = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        Load {
+            running: self.running.load(Ordering::SeqCst),
+            queued: self.queued.load(Ordering::SeqCst),
+            max_concurrent: limit(self.capacity.max_concurrent),
+            max_queue: limit(self.capacity.max_queue),
+        }
+    }
+}
+
+/// One task in a [`WorkerLoad`] counter, for as long as this value lives.
+struct Counted(Arc<AtomicU32>);
+
+impl Counted {
+    fn new(counter: &Arc<AtomicU32>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// How a run gets and sends files.
@@ -217,7 +261,19 @@ impl WorkerExecutor {
                 max_blob_bytes: cfg.limits.max_blob_bytes,
                 fetch_timeout: Duration::from_secs(cfg.limits.blob_fetch_timeout_s),
             },
+            load: Arc::new(WorkerLoad {
+                running: Arc::default(),
+                queued: Arc::default(),
+                capacity,
+            }),
         }
+    }
+
+    /// Its load as its counters say, shared with it: what the node's
+    /// discovery answers read, while the executor itself is the A2A
+    /// server's.
+    pub fn load_probe(&self) -> Arc<dyn LoadProbe> {
+        Arc::clone(&self.load) as Arc<dyn LoadProbe>
     }
 
     /// The adapter's input for the execution `ctx`, without its directories
@@ -327,6 +383,12 @@ fn safe_file_name(filename: &str) -> Option<String> {
     (!unfit).then(|| last.to_owned())
 }
 
+impl LoadProbe for WorkerExecutor {
+    fn load(&self) -> Load {
+        self.load.load()
+    }
+}
+
 impl AgentExecutor for WorkerExecutor {
     fn execute(&self, ctx: ExecutorContext) -> Events {
         let working = StreamResponse::Task(working_task(&ctx));
@@ -347,10 +409,11 @@ impl AgentExecutor for WorkerExecutor {
         self.runs.insert(&input.task_id, &run);
         let finished = tokio::spawn(run_task(
             Arc::clone(&self.adapter),
-            Arc::clone(&self.running),
+            (Arc::clone(&self.running), Arc::clone(&self.load.running)),
             RunSlot {
                 task_id: input.task_id.clone(),
                 taken: Some(taken),
+                queued: Some(Counted::new(&self.load.queued)),
                 runs: Arc::clone(&self.runs),
                 run: Arc::clone(&run),
             },
@@ -439,16 +502,19 @@ struct Run {
 }
 
 /// A run's place in the executor, given back when dropped: its permit, its
-/// entry in [`Runs`], and then [`Run::done`].
+/// entry in [`Runs`], and then [`Run::done`]; and, until it gets its turn,
+/// its count among the queued.
 struct RunSlot {
     task_id: String,
     taken: Option<OwnedSemaphorePermit>,
+    queued: Option<Counted>,
     runs: Arc<Runs>,
     run: Arc<Run>,
 }
 
 impl Drop for RunSlot {
     fn drop(&mut self) {
+        drop(self.queued.take());
         drop(self.taken.take());
         self.runs.remove(&self.task_id, &self.run);
         self.run.done.cancel();
@@ -465,21 +531,26 @@ struct Answer {
 /// Waits for a turn to run, unless canceled first, and runs `adapter` on
 /// `input` in new working directories, with the `inputs` fetched into
 /// `in_dir` first and the files it answers with published after; the
-/// directories are removed afterwards.
+/// directories are removed afterwards. The task counts as queued until its
+/// turn, then as running until it ends.
 async fn run_task(
     adapter: Arc<dyn Adapter>,
-    running: Arc<Semaphore>,
-    slot: RunSlot,
+    (running, running_count): (Arc<Semaphore>, Arc<AtomicU32>),
+    mut slot: RunSlot,
     input: TaskInput,
     (files, inputs): (Files, Vec<InputFile>),
 ) -> Result<Answer, AdapterError> {
     let cancel = slot.run.cancel.clone();
+    let queued = slot.queued.take();
     let outcome = async {
         let _turn = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(canceled()),
             turn = running.acquire_owned() => turn.expect("the semaphore is never closed"),
         };
+        // Running now, no longer waiting.
+        let _running = Counted::new(&running_count);
+        drop(queued);
         let task_dir = input
             .in_dir
             .parent()

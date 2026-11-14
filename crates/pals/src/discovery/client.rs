@@ -16,6 +16,11 @@
 //! A response that refuses is [`DiscoveryError::Remote`], once its records
 //! passed, with the peer's message cut to [`MAX_ERROR_MESSAGE_BYTES`].
 //!
+//! A service query ([`DiscoveryClient::query`]) gets an offer, which the
+//! client takes only once [`accept_offer`] does (signed by the peer asked,
+//! for this agent, for this query, in force) and keeps
+//! ([`Store::offer_received_put`]).
+//!
 //! [`CLOCK_SKEW_S`]: pals_core::grant::CLOCK_SKEW_S
 
 use std::collections::HashMap;
@@ -26,12 +31,13 @@ use std::time::Duration;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt, WriteError};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use pals_core::clock::{Clock, SystemClock};
-use pals_core::discovery::wire::{self, response};
+use pals_core::discovery::query::{MAX_QUERY_BYTES, OfferError, ServiceOffer, ServiceQuery};
+use pals_core::discovery::wire::{self, request, response};
 use pals_core::discovery::{
-    ALPN_DISCOVERY, MAX_ERROR_MESSAGE_BYTES, MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES,
-    decode, encode_frame, frame_len,
+    ALPN_DISCOVERY, DISCOVERY_VERSION, MAX_ERROR_MESSAGE_BYTES, MAX_REQUEST_FRAME_BYTES,
+    MAX_RESPONSE_FRAME_BYTES, accept_offer, decode, encode_frame, frame_len,
 };
-use pals_core::grant::parse_timestamp;
+use pals_core::grant::{SignedGrant, parse_timestamp};
 use pals_core::identity::AgentId;
 use pals_core::records::{AnnounceRecord, ContactRecord};
 use pals_core::signed::{Signed, SignedDoc, check_validity};
@@ -84,6 +90,10 @@ pub enum DiscoveryError {
     /// most [`MAX_ERROR_MESSAGE_BYTES`].
     #[error("the peer refused: {:?} ({:?})", .0.message, .0.code())]
     Remote(wire::Error),
+    /// The peer's answer to a service query is no offer this agent takes
+    /// ([`accept_offer`]).
+    #[error("the peer's offer is refused: {0}")]
+    Offer(OfferError),
 }
 
 /// Calls peers on `agentnet-discovery/0`. Cloning is cheap, and clones
@@ -147,7 +157,7 @@ impl DiscoveryClient {
             tokio::time::timeout(timeout, self.exchange(addr, &frame, limit))
                 .await
                 .map_err(|_| DiscoveryError::Timeout)??;
-        if response.version != pals_core::discovery::DISCOVERY_VERSION {
+        if response.version != DISCOVERY_VERSION {
             return Err(DiscoveryError::Protocol(format!(
                 "a response of version {}",
                 response.version
@@ -166,6 +176,65 @@ impl DiscoveryClient {
             None => Err(DiscoveryError::Protocol(
                 "a response without a result".to_owned(),
             )),
+        }
+    }
+
+    /// Asks `peer`, dialed at the addresses of `addr`, for an offer for
+    /// `query`, presenting `grant` when given, within `timeout`; the offer,
+    /// once [`accept_offer`] takes it at this agent's clock and the store
+    /// keeps it under (`peer`, its `offer_id`), and the reply it came in.
+    ///
+    /// [`DiscoveryError::TooLarge`] for a query over [`MAX_QUERY_BYTES`],
+    /// before anything is sent; [`DiscoveryError::Protocol`] for an answer
+    /// that is neither an offer nor a refusal; [`DiscoveryError::Offer`] for
+    /// an offer refused, which is not kept.
+    pub async fn query(
+        &self,
+        peer: &AgentId,
+        addr: EndpointAddr,
+        query: &ServiceQuery,
+        grant: Option<&SignedGrant>,
+        timeout: Duration,
+    ) -> Result<(Signed<ServiceOffer>, Reply), DiscoveryError> {
+        let bytes = query.to_jcs();
+        if bytes.len() > MAX_QUERY_BYTES {
+            return Err(DiscoveryError::TooLarge);
+        }
+        let req = wire::Request {
+            version: DISCOVERY_VERSION,
+            max_response_bytes: 0,
+            grant_token: grant.map(SignedGrant::to_token).unwrap_or_default(),
+            op: Some(request::Op::ServiceQuery(wire::ServiceQuery {
+                query: bytes,
+            })),
+        };
+        let reply = self.call(peer, addr, req, timeout).await?;
+        let Some(response::Result::ServiceOffer(offer)) = &reply.response.result else {
+            return Err(DiscoveryError::Protocol(
+                "an answer to a service query that is not an offer".to_owned(),
+            ));
+        };
+        let now = self.clock.now_unix();
+        let offer = accept_offer(offer, peer, self.store.owner(), query, now)
+            .map_err(DiscoveryError::Offer)?;
+        let kept = {
+            let (store, offer) = (Arc::clone(&self.store), offer.clone());
+            tokio::task::spawn_blocking(move || store.offer_received_put(&offer, now)).await
+        };
+        match kept {
+            Ok(Ok(())) => Ok((offer, reply)),
+            Ok(Err(err)) => {
+                tracing::warn!(error = %format!("{err:#}"), "cannot keep a peer's offer");
+                Err(DiscoveryError::Unreachable(
+                    "this agent cannot keep the peer's offer".to_owned(),
+                ))
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "keeping a peer's offer did not finish");
+                Err(DiscoveryError::Unreachable(
+                    "this agent cannot keep the peer's offer".to_owned(),
+                ))
+            }
         }
     }
 

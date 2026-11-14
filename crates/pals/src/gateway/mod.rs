@@ -12,6 +12,7 @@
 //! | `POST /peers/{peer}/jsonrpc`, or `/jsonrpc/` | the peer's `/jsonrpc` |
 //! | any method, `/peers/{peer}/rest/{*rest}` | the peer's `/rest/{rest}` |
 //! | `GET /discovery/inventory/{peer}?sections=a,b&cursor=…` | a page of the peer's inventory view, over `agentnet-discovery/0`, verified, as the peer signed it |
+//! | `POST /discovery/query/{peer}` | the body, an `agentnet.service-query/1`, asked of the peer over `agentnet-discovery/0`: its offer, accepted and kept, as the peer signed it |
 //! | `POST /blobs` | stores the raw body as a blob: `201 {"url", "hash", "size"}` |
 //! | `GET /blobs/{holder}/{hash}` | the blob, fetched from its holder first if need be |
 //! | any method, `/mcp` | the local [MCP server](crate::mcp), Streamable HTTP |
@@ -53,6 +54,17 @@
 //! An unknown section is `400`; the peer's refusal is `400` for a bad
 //! request or cursor, `429` with `Retry-After` when rate limited, `502`
 //! otherwise, with its message cut to printable ASCII.
+//!
+//! **Queries.** `POST /discovery/query/{peer}` takes a service query as its
+//! JSON body (at most [`MAX_QUERY_BODY_BYTES`], its JCS at most
+//! [`MAX_QUERY_BYTES`], else `413`; one that is not a valid query is `400`
+//! with the reason, before the peer is asked), asks the peer
+//! ([`DiscoveryClient::query`]) presenting the grant it holds for the
+//! query's `project` when it holds one, else the grant it would present to
+//! the peer's A2A server, or none, and answers with the offer as the peer
+//! signed it, re-encoded in ASCII, once the client accepted it, which keeps
+//! it ([`Store::offer_received_put`]). A refused offer is `502`; the peer's
+//! refusals and failures are answered as for the inventory.
 //!
 //! When the request carries no `Authorization`, the gateway presents the
 //! newest unexpired grant it holds for the peer that allows a task operation
@@ -145,6 +157,7 @@ use iroh_blobs::api::TempTag;
 use pals_core::card_jws::VerifiedCard;
 use pals_core::clock::Clock;
 use pals_core::discovery::DISCOVERY_VERSION;
+use pals_core::discovery::query::{MAX_QUERY_BYTES, ServiceQuery};
 use pals_core::discovery::wire::{self, ErrorCode, request, response};
 use pals_core::grant::{Grant, Operation, SignedGrant, parse_timestamp};
 use pals_core::identity::AgentId;
@@ -197,9 +210,12 @@ const JSON: &str = "application/json";
 const A2A_JSON: &str = "application/a2a+json";
 /// The type of every blob the gateway serves, whatever its content.
 const OCTET_STREAM: &str = "application/octet-stream";
-/// How long asking a peer for a page of its inventory may take, dialing
-/// included.
+/// How long asking a peer for a page of its inventory, or for an offer, may
+/// take, dialing included.
 const INVENTORY_TIMEOUT: Duration = Duration::from_secs(20);
+/// The largest body of `POST /discovery/query/{peer}`: a query, however it
+/// is spelled.
+pub const MAX_QUERY_BODY_BYTES: usize = 64 * 1024;
 /// The longest refusal message of a peer the gateway passes on.
 const MAX_PEER_MESSAGE_BYTES: usize = 256;
 
@@ -466,11 +482,31 @@ impl GatewayState {
     /// The newest unexpired grant held for `peer` that [serves
     /// tasks](serves_tasks).
     async fn held_grant(&self, peer: AgentId) -> Result<Option<SignedGrant>, StoreUnavailable> {
+        self.held_grant_for(peer, None).await
+    }
+
+    /// The newest unexpired grant held for `peer` that [serves
+    /// tasks](serves_tasks) in `project`, when there is one; else, as
+    /// [`GatewayState::held_grant`], the newest that serves tasks.
+    async fn held_grant_for(
+        &self,
+        peer: AgentId,
+        project: Option<String>,
+    ) -> Result<Option<SignedGrant>, StoreUnavailable> {
         let store = Arc::clone(&self.inner.store);
         blocking(move || {
             let now = chrono::Utc::now().timestamp();
-            let held = store.grants_held_for(&peer, now)?;
-            Ok(held.into_iter().find(|g| serves_tasks(&g.grant)))
+            let held: Vec<SignedGrant> = store
+                .grants_held_for(&peer, now)?
+                .into_iter()
+                .filter(|g| serves_tasks(&g.grant))
+                .collect();
+            let for_project =
+                project.and_then(|project| held.iter().position(|g| g.grant.project == project));
+            Ok(match for_project {
+                Some(at) => held.into_iter().nth(at),
+                None => held.into_iter().next(),
+            })
         })
         .await
     }
@@ -530,6 +566,7 @@ pub fn router(state: GatewayState) -> Router {
         .route("/peers/{peer}/jsonrpc/", post(forward_jsonrpc))
         .route("/peers/{peer}/rest/{*rest}", any(forward_rest))
         .route("/discovery/inventory/{peer}", get(peer_inventory))
+        .route("/discovery/query/{peer}", post(peer_query))
         .route("/blobs", post(upload_blob))
         .route("/blobs/{holder}/{hash}", get(download_blob))
         .route_service("/mcp", crate::mcp::service(state.clone()))
@@ -792,9 +829,54 @@ async fn peer_inventory(
     page_response(&page)
 }
 
-/// A verified page as the gateway serves it: its JSON, re-encoded in ASCII.
+/// `peer`'s offer for the query the body holds, accepted and kept by this
+/// agent's discovery client, as the peer signed it.
+async fn peer_query(
+    State(state): State<GatewayState>,
+    Path(peer): Path<String>,
+    request: Request,
+) -> Response {
+    let Ok(body) = axum::body::to_bytes(request.into_body(), MAX_QUERY_BODY_BYTES).await else {
+        return error(StatusCode::PAYLOAD_TOO_LARGE, "query too large");
+    };
+    let Ok(query) = serde_json::from_slice::<ServiceQuery>(&body) else {
+        return error(StatusCode::BAD_REQUEST, "invalid query: malformed query");
+    };
+    if query.to_jcs().len() > MAX_QUERY_BYTES {
+        return error(StatusCode::PAYLOAD_TOO_LARGE, "query too large");
+    }
+    if let Err(why) = query.validate() {
+        return error(StatusCode::BAD_REQUEST, format!("invalid query: {why}"));
+    }
+    let target = match state.resolve(peer).await {
+        Ok(Some(target)) => target,
+        Ok(None) => return unknown_peer(),
+        Err(failure) => return failure.into_response(),
+    };
+    let grant = match state.held_grant_for(target.id, query.project.clone()).await {
+        Ok(grant) => grant,
+        Err(failure) => return failure.into_response(),
+    };
+    let discovery = &state.inner.discovery;
+    match discovery
+        .query(
+            &target.id,
+            target.addr.clone(),
+            &query,
+            grant.as_ref(),
+            INVENTORY_TIMEOUT,
+        )
+        .await
+    {
+        Ok((offer, _)) => page_response(&offer.to_json()),
+        Err(failure) => discovery_failure(&target.id, &failure),
+    }
+}
+
+/// A verified page, or offer, as the gateway serves it: its JSON,
+/// re-encoded in ASCII.
 fn page_response(page: &[u8]) -> Response {
-    let value: Value = serde_json::from_slice(page).expect("a verified page is JSON");
+    let value: Value = serde_json::from_slice(page).expect("a verified document is JSON");
     (
         [(CONTENT_TYPE, HeaderValue::from_static(JSON))],
         checks::ascii_json(&value),
@@ -846,9 +928,9 @@ fn inventory_request_key(sections: &[String], cursor: &str) -> String {
     )
 }
 
-/// The answer to a discovery call to `peer` that got no page.
+/// The answer to a discovery call to `peer` that got no page, or no offer.
 fn discovery_failure(peer: &AgentId, failure: &DiscoveryError) -> Response {
-    tracing::debug!(%peer, error = %failure, "no inventory page from the peer");
+    tracing::debug!(%peer, error = %failure, "no answer to use from the peer");
     match failure {
         DiscoveryError::Unreachable(_) | DiscoveryError::Timeout => {
             error(StatusCode::BAD_GATEWAY, "peer unreachable")
@@ -860,6 +942,10 @@ fn discovery_failure(peer: &AgentId, failure: &DiscoveryError) -> Response {
         DiscoveryError::Regression { .. } => {
             error(StatusCode::BAD_GATEWAY, "peer record regression")
         }
+        DiscoveryError::Offer(refused) => error(
+            StatusCode::BAD_GATEWAY,
+            format!("peer offer invalid: {refused}"),
+        ),
         DiscoveryError::Remote(refusal) => {
             // The peer's words are data: printable ASCII only, and short.
             let said: String = refusal

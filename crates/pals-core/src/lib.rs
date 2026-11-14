@@ -11,10 +11,12 @@
 //! (contacts, grants, revocations, the A2A tasks the agent serves, the
 //! messages it has seen, the questions it asks, its own and its peers'
 //! records, its peers' verified cards, the revisions of its own views and
-//! the pages of its peers'), [`events`] the signed, hash-chained event log
-//! kept in it, [`discovery`] the messages of `agentnet-discovery/0` and the
-//! answers to them, which read and sign but never run work, and [`clock`]
-//! the clock quotas and records follow, which tests set by hand.
+//! the pages of its peers', the service offers it issued and received),
+//! [`events`] the signed, hash-chained event log kept in it, [`discovery`]
+//! the messages of `agentnet-discovery/0` and the answers to them, service
+//! queries matched on metadata and the signed offers that answer them,
+//! which read and sign but never run work, and [`clock`] the clock quotas,
+//! records and offers follow, which tests set by hand.
 
 pub mod card_jws;
 pub mod clock;

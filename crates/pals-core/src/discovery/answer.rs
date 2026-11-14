@@ -16,9 +16,10 @@
 //!    public one, or an empty public view when the agent shows none: a view
 //!    of revision 1 whose pages are never cached, so that it and the public
 //!    view a grant gives never stand for each other.
-//! 4. **Operation.** `GetInventory` is a signed page of the scope's view;
-//!    `GetBenchmarkReport` and `ServiceQuery` are `UNSUPPORTED_OPERATION`
-//!    in this version of the daemon; none is `BAD_REQUEST`.
+//! 4. **Operation.** `GetInventory` is a signed page of the scope's view.
+//!    `ServiceQuery` is a signed offer ([`service_query`]).
+//!    `GetBenchmarkReport` is `UNSUPPORTED_OPERATION` in this version of
+//!    the daemon; none is `BAD_REQUEST`.
 //!
 //! Every response carries the agent's limits and its signed records in
 //! force. An error message is a fixed text of at most
@@ -28,18 +29,24 @@
 //! `max_response_bytes` and [`MAX_RESPONSE_FRAME_BYTES`] is replaced by a
 //! `TOO_LARGE` error, which is sent whatever its size.
 
+use std::sync::Arc;
+
 use serde::Deserialize;
 use serde::de::IntoDeserializer;
 use serde::de::value::{Error as NotASection, StrDeserializer};
 
+use super::matching::evaluate;
+use super::query::{OfferParts, QueryError, ServiceOffer, ServiceQuery, query_hash, sign_offer};
 use super::wire::{self, ErrorCode, request, response};
 use super::{DISCOVERY_VERSION, DiscoveryContext, MAX_RESPONSE_FRAME_BYTES, PUBLIC_CARD};
+use crate::card_jws::CardHash;
 use crate::grant::{AcceptError, Acceptance, GrantError, Need, accept_grant};
 use crate::identity::AgentId;
 use crate::inventory::view::{
-    INVENTORY_SECTIONS, PageRequest, VIEW_TTL_S, ViewError, content_hash, page, render, sign_page,
+    INVENTORY_SECTIONS, PageRequest, VIEW_TTL_S, ViewEntry, ViewError, content_hash, page, render,
+    sign_page,
 };
-use crate::inventory::{Scope, Section};
+use crate::inventory::{InventorySnapshot, Scope, Section};
 use prost::Message;
 
 /// How long a signed page is served again from the cache: half its life, so
@@ -115,19 +122,38 @@ fn outcome(
         Some(request::Op::GetInventory(get)) => {
             get_inventory(ctx, peer, &viewer, get, now_unix).map(response::Result::InventoryPage)
         }
-        Some(request::Op::GetBenchmarkReport(_) | request::Op::ServiceQuery(_)) => Err(
-            wire::Error::new(ErrorCode::UnsupportedOperation, "unsupported operation"),
-        ),
+        Some(request::Op::ServiceQuery(query)) => {
+            service_query(ctx, peer, &viewer, &query.query, now_unix)
+                .map(response::Result::ServiceOffer)
+        }
+        Some(request::Op::GetBenchmarkReport(_)) => Err(wire::Error::new(
+            ErrorCode::UnsupportedOperation,
+            "unsupported operation",
+        )),
         None => Err(bad_request("no operation")),
     }
 }
 
-/// Who asks, as the agent sees it: the scope its grant gives, and whether
-/// its view is the empty one of a requester without a grant when the agent
-/// shows no public view.
+/// Who asks, as the agent sees it: the scope its grant gives, the grant's
+/// project, and whether its view is the empty one of a requester without a
+/// grant when the agent shows no public view.
 struct Viewer {
     scope: Scope,
+    /// The project of the grant presented and accepted.
+    project: Option<String>,
     empty: bool,
+}
+
+impl Viewer {
+    /// The scope a query that names `project` gets: the grant's when it
+    /// names none or the grant's own project, the public one otherwise. A
+    /// v1 grant covers one project, and a query never widens what it shows.
+    fn scope_for(&self, project: Option<&str>) -> Scope {
+        match project {
+            Some(asked) if self.project.as_deref() != Some(asked) => Scope::Public,
+            _ => self.scope.clone(),
+        }
+    }
 }
 
 fn viewer(
@@ -139,6 +165,7 @@ fn viewer(
     if token.is_empty() {
         return Ok(Viewer {
             scope: Scope::Public,
+            project: None,
             empty: !ctx.public,
         });
     }
@@ -161,6 +188,7 @@ fn viewer(
     }
     Ok(Viewer {
         scope,
+        project: Some(grant.grant.project),
         empty: false,
     })
 }
@@ -182,17 +210,7 @@ fn get_inventory(
     let (all, revision) = if viewer.empty {
         (Vec::new(), EMPTY_VIEW_REVISION)
     } else {
-        // The revision follows every section the scope shows, whatever is
-        // asked.
-        let all = render(&(ctx.inventory)(), scope, &INVENTORY_SECTIONS);
-        let revision = ctx
-            .store
-            .view_revision(&scope.key(), &content_hash(&all), now_unix)
-            .map_err(|err| {
-                tracing::warn!(error = %format!("{err:#}"), "cannot read a view's revision");
-                internal()
-            })?;
-        (all, revision)
+        view_revision(ctx, &(ctx.inventory)(), scope, now_unix)?
     };
     let req = PageRequest {
         scope,
@@ -211,20 +229,111 @@ fn get_inventory(
         .filter(|entry| sections.contains(&entry.section))
         .collect();
     let slice = page(&entries, &req, &ctx.cursor_key).map_err(view_refusal)?;
-    let card_hash = ctx
-        .card_hashes
-        .get(&scope.key())
-        .or_else(|| ctx.card_hashes.get(PUBLIC_CARD))
-        .ok_or_else(|| {
-            tracing::error!("the discovery context holds no public card hash");
-            internal()
-        })?;
+    let card_hash = card_hash(ctx, scope)?;
     let signed = sign_page(&ctx.key, card_hash, &req, slice, now_unix).map_err(view_refusal)?;
     let bytes = signed.to_json();
     if !viewer.empty {
         ctx.views.put(&req, bytes.clone(), now_unix + PAGE_CACHE_S);
     }
     Ok(bytes)
+}
+
+/// The offer for `peer`'s query `bytes`, signed and kept
+/// ([`crate::store::Store::offer_issued_put`]).
+///
+/// The query must be one ([`ServiceQuery::from_jcs`]): `TOO_LARGE` over
+/// [`super::query::MAX_QUERY_BYTES`], `BAD_REQUEST` with the fixed reason
+/// otherwise. Its scope is the viewer's for the project it names
+/// ([`Viewer::scope_for`]); it is matched against the inventory as that
+/// scope shows it and the worker's load ([`evaluate`]), and the offer names
+/// the scope, its card, its view's revision and the query's hash, lasts
+/// [`DiscoveryContext::offer_valid_for_ms`] and is cut to fit
+/// ([`sign_offer`]). Nothing runs: the matching reads metadata only.
+fn service_query(
+    ctx: &DiscoveryContext,
+    peer: &AgentId,
+    viewer: &Viewer,
+    bytes: &[u8],
+    now_unix: i64,
+) -> Result<Vec<u8>, wire::Error> {
+    let query = ServiceQuery::from_jcs(bytes).map_err(|err| match err {
+        QueryError::TooLarge => wire::Error::new(ErrorCode::TooLarge, "query too large"),
+        QueryError::Invalid(why) => bad_request(why),
+    })?;
+    let scope = viewer.scope_for(query.project.as_deref());
+    // The empty view shows nothing: no service of any capability.
+    let (snapshot, revision) = if viewer.empty {
+        (Arc::new(InventorySnapshot::default()), EMPTY_VIEW_REVISION)
+    } else {
+        let snapshot = (ctx.inventory)();
+        let (_, revision) = view_revision(ctx, &snapshot, &scope, now_unix)?;
+        (snapshot, revision)
+    };
+    let evaluation = evaluate(&query, &snapshot, &scope, ctx.load.load(), now_unix);
+    let parts = OfferParts {
+        offer_id: new_offer_id(),
+        agent_id: ctx.key.id(),
+        requester: *peer,
+        query_id: query.query_id.clone(),
+        query_hash: query_hash(bytes),
+        agent_card_hash: card_hash(ctx, &scope)?.clone(),
+        scope: scope.key(),
+        inventory_revision: revision,
+        valid_for_ms: ctx.offer_valid_for_ms,
+        now_unix,
+    };
+    let offer = ServiceOffer::new(parts, evaluation).ok_or_else(|| {
+        tracing::warn!(now_unix, "cannot date an offer");
+        internal()
+    })?;
+    let signed = sign_offer(&ctx.key, offer).map_err(|err| {
+        tracing::warn!(error = %err, "cannot sign an offer");
+        internal()
+    })?;
+    ctx.store.offer_issued_put(&signed).map_err(|err| {
+        tracing::warn!(error = %format!("{err:#}"), "cannot keep an offer");
+        internal()
+    })?;
+    Ok(signed.to_json())
+}
+
+/// A new offer id: `offer-` and 32 random hex characters.
+fn new_offer_id() -> String {
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).expect("the OS random number generator failed");
+    let hex: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    format!("offer-{hex}")
+}
+
+/// What `scope` shows of `snapshot`, every section of it, and its
+/// revision: it follows every section the scope shows, whatever is asked.
+fn view_revision(
+    ctx: &DiscoveryContext,
+    snapshot: &InventorySnapshot,
+    scope: &Scope,
+    now_unix: i64,
+) -> Result<(Vec<ViewEntry>, u64), wire::Error> {
+    let all = render(snapshot, scope, &INVENTORY_SECTIONS);
+    let revision = ctx
+        .store
+        .view_revision(&scope.key(), &content_hash(&all), now_unix)
+        .map_err(|err| {
+            tracing::warn!(error = %format!("{err:#}"), "cannot read a view's revision");
+            internal()
+        })?;
+    Ok((all, revision))
+}
+
+/// The hash of the card of `scope`, or of the public card when the scope
+/// has none of its own.
+fn card_hash<'a>(ctx: &'a DiscoveryContext, scope: &Scope) -> Result<&'a CardHash, wire::Error> {
+    ctx.card_hashes
+        .get(&scope.key())
+        .or_else(|| ctx.card_hashes.get(PUBLIC_CARD))
+        .ok_or_else(|| {
+            tracing::error!("the discovery context holds no public card hash");
+            internal()
+        })
 }
 
 /// The inventory sections `names` lists, in order and without repeats; all
@@ -318,6 +427,7 @@ mod tests {
             cursor_key: CursorKey::random(),
             views: ViewCache::new(),
             load: Arc::new(Load::unbounded()),
+            offer_valid_for_ms: 15_000,
         }
     }
 

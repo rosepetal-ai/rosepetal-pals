@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Oferta de servicio firmada, agentnet.service-offer/1",
+  "description": "La respuesta de un candidato a una consulta de servicio (diseño §7.2), firmada por él para un solo solicitante y vinculada a la consulta por su hash. Viaja como el JCS (RFC 8785) de este objeto, de 16384 bytes como mucho, en el resultado service_offer de agentnet-discovery/0. La firma es Ed25519 de la clave de offer.agent_id sobre \"agentnet.offer/1\\n\" seguido del JCS de offer, en base64url sin relleno, y se comprueba sobre la oferta recibida antes de leerla; lo ausente se omite, nunca es null. Quien la recibe la rechaza si no la firma el par al que preguntó, si es para otro solicitante, si no es de su consulta o si ha caducado, con 60 s de desfase solo para rechazar. Una oferta no reserva capacidad ni autoriza nada: la tarea que la nombra se vuelve a comprobar, grant incluido, al llegar.",
+  "type": "object",
+  "properties": {
+    "offer": { "$ref": "#/$defs/offer" },
+    "signature": { "$ref": "#/$defs/signature" }
+  },
+  "required": ["offer", "signature"],
+  "additionalProperties": false,
+  "$defs": {
+    "offer": {
+      "type": "object",
+      "properties": {
+        "schema": { "const": "agentnet.service-offer/1" },
+        "query_id": {
+          "$ref": "#/$defs/id",
+          "description": "El de la consulta que contesta."
+        },
+        "offer_id": {
+          "$ref": "#/$defs/id",
+          "description": "Único entre las ofertas del proveedor, no entre las de todos: quien la recibe la guarda por (proveedor, offer_id)."
+        },
+        "agent_id": {
+          "$ref": "#/$defs/agentId",
+          "description": "El proveedor, que es también quien la firma."
+        },
+        "requester": {
+          "$ref": "#/$defs/agentId",
+          "description": "El único agente para el que vale."
+        },
+        "query_hash": {
+          "$ref": "#/$defs/hash",
+          "description": "BLAKE3 del JCS de la consulta contestada."
+        },
+        "skill_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+          "description": "El servicio, skill de la card, del que trata. Ausente cuando el ámbito del solicitante no muestra ningún servicio de la capacidad."
+        },
+        "agent_card_hash": {
+          "$ref": "#/$defs/hash",
+          "description": "La card del ámbito del solicitante."
+        },
+        "scope": {
+          "type": "string",
+          "pattern": "^(public|(project|task):[!-~]+)$",
+          "description": "El ámbito del solicitante: sale del grant que presentó, y la consulta nunca lo amplía."
+        },
+        "inventory_revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "description": "La revisión de la vista del ámbito al hacer la oferta. Cambia con todo cambio de lo que muestra el ámbito, también con las fechas de una observación: una oferta así queda obsoleta."
+        },
+        "status": {
+          "enum": ["available", "busy", "needs_information", "not_offered"],
+          "description": "available y busy: compatible, con plaza o sin ella. needs_information: incompatible solo por algo obligatorio desconocido. not_offered: ningún servicio de la capacidad en el ámbito, o uno que incumple algo obligatorio."
+        },
+        "compatible": {
+          "type": "boolean",
+          "description": "Todo lo obligatorio se cumple; true exactamente con available y busy."
+        },
+        "conditions": { "$ref": "#/$defs/conditions" },
+        "requirement_results": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/requirementResult" }
+        },
+        "unknown_requirements": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Los requisitos obligatorios que el candidato no conoce: nunca cumplidos."
+        },
+        "estimated_start_delay_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Lo que declara el servicio; ausente si no declara nada, nunca cero por desconocido."
+        },
+        "estimated_duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Lo que declara el servicio; ausente si no declara nada, nunca cero por desconocido."
+        },
+        "valid_for_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300000
+        },
+        "issued_at": { "$ref": "#/$defs/timestamp" },
+        "expires_at": {
+          "$ref": "#/$defs/timestamp",
+          "description": "issued_at más valid_for_ms redondeado al segundo por arriba. Este esquema no puede expresarlo; PALS rechaza la oferta que lo incumple."
+        },
+        "limitations": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Las del servicio. Una oferta que no cabe en 16 KiB se recorta por el final y termina en \"truncated\"."
+        },
+        "benchmark_refs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/benchmarkRef" }
+        }
+      },
+      "required": [
+        "schema",
+        "query_id",
+        "offer_id",
+        "agent_id",
+        "requester",
+        "query_hash",
+        "agent_card_hash",
+        "scope",
+        "inventory_revision",
+        "status",
+        "compatible",
+        "conditions",
+        "requirement_results",
+        "unknown_requirements",
+        "valid_for_ms",
+        "issued_at",
+        "expires_at",
+        "limitations",
+        "benchmark_refs"
+      ],
+      "additionalProperties": false
+    },
+    "conditions": {
+      "type": "object",
+      "description": "Cómo sería ejecutarlo, según lo declara el servicio.",
+      "properties": {
+        "external_cloud_used": { "type": "boolean" },
+        "processing_region": { "type": "string", "minLength": 1 },
+        "authorization_required": {
+          "type": "boolean",
+          "description": "El grant presentado no deja enviar tareas. Toda tarea se comprueba contra su grant diga esto lo que diga."
+        }
+      },
+      "required": ["authorization_required"],
+      "additionalProperties": false
+    },
+    "requirementResult": {
+      "type": "object",
+      "properties": {
+        "requirement": {
+          "type": "string",
+          "minLength": 1,
+          "description": "language, required_region, external_cloud_allowed, input_media_type:<tipo>, output_media_type:<tipo>, mcp_integration:<id>, information_source:<id>, skill_package:<id>, plugin:<id>, model:<id>, execution_external_cloud_allowed, min_offered_ram_mib, min_offered_vram_mib, accelerator:<nombre>, o la clave desconocida (inventory.<clave> bajo inventory.required)."
+        },
+        "mandatory": { "type": "boolean" },
+        "result": {
+          "enum": ["met", "not_met", "unknown"],
+          "description": "unknown: desconocido o no visible en el ámbito del solicitante; nunca cumplido."
+        },
+        "basis": {
+          "enum": ["declared", "observed"],
+          "description": "En qué se apoya: la declaración del operador o una observación en vigor de un adaptador. Ausente si el resultado es unknown."
+        }
+      },
+      "required": ["requirement", "mandatory", "result"],
+      "additionalProperties": false
+    },
+    "benchmarkRef": {
+      "type": "object",
+      "properties": {
+        "benchmark_id": { "type": "string", "minLength": 1 },
+        "profile": { "type": "string", "minLength": 1 },
+        "measurement_kind": { "type": "string", "minLength": 1 },
+        "measured_at": { "$ref": "#/$defs/timestamp" },
+        "expires_at": { "$ref": "#/$defs/timestamp" }
+      },
+      "required": ["benchmark_id", "profile", "measurement_kind", "measured_at", "expires_at"],
+      "additionalProperties": false
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,64}$"
+    },
+    "hash": {
+      "type": "string",
+      "pattern": "^blake3:[0-9a-f]{64}$"
+    },
+    "agentId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Clave pública Ed25519 del agente en hexadecimal en minúsculas."
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$",
+      "description": "RFC 3339 en UTC con segundos enteros: 2026-11-14T00:00:00Z."
+    },
+    "signature": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{85}[AQgw]$",
+      "description": "Firma Ed25519 de 64 bytes en base64url sin relleno."
+    }
+  }
+}

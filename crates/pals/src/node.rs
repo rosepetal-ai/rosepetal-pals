@@ -65,6 +65,10 @@ const DEDUP_PURGE_INTERVAL: Duration = Duration::from_secs(3600);
 /// ([`Records::renew`]), besides once when it starts.
 const RECORD_RENEW_INTERVAL: Duration = Duration::from_secs(3600);
 
+/// How long a node keeps an offer it issued once it expired: a task that
+/// names it is refused as `offer_expired`, not `offer_unknown`, meanwhile.
+const OFFER_RETENTION_S: i64 = 24 * 3600;
+
 /// How long [`Node::shutdown`] waits for the gateway's open connections to
 /// finish before dropping them.
 const GATEWAY_STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -125,8 +129,8 @@ pub struct Node {
     records: Records,
     router: Router,
     gateway: GatewayServer,
-    /// Purges old dedup rows and expired pages of peers' views every
-    /// [`DEDUP_PURGE_INTERVAL`] while the node runs.
+    /// Purges old dedup rows, expired pages of peers' views and expired
+    /// offers every [`DEDUP_PURGE_INTERVAL`] while the node runs.
     dedup_purge: AbortOnDrop,
     /// Renews the records every [`RECORD_RENEW_INTERVAL`] while the node
     /// runs.
@@ -154,7 +158,8 @@ impl Node {
     /// progress and removes
     /// their working directories ([`TASKS_DIR`]); frees the dedup keys it
     /// left with no execution behind them, and purges the dedup rows older
-    /// than [`DEDUP_RETENTION_S`]; logs how many questions of its own
+    /// than [`DEDUP_RETENTION_S`], and the expired pages of peers' views and
+    /// offers; logs how many questions of its own
     /// [outbox](Outbox) are still pending, and leaves them for
     /// [`Outbox::resume`]: it never sends them again on its own; binds the
     /// gateway's listener on `gateway.listen`, which must be a loopback
@@ -166,9 +171,11 @@ impl Node {
     /// endpoint and starts the gateway. With `net.relay` the endpoint uses
     /// Iroh's N0 preset and its public relays; without it, it has no relay
     /// and is bound to 127.0.0.1 only. While it runs, the node purges the
-    /// dedup rows and the expired pages of peers' views again and renews its
-    /// records every hour, and renews them too whenever the endpoint's
-    /// addresses change.
+    /// dedup rows, the expired pages of peers' views and the expired offers
+    /// again and renews its records every hour, and renews them too whenever
+    /// the endpoint's addresses change. With the `exec` worker, its offers
+    /// report the worker's load ([`WorkerExecutor::load_probe`]); with the
+    /// others, a load without bounds.
     pub async fn spawn(cfg: Config) -> anyhow::Result<Node> {
         #[cfg(not(unix))]
         if matches!(cfg.worker, WorkerCfg::Exec(_)) {
@@ -184,6 +191,11 @@ impl Node {
                 let adapter = Arc::new(ExecAdapter::new(exec.clone(), &cfg.projects));
                 let executor =
                     WorkerExecutor::new(adapter, &cfg, Capacity::from(exec), opened.blobs.clone());
+                // Its offers say how busy it is.
+                let opts = NodeOptions {
+                    load: Some(executor.load_probe()),
+                    ..opts
+                };
                 Ok(opened.start(&cfg, executor, opts))
             }
             #[cfg(not(unix))]
@@ -391,6 +403,7 @@ impl Opened {
                 purge_dedup(&store).context("cannot purge the old dedup rows")?;
                 purge_inventory_cache(&store, started)
                     .context("cannot purge the expired pages of peers' views")?;
+                purge_offers(&store, started).context("cannot purge the expired offers")?;
                 let pending = store
                     .outbox_pending()
                     .context("cannot read the outbox")?
@@ -553,7 +566,8 @@ impl Opened {
 /// store, its inventory and records as they are at each answer (never as
 /// they were at start), the hash of each card, the issuers it accepts
 /// grants of (itself and `trusted_issuers`), whether it shows its public
-/// view, this run's cursor key and page cache, and the worker's load.
+/// view, this run's cursor key and page cache, the worker's load, and how
+/// long its offers last.
 fn discovery_context(
     cfg: &Config,
     key: &Arc<AgentKey>,
@@ -586,6 +600,7 @@ fn discovery_context(
         cursor_key: CursorKey::random(),
         views: ViewCache::new(),
         load: load.unwrap_or_else(|| Arc::new(Load::unbounded())),
+        offer_valid_for_ms: cfg.discovery.offer_valid_for_ms,
     }
 }
 
@@ -677,9 +692,21 @@ fn purge_inventory_cache(store: &Store, now_unix: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// [`purge_dedup`], and [`purge_inventory_cache`] at `clock`'s time, every
-/// [`DEDUP_PURGE_INTERVAL`], for as long as it runs. A failed purge is
-/// logged, and the next one tries again.
+/// Deletes the offers this agent issued that expired more than
+/// [`OFFER_RETENTION_S`] before `now_unix`, and those it received that
+/// expired by then.
+fn purge_offers(store: &Store, now_unix: i64) -> anyhow::Result<()> {
+    let issued = store.offers_issued_purge(now_unix - OFFER_RETENTION_S)?;
+    let received = store.offers_received_purge(now_unix)?;
+    if issued + received > 0 {
+        tracing::debug!(issued, received, "purged expired offers");
+    }
+    Ok(())
+}
+
+/// [`purge_dedup`], and [`purge_inventory_cache`] and [`purge_offers`] at
+/// `clock`'s time, every [`DEDUP_PURGE_INTERVAL`], for as long as it runs. A
+/// failed purge is logged, and the next one tries again.
 async fn purge_hourly(store: Arc<Store>, clock: Arc<dyn Clock>) {
     let start = tokio::time::Instant::now() + DEDUP_PURGE_INTERVAL;
     let mut ticks = tokio::time::interval_at(start, DEDUP_PURGE_INTERVAL);
@@ -691,7 +718,8 @@ async fn purge_hourly(store: Arc<Store>, clock: Arc<dyn Clock>) {
         let purged = tokio::task::spawn_blocking(move || {
             purge_dedup(&store).context("cannot purge the old dedup rows")?;
             purge_inventory_cache(&store, now)
-                .context("cannot purge the expired pages of peers' views")
+                .context("cannot purge the expired pages of peers' views")?;
+            purge_offers(&store, now).context("cannot purge the expired offers")
         })
         .await;
         match purged {

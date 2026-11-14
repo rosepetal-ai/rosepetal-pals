@@ -12,6 +12,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use pals_core::discovery::MAX_OFFER_VALID_FOR_MS;
 use pals_core::identity::AgentId;
 use serde::Deserialize;
 
@@ -95,6 +96,10 @@ refresh_interval_s = 900
 # Iroh ALPN: they get the view of the inventory their grant gives, signed.
 # true: a peer without a grant sees the public view; false: an empty one.
 public = true
+# How long the offers this agent makes in answer to service queries last,
+# in milliseconds, rounded up to whole seconds: at most 300000. An offer
+# reserves nothing and authorizes nothing.
+offer_valid_for_ms = 15000
 
 [limits]
 max_body_bytes = 1048576      # 1 MiB
@@ -489,11 +494,19 @@ pub struct DiscoveryCfg {
     /// inventory; without it, it sees an empty one. A grant's view is shown
     /// either way.
     pub public: bool,
+    /// How long a service offer lasts, from 1 to
+    /// [`MAX_OFFER_VALID_FOR_MS`]; rounded up to whole seconds.
+    pub offer_valid_for_ms: u32,
 }
 
 impl Default for DiscoveryCfg {
+    /// The public view, and offers valid 15 s, as the example of design
+    /// §7.2.
     fn default() -> Self {
-        Self { public: true }
+        Self {
+            public: true,
+            offer_valid_for_ms: 15_000,
+        }
     }
 }
 
@@ -550,6 +563,13 @@ impl Config {
         if cfg.inventory.refresh_interval_s == 0 {
             bail!(
                 "invalid {}: inventory.refresh_interval_s must be at least 1",
+                path.display()
+            );
+        }
+        if !(1..=MAX_OFFER_VALID_FOR_MS).contains(&cfg.discovery.offer_valid_for_ms) {
+            bail!(
+                "invalid {}: discovery.offer_valid_for_ms must be from 1 to \
+                 {MAX_OFFER_VALID_FOR_MS}",
                 path.display()
             );
         }
@@ -823,12 +843,31 @@ path = "/srv/demo"
         let text = "[discovery]\npublic = false\n";
         let cfg = Config::load(&write_config(dir.path(), text)).unwrap();
         assert!(!cfg.discovery.public);
+        assert_eq!(cfg.discovery.offer_valid_for_ms, 15_000);
         let err =
             Config::load(&write_config(dir.path(), "[discovery]\nforward = true\n")).unwrap_err();
         assert!(
             format!("{err:#}").contains("unknown field `forward`"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn offers_last_from_a_millisecond_to_five_minutes() {
+        let dir = tempfile::tempdir().unwrap();
+        for (ms, valid) in [(0, false), (1, true), (300_000, true), (300_001, false)] {
+            let text = format!("[discovery]\noffer_valid_for_ms = {ms}\n");
+            match Config::load(&write_config(dir.path(), &text)) {
+                Ok(cfg) => {
+                    assert!(valid, "{ms}");
+                    assert_eq!(cfg.discovery.offer_valid_for_ms, ms);
+                }
+                Err(err) => {
+                    assert!(!valid, "{ms}: {err:#}");
+                    assert!(format!("{err:#}").contains("offer_valid_for_ms"), "{err:#}");
+                }
+            }
+        }
     }
 
     #[test]

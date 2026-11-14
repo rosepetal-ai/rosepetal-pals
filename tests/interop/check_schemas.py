@@ -31,6 +31,8 @@ DOCUMENTS: dict[str, tuple[str, str]] = {
     "announce-v1.json": ("announce-record.schema.json", "/signed"),
     "inventory-v1.json": ("inventory.schema.json", "/inventory"),
     "view-v1.json": ("inventory-view.schema.json", "/signed"),
+    "service-query-v1.json": ("service-query.schema.json", "/query"),
+    "service-offer-v1.json": ("service-offer.schema.json", "/signed"),
 }
 
 

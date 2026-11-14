@@ -1119,7 +1119,7 @@ fn is_common_capability(capability: &str) -> bool {
 }
 
 /// A safe skill id: `[a-z0-9][a-z0-9-]{0,63}`.
-fn is_service_id(id: &str) -> bool {
+pub(crate) fn is_service_id(id: &str) -> bool {
     let mut bytes = id.bytes();
     bytes
         .next()

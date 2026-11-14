@@ -13,6 +13,8 @@ Extensión opcional de A2A con la que un agente PALS describe, además de lo que
 | Transporte | El inventario no viaja por A2A: lo sirve, en vistas firmadas y filtradas por el permiso de quien pregunta, el protocolo de descubrimiento que nombra `discoveryAlpn`, [`agentnet-discovery/0`](../protocols/agentnet-discovery-0.md) |
 | Esquema | [`inventory-v1/inventory.schema.json`](inventory-v1/inventory.schema.json) (JSON Schema 2020-12), con el vector `crates/pals-core/tests/vectors/inventory-v1.json` |
 | Vistas | `agentnet.inventory-view/1`, dominio de firma `agentnet.inventory-view/1\n`: [`inventory-v1/inventory-view.schema.json`](inventory-v1/inventory-view.schema.json), con el vector `crates/pals-core/tests/vectors/view-v1.json` |
+| Consultas de servicio | `agentnet.service-query/1`: [`inventory-v1/service-query.schema.json`](inventory-v1/service-query.schema.json), con el vector `crates/pals-core/tests/vectors/service-query-v1.json` |
+| Ofertas | `agentnet.service-offer/1`, dominio de firma `agentnet.offer/1\n`: [`inventory-v1/service-offer.schema.json`](inventory-v1/service-offer.schema.json), con el vector `crates/pals-core/tests/vectors/service-offer-v1.json` |
 
 La URI y el perfil no cambian de significado: un cambio incompatible será `inventory/v2` y `agentnet.inventory/2`.
 
@@ -124,3 +126,32 @@ Quien pregunta nunca recibe el inventario, sino la vista de su ámbito: páginas
 **Caché.** El agente guarda como mucho 256 páginas, por ámbito, destinatario, secciones, cursor, tamaño de página y revisión: una página privada nunca se sirve a otro solicitante.
 
 `pals inventory show [--scope public|project:<p>|task:<p>] [--sections a,b]` imprime en JSON lo que vería un par de ese ámbito, renderizado en local desde el fichero: las entradas de su vista de una pieza, sin firma, sin `seq` y sin paginar.
+
+## Consultas de servicio y ofertas
+
+Antes de encargar nada, quien busca un servicio pregunta a cada candidato si puede atender su caso con una consulta de servicio (§7.1), y el candidato contesta con una oferta firmada (§7.2). Las dos viajan por [`agentnet-discovery/0`](../protocols/agentnet-discovery-0.md#servicequery). Contestar nunca ejecuta nada: el candidato compara la consulta con los metadatos de su inventario y con los contadores de su worker, sin arrancar un LLM, una herramienta ni un adaptador (§7.3).
+
+**Consulta.** Lleva `query_id` (de 1 a 64 caracteres `[A-Za-z0-9_-]`), `capability` (con la forma de las capacidades del inventario), los tipos MIME de entrada y de salida (16 por lista como mucho), `requirements`, un `summary` de 1 KiB como mucho, `reply_timeout_ms` (más de 3000 cuenta como 3000), `requested_inventory_sections` (las secciones de la vista que piensa leer; la oferta no depende de ellas), `project` y `execution_authorized`, que tiene que ser `false`: una consulta nunca autoriza ejecución. Viaja como su JCS, de 8 KiB como mucho, con una sola grafía, y su BLAKE3 (`query_hash`) la vincula con la oferta. `requirements` lleva `language`, `external_cloud_allowed`, `required_region` e `inventory`, con `required` y `preferred`: ids de conexiones MCP, fuentes de información, skills instaladas, plugins y modelos (32 por lista como mucho), `execution_external_cloud_allowed`, `min_offered_ram_mib`, `min_offered_vram_mib` y `accelerators`. Lo que no está en `inventory.preferred` es obligatorio. Las claves desconocidas se admiten (32 por grupo como mucho) y nunca se dan por cumplidas. Quien pregunta solo envía ids de su inventario a candidatos con un grant del proyecto (§7.1, §9.9).
+
+**Ámbito.** El que da el grant presentado ([Visibilidad y ámbitos](#visibilidad-y-ámbitos)). `project` solo elige entre los proyectos que ese grant cubre: si coincide con el del grant, el ámbito es el del grant; si no, o sin grant, la consulta se contesta como pública.
+
+**Matching.** Sobre los servicios que el ámbito muestra con la capacidad pedida. Si no hay ninguno, la oferta es `not_offered`, sin servicio ni nada más: la misma exista o no un servicio que el ámbito no muestra. Si hay varios, el primero compatible, si no el primero al que solo le falta información, si no el primero, en el orden del inventario. Cada requisito da un resultado (`met`, `not_met` o `unknown`) y en qué se apoya (`declared` u `observed`):
+
+| Requisito | Se cumple si |
+|-|-|
+| `input_media_type:<tipo>`, `output_media_type:<tipo>` | el servicio acepta, o produce, el tipo (`*/*` y `tipo/*` lo cubren); desconocido si no declara ningún tipo |
+| `language`, `required_region` | el servicio lo declara; desconocido si no declara nada |
+| `external_cloud_allowed: false` | el servicio declara `external_cloud_used = false`; con `true` no se cumple; sin declaración, desconocido |
+| `mcp_integration:<id>` | la conexión es visible en el ámbito y una observación en vigor la da por operativa; con una en vigor que dice `failed`, no se cumple; visible sin observación en vigor, o no visible, exista o no, desconocido |
+| `information_source:<id>`, `skill_package:<id>`, `plugin:<id>`, `model:<id>` | la entrada es visible (`declared`, u `observed` con una observación en vigor que dice `ok`); con una que dice `failed`, no se cumple; no visible, desconocido |
+| `execution_external_cloud_allowed: false` | ningún modelo entre los componentes del servicio visibles en el ámbito se ejecuta en un proveedor externo, y el servicio declara que no usa nube externa |
+| `min_offered_ram_mib`, `min_offered_vram_mib`, `accelerator:<nombre>` | contra lo que ofrece el hardware (`offered`), nunca contra lo instalado (§8, §9.6); desconocido si el ámbito no lo muestra o no ofrece eso |
+| otra clave | nunca: desconocida, y si es obligatoria va en `unknown_requirements` (`<clave>`, o `inventory.<clave>` bajo `inventory.required`); bajo `preferred` se ignora |
+
+Una observación está en vigor hasta su `expires_at` y 60 s más, según el reloj del propio agente. Lo desconocido o no demostrable nunca se da por cumplido (§7.2).
+
+**Resultado.** La oferta es compatible si se cumple todo lo obligatorio: `available` si el worker tiene menos tareas en marcha de las que admite a la vez, `busy` si no. Si solo le falta información, `needs_information`. Si algo obligatorio no se cumple, `not_offered`, con el servicio y los resultados que dicen por qué. Los tiempos son los que declara el servicio, y si no declara ninguno no aparecen: nunca valen cero por desconocidos. `conditions` repite lo que declara el servicio sobre nube y región, y `authorization_required` dice si el grant presentado no deja enviar tareas.
+
+**Oferta.** La firma el candidato para quien pregunta (`requester`) con el dominio `agentnet.offer/1\n`, de 16 KiB como mucho (si no cabe, se recortan por el final las limitaciones, después los resultados y después los requisitos desconocidos, y la última limitación es `truncated`). Nombra el servicio (`skill_id`), el ámbito, el hash de la card de ese ámbito y la revisión de su vista, que cambia con todo cambio de lo que muestra el ámbito, también con las fechas de una observación. Dura `[discovery] offer_valid_for_ms` (15000 por defecto, como mucho 300000) redondeado al segundo por arriba, con fechas de segundos enteros como los grants. `benchmark_refs` queda vacío hasta que el agente sirva informes de benchmark. Una oferta no reserva capacidad ni autoriza ejecución: la tarea que la nombra se vuelve a comprobar, grant incluido, al llegar (§7.2, §9.3).
+
+**Aceptación.** Quien recibe una oferta la acepta solo si cabe en 16 KiB, está firmada por el par al que preguntó, es para él, es de su consulta y no ha caducado, con 60 s de desfase solo para rechazar. La guarda con la clave (proveedor, `offer_id`), porque dos proveedores pueden usar el mismo `offer_id`. Cada lado purga cada hora las suyas: el candidato, las que caducaron hace más de un día; quien pregunta, las caducadas.

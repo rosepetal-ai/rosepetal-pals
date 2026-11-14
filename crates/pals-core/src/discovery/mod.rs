@@ -10,16 +10,20 @@
 //!
 //! The answer is [`answer`]'s, here, in a crate that opens no sockets and
 //! holds no endpoint, worker, executor or adapter: answering reads the
-//! inventory, the store and the agent's own signed records, and signs with
-//! the agent's key, and that is all it can do. It never runs work and never
-//! asks another peer. The transport, the limits on time and the quotas are
-//! the daemon's (`pals::discovery::DiscoveryServer`).
+//! inventory, the store, the agent's own signed records and the worker's
+//! load counters ([`LoadProbe`]), and signs with the agent's key, and that
+//! is all it can do. It never runs work and never asks another peer. A
+//! service query ([`query`]) is matched on that metadata only
+//! ([`matching`]). The transport, the limits on time and the quotas are the
+//! daemon's (`pals::discovery::DiscoveryServer`).
 //!
 //! What a requester sees comes from the grant it presents, verified as the
 //! HTTP layer of milestone 1 verifies it ([`crate::grant::accept_grant`]),
 //! and from nothing else it sends.
 
 mod answer;
+pub mod matching;
+pub mod query;
 pub mod wire;
 
 use std::collections::BTreeMap;
@@ -27,6 +31,11 @@ use std::fmt;
 use std::sync::Arc;
 
 pub use answer::{answer, error_response};
+pub use matching::{Evaluation, evaluate};
+pub use query::{
+    MAX_OFFER_BYTES, MAX_OFFER_VALID_FOR_MS, MAX_QUERY_BYTES, OfferError, ServiceOffer,
+    ServiceQuery, accept_offer,
+};
 pub use wire::{WireError, decode, encode_frame, frame_len};
 
 use crate::card_jws::{CardHash, MAX_CARD_BYTES};
@@ -52,11 +61,6 @@ pub const MAX_ERROR_MESSAGE_BYTES: usize = 256;
 /// The scope key under which [`DiscoveryContext::card_hashes`] holds the
 /// public card's hash, which every scope without a card of its own gets.
 pub const PUBLIC_CARD: &str = "public";
-
-/// The largest service query (design §7.3), which `ServiceQuery` carries.
-const MAX_QUERY_BYTES: usize = 8 * 1024;
-/// The largest service offer (design §7.3).
-const MAX_OFFER_BYTES: usize = 16 * 1024;
 
 /// The limits a server announces in every response.
 pub fn server_limits() -> wire::Limits {
@@ -111,7 +115,8 @@ impl LoadProbe for Load {
 /// What [`answer`] answers with: the agent's key and store, its inventory
 /// and records as they are now, the hashes of its cards, the issuers whose
 /// grants it accepts, whether it shows its public view to requesters
-/// without a grant, and this run's cursor key and page cache.
+/// without a grant, this run's cursor key and page cache, the worker's load
+/// and how long its offers last.
 pub struct DiscoveryContext {
     pub key: Arc<AgentKey>,
     pub store: Arc<Store>,
@@ -135,6 +140,9 @@ pub struct DiscoveryContext {
     pub views: ViewCache,
     /// The worker's load, for service offers.
     pub load: Arc<dyn LoadProbe>,
+    /// How long a service offer lasts, from 1 to
+    /// [`MAX_OFFER_VALID_FOR_MS`]; rounded up to whole seconds.
+    pub offer_valid_for_ms: u32,
 }
 
 impl fmt::Debug for DiscoveryContext {
@@ -145,6 +153,7 @@ impl fmt::Debug for DiscoveryContext {
             .field("accepted_issuers", &self.accepted_issuers)
             .field("public", &self.public)
             .field("views", &self.views)
+            .field("offer_valid_for_ms", &self.offer_valid_for_ms)
             .finish_non_exhaustive()
     }
 }
