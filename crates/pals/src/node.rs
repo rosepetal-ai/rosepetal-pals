@@ -307,6 +307,7 @@ impl Opened {
                 endpoint,
                 blobs: blobs.clone(),
                 limits: cfg.limits.clone(),
+                data_dir: cfg.data_dir.clone(),
             },
             gateway_addr,
         );

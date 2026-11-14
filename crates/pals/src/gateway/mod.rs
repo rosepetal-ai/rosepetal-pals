@@ -73,6 +73,7 @@ pub mod rewrite;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -181,6 +182,8 @@ pub struct GatewayParts {
     pub endpoint: Endpoint,
     pub blobs: BlobService,
     pub limits: LimitsCfg,
+    /// The agent's data directory, whose files are never sent.
+    pub data_dir: PathBuf,
 }
 
 impl GatewayState {
@@ -194,8 +197,10 @@ impl GatewayState {
             endpoint,
             blobs,
             limits,
+            data_dir,
         } = parts;
-        let outbox = Outbox::new(Arc::clone(&store), base_url(&local_addr));
+        let outbox =
+            Outbox::new(Arc::clone(&store), base_url(&local_addr)).with_data_dir(&data_dir);
         Self {
             inner: Arc::new(Inner {
                 id,

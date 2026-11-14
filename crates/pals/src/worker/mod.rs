@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
 use crate::a2a::auth::PROJECT_HEADER;
+use crate::a2a::is_safe_task_id;
 use crate::blobs::{BLOB_SCHEME, BLOB_SHARE_TTL_S, BlobError, BlobRef, BlobService};
 use crate::config::{Config, ExecCfg};
 use crate::net::PEER_HEADER;
@@ -217,6 +218,7 @@ impl WorkerExecutor {
     /// a task id is just a string any peer can send, so following one would
     /// hand another peer's work to this one.
     fn input(&self, ctx: &ExecutorContext) -> Result<(TaskInput, Vec<InputFile>), AdapterError> {
+        // Only such an id names a directory as it is.
         if !is_safe_task_id(&ctx.task_id) {
             error!(task_id = %ctx.task_id, "a task id unfit for a directory name");
             return Err(AdapterError::Failed("invalid task id".to_owned()));
@@ -650,15 +652,6 @@ async fn remove_dir(dir: &Path) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => warn!(dir = %dir.display(), error = %err, "cannot remove a task's directory"),
     }
-}
-
-/// Whether `task_id` can name a directory as it is. The SDK makes task ids
-/// UUIDs; anything else is refused rather than used as a path.
-fn is_safe_task_id(task_id: &str) -> bool {
-    !task_id.is_empty()
-        && task_id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// The one value of the service param `name`.

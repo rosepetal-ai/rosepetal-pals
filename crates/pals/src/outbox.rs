@@ -28,9 +28,19 @@
 //! `REJECTED`) or waits for the requester (`INPUT_REQUIRED`,
 //! `AUTH_REQUIRED`), with the task as it is then; or when its `wait` runs
 //! out, with the state last seen and the row still pending.
+//!
+//! What a peer sends is used only once checked. A task id that is not
+//! [safe](is_safe_task_id) ends the attempt as refused, and is neither kept
+//! nor ever put in a URL; a task the peer answers for must be the one asked
+//! about.
+//!
+//! An attachment is read only when it is a regular file outside the agent's
+//! data directory ([`Outbox::with_data_dir`]), which holds its key and its
+//! grants: the path is resolved first, symbolic links and `..` included,
+//! and the file opened must be the one checked.
 
-use std::path::Path;
-use std::path::PathBuf;
+use std::fs::Metadata;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,6 +58,8 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::time::Instant;
 
+use crate::a2a::is_safe_task_id;
+
 /// How many times an ask retries an attempt that failed on the way, after
 /// waiting 1 s, 2 s and 4 s.
 pub const ASK_MAX_ATTEMPTS: u32 = 3;
@@ -61,6 +73,8 @@ const BACKOFF: [Duration; ASK_MAX_ATTEMPTS as usize] = [
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(30);
 /// The media type of an attachment whose extension says nothing.
 const OCTET_STREAM: &str = "application/octet-stream";
+/// Why a peer's answer naming an unsafe or another task is refused.
+const INVALID_TASK_ID: &str = "the peer returned an invalid task id";
 
 type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 type Client = A2AClient<RestTransport>;
@@ -128,6 +142,8 @@ pub struct Outbox {
     store: Arc<Store>,
     gateway_url: String,
     http: reqwest::Client,
+    /// The agent's data directory, resolved: no attachment comes from it.
+    data_dir: Option<PathBuf>,
 }
 
 impl Outbox {
@@ -143,7 +159,26 @@ impl Outbox {
             store,
             gateway_url: gateway_url.trim_end_matches('/').to_owned(),
             http,
+            data_dir: None,
         }
+    }
+
+    /// This outbox, refusing to send any file inside `data_dir`, the
+    /// agent's data directory: its key, its store with the grants it holds,
+    /// its blobs and its tasks' files. The directory is resolved now, as
+    /// attachments are.
+    pub fn with_data_dir(mut self, data_dir: &Path) -> Self {
+        let resolved = std::fs::canonicalize(data_dir)
+            .or_else(|_| std::path::absolute(data_dir))
+            .unwrap_or_else(|_| data_dir.to_owned());
+        self.data_dir = Some(resolved);
+        self
+    }
+
+    /// The agent's data directory, resolved, as [`Outbox::with_data_dir`]
+    /// set it.
+    pub fn data_dir(&self) -> Option<&Path> {
+        self.data_dir.as_deref()
     }
 
     /// Asks `req.peer` `req.question`, with `req.attachments` uploaded to
@@ -152,8 +187,20 @@ impl Outbox {
     ///
     /// Fails with [`AskError::Local`], having sent nothing, when the peer is
     /// neither a contact nor an agent id, or an attachment cannot be read
-    /// or uploaded.
+    /// or uploaded: one that is not a regular file, or is inside the data
+    /// directory, is refused.
     pub async fn ask(&self, req: AskRequest) -> Result<AskOutcome, AskError> {
+        self.ask_kept(req, |_| {}).await
+    }
+
+    /// [`Outbox::ask`], calling `kept` with the question's message id as
+    /// soon as the outbox keeps it, before the first attempt to send it:
+    /// from then on, [`Outbox::resume`] takes it up by that id.
+    pub async fn ask_kept(
+        &self,
+        req: AskRequest,
+        kept: impl FnOnce(&str) + Send,
+    ) -> Result<AskOutcome, AskError> {
         let AskRequest {
             peer,
             question,
@@ -191,6 +238,7 @@ impl Outbox {
         };
         self.with_store(move |store| store.outbox_insert(&row))
             .await?;
+        kept(&message_id);
         self.drive(Ask {
             message_id,
             peer,
@@ -207,6 +255,7 @@ impl Outbox {
     /// an outcome gets it again.
     pub async fn resume(&self, message_id: &str, wait: Duration) -> Result<AskOutcome, AskError> {
         let row = self.row(message_id).await?;
+        check_stored_task(&row)?;
         let request = decode_request(&row.request_json)?;
         if row.state == OUTBOX_REFUSED {
             let id = row.message_id.clone();
@@ -232,6 +281,7 @@ impl Outbox {
     /// that has ended.
     pub async fn cancel(&self, message_id: &str) -> Result<AskOutcome, AskError> {
         let row = self.row(message_id).await?;
+        check_stored_task(&row)?;
         let Some(task_id) = row.task_id else {
             return Err(AskError::Local(format!(
                 "no task of the peer is known for message {message_id} yet: there is nothing \
@@ -251,6 +301,9 @@ impl Outbox {
                 .await
                 .unwrap_or_else(|_| Err(A2AError::internal("the cancel got no answer in time")));
             match canceled {
+                Ok(task) if task.id != request.id => {
+                    return Err(AskError::Rejected(INVALID_TASK_ID.to_owned()));
+                }
                 Ok(task) => return self.finish(message_id, &task, attempts).await,
                 Err(err) => match Failure::of(&err) {
                     Failure::Refused(reason) => return Err(AskError::Rejected(reason)),
@@ -346,6 +399,7 @@ impl Outbox {
             };
         };
         let task = match get_task(client, &task_id).await {
+            Ok(task) if task.id != task_id => return Ended::Refused(INVALID_TASK_ID.to_owned()),
             Ok(task) => task,
             Err(err) => return Ended::failed(&err, false),
         };
@@ -393,6 +447,10 @@ impl Outbox {
             if let Some(task_id) = event_task_id(&event)
                 && ask.task_id.as_deref() != Some(task_id)
             {
+                // Neither kept nor put in a URL.
+                if !is_safe_task_id(task_id) || ask.task_id.is_some() {
+                    return Ended::Refused(INVALID_TASK_ID.to_owned());
+                }
                 let (id, task) = (ask.message_id.clone(), task_id.to_owned());
                 let recorded = self
                     .with_store(move |store| store.outbox_set_task(&id, &task, now_unix()))
@@ -412,7 +470,8 @@ impl Outbox {
                 StreamResponse::StatusUpdate(update) => {
                     *seen = Some(update.status.state.clone());
                     if is_final(&update.status.state) {
-                        // The whole task, artifacts included.
+                        // The whole task, artifacts included: the one
+                        // checked and recorded above.
                         return final_task(client, &update.task_id, seen).await;
                     }
                 }
@@ -466,16 +525,13 @@ impl Outbox {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .ok_or_else(|| cannot("it names no file".to_owned()))?;
-        let file = tokio::fs::File::open(path)
-            .await
-            .map_err(|err| cannot(err.to_string()))?;
-        let metadata = file
-            .metadata()
-            .await
-            .map_err(|err| cannot(err.to_string()))?;
-        if !metadata.is_file() {
-            return Err(cannot("not a regular file".to_owned()));
-        }
+        let (path_owned, data_dir) = (path.to_owned(), self.data_dir.clone());
+        let file =
+            tokio::task::spawn_blocking(move || open_attachment(&path_owned, data_dir.as_deref()))
+                .await
+                .map_err(|err| cannot(err.to_string()))?
+                .map_err(cannot)?;
+        let file = tokio::fs::File::from_std(file);
         let response = self
             .http
             .post(format!("{}/blobs", self.gateway_url))
@@ -625,6 +681,7 @@ fn http_failure(message: &str) -> Option<(u16, String)> {
 /// `task_id`, which an event said is final, as the peer keeps it.
 async fn final_task(client: &Client, task_id: &str, seen: &mut Option<TaskState>) -> Ended {
     match get_task(client, task_id).await {
+        Ok(task) if task.id != task_id => Ended::Refused(INVALID_TASK_ID.to_owned()),
         Ok(task) if is_final(&task.status.state) => Ended::Task(task),
         Ok(task) => {
             *seen = Some(task.status.state);
@@ -762,6 +819,67 @@ impl Answer {
     /// The texts, one per line; none when there are none.
     fn text(&self) -> Option<String> {
         (!self.texts.is_empty()).then(|| self.texts.join("\n"))
+    }
+}
+
+/// Opens the attachment at `path` to read it, once resolved (symbolic links
+/// and `..` included): it must be outside `data_dir` and a regular file,
+/// checked before it is opened, so that a FIFO cannot block the call, and
+/// the file opened must be the one checked.
+fn open_attachment(path: &Path, data_dir: Option<&Path>) -> Result<std::fs::File, String> {
+    let resolved = std::fs::canonicalize(path).map_err(|err| err.to_string())?;
+    if let Some(data_dir) = data_dir
+        && resolved.starts_with(data_dir)
+    {
+        return Err(format!(
+            "it is inside this agent's data directory {}, which holds its key and its grants: \
+             nothing in it is ever sent",
+            data_dir.display()
+        ));
+    }
+    let checked = std::fs::metadata(&resolved).map_err(|err| err.to_string())?;
+    if !checked.is_file() {
+        return Err("not a regular file".to_owned());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // Should the path have become a FIFO or a link since, opening it does
+    // not wait for a writer nor follow the link.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        libc::O_NONBLOCK | libc::O_NOFOLLOW,
+    );
+    let file = options.open(&resolved).map_err(|err| err.to_string())?;
+    let opened = file.metadata().map_err(|err| err.to_string())?;
+    if !opened.is_file() || !same_file(&checked, &opened) {
+        return Err("it changed while it was being opened".to_owned());
+    }
+    Ok(file)
+}
+
+/// Whether `a` and `b` describe the same file.
+#[cfg(unix)]
+fn same_file(a: &Metadata, b: &Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+/// Whether `a` and `b` describe the same file: as far as this platform
+/// tells, files of the same size.
+#[cfg(not(unix))]
+fn same_file(a: &Metadata, b: &Metadata) -> bool {
+    a.len() == b.len()
+}
+
+/// Refuses a row whose task id is not [safe](is_safe_task_id), as a build
+/// that did not check them may have kept it.
+fn check_stored_task(row: &OutboxRow) -> Result<(), AskError> {
+    match &row.task_id {
+        Some(task_id) if !is_safe_task_id(task_id) => {
+            Err(AskError::Rejected(INVALID_TASK_ID.to_owned()))
+        }
+        _ => Ok(()),
     }
 }
 

@@ -4,14 +4,25 @@
 
 mod common;
 
-use common::{TestNode, TestResponse, gateway_request, gateway_send_raw, grant, spawn_node};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use common::{
+    CountingExecutor, TestNode, TestResponse, gateway_request, gateway_send_raw, grant, spawn_node,
+    spawn_node_with_executor,
+};
 use pals::config::WorkerCfg;
+use pals::mcp::DEFAULT_WAIT_S;
 use pals_core::grant::Operation::{TaskCancel, TaskRead, TaskSend};
-use rmcp::model::{CallToolRequestParams, CallToolResult, ClientConfig, Tool};
-use rmcp::service::RunningService;
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, ClientConfig, NumberOrString, ProgressNotificationParam,
+    ProgressToken, RequestMetaObject, Tool,
+};
+use rmcp::service::{NotificationContext, RunningService};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp::{RoleClient, ServiceExt};
+use rmcp::{ClientHandler, RoleClient, ServiceExt};
 use serde_json::{Value, json};
 
 const UNTRUSTED: &str =
@@ -31,7 +42,11 @@ async fn mcp_client(node: &TestNode) -> Client {
 }
 
 /// Calls `tool` with `args`.
-async fn call(client: &Client, tool: &str, args: Value) -> CallToolResult {
+async fn call<H: ClientHandler>(
+    client: &RunningService<RoleClient, H>,
+    tool: &str,
+    args: Value,
+) -> CallToolResult {
     let args = args.as_object().cloned().expect("arguments are an object");
     client
         .call_tool(CallToolRequestParams::new(tool.to_owned()).with_arguments(args))
@@ -61,11 +76,48 @@ fn error_text(result: &CallToolResult) -> String {
 /// A requester `a`, whose MCP server the tests use, and an echo provider
 /// `b`, which `a` knows as `bob` and holds a grant of.
 async fn pair() -> (TestNode, TestNode) {
-    let a = spawn_node(WorkerCfg::Echo).await;
     let b = spawn_node(WorkerCfg::Echo).await;
-    a.add_contact("bob", &b);
-    a.hold(&grant(&b, &a, &[TaskSend, TaskRead, TaskCancel], 3600));
-    (a, b)
+    (requester_of(&b).await, b)
+}
+
+/// A requester that knows `b` as `bob` and holds a grant of it.
+async fn requester_of(b: &TestNode) -> TestNode {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    a.add_contact("bob", b);
+    a.hold(&grant(b, &a, &[TaskSend, TaskRead, TaskCancel], 3600));
+    a
+}
+
+/// How many blobs `node` keeps tagged: one more for every upload.
+async fn tagged_blobs(node: &TestNode) -> usize {
+    node.node.blobs.tags().await.expect("the blob tags").len()
+}
+
+/// `dir` with its symbolic links resolved.
+fn resolved(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir).expect("resolve the directory")
+}
+
+/// An MCP client that keeps the messages of the progress notifications it
+/// gets.
+#[derive(Clone, Default)]
+struct ProgressClient {
+    notes: Arc<Mutex<Vec<String>>>,
+}
+
+impl ClientHandler for ProgressClient {
+    fn get_info(&self) -> ClientConfig {
+        ClientConfig::default()
+    }
+
+    async fn on_progress(
+        &self,
+        params: ProgressNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        let note = params.message.unwrap_or_default();
+        self.notes.lock().unwrap().push(note);
+    }
 }
 
 async fn tools(client: &Client) -> Vec<Tool> {
@@ -265,7 +317,8 @@ async fn pals_fetch_refuses_to_overwrite_and_rejects_non_gateway_urls() {
     }
 
     let out = ok_json(&call(&client, "pals_fetch", json!({"url": url, "dest": dest})).await);
-    assert_eq!(out, json!({"path": dest, "bytes": 8}));
+    let written = resolved(dir.path()).join("out.bin");
+    assert_eq!(out, json!({"path": written, "bytes": 8}));
     assert_eq!(std::fs::read(&dest).unwrap(), b"contents");
     client.cancel().await.expect("close the session");
 }
@@ -347,4 +400,172 @@ async fn mcp_endpoint_enforces_the_local_guard() {
     );
     assert_eq!(res.header("content-security-policy"), "sandbox");
     assert_eq!(res.header("x-content-type-options"), "nosniff");
+}
+
+#[tokio::test]
+async fn attachments_inside_the_data_dir_or_not_regular_files_are_refused() {
+    let (a, _b) = pair().await;
+    let client = mcp_client(&a).await;
+    let data_dir = a.dir.path();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let key_link = elsewhere.path().join("innocent.txt");
+    std::os::unix::fs::symlink(data_dir.join("agent.key"), &key_link).unwrap();
+    let dotdot = elsewhere
+        .path()
+        .join("..")
+        .join(data_dir.file_name().unwrap())
+        .join("agent.key");
+    let uploads = tagged_blobs(&a).await;
+
+    // The key, directly, through a link and through `..`, and the store.
+    for secret in [
+        data_dir.join("agent.key"),
+        key_link,
+        dotdot,
+        data_dir.join("pals.db"),
+    ] {
+        let refused = call(
+            &client,
+            "pals_ask",
+            json!({"peer": "bob", "question": "hola", "attachments": [secret]}),
+        )
+        .await;
+        let text = error_text(&refused);
+        assert!(
+            text.contains("data directory"),
+            "{}: {text}",
+            secret.display()
+        );
+    }
+
+    // A FIFO is refused at once, never opened; so is a directory.
+    let fifo = elsewhere.path().join("fifo");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("run mkfifo");
+    assert!(made.success());
+    for odd in [fifo, elsewhere.path().to_owned()] {
+        let asked = call(
+            &client,
+            "pals_ask",
+            json!({"peer": "bob", "question": "hola", "attachments": [odd]}),
+        );
+        let refused = tokio::time::timeout(Duration::from_secs(30), asked)
+            .await
+            .expect("refused without waiting");
+        let text = error_text(&refused);
+        assert!(
+            text.contains("not a regular file"),
+            "{}: {text}",
+            odd.display()
+        );
+    }
+
+    // Nothing was uploaded, nothing asked.
+    assert_eq!(tagged_blobs(&a).await, uploads);
+    assert!(a.node.store.outbox_all().unwrap().is_empty());
+    client.cancel().await.expect("close the session");
+}
+
+#[tokio::test]
+async fn pals_fetch_refuses_a_dest_inside_the_data_dir() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let gw = a.gateway_url();
+    let client = mcp_client(&a).await;
+    let uploaded = TestResponse::read(
+        gateway_send_raw(
+            &gw,
+            "POST",
+            "/blobs",
+            &[],
+            Some(("application/octet-stream", b"contents".to_vec())),
+        )
+        .await,
+    )
+    .await;
+    let url = uploaded.json["url"].as_str().unwrap().to_owned();
+    let data_dir = a.dir.path();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let dir_link = elsewhere.path().join("innocent");
+    std::os::unix::fs::symlink(data_dir, &dir_link).unwrap();
+
+    for dest in [
+        data_dir.join("planted.bin"),
+        data_dir.join("blobs").join("planted.bin"),
+        dir_link.join("planted.bin"),
+        elsewhere
+            .path()
+            .join("..")
+            .join(data_dir.file_name().unwrap())
+            .join("planted.bin"),
+    ] {
+        let refused = call(&client, "pals_fetch", json!({"url": url, "dest": dest})).await;
+        let text = error_text(&refused);
+        assert!(
+            text.contains("data directory"),
+            "{}: {text}",
+            dest.display()
+        );
+    }
+    assert!(!data_dir.join("planted.bin").exists());
+    assert!(!data_dir.join("blobs").join("planted.bin").exists());
+    client.cancel().await.expect("close the session");
+}
+
+#[tokio::test]
+async fn pals_ask_returns_a_message_id_before_a_slow_answer() {
+    // MCP clients time tool calls out (the TypeScript SDK after 60 s): the
+    // default wait stays below that.
+    assert_eq!(DEFAULT_WAIT_S, 50);
+    let exec = CountingExecutor::new(Duration::from_secs(12));
+    let b = spawn_node_with_executor(exec.clone()).await;
+    let a = requester_of(&b).await;
+    pals::install_crypto_provider();
+    let progress = ProgressClient::default();
+    let config = StreamableHttpClientTransportConfig::with_uri(format!("{}/mcp", a.gateway_url()));
+    let client = progress
+        .clone()
+        .serve(StreamableHttpClientTransport::from_config(config))
+        .await
+        .expect("an MCP session with the gateway");
+
+    // A wait shorter than the answer: the call returns the handle.
+    let args = json!({"peer": "bob", "question": "hola", "wait_s": 5});
+    let mut params =
+        CallToolRequestParams::new("pals_ask").with_arguments(args.as_object().cloned().unwrap());
+    let mut meta = RequestMetaObject::default();
+    meta.set_progress_token(ProgressToken(NumberOrString::String("ask-1".into())));
+    params.meta = Some(meta);
+    let started = std::time::Instant::now();
+    let out = ok_json(&client.call_tool(params).await.expect("a tool result"));
+    assert!(started.elapsed() < Duration::from_secs(12), "{out}");
+    let message_id = out["message_id"].as_str().expect("a message id").to_owned();
+    let state = out["state"].as_str().unwrap();
+    assert!(
+        ["TASK_STATE_SUBMITTED", "TASK_STATE_WORKING"].contains(&state),
+        "{out}"
+    );
+    assert_eq!(out["answer"], Value::Null);
+    // The id came first as a progress notification, as soon as it was kept.
+    let notes = progress.notes.lock().unwrap().clone();
+    assert!(
+        notes.iter().any(|note| note.contains(&message_id)),
+        "{notes:?}"
+    );
+
+    // Polling by that id gets the answer, from the one run.
+    let answered = ok_json(
+        &call(
+            &client,
+            "pals_task",
+            json!({"message_id": message_id, "wait_s": 60}),
+        )
+        .await,
+    );
+    assert_eq!(answered["state"], "TASK_STATE_COMPLETED", "{answered}");
+    assert_eq!(answered["answer"], "echo: hola");
+    assert_eq!(answered["task_id"], out["task_id"]);
+    assert_eq!(exec.runs(), 1);
+    client.cancel().await.expect("close the session");
 }

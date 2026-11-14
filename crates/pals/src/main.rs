@@ -450,6 +450,7 @@ where
 {
     let (cfg, key) = load_agent(home)?;
     let listen = cfg.gateway.listen;
+    let data_dir = cfg.data_dir.clone();
     let store = Arc::new(open_store(&cfg, &key)?);
     runtime(false)?.block_on(async move {
         let health = gateway_health(listen).await.with_context(|| {
@@ -461,7 +462,7 @@ where
             "the pals daemon at http://{listen} runs agent {running}, not this agent {}",
             key.id()
         );
-        call(Outbox::new(store, format!("http://{listen}"))).await
+        call(Outbox::new(store, format!("http://{listen}")).with_data_dir(&data_dir)).await
     })
 }
 
