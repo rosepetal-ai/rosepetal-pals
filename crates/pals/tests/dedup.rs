@@ -611,3 +611,42 @@ async fn the_extension_reaches_the_peer_through_the_gateway() {
     assert_ne!(task_of(&third)["id"], task_of(&first)["id"]);
     assert_eq!(exec.runs(), 2);
 }
+
+#[tokio::test]
+async fn an_activated_extension_is_echoed_through_the_gateway() {
+    // A2A: the response SHOULD list in `A2A-Extensions` the extensions the
+    // request activated; the gateway passes the header back unchanged.
+    let (b, a, g, _exec) = setup(Duration::ZERO).await;
+    a.add_contact("bob", &b);
+    a.hold(&g);
+    let gw = a.gateway_url();
+    let listed = format!("https://example.com/ext/v1, {IDEMPOTENCY_EXTENSION}");
+    let send = rpc_request("SendMessage", message_params("hola", None));
+    let stream = rpc_request("SendStreamingMessage", message_params("hola", None));
+    let rest_send = message_params("hola", None);
+    for (extensions, echoed) in [
+        (Some(IDEMPOTENCY_EXTENSION), true),
+        (Some(listed.as_str()), true),
+        (Some("https://example.com/ext/v1"), false),
+        (None, false),
+    ] {
+        let mut headers = vec![("a2a-version", "1.0")];
+        if let Some(extensions) = extensions {
+            headers.push(("a2a-extensions", extensions));
+        }
+        for (path, body) in [
+            ("/peers/bob/jsonrpc", &send),
+            ("/peers/bob/jsonrpc", &stream),
+            ("/peers/bob/rest/message:send", &rest_send),
+        ] {
+            let res = common::gateway_request(&gw, "POST", path, &headers, Some(body)).await;
+            assert_eq!(res.status, 200, "{path}: {}", res.json);
+            let expected = if echoed { IDEMPOTENCY_EXTENSION } else { "" };
+            assert_eq!(
+                res.header("a2a-extensions"),
+                expected,
+                "{extensions:?} {path} {body}"
+            );
+        }
+    }
+}

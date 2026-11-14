@@ -393,10 +393,20 @@ fn single(event: StreamResponse) -> Events {
 /// `A2A-Extensions` service parameter, a comma-separated list of extension
 /// URIs (A2A §3.2.6), names it, in any of its values.
 pub(crate) fn idempotency_requested(params: &ServiceParams) -> bool {
-    params
-        .get(EXTENSIONS_PARAM)
+    names_idempotency(
+        params
+            .get(EXTENSIONS_PARAM)
+            .into_iter()
+            .flatten()
+            .map(String::as_str),
+    )
+}
+
+/// Whether one of `values`, each a comma-separated list of extension URIs
+/// as `A2A-Extensions` carries them, names the [`IDEMPOTENCY_EXTENSION`].
+pub(crate) fn names_idempotency<'a>(values: impl IntoIterator<Item = &'a str>) -> bool {
+    values
         .into_iter()
-        .flatten()
         .flat_map(|value| value.split(','))
         .any(|uri| uri.trim() == IDEMPOTENCY_EXTENSION)
 }

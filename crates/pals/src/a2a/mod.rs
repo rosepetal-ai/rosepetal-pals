@@ -19,7 +19,7 @@ pub use card::{
     canonical_card, gateway_view,
 };
 pub use guard::GuardedHandler;
-pub(crate) use shims::{jsonrpc_shim, rest_shim};
+pub(crate) use shims::{echo_extensions, jsonrpc_shim, rest_shim};
 pub use task_store::SqliteTaskStore;
 
 /// The longest task id PALS accepts, from a peer or for its own tasks.

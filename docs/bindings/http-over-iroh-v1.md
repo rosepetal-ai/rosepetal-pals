@@ -57,7 +57,7 @@ Convención propia dentro de los campos estándar: un fichero que el agente `<ho
 ## 4. Parámetros de servicio
 
 - **Mecanismo:** cabeceras HTTP de la petición, como en los bindings estándar basados en HTTP (A2A §3.2.6): `A2A-Version` (`1.0`; como cabecera o, si falta la cabecera, como parámetro de la petición `A2A-Version`, con la clave sin distinguir mayúsculas, A2A §3.6.1; sin ninguno de los dos cuenta como `0.3` y se rechaza, en los dos bindings), `A2A-Extensions` y `Authorization`, entre otras. Nombres insensibles a mayúsculas.
-- **Extensiones:** `A2A-Extensions` activa las extensiones que la card declara. PALS declara una, opcional: [`idempotency/v1`](../extensions/idempotency-v1.md), que hace idempotentes `SendMessage` y `SendStreamingMessage` por `messageId`. El cliente de PALS la activa siempre.
+- **Extensiones:** `A2A-Extensions` activa las extensiones que la card declara. PALS declara una, opcional: [`idempotency/v1`](../extensions/idempotency-v1.md), que hace idempotentes `SendMessage` y `SendStreamingMessage` por `messageId`. La respuesta a una petición que la activa la nombra en su propia cabecera `A2A-Extensions`. El cliente de PALS la activa siempre.
 - **Valores:** los de una cabecera HTTP/1.1 (RFC 9110): texto visible ASCII. El servidor rechaza un cuerpo mayor de 1 MiB, no un tamaño de cabeceras concreto distinto del de su biblioteca HTTP (hyper).
 - **Nombres reservados por el binding:** todo `x-agentnet-*`. El cliente no debe enviarlos; el servidor los descarta y fija:
   - `x-agentnet-peer`: el id del agente remoto que autenticó el handshake de QUIC, en hexadecimal. Lo pone el túnel del servidor y sustituye cualquier valor recibido.

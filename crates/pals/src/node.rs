@@ -12,6 +12,7 @@ use a2a_server::jsonrpc::jsonrpc_router;
 use a2a_server::rest::rest_router;
 use a2a_server::{AgentExecutor, DefaultRequestHandler, StaticAgentCard};
 use anyhow::{Context, ensure};
+use axum::middleware::from_fn;
 use iroh::endpoint::{PortmapperConfig, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
@@ -25,7 +26,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::a2a::auth::{Authenticator, JSONRPC_PATH, REST_PATH};
 use crate::a2a::{
-    BindingExecutor, GuardedHandler, SqliteTaskStore, canonical_card, jsonrpc_shim, rest_shim,
+    BindingExecutor, GuardedHandler, SqliteTaskStore, canonical_card, echo_extensions,
+    jsonrpc_shim, rest_shim,
 };
 use crate::blobs::{BLOBS_DIR, BlobService};
 use crate::config::{Config, DataDirLock, WorkerCfg};
@@ -58,8 +60,8 @@ const GATEWAY_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// The server is the SDK's, with the [canonical card](canonical_card) at
 /// `/.well-known/agent-card.json`, JSON-RPC at `/jsonrpc` (behind
-/// [`jsonrpc_shim`]) and HTTP+JSON at `/rest` (behind [`rest_shim`]),
-/// behind grant authentication
+/// [`jsonrpc_shim`]) and HTTP+JSON at `/rest` (behind [`rest_shim`]), both
+/// with [`echo_extensions`], behind grant authentication
 /// ([`crate::a2a::auth`]) and the ownership of tasks and idempotency of
 /// messages ([`GuardedHandler`]), on the durable task store.
 pub struct Node {
@@ -489,11 +491,15 @@ fn app(
         .merge(agent_card_router(Arc::new(StaticAgentCard::new(card))))
         .nest(
             JSONRPC_PATH,
-            jsonrpc_router(Arc::clone(&handler)).layer(axum::middleware::from_fn(jsonrpc_shim)),
+            jsonrpc_router(Arc::clone(&handler))
+                .layer(from_fn(echo_extensions))
+                .layer(from_fn(jsonrpc_shim)),
         )
         .nest(
             REST_PATH,
-            rest_router(handler).layer(axum::middleware::from_fn(rest_shim)),
+            rest_router(handler)
+                .layer(from_fn(echo_extensions))
+                .layer(from_fn(rest_shim)),
         );
     Authenticator::new(
         id,

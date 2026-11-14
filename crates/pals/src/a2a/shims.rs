@@ -1,6 +1,6 @@
 //! What the SDK's bindings lack for A2A conformance, made up for in front
 //! of their routers: [`rest_shim`] for HTTP+JSON, [`jsonrpc_shim`] for
-//! JSON-RPC.
+//! JSON-RPC, and [`echo_extensions`] for both.
 
 use std::collections::HashMap;
 
@@ -14,8 +14,14 @@ use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use serde_json::json;
 
+use super::IDEMPOTENCY_EXTENSION;
+use super::guard::names_idempotency;
+
 /// The service parameter that names the client's protocol version.
 const VERSION_HEADER: &str = "a2a-version";
+/// The service parameter that lists the extensions a request activates, and
+/// a response the extensions it activated.
+const EXTENSIONS_HEADER: &str = "a2a-extensions";
 /// The request parameter a client may send the version in instead
 /// (A2A §3.6.1), its key matched ignoring ASCII case (§3.2.6).
 const VERSION_PARAM: &str = "a2a-version";
@@ -72,6 +78,28 @@ pub(crate) async fn jsonrpc_shim(mut request: Request, next: Next) -> Response {
         request.headers_mut().insert(VERSION_HEADER, value);
     }
     next.run(request).await
+}
+
+/// A layer for both bindings' routers: the response to a request that
+/// activates the [`IDEMPOTENCY_EXTENSION`] lists it in its `A2A-Extensions`
+/// header, the extensions activated for the request, as A2A asks a server
+/// to (SHOULD). The idempotency extension is the only one the agent has.
+pub(crate) async fn echo_extensions(request: Request, next: Next) -> Response {
+    let activated = names_idempotency(
+        request
+            .headers()
+            .get_all(EXTENSIONS_HEADER)
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
+    );
+    let mut response = next.run(request).await;
+    if activated {
+        response.headers_mut().insert(
+            EXTENSIONS_HEADER,
+            HeaderValue::from_static(IDEMPOTENCY_EXTENSION),
+        );
+    }
+    response
 }
 
 /// The protocol version a request names: its first `A2A-Version` header
