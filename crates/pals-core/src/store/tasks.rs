@@ -2,10 +2,15 @@
 //! recovery of the tasks a restart interrupted.
 //!
 //! The task methods follow the SDK's `TaskStore` contract as
-//! `a2a_server::InMemoryTaskStore` keeps it, in everything a client can
-//! observe: the same errors, versions, list filters, order (by task id) and
-//! offset page tokens. The daemon's `SqliteTaskStore` only adapts them to the
-//! async trait.
+//! `a2a_server::InMemoryTaskStore` keeps it, in the errors, versions and
+//! list filters a client can observe, but for listing, where A2A v1.0.1
+//! §3.1.4 binds and that store departs from it (ruling R53): tasks come most
+//! recently updated first, by status timestamp, newest first, then by task
+//! id, last first, a task with no status timestamp after every other; page
+//! tokens are cursors, where the page before ended, so that a walk through
+//! the pages repeats no task and skips none of those not updated meanwhile;
+//! and a task's artifacts are left out unless `includeArtifacts` is true.
+//! The daemon's `SqliteTaskStore` only adapts them to the async trait.
 //!
 //! An error an A2A client must see (`TASK_NOT_FOUND`, `TASK_NOT_CANCELABLE`,
 //! `INVALID_REQUEST`, `INVALID_PARAMS`) is an [`A2AError`] inside the
@@ -17,6 +22,8 @@ use a2a::{
     A2AError, ListTasksRequest, ListTasksResponse, Message, Part, Role, Task, TaskState, TaskStatus,
 };
 use anyhow::{Context, bail, ensure};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use tracing::warn;
@@ -41,6 +48,90 @@ fn page_size(requested: Option<i32>) -> usize {
         Some(size) if size > 0 => (size as usize).min(MAX_PAGE_SIZE),
         _ => DEFAULT_PAGE_SIZE,
     }
+}
+
+/// The `status_at` of a task with no status timestamp: before any other.
+const NO_STATUS_AT: i64 = i64::MIN;
+
+/// The `status_at` column of `task`: its status timestamp in nanoseconds
+/// since the Unix epoch, held to what an `i64` counts (the years 1677 to
+/// 2262), or [`NO_STATUS_AT`] when it has none.
+pub(super) fn status_at(task: &Task) -> i64 {
+    task.status.timestamp.map_or(NO_STATUS_AT, |at| nanos(&at))
+}
+
+/// `at` in nanoseconds since the Unix epoch, held to what an `i64` counts,
+/// above [`NO_STATUS_AT`].
+fn nanos(at: &DateTime<Utc>) -> i64 {
+    at.timestamp_nanos_opt().unwrap_or(if at.timestamp() < 0 {
+        NO_STATUS_AT + 1
+    } else {
+        i64::MAX
+    })
+}
+
+/// Where a page of a listing ended: its last task's `status_at` and id. As a
+/// page token it is opaque: the base64url of `<status_at>:<task id>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Cursor {
+    status_at: i64,
+    task_id: String,
+}
+
+impl Cursor {
+    fn token(&self) -> String {
+        URL_SAFE_NO_PAD.encode(format!("{}:{}", self.status_at, self.task_id))
+    }
+
+    /// The cursor `token` holds; `INVALID_PARAMS` when it holds none.
+    fn of_token(token: &str) -> Result<Self, A2AError> {
+        let invalid = || A2AError::invalid_params("invalid page token");
+        let text = URL_SAFE_NO_PAD
+            .decode(token)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .ok_or_else(invalid)?;
+        let (status_at, task_id) = text.split_once(':').ok_or_else(invalid)?;
+        let status_at = status_at.parse::<i64>().map_err(|_| invalid())?;
+        if task_id.is_empty() {
+            return Err(invalid());
+        }
+        Ok(Self {
+            status_at,
+            task_id: task_id.to_owned(),
+        })
+    }
+}
+
+/// Adds `tasks.status_at` and its index to a database of this schema
+/// version written before they existed, filled from each task's JSON (a
+/// row whose task does not decode gets [`NO_STATUS_AT`]). Does nothing to
+/// one that has them.
+pub(super) fn add_status_at(conn: &Connection) -> anyhow::Result<()> {
+    let present: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'status_at'",
+        [],
+        |r| r.get(0),
+    )?;
+    if present > 0 {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "ALTER TABLE tasks ADD COLUMN status_at INTEGER NOT NULL DEFAULT 0;
+         CREATE INDEX tasks_by_status_at ON tasks (status_at, task_id);",
+    )?;
+    let rows: Vec<(String, String)> = conn
+        .prepare("SELECT task_id, task_json FROM tasks")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    for (task_id, json) in rows {
+        let at = decode(&task_id, &json).map_or(NO_STATUS_AT, |task| status_at(&task));
+        conn.execute(
+            "UPDATE tasks SET status_at = ?2 WHERE task_id = ?1",
+            params![task_id, at],
+        )?;
+    }
+    Ok(())
 }
 
 /// Keeps the last `history_length` messages of the task's history, none
@@ -86,7 +177,8 @@ fn decode(task_id: &str, json: &str) -> anyhow::Result<Task> {
 fn rewrite(conn: &Connection, task: &Task, version: i64, now_unix: i64) -> anyhow::Result<()> {
     let changed = conn.execute(
         "UPDATE tasks
-         SET context_id = ?2, state = ?3, updated_at = ?4, version = ?5, task_json = ?6
+         SET context_id = ?2, state = ?3, updated_at = ?4, version = ?5, task_json = ?6,
+             status_at = ?7
          WHERE task_id = ?1",
         params![
             task.id,
@@ -94,7 +186,8 @@ fn rewrite(conn: &Connection, task: &Task, version: i64, now_unix: i64) -> anyho
             state_name(&task.status.state)?,
             now_unix,
             version,
-            serde_json::to_string(task)?
+            serde_json::to_string(task)?,
+            status_at(task)
         ],
     )?;
     ensure!(changed == 1, "task {} is not stored", task.id);
@@ -110,15 +203,17 @@ impl Store {
     /// already stored is refused, and stays as it was.
     pub fn task_create(&self, task: &Task, now_unix: i64) -> anyhow::Result<u64> {
         let inserted = self.conn().execute(
-            "INSERT INTO tasks (task_id, context_id, state, updated_at, version, task_json)
-             VALUES (?1, ?2, ?3, ?4, 1, ?5)
+            "INSERT INTO tasks (task_id, context_id, state, updated_at, version, task_json,
+                                status_at)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6)
              ON CONFLICT (task_id) DO NOTHING",
             params![
                 task.id,
                 task.context_id,
                 state_name(&task.status.state)?,
                 now_unix,
-                serde_json::to_string(task)?
+                serde_json::to_string(task)?,
+                status_at(task)
             ],
         )?;
         ensure!(inserted == 1, "task {} already exists", task.id);
@@ -182,12 +277,14 @@ impl Store {
     }
 
     /// One page of the tasks that match `req`'s filters (context, state, a
-    /// status timestamp strictly after `status_timestamp_after`), by task
-    /// id, with their history cut to `history_length`.
+    /// status timestamp strictly after `status_timestamp_after`), most
+    /// recently updated first: by status timestamp, newest first, then by
+    /// task id, last first. History is cut to `history_length`; artifacts
+    /// are left out unless `include_artifacts` is true.
     ///
-    /// A page token is the offset of the page's first task in the filtered
-    /// list; `INVALID_PARAMS` for one that is not a number, and an empty last
-    /// page for one past the end. `total_size` counts the filtered list.
+    /// A page token is the cursor of where the page before ended
+    /// ([`Cursor`]); `INVALID_PARAMS` for one that is not. `next_page_token`
+    /// is empty on the last page, and `total_size` counts the filtered list.
     pub fn tasks_list(&self, req: &ListTasksRequest) -> anyhow::Result<ListTasksResponse> {
         self.tasks_list_where(None, req)
     }
@@ -206,54 +303,79 @@ impl Store {
         owner: Option<&AgentId>,
         req: &ListTasksRequest,
     ) -> anyhow::Result<ListTasksResponse> {
+        const FILTERS: &str = "(?1 IS NULL OR context_id = ?1)
+            AND (?2 IS NULL OR state = ?2)
+            AND (?3 IS NULL OR task_id IN (SELECT task_id FROM task_owners WHERE owner = ?3))
+            AND (?4 IS NULL OR status_at > ?4)";
         let page_size = page_size(req.page_size);
-        let start = match &req.page_token {
-            Some(token) => token
-                .parse::<usize>()
-                .map_err(|_| A2AError::invalid_params("invalid page token"))?,
-            None => 0,
-        };
+        let after = req
+            .page_token
+            .as_deref()
+            .map(Cursor::of_token)
+            .transpose()?;
         let state = req.status.as_ref().map(state_name).transpose()?;
-        let rows: Vec<(String, String)> = {
-            let conn = self.conn();
-            let mut stmt = conn.prepare(
-                "SELECT task_id, task_json FROM tasks
-                 WHERE (?1 IS NULL OR context_id = ?1)
-                   AND (?2 IS NULL OR state = ?2)
-                   AND (?3 IS NULL
-                        OR task_id IN (SELECT task_id FROM task_owners WHERE owner = ?3))
-                 ORDER BY task_id",
+        let since = req.status_timestamp_after.as_ref().map(nanos);
+        let (total, rows): (i64, Vec<(String, String, i64)>) = {
+            let mut conn = self.conn();
+            // One snapshot for the count and the page.
+            let tx = conn.transaction()?;
+            let total = tx.query_row(
+                &format!("SELECT COUNT(*) FROM tasks WHERE {FILTERS}"),
+                params![req.context_id, state, owner, since],
+                |r| r.get(0),
             )?;
-            stmt.query_map(params![req.context_id, state, owner], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?
-            .collect::<Result<_, _>>()?
+            let mut stmt = tx.prepare(&format!(
+                "SELECT task_id, task_json, status_at FROM tasks
+                 WHERE {FILTERS}
+                   AND (?5 IS NULL OR status_at < ?5 OR (status_at = ?5 AND task_id < ?6))
+                 ORDER BY status_at DESC, task_id DESC
+                 LIMIT ?7"
+            ))?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        req.context_id,
+                        state,
+                        owner,
+                        since,
+                        after.as_ref().map(|cursor| cursor.status_at),
+                        after.as_ref().map(|cursor| cursor.task_id.as_str()),
+                        // One more, to know whether a page follows.
+                        i64::try_from(page_size)? + 1
+                    ],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?
+                .collect::<Result<_, _>>()?;
+            drop(stmt);
+            tx.commit()?;
+            (total, rows)
         };
-        let mut tasks = rows
+        let next_page_token = match rows.get(page_size) {
+            Some(_) => {
+                let (task_id, _, status_at) = &rows[page_size - 1];
+                Cursor {
+                    status_at: *status_at,
+                    task_id: task_id.clone(),
+                }
+                .token()
+            }
+            None => String::new(),
+        };
+        let include_artifacts = req.include_artifacts == Some(true);
+        let tasks = rows
             .iter()
-            .map(|(task_id, json)| decode(task_id, json))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        if let Some(after) = req.status_timestamp_after {
-            tasks.retain(|t| t.status.timestamp.is_some_and(|at| at > after));
-        }
-
-        let total = tasks.len();
-        let start = start.min(total);
-        let end = start.saturating_add(page_size).min(total);
-        let next_page_token = if end < total {
-            end.to_string()
-        } else {
-            String::new()
-        };
-        let page = tasks
-            .drain(start..end)
-            .map(|mut task| {
+            .take(page_size)
+            .map(|(task_id, json, _)| {
+                let mut task = decode(task_id, json)?;
                 apply_history_length(&mut task, req.history_length);
-                task
+                if !include_artifacts {
+                    task.artifacts = None;
+                }
+                Ok(task)
             })
-            .collect();
+            .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(ListTasksResponse {
-            tasks: page,
+            tasks,
             next_page_token,
             page_size: i32::try_from(page_size)?,
             total_size: i32::try_from(total).context("too many tasks to count")?,
@@ -421,6 +543,94 @@ mod tests {
     }
 
     #[test]
+    fn a_database_from_before_status_at_gets_it_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pals.db");
+        let owner = AgentKey::generate().id();
+        // The schema as this version first wrote it, and two tasks in it.
+        let old_schema = super::super::SCHEMA
+            .replace(",\n    status_at  INTEGER NOT NULL", "")
+            .replace(
+                "CREATE INDEX tasks_by_status_at ON tasks (status_at, task_id);\n",
+                "",
+            );
+        assert!(!old_schema.contains("status_at  INTEGER"));
+        assert!(!old_schema.contains("tasks_by_status_at"));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&old_schema).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            for (id, at) in [("t-old", NOW - 60), ("t-new", NOW)] {
+                let mut t = task(id, TaskState::Working);
+                t.status.timestamp = DateTime::from_timestamp(at, 0);
+                conn.execute(
+                    "INSERT INTO tasks (task_id, context_id, state, updated_at, version, task_json)
+                     VALUES (?1, 'ctx', 'TASK_STATE_WORKING', ?2, 1, ?3)",
+                    params![id, at, serde_json::to_string(&t).unwrap()],
+                )
+                .unwrap();
+            }
+        }
+
+        for _ in 0..2 {
+            let store = Store::open(&path, owner).unwrap();
+            let all = ListTasksRequest {
+                context_id: None,
+                status: None,
+                page_size: None,
+                page_token: None,
+                history_length: None,
+                status_timestamp_after: None,
+                include_artifacts: None,
+                tenant: None,
+            };
+            let listed: Vec<String> = store
+                .tasks_list(&all)
+                .unwrap()
+                .tasks
+                .into_iter()
+                .map(|t| t.id)
+                .collect();
+            assert_eq!(listed, ["t-new", "t-old"]);
+            store
+                .task_create(&task("t-after", TaskState::Working), NOW)
+                .unwrap();
+            store
+                .conn()
+                .execute("DELETE FROM tasks WHERE task_id = 't-after'", [])
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn page_tokens_are_opaque_cursors() {
+        let cursor = Cursor {
+            status_at: -5,
+            task_id: "t:1".to_owned(),
+        };
+        assert_eq!(Cursor::of_token(&cursor.token()).unwrap(), cursor);
+        assert!(!cursor.token().contains("t:1"));
+        for bad in ["", "2", "!!", "LTU"] {
+            let err = Cursor::of_token(bad).unwrap_err();
+            assert_eq!(err.code, a2a::error_code::INVALID_PARAMS, "{bad}");
+        }
+    }
+
+    #[test]
+    fn status_timestamps_order_as_nanoseconds() {
+        let mut t = task("t", TaskState::Working);
+        t.status.timestamp = None;
+        assert_eq!(status_at(&t), NO_STATUS_AT);
+        let early = DateTime::from_timestamp(NOW, 1).unwrap();
+        let late = DateTime::from_timestamp(NOW, 2).unwrap();
+        assert!(nanos(&early) < nanos(&late));
+        let far = DateTime::from_timestamp(i64::MAX / 1_000_000_000 + 1, 0).unwrap();
+        assert_eq!(nanos(&far), i64::MAX);
+        let ancient = DateTime::from_timestamp(i64::MIN / 1_000_000_000 - 1, 0).unwrap();
+        assert_eq!(nanos(&ancient), NO_STATUS_AT + 1);
+    }
+
+    #[test]
     fn a_task_owner_is_set_once() {
         let store = Store::open_in_memory(AgentKey::generate().id()).unwrap();
         let alice = AgentKey::generate().id();
@@ -493,8 +703,9 @@ mod tests {
         store
             .conn()
             .execute(
-                "INSERT INTO tasks (task_id, context_id, state, updated_at, version, task_json)
-                 VALUES ('t-corrupt', 'ctx', 'TASK_STATE_WORKING', ?1, 1, '{not json')",
+                "INSERT INTO tasks (task_id, context_id, state, updated_at, version, task_json,
+                                    status_at)
+                 VALUES ('t-corrupt', 'ctx', 'TASK_STATE_WORKING', ?1, 1, '{not json', 0)",
                 params![NOW - 60],
             )
             .unwrap();

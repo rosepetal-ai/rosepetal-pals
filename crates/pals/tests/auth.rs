@@ -465,7 +465,8 @@ async fn list_tasks_returns_only_own_tasks() {
         task_id(&a.ask(&b, &for_a, "a1").await).to_owned(),
         task_id(&a.ask(&b, &for_a, "a2").await).to_owned(),
     ];
-    mine.sort();
+    // Listed most recently updated first (A2A §3.1.4).
+    mine.reverse();
     let theirs = task_id(&c.ask(&b, &for_c, "c1").await).to_owned();
 
     // One page at a time, every page holds only A's tasks.

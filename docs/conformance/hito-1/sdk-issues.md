@@ -1,6 +1,6 @@
 # Borradores de issues para el SDK oficial de Rust
 
-Defectos del SDK fijado (`a2a-lf =0.4.2`, `a2a-server-lf =0.5.3`, con `a2a-pb 0.3.2`) que hacían fallar requisitos MUST del TCK de A2A (`a2aproject/a2a-tck` en `104a7b4ae0d8`). PALS los rodea en sus propias capas; estos textos son para abrirlos aguas arriba en `a2aproject/a2a-rs`. **No se han enviado:** abrirlos es una acción externa que decide el responsable. Van en inglés, como el repositorio de destino.
+Defectos del SDK fijado (`a2a-lf =0.4.2`, `a2a-server-lf =0.5.3`, con `a2a-pb 0.3.2`) que hacían fallar requisitos MUST del TCK de A2A (`a2aproject/a2a-tck` en `104a7b4ae0d8`), o que incumplen requisitos MUST de la especificación aunque el TCK no lo detecte (el 5). PALS los rodea en sus propias capas; estos textos son para abrirlos aguas arriba en `a2aproject/a2a-rs`. **No se han enviado:** abrirlos es una acción externa que decide el responsable. Van en inglés, como el repositorio de destino.
 
 Cada borrador se puede reproducir con el servidor de ejemplo del SDK; los números de línea son los de las versiones citadas.
 
@@ -72,3 +72,19 @@ Both answer with a task (`200`), whose history holds a message with a server-gen
 **Expected.** A stream whose first event is the `Task` as it is now, followed by its updates (including those of the execution a later message starts) until the task reaches a terminal state.
 
 **Suggested fix.** On a registry miss for a non-terminal stored task, start a subscription that emits the stored task and attaches to the next execution of that task (the execution manager could keep a per-task broadcast channel that outlives a single execution).
+
+---
+
+## 5. `InMemoryTaskStore::list` sorts by task id, pages by offset and always returns artifacts
+
+**Crate:** `a2a-server-lf 0.5.3` (`task_store::inmemory::InMemoryTaskStore::list`, `handler::DefaultRequestHandler::list_tasks`)
+
+**TCK:** CORE-LIST-002, CORE-LIST-003 and CORE-LIST-005 (MUST, §3.1.4). The TCK lists an empty context, so it checks only the shape of the response and these pass anyway.
+
+**What happens.** `list` sorts the matching tasks by `id` ("for deterministic output"), returns `pageToken` as a decimal offset into that order, and never looks at `include_artifacts`: each task comes with its artifacts. Neither `list_tasks` in the handler nor the REST and JSON-RPC routers drop them afterwards.
+
+**Reproduce.** Create two tasks, the second with an id that sorts first, then `ListTasks {}`: the second task is listed last although it was updated last, and both carry `artifacts`. Update a task between two `pageSize: 1` requests: offsets shift, and a task is listed twice or skipped.
+
+**Expected.** §3.1.4: "Implementations MUST return tasks sorted by their status timestamp time in descending order (most recently updated tasks first)"; "MUST use cursor-based pagination"; "When `includeArtifacts` is false (the default), the artifacts field MUST be omitted entirely from each Task object in the response."
+
+**Suggested fix.** Sort by `status.timestamp` descending with the task id as tie-break, encode the last task's (timestamp, id) as an opaque cursor in `nextPageToken` and resume strictly after it, and clear `artifacts` unless `include_artifacts` is true (in the store, or in `list_tasks` for every store).

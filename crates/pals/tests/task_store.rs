@@ -1,7 +1,10 @@
 //! The SQLite task store: the SDK's `TaskStore` contract, checked with the
-//! same assertions against the SDK's own `InMemoryTaskStore`; durability
-//! across a reopen; recovery of the tasks a restart interrupted; listing
-//! scoped to the peer that owns each task; and the task events it logs.
+//! same assertions against the SDK's own `InMemoryTaskStore`, but for
+//! listing, which follows A2A v1.0.1 §3.1.4 where that store does not (most
+//! recently updated first, cursor page tokens, artifacts only on request);
+//! durability across a reopen; recovery of the tasks a restart interrupted;
+//! listing scoped to the peer that owns each task; and the task events it
+//! logs.
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -123,12 +126,18 @@ where
 
 /// The same assertions against any `TaskStore`.
 async fn suite<S: TaskStore>(s: S) {
-    list_filters_and_pages(&s).await;
     create_get_update(&s).await;
     begin_cancel(&s).await;
 }
 
-/// On an empty store: filters, ordering, history truncation and paging.
+/// `task` as a listing shows it without `includeArtifacts`.
+fn without_artifacts(mut task: Task) -> Task {
+    task.artifacts = None;
+    task
+}
+
+/// On an empty store: filters, ordering, history truncation, artifacts and
+/// paging, as A2A v1.0.1 §3.1.4 wants them.
 async fn list_filters_and_pages<S: TaskStore>(s: &S) {
     let rows = [
         ("t-05", "ctx-a", TaskState::Working, Some(at(5))),
@@ -139,6 +148,10 @@ async fn list_filters_and_pages<S: TaskStore>(s: &S) {
         ("t-03", "ctx-b", TaskState::Working, Some(at(3))),
         ("t-04", "ctx-a", TaskState::InputRequired, Some(at(4))),
     ];
+    // Two tasks updated at the same instant, told apart by id.
+    let rows = rows
+        .into_iter()
+        .chain([("t-08", "ctx-b", TaskState::Working, Some(at(6)))]);
     let mut all = Vec::new();
     for (id, context_id, state, timestamp) in rows {
         let mut t = task(id, context_id, state);
@@ -146,14 +159,44 @@ async fn list_filters_and_pages<S: TaskStore>(s: &S) {
         assert_eq!(s.create(t.clone()).await.unwrap(), 1);
         all.push(t);
     }
-    all.sort_by(|a, b| a.id.cmp(&b.id));
+    // Most recently updated first, the last id first among equals, and a
+    // task with no status timestamp last.
+    let newest_first = [
+        "t-07", "t-08", "t-06", "t-05", "t-04", "t-03", "t-02", "t-01",
+    ];
+    let by_id = |id: &str| all.iter().find(|t| t.id == id).unwrap().clone();
     let list = |r: ListTasksRequest| async move { s.list(&r).await.unwrap() };
 
-    // Everything, by id, whole.
+    // Everything, newest first, without artifacts unless asked for.
     let resp = list(req()).await;
-    assert_eq!(resp.tasks, all);
+    assert_eq!(ids(&resp), newest_first);
+    let expected: Vec<Task> = newest_first.map(|id| without_artifacts(by_id(id))).into();
+    assert_eq!(resp.tasks, expected);
     assert_eq!(resp.next_page_token, "");
-    assert_eq!((resp.page_size, resp.total_size), (50, 7));
+    assert_eq!((resp.page_size, resp.total_size), (50, 8));
+    let wire = serde_json::to_value(&resp).unwrap();
+    assert!(
+        wire["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t.get("artifacts").is_none()),
+        "{wire}"
+    );
+    for include in [Some(false), None] {
+        let resp = list(ListTasksRequest {
+            include_artifacts: include,
+            ..req()
+        })
+        .await;
+        assert!(resp.tasks.iter().all(|t| t.artifacts.is_none()));
+    }
+    let resp = list(ListTasksRequest {
+        include_artifacts: Some(true),
+        ..req()
+    })
+    .await;
+    assert_eq!(resp.tasks, newest_first.map(by_id));
 
     let filtered = |context_id: Option<&str>, status: Option<TaskState>| ListTasksRequest {
         context_id: context_id.map(str::to_owned),
@@ -161,13 +204,13 @@ async fn list_filters_and_pages<S: TaskStore>(s: &S) {
         ..req()
     };
     let resp = list(filtered(Some("ctx-a"), None)).await;
-    assert_eq!(ids(&resp), ["t-01", "t-02", "t-04", "t-05", "t-06", "t-07"]);
+    assert_eq!(ids(&resp), ["t-07", "t-06", "t-05", "t-04", "t-02", "t-01"]);
     assert_eq!(resp.total_size, 6);
     let resp = list(filtered(None, Some(TaskState::Working))).await;
-    assert_eq!(ids(&resp), ["t-01", "t-03", "t-05", "t-06"]);
-    assert_eq!(resp.total_size, 4);
+    assert_eq!(ids(&resp), ["t-08", "t-06", "t-05", "t-03", "t-01"]);
+    assert_eq!(resp.total_size, 5);
     let resp = list(filtered(Some("ctx-a"), Some(TaskState::Working))).await;
-    assert_eq!(ids(&resp), ["t-01", "t-05", "t-06"]);
+    assert_eq!(ids(&resp), ["t-06", "t-05", "t-01"]);
     let resp = list(filtered(Some("ctx-none"), None)).await;
     assert_eq!((resp.tasks.len(), resp.total_size), (0, 0));
 
@@ -177,10 +220,11 @@ async fn list_filters_and_pages<S: TaskStore>(s: &S) {
         ..req()
     })
     .await;
-    assert_eq!(ids(&resp), ["t-06", "t-07"]);
-    assert_eq!(resp.total_size, 2);
+    assert_eq!(ids(&resp), ["t-07", "t-08", "t-06"]);
+    assert_eq!(resp.total_size, 3);
 
-    // The pages cover the filtered set once, in order.
+    // The pages cover the filtered set once, newest first, the tie across
+    // a page break included.
     let paged =
         |page_size: i32, context_id: Option<&str>, status: Option<TaskState>| ListTasksRequest {
             page_size: Some(page_size),
@@ -188,18 +232,23 @@ async fn list_filters_and_pages<S: TaskStore>(s: &S) {
         };
     assert_eq!(
         walk(list, paged(2, Some("ctx-a"), None), 6).await,
-        [["t-01", "t-02"], ["t-04", "t-05"], ["t-06", "t-07"]]
+        [["t-07", "t-06"], ["t-05", "t-04"], ["t-02", "t-01"]]
     );
     assert_eq!(
-        walk(list, paged(4, None, None), 7).await,
+        walk(list, paged(3, None, None), 8).await,
         [
-            vec!["t-01", "t-02", "t-03", "t-04"],
-            vec!["t-05", "t-06", "t-07"]
+            vec!["t-07", "t-08", "t-06"],
+            vec!["t-05", "t-04", "t-03"],
+            vec!["t-02", "t-01"]
         ]
     );
     assert_eq!(
-        walk(list, paged(1, None, Some(TaskState::Working)), 4).await,
-        [["t-01"], ["t-03"], ["t-05"], ["t-06"]]
+        walk(list, paged(1, None, None), 8).await,
+        newest_first.map(|id| vec![id])
+    );
+    assert_eq!(
+        walk(list, paged(2, None, Some(TaskState::Working)), 5).await,
+        [vec!["t-08", "t-06"], vec!["t-05", "t-03"], vec!["t-01"]]
     );
 
     // Absent, zero and negative sizes mean the default page; larger ones are
@@ -210,27 +259,39 @@ async fn list_filters_and_pages<S: TaskStore>(s: &S) {
             ..req()
         })
         .await;
-        assert_eq!((resp.page_size, resp.tasks.len()), (served, 7));
+        assert_eq!((resp.page_size, resp.tasks.len()), (served, 8));
     }
 
-    // A token past the end is an empty last page; one that is not a token is
-    // refused.
-    let resp = list(ListTasksRequest {
-        page_token: Some("999".to_owned()),
+    // Anything but a token this store gave is refused: offsets, garbage, a
+    // token of no cursor.
+    let first = list(ListTasksRequest {
+        page_size: Some(1),
         ..req()
     })
     .await;
-    assert!(resp.tasks.is_empty());
-    assert_eq!((resp.next_page_token.as_str(), resp.total_size), ("", 7));
-    assert_error(
-        s.list(&ListTasksRequest {
-            page_token: Some("not-a-number".to_owned()),
-            ..req()
-        })
-        .await,
-        error_code::INVALID_PARAMS,
-        "invalid page token",
-    );
+    let token = first.next_page_token;
+    let cut = token[..token.len() - 2].to_owned();
+    for bad in [
+        "2",
+        "999",
+        "not-a-number",
+        "",
+        "%%%",
+        cut.as_str(),
+        "bm8tY29sb24", // "no-colon"
+        "eDp0LTAx",    // "x:t-01"
+        "MTIzOg",      // "123:"
+    ] {
+        assert_error(
+            s.list(&ListTasksRequest {
+                page_token: Some(bad.to_owned()),
+                ..req()
+            })
+            .await,
+            error_code::INVALID_PARAMS,
+            "invalid page token",
+        );
+    }
 
     // History is cut in the listing only.
     let history_of = |resp: &ListTasksResponse| -> Vec<Vec<Message>> {
@@ -244,9 +305,9 @@ async fn list_filters_and_pages<S: TaskStore>(s: &S) {
         ..req()
     })
     .await;
-    let last: Vec<Vec<Message>> = all
+    let last: Vec<Vec<Message>> = newest_first
         .iter()
-        .map(|t| t.history.as_ref().unwrap()[2..].to_vec())
+        .map(|id| by_id(id).history.unwrap()[2..].to_vec())
         .collect();
     assert_eq!(history_of(&resp), last);
     for cut in [0, -1] {
@@ -257,7 +318,63 @@ async fn list_filters_and_pages<S: TaskStore>(s: &S) {
         .await;
         assert!(history_of(&resp).iter().all(Vec::is_empty));
     }
-    assert_eq!(s.get("t-01").await.unwrap().as_ref(), Some(&all[0]));
+    // Only the listing leaves artifacts out.
+    assert_eq!(s.get("t-01").await.unwrap(), Some(by_id("t-01")));
+}
+
+/// Pages walked one by one while tasks are updated in between: no task
+/// comes twice, and every task not updated during the walk comes once.
+async fn page_walk_while_updating<S: TaskStore>(s: &S) {
+    for n in 0..20 {
+        let mut t = task(&format!("w-{n:02}"), "ctx-w", TaskState::Working);
+        t.status.timestamp = Some(at(n));
+        s.create(t).await.unwrap();
+    }
+    let mut seen = Vec::new();
+    let mut updated = Vec::new();
+    let mut token = None;
+    for step in 0.. {
+        let resp = s
+            .list(&ListTasksRequest {
+                context_id: Some("ctx-w".to_owned()),
+                page_size: Some(3),
+                page_token: token.take(),
+                ..req()
+            })
+            .await
+            .unwrap();
+        seen.extend(ids(&resp).into_iter().map(str::to_owned));
+        if resp.next_page_token.is_empty() {
+            break;
+        }
+        token = Some(resp.next_page_token);
+        // Between pages, a task already listed and one not listed yet move
+        // to the front, as the newest.
+        for id in [seen[0].clone(), format!("w-{:02}", 2 * step)] {
+            let mut t = s.get(&id).await.unwrap().unwrap();
+            t.status.timestamp = Some(at(100 + step));
+            s.update(t).await.unwrap();
+            updated.push(id);
+        }
+    }
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), seen.len(), "a task came twice: {seen:?}");
+    for n in 0..20 {
+        let id = format!("w-{n:02}");
+        assert!(
+            seen.contains(&id) || updated.contains(&id),
+            "{id} was skipped: {seen:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sqlite_lists_newest_first_with_cursor_pages() {
+    let s = SqliteTaskStore::new(store());
+    list_filters_and_pages(&s).await;
+    page_walk_while_updating(&s).await;
 }
 
 async fn create_get_update<S: TaskStore>(s: &S) {
@@ -431,7 +548,10 @@ async fn tasks_survive_reopen() {
     assert_eq!(tasks.get("r-done").await.unwrap(), Some(done.clone()));
     assert_eq!(
         tasks.list(&req()).await.unwrap().tasks,
-        [done.clone(), working.clone()]
+        [
+            without_artifacts(done.clone()),
+            without_artifacts(working.clone())
+        ]
     );
     assert_eq!(store.task_owner("r-working").unwrap(), Some(peer));
     assert_eq!(store.task_owner("r-done").unwrap(), None);
@@ -530,14 +650,15 @@ async fn list_for_owner_never_returns_other_owners_tasks() {
         resp
     };
 
+    // All updated at the same instant: by id, last first.
     let resp = for_owner(alice, req());
-    assert_eq!(ids(&resp), ["o-1", "o-3", "o-5"]);
+    assert_eq!(ids(&resp), ["o-5", "o-3", "o-1"]);
     assert_eq!((resp.total_size, resp.next_page_token.as_str()), (3, ""));
     assert_eq!(
-        Some(&resp.tasks[0]),
-        tasks.get("o-1").await.unwrap().as_ref()
+        Some(resp.tasks[2].clone()),
+        tasks.get("o-1").await.unwrap().map(without_artifacts)
     );
-    assert_eq!(ids(&for_owner(bob, req())), ["o-2", "o-4", "o-6"]);
+    assert_eq!(ids(&for_owner(bob, req())), ["o-6", "o-4", "o-2"]);
     let resp = for_owner(carol, req());
     assert_eq!((resp.tasks.len(), resp.total_size), (0, 0));
 
@@ -549,7 +670,7 @@ async fn list_for_owner_never_returns_other_owners_tasks() {
             ..req()
         },
     );
-    assert_eq!(ids(&resp), ["o-1", "o-5"]);
+    assert_eq!(ids(&resp), ["o-5", "o-1"]);
     let resp = for_owner(
         bob,
         ListTasksRequest {
@@ -568,27 +689,29 @@ async fn list_for_owner_never_returns_other_owners_tasks() {
     );
     assert!(resp.tasks.iter().all(|t| t.history == Some(Vec::new())));
 
-    // Pages walk the owner's tasks only, whatever token is presented.
+    // Pages walk the owner's tasks only, whatever token is presented: a
+    // cursor taken from another owner's listing only says where to start.
     let paged = ListTasksRequest {
         page_size: Some(1),
         ..req()
     };
     assert_eq!(
         walk(|r| ready(for_owner(alice, r)), paged.clone(), 3).await,
-        [["o-1"], ["o-3"], ["o-5"]]
+        [["o-5"], ["o-3"], ["o-1"]]
     );
     assert_eq!(
-        walk(|r| ready(for_owner(bob, r)), paged, 3).await,
-        [["o-2"], ["o-4"], ["o-6"]]
+        walk(|r| ready(for_owner(bob, r)), paged.clone(), 3).await,
+        [["o-6"], ["o-4"], ["o-2"]]
     );
+    let bobs_token = for_owner(bob, paged).next_page_token;
     let resp = for_owner(
         alice,
         ListTasksRequest {
-            page_token: Some("2".to_owned()),
+            page_token: Some(bobs_token),
             ..req()
         },
     );
-    assert_eq!(ids(&resp), ["o-5"]);
+    assert_eq!(ids(&resp), ["o-5", "o-3", "o-1"]);
 
     // A bad token is the A2A error the SDK store gives.
     let err = store

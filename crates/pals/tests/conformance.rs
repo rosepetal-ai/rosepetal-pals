@@ -426,3 +426,73 @@ async fn agent_cards_can_be_cached() {
     assert_eq!(res.status, 200);
     assert_eq!(res.json, card);
 }
+
+#[tokio::test]
+async fn list_tasks_comes_newest_first_with_cursors_and_artifacts_on_request() {
+    // A2A v1.0.1 §3.1.4, which the SDK's own store does not follow.
+    let b = spawn_node(WorkerCfg::Echo).await;
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let g = grant(&b, &a, &[TaskSend, TaskRead], 3600);
+    let mut ids = Vec::new();
+    for text in ["first", "second", "third"] {
+        let task = a.ask(&b, &g, text).await;
+        assert!(task["artifacts"].is_array(), "{task}");
+        ids.push(task["id"].as_str().unwrap().to_owned());
+    }
+    let newest_first: Vec<&str> = ids.iter().rev().map(String::as_str).collect();
+    let listed = |result: &Value| -> Vec<String> {
+        result["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let has_artifacts = |result: &Value| -> Vec<bool> {
+        result["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.get("artifacts").is_some())
+            .collect()
+    };
+
+    // JSON-RPC: artifacts omitted, not empty nor null, unless asked for.
+    let res = a.rpc(&b, Some(&g), "ListTasks", json!({})).await;
+    let result = &res.json["result"];
+    assert_eq!(listed(result), newest_first, "{}", res.json);
+    assert_eq!(has_artifacts(result), [false; 3], "{}", res.json);
+    let res = a
+        .rpc(&b, Some(&g), "ListTasks", json!({"includeArtifacts": true}))
+        .await;
+    assert_eq!(
+        has_artifacts(&res.json["result"]),
+        [true; 3],
+        "{}",
+        res.json
+    );
+
+    // HTTP+JSON, a page at a time, by cursor.
+    let version = [("a2a-version", "1.0")];
+    let mut seen = Vec::new();
+    let mut path = "/rest/tasks?pageSize=2".to_owned();
+    loop {
+        let res = rest(&a, &b, &g, "GET", &path, &version, None).await;
+        assert_eq!(res.status, 200, "{}", res.json);
+        assert!(
+            has_artifacts(&res.json).iter().all(|has| !has),
+            "{}",
+            res.json
+        );
+        seen.extend(listed(&res.json));
+        match res.json["nextPageToken"].as_str() {
+            Some(token) if !token.is_empty() => {
+                path = format!("/rest/tasks?pageSize=2&pageToken={token}");
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(seen, newest_first);
+    let res = rest(&a, &b, &g, "GET", "/rest/tasks?pageToken=1", &version, None).await;
+    assert_rest_error(&res, 400, "INVALID_PARAMS");
+}

@@ -19,7 +19,10 @@ const TASK_TERMINAL: &str = "task.terminal";
 
 /// The SDK's [`TaskStore`] on the agent's [`Store`], so tasks survive a
 /// restart. It behaves as the SDK's `InMemoryTaskStore` in everything a
-/// client can observe; the `Store::task_*` methods it calls hold the logic.
+/// client can observe but listing, which follows A2A v1.0.1 §3.1.4 where
+/// that store does not (most recently updated first, cursor page tokens,
+/// artifacts only when asked for); the `Store::task_*` methods it calls
+/// hold the logic.
 ///
 /// With [`SqliteTaskStore::with_events`] it also logs, signed by the agent,
 /// `task.accepted` when a task is created and `task.terminal` when a task

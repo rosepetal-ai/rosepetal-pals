@@ -85,7 +85,9 @@ impl Store {
                 tx.execute_batch(SCHEMA)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
-            SCHEMA_VERSION => {}
+            // Written before `tasks.status_at` was added to this version,
+            // while it was unreleased.
+            SCHEMA_VERSION => tasks::add_status_at(&tx)?,
             _ => bail!(
                 "unsupported schema version {version}: this build of pals reads version \
                  {SCHEMA_VERSION}"
