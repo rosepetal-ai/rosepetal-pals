@@ -29,6 +29,7 @@ mod records;
 mod tasks;
 mod views;
 
+pub use benchmarks::KeptBenchmark;
 pub use cards::MAX_CARD_CONTEXTS_PER_PEER;
 pub use contacts::Contact;
 pub use dedup::{DEDUP_INFLIGHT_WAIT_S, DEDUP_RETENTION_S, DedupBegin, DedupRow};

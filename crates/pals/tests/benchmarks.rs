@@ -20,9 +20,11 @@ use pals_core::benchmark::{
     Provenance, Subject,
 };
 use pals_core::discovery::DISCOVERY_VERSION;
-use pals_core::discovery::query::{BenchmarkRef, QUERY_SCHEMA, Requirements, ServiceQuery};
+use pals_core::discovery::query::{
+    BenchmarkRef, QUERY_SCHEMA, Requirements, ServiceOffer, ServiceQuery,
+};
 use pals_core::discovery::wire::{self, ErrorCode, Request, request, response};
-use pals_core::grant::Operation::TaskRead;
+use pals_core::grant::Operation::{TaskRead, TaskSend};
 use pals_core::grant::{SignedGrant, format_timestamp};
 use pals_core::identity::AgentKey;
 use pals_core::inventory::Visibility;
@@ -195,6 +197,17 @@ async fn refs_offered(
     capability: &str,
     grant: Option<&SignedGrant>,
 ) -> (Option<String>, Vec<BenchmarkRef>) {
+    let offer = offer_of(from, to, capability, grant).await;
+    (offer.skill_id, offer.benchmark_refs)
+}
+
+/// The offer `to` makes `from` for `capability`, presenting `grant`.
+async fn offer_of(
+    from: &TestNode,
+    to: &TestNode,
+    capability: &str,
+    grant: Option<&SignedGrant>,
+) -> ServiceOffer {
     let query = ServiceQuery {
         schema: QUERY_SCHEMA.to_owned(),
         query_id: "q-bench".to_owned(),
@@ -214,7 +227,23 @@ async fn refs_offered(
         .query(&to.id(), to.node.addr(), &query, grant, CALL)
         .await
         .unwrap();
-    (offer.doc.skill_id, offer.doc.benchmark_refs)
+    offer.doc
+}
+
+/// The revision of the view of the scope `grant` gives `from` on `to`: the
+/// `seq` of its pages.
+async fn seq_of(from: &TestNode, to: &TestNode, grant: Option<&SignedGrant>) -> u64 {
+    benchmarks_page(from, to, grant).await.seq
+}
+
+/// The ids of the reports `page` refers to, not those of subjects without
+/// any.
+fn references(page: &ViewPage) -> Vec<String> {
+    page.entries
+        .iter()
+        .filter(|entry| entry.body.get("status").is_none())
+        .map(|entry| entry.id.clone())
+        .collect()
 }
 
 #[tokio::test]
@@ -334,6 +363,189 @@ async fn private_report_is_not_found_like_a_missing_one() {
     assert_eq!(
         page.entries[2].body,
         json!({"subject": {"service": "repo-review"}, "status": "no_measurement"})
+    );
+}
+
+#[tokio::test]
+async fn every_scope_gets_exactly_the_reports_its_view_lists() {
+    // One rule for what a scope sees of the reports (RF2): its view, its
+    // offers and GetBenchmarkReport never disagree.
+    let b = provider_with(EchoExecutor).await;
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let measurer = AgentKey::generate();
+    let kind = MeasurementKind::PeerObservation;
+    let review = || Subject::Service("repo-review".to_owned());
+    let demo = |visibility: fn(Vec<String>) -> Visibility| visibility(vec!["demo".to_owned()]);
+    let kept = [
+        ("r-public", ocr(), Visibility::Public),
+        ("r-private", ocr(), Visibility::Private),
+        ("r-demo", ocr(), demo(Visibility::Project)),
+        (
+            "r-other",
+            ocr(),
+            Visibility::Project(vec!["other".to_owned()]),
+        ),
+        ("r-review", review(), Visibility::Public),
+        ("r-task", review(), demo(Visibility::Task)),
+        (
+            "r-hidden",
+            Subject::Service("transcriber".to_owned()),
+            Visibility::Public,
+        ),
+        (
+            "r-pair",
+            Subject::NodePair {
+                a: measurer.id(),
+                b: b.id(),
+            },
+            Visibility::Public,
+        ),
+    ];
+    for (id, subject, visibility) in &kept {
+        keep(
+            &b,
+            &report(&measurer, id, subject.clone(), kind, DAY),
+            visibility.clone(),
+        );
+    }
+
+    let read = grant(&b, &a, &[TaskRead], 3600);
+    let send = grant(&b, &a, &[TaskSend], 3600);
+    for (grant, expected) in [
+        (None, vec!["r-public", "r-pair"]),
+        (
+            Some(&read),
+            vec!["r-demo", "r-public", "r-review", "r-pair"],
+        ),
+        (
+            Some(&send),
+            vec!["r-demo", "r-public", "r-review", "r-task", "r-pair"],
+        ),
+    ] {
+        let page = benchmarks_page(&a, &b, grant).await;
+        let listed = references(&page);
+        assert_eq!(listed, expected, "{}", page.scope);
+        // GetBenchmarkReport serves exactly what the view lists.
+        let mut served = Vec::new();
+        for (id, _, _) in &kept {
+            match get_report(&a, &b, id, grant).await {
+                Ok(_) => served.push(id.to_string()),
+                Err(DiscoveryError::Remote(error)) => {
+                    assert_eq!(error.code(), ErrorCode::NotFound, "{id}")
+                }
+                Err(other) => panic!("{id}: {other}"),
+            }
+        }
+        let mut sorted = listed.clone();
+        sorted.sort();
+        served.sort();
+        assert_eq!(served, sorted, "{}", page.scope);
+        // And each offer refers to what the view lists of its service.
+        for capability in ["vision.ocr", "code.rust.review", "audio.transcribe"] {
+            let offer = offer_of(&a, &b, capability, grant).await;
+            let of_service: Vec<String> = match &offer.skill_id {
+                Some(skill) => page
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.body.get("status").is_none()
+                            && entry.body["subject"] == json!({ "service": skill })
+                    })
+                    .map(|entry| entry.id.clone())
+                    .collect(),
+                None => Vec::new(),
+            };
+            let mut referred: Vec<String> = offer
+                .benchmark_refs
+                .iter()
+                .map(|reference| reference.benchmark_id.clone())
+                .collect();
+            referred.sort();
+            let mut of_service = of_service;
+            of_service.sort();
+            assert_eq!(referred, of_service, "{} {capability}", page.scope);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_report_the_public_scope_does_not_see_leaves_its_revision_alone() {
+    // RF2: what the public scope does not see moves nothing it sees, not
+    // even the revision of its view or of its offers.
+    let b = provider_with(EchoExecutor).await;
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let measurer = AgentKey::generate();
+    let kind = MeasurementKind::PeerObservation;
+    let read = grant(&b, &a, &[TaskRead], 3600);
+    let public = seq_of(&a, &b, None).await;
+    let project = seq_of(&a, &b, Some(&read)).await;
+    let offered = offer_of(&a, &b, "vision.ocr", None).await;
+    assert_eq!(offered.inventory_revision, public);
+
+    // A private report, one for the project, and a public one about a
+    // service the public is not shown.
+    let private = report(&measurer, "r-private", ocr(), kind, DAY);
+    keep(&b, &private, Visibility::Private);
+    keep(
+        &b,
+        &report(&measurer, "r-demo", ocr(), kind, DAY),
+        Visibility::Project(vec!["demo".to_owned()]),
+    );
+    keep(
+        &b,
+        &report(
+            &measurer,
+            "r-hidden",
+            Subject::Service("transcriber".to_owned()),
+            kind,
+            DAY,
+        ),
+        Visibility::Public,
+    );
+    assert_eq!(seq_of(&a, &b, None).await, public);
+    let offered = offer_of(&a, &b, "vision.ocr", None).await;
+    assert_eq!(offered.inventory_revision, public);
+    assert!(offered.benchmark_refs.is_empty());
+    // The project's scope does see one: its view moved.
+    assert_eq!(seq_of(&a, &b, Some(&read)).await, project + 1);
+    // The private report made the project's: still nothing public.
+    keep(&b, &private, Visibility::Project(vec!["demo".to_owned()]));
+    assert_eq!(seq_of(&a, &b, None).await, public);
+    assert_eq!(
+        offer_of(&a, &b, "vision.ocr", None)
+            .await
+            .inventory_revision,
+        public
+    );
+}
+
+#[tokio::test]
+async fn a_report_the_public_scope_sees_moves_its_revision() {
+    let b = provider_with(EchoExecutor).await;
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let measurer = AgentKey::generate();
+    let public = seq_of(&a, &b, None).await;
+
+    let seen = report(
+        &measurer,
+        "r-public",
+        ocr(),
+        MeasurementKind::PeerObservation,
+        DAY,
+    );
+    keep(&b, &seen, Visibility::Public);
+    assert_eq!(seq_of(&a, &b, None).await, public + 1);
+    let offered = offer_of(&a, &b, "vision.ocr", None).await;
+    assert_eq!(offered.inventory_revision, public + 1);
+    assert_eq!(offered.benchmark_refs, [seen.doc.reference()]);
+    // Made private again, it leaves the view, which moves again.
+    keep(&b, &seen, Visibility::Private);
+    assert_eq!(seq_of(&a, &b, None).await, public + 2);
+    assert!(
+        offer_of(&a, &b, "vision.ocr", None)
+            .await
+            .benchmark_refs
+            .is_empty()
     );
 }
 

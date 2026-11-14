@@ -41,7 +41,7 @@ use pals_core::identity::{AgentId, AgentKey};
 use pals_core::inventory::view::{INVENTORY_SECTIONS, render, verify_page};
 use pals_core::inventory::{Scope, Section, Visibility};
 use pals_core::signed::{Signed, SignedError};
-use pals_core::store::{Contact, Store};
+use pals_core::store::{Contact, KeptBenchmark, Store};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -191,7 +191,9 @@ enum BenchmarkCommand {
         visibility: String,
     },
     /// List the reports kept, by id: id, kind, profile and version, subject,
-    /// measurer, measured_at, expires_at and visibility, tab separated
+    /// measurer, measured_at, expires_at and visibility, tab separated. A
+    /// row that does not read, which no peer is shown, is listed as its id,
+    /// `unreadable` and why
     Ls,
 }
 
@@ -712,25 +714,39 @@ fn benchmark_import(home: &Path, file: &Path, visibility: &str) -> anyhow::Resul
     Ok(())
 }
 
-/// Lists the reports kept, one per line.
+/// Lists the reports kept, one per line, those whose row does not read
+/// too ([`benchmark_line`]).
 fn benchmark_ls(home: &Path) -> anyhow::Result<()> {
     let (cfg, key) = load_agent(home)?;
-    for (report, visibility) in open_store(&cfg, &key)?.benchmarks()? {
-        let doc = &report.doc;
-        println!(
-            "{}\t{}\t{} {}\t{}\t{}\t{}\t{}\t{}",
-            doc.benchmark_id,
-            doc.measurement_kind.as_str(),
-            doc.procedure.profile,
-            doc.procedure.profile_version,
-            doc.subject.key(),
-            doc.provenance.measured_by,
-            doc.measured_at,
-            doc.expires_at,
-            visibility_name(&visibility)
-        );
+    for kept in open_store(&cfg, &key)?.benchmarks()? {
+        println!("{}", benchmark_line(&kept));
     }
     Ok(())
+}
+
+/// The line `pals benchmark ls` prints for `kept`, tab separated: id, kind,
+/// profile and version, subject, measurer, measured_at, expires_at and
+/// visibility; or, for a row that does not read, its id, `unreadable` and
+/// why, so that no peer sees it and the operator does.
+fn benchmark_line(kept: &KeptBenchmark) -> String {
+    match &kept.report {
+        Ok((report, visibility)) => {
+            let doc = &report.doc;
+            format!(
+                "{}\t{}\t{} {}\t{}\t{}\t{}\t{}\t{}",
+                doc.benchmark_id,
+                doc.measurement_kind.as_str(),
+                doc.procedure.profile,
+                doc.procedure.profile_version,
+                doc.subject.key(),
+                doc.provenance.measured_by,
+                doc.measured_at,
+                doc.expires_at,
+                visibility_name(visibility)
+            )
+        }
+        Err(why) => format!("{}\tunreadable\t{why}", kept.benchmark_id),
+    }
 }
 
 /// The visibility `text` names: `public`, `private`, `project:<project>` or
@@ -1542,6 +1558,18 @@ mod tests {
         for text in ["private", "public", "project:demo", "task:demo"] {
             assert_eq!(visibility_name(&parse_visibility(text).unwrap()), text);
         }
+    }
+
+    #[test]
+    fn an_unreadable_benchmark_row_is_listed_by_its_id() {
+        let kept = KeptBenchmark {
+            benchmark_id: "r-1".to_owned(),
+            report: Err("its report does not verify (bad signature)".to_owned()),
+        };
+        assert_eq!(
+            benchmark_line(&kept),
+            "r-1\tunreadable\tits report does not verify (bad signature)"
+        );
     }
 
     #[test]

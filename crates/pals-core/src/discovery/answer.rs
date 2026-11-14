@@ -43,7 +43,7 @@ use super::matching::evaluate;
 use super::query::{OfferParts, QueryError, ServiceOffer, ServiceQuery, query_hash, sign_offer};
 use super::wire::{self, ErrorCode, request, response};
 use super::{DISCOVERY_VERSION, DiscoveryContext, MAX_RESPONSE_FRAME_BYTES, PUBLIC_CARD};
-use crate::benchmark::{BenchmarkReport, is_benchmark_id, references_for};
+use crate::benchmark::{BenchmarkReport, Subject, is_benchmark_id, references_for};
 use crate::card_jws::CardHash;
 use crate::grant::{AcceptError, Acceptance, GrantError, Need, accept_grant};
 use crate::identity::AgentId;
@@ -325,28 +325,16 @@ struct ScopeView {
     revision: u64,
 }
 
-/// What `scope` shows of `snapshot` and of the reports the agent holds:
-/// every section, benchmarks last, and its revision, which follows every
-/// section the scope shows, whatever is asked. A report shows when its
-/// visibility shows it in the scope and it is about something the scope
-/// shows, or about a pair of nodes ([`benchmark_subjects`]).
+/// What `scope` shows of `snapshot` and of the reports the agent holds
+/// ([`reports_seen`]): every section, benchmarks last, and its revision,
+/// which follows every section the scope shows, whatever is asked.
 fn scope_view(
     ctx: &DiscoveryContext,
     snapshot: &InventorySnapshot,
     scope: &Scope,
     now_unix: i64,
 ) -> Result<ScopeView, wire::Error> {
-    let subjects = benchmark_subjects(snapshot, scope);
-    let reports: Vec<_> = ctx
-        .store
-        .benchmarks_visible(scope)
-        .map_err(|err| {
-            tracing::warn!(error = %format!("{err:#}"), "cannot read the benchmark reports");
-            internal()
-        })?
-        .into_iter()
-        .filter(|report| report.doc.subject.shown_among(&subjects))
-        .collect();
+    let (subjects, reports) = reports_seen(ctx, snapshot, scope)?;
     let mut entries = render(snapshot, scope, &INVENTORY_SECTIONS);
     entries.extend(render_benchmarks(&reports, &subjects));
     let revision = ctx
@@ -363,12 +351,41 @@ fn scope_view(
     })
 }
 
+/// What `scope` sees of the benchmark reports the agent holds, with the
+/// subjects it shows ([`benchmark_subjects`]): the one rule for the
+/// scope's view, the references of its offers and `GetBenchmarkReport`, so
+/// that they never disagree (RF2). A report shows when its visibility shows
+/// it in the scope ([`crate::store::Store::benchmarks_visible`], which skips
+/// a row that does not read, with a warning naming it) and it measures
+/// something the scope shows, or a pair of nodes
+/// ([`crate::benchmark::Subject::shown_among`]).
+///
+/// `INTERNAL` only when the store cannot be read at all, whatever any one
+/// report is.
+fn reports_seen(
+    ctx: &DiscoveryContext,
+    snapshot: &InventorySnapshot,
+    scope: &Scope,
+) -> Result<(Vec<Subject>, Vec<Signed<BenchmarkReport>>), wire::Error> {
+    let subjects = benchmark_subjects(snapshot, scope);
+    let reports = ctx
+        .store
+        .benchmarks_visible(scope)
+        .map_err(|err| {
+            tracing::warn!(error = %format!("{err:#}"), "cannot read the benchmark reports");
+            internal()
+        })?
+        .into_iter()
+        .filter(|report| report.doc.subject.shown_among(&subjects))
+        .collect();
+    Ok((subjects, reports))
+}
+
 /// The report `id` the agent holds, as its measurer signed it, when
-/// `viewer`'s scope sees it: its visibility shows it in the scope, and it is
-/// about something the scope shows or about a pair of nodes. Otherwise,
-/// whether it exists or not, and whatever the id is, `NOT_FOUND`, the same
-/// answer. A report is only ever read: nothing is measured, and its
-/// evidence is never fetched.
+/// `viewer`'s scope sees it ([`reports_seen`]): exactly a report its view
+/// lists. Otherwise, whether it exists or not, its row reads or not, and
+/// whatever the id is, `NOT_FOUND`, the same answer. A report is only ever
+/// read: nothing is measured, and its evidence is never fetched.
 fn get_benchmark_report(
     ctx: &DiscoveryContext,
     viewer: &Viewer,
@@ -378,18 +395,12 @@ fn get_benchmark_report(
     if viewer.empty || !is_benchmark_id(id) {
         return Err(not_found());
     }
-    let kept = ctx.store.benchmark(id).map_err(|err| {
-        tracing::warn!(error = %format!("{err:#}"), "cannot read a benchmark report");
-        internal()
-    })?;
-    let Some((report, visibility)) = kept else {
-        return Err(not_found());
-    };
-    let subjects = benchmark_subjects(&(ctx.inventory)(), &viewer.scope);
-    if !visibility.visible_in(&viewer.scope) || !report.doc.subject.shown_among(&subjects) {
-        return Err(not_found());
-    }
-    Ok(report.to_json())
+    let (_, reports) = reports_seen(ctx, &(ctx.inventory)(), &viewer.scope)?;
+    reports
+        .into_iter()
+        .find(|report| report.doc.benchmark_id == id)
+        .map(|report| report.to_json())
+        .ok_or_else(not_found)
 }
 
 /// The hash of the card of `scope`, or of the public card when the scope

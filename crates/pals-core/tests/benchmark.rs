@@ -200,9 +200,9 @@ fn benchmarks_section(ctx: &DiscoveryContext, peer: &AgentId) -> Vec<ViewEntry> 
         cursor: String::new(),
         page_entries: 0,
     });
-    let Some(response::Result::InventoryPage(page)) = answer(ctx, peer, request(get), NOW).result
-    else {
-        panic!("a page");
+    let result = answer(ctx, peer, request(get), NOW).result;
+    let Some(response::Result::InventoryPage(page)) = result else {
+        panic!("a page, not {result:?}");
     };
     let page = verify_page(&page, &ctx.key.id(), Some(peer), NOW).unwrap();
     assert_eq!(page.sections, [Section::Benchmarks]);
@@ -867,4 +867,100 @@ fn a_page_with_a_benchmark_entry_no_view_makes_is_malformed() {
     malformed("a reference with a colon in its id", 0, &|e| {
         e.id = "service:ocr-metal-v1".to_owned();
     });
+}
+
+#[test]
+fn an_unreadable_report_hides_only_itself() {
+    // Rows that no longer read, as a damaged disk or another program might
+    // leave them: a private one and a public one that no longer verify, and
+    // one whose visibility does not parse. Each hides only itself.
+    let key = Arc::new(fixed_key(0x01));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pals.db");
+    let store = Arc::new(Store::open(&path, key.id()).unwrap());
+    let with_id = |id: &str| {
+        let report = BenchmarkReport {
+            benchmark_id: id.to_owned(),
+            ..task_report(key.id())
+        };
+        Signed::issue(&key, report).unwrap()
+    };
+    let good = with_id("ocr-good");
+    store
+        .benchmark_put(&good, &Visibility::Public, NOW)
+        .unwrap();
+    for (id, visibility) in [
+        ("ocr-private-bad", Visibility::Private),
+        ("ocr-public-bad", Visibility::Public),
+        ("ocr-visibility-bad", Visibility::Public),
+    ] {
+        store.benchmark_put(&with_id(id), &visibility, NOW).unwrap();
+    }
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    for id in ["ocr-private-bad", "ocr-public-bad"] {
+        let tampered = String::from_utf8(with_id(id).to_json())
+            .unwrap()
+            .replace("1180.5", "118.5");
+        let changed = raw
+            .execute(
+                "UPDATE benchmark_reports SET report_json = ?1 WHERE benchmark_id = ?2",
+                rusqlite::params![tampered.as_bytes(), id],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+    raw.execute(
+        "UPDATE benchmark_reports SET visibility = 'everyone' WHERE benchmark_id = ?1",
+        ["ocr-visibility-bad"],
+    )
+    .unwrap();
+
+    let ctx = context(&key, Arc::clone(&store));
+    let peer = fixed_key(0x02).id();
+    // The public view and the offers still work, with the report that reads.
+    let section = benchmarks_section(&ctx, &peer);
+    let references: Vec<&str> = section
+        .iter()
+        .filter(|entry| entry.body.get("status").is_none())
+        .map(|entry| entry.id.as_str())
+        .collect();
+    assert_eq!(references, ["ocr-good"]);
+    assert_eq!(
+        ocr_offer(&ctx, &peer).benchmark_refs,
+        [good.doc.reference()]
+    );
+    // A report that does not read is not found, as one that does not exist:
+    // the answer never says it is there.
+    let missing = get_report(&ctx, &peer, "ocr-missing");
+    let response::Result::Error(error) = &missing else {
+        panic!("not found, not {missing:?}");
+    };
+    assert_eq!(error.code(), ErrorCode::NotFound);
+    for id in ["ocr-private-bad", "ocr-public-bad", "ocr-visibility-bad"] {
+        assert_eq!(get_report(&ctx, &peer, id), missing, "{id}");
+    }
+    let response::Result::BenchmarkReport(served) = get_report(&ctx, &peer, "ocr-good") else {
+        panic!("the report that reads");
+    };
+    assert_eq!(served, good.to_json());
+
+    // The store lists every row, those that do not read by their id.
+    let kept: Vec<(String, bool)> = store
+        .benchmarks()
+        .unwrap()
+        .into_iter()
+        .map(|kept| (kept.benchmark_id, kept.report.is_ok()))
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            ("ocr-good".to_owned(), true),
+            ("ocr-private-bad".to_owned(), false),
+            ("ocr-public-bad".to_owned(), false),
+            ("ocr-visibility-bad".to_owned(), false),
+        ]
+    );
+    // Asked for by its id, a row that does not read is an error naming it.
+    let err = store.benchmark("ocr-private-bad").unwrap_err();
+    assert!(format!("{err:#}").contains("ocr-private-bad"), "{err:#}");
 }

@@ -4,19 +4,40 @@
 //! A report is kept as the bytes of its signed JSON, with the columns that
 //! index it and its visibility, which is this agent's, never part of what
 //! the measurer signed: whoever keeps a report cannot change it, only say
-//! who sees it. It is read back verified ([`Signed::from_json`]): a row
-//! that no longer verifies is an error, never a report. One id names one
-//! report: keeping the same report again only sets its visibility, and
-//! another report under an id kept already is refused.
+//! who sees it. It is read back verified ([`Signed::from_json`]), and only
+//! what verifies is ever a report. One id names one report: keeping the
+//! same report again only sets its visibility, and another report under an
+//! id kept already is refused.
+//!
+//! **A row that does not read** (a report that no longer verifies, or is
+//! another id's, or a visibility that does not parse), as a damaged disk or
+//! another program may leave it, hides only itself, as the unreadable task
+//! rows of milestone 1 do: the reports a scope sees
+//! ([`Store::benchmarks_visible`]) are read by their visibility first and
+//! skip it with a warning naming its id, so one bad row never keeps a peer
+//! from the others, nor says it exists; the listing of every row
+//! ([`Store::benchmarks`]) names it, unreadable, so the operator sees it;
+//! asked for by its id ([`Store::benchmark`]), it is an error naming it.
 
 use anyhow::{Context, anyhow, bail, ensure};
 use rusqlite::{OptionalExtension, params};
+use tracing::warn;
 
 use super::Store;
 use crate::benchmark::BenchmarkReport;
 use crate::grant::parse_timestamp;
 use crate::inventory::{Scope, Visibility, is_project_name};
 use crate::signed::Signed;
+
+/// A row of the reports kept: its id, and its report and visibility, or
+/// why the row does not read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeptBenchmark {
+    pub benchmark_id: String,
+    /// The report, verified, and who sees it; or why the row does not
+    /// read.
+    pub report: Result<(Signed<BenchmarkReport>, Visibility), String>,
+}
 
 impl Store {
     /// Keeps `report`, seen by `visibility`, at `now_unix`; or, when this
@@ -70,65 +91,104 @@ impl Store {
     }
 
     /// The report kept as `id`, verified, and who sees it.
+    ///
+    /// An error, naming `id`, when its row does not read.
     pub fn benchmark(
         &self,
         id: &str,
     ) -> anyhow::Result<Option<(Signed<BenchmarkReport>, Visibility)>> {
-        let row: Option<(Vec<u8>, String)> = self
+        let row: Option<(String, Vec<u8>)> = self
             .conn()
             .query_row(
-                "SELECT report_json, visibility FROM benchmark_reports WHERE benchmark_id = ?1",
+                "SELECT visibility, report_json FROM benchmark_reports WHERE benchmark_id = ?1",
                 [id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        row.map(|(json, visibility)| read(&json, &visibility))
-            .transpose()
+        let Some((visibility, json)) = row else {
+            return Ok(None);
+        };
+        let visibility = visibility_of(&visibility)
+            .map_err(|why| anyhow!("the benchmark report {id} kept does not read: {why}"))?;
+        let report = report_of(id, &json)
+            .map_err(|why| anyhow!("the benchmark report {id} kept does not read: {why}"))?;
+        Ok(Some((report, visibility)))
     }
 
-    /// Every report kept, verified, with who sees it, by id.
-    pub fn benchmarks(&self) -> anyhow::Result<Vec<(Signed<BenchmarkReport>, Visibility)>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT report_json, visibility FROM benchmark_reports ORDER BY benchmark_id",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
-        })?;
-        rows.map(|row| {
-            let (json, visibility) = row?;
-            read(&json, &visibility)
-        })
-        .collect()
+    /// Every row of the reports kept, by id: each with its report, verified,
+    /// and who sees it, or why it does not read.
+    pub fn benchmarks(&self) -> anyhow::Result<Vec<KeptBenchmark>> {
+        Ok(self
+            .benchmark_rows()?
+            .into_iter()
+            .map(|(benchmark_id, visibility, json)| {
+                let report = visibility_of(&visibility)
+                    .and_then(|visibility| Ok((report_of(&benchmark_id, &json)?, visibility)));
+                KeptBenchmark {
+                    benchmark_id,
+                    report,
+                }
+            })
+            .collect())
     }
 
     /// The reports kept whose visibility shows them in `scope`, verified,
-    /// by id. Whether the scope also shows what a report is about is the
-    /// caller's to check ([`crate::benchmark::Subject::shown_among`]).
+    /// by id. A row is read by its visibility first: one the scope does not
+    /// see is never verified, and one that does not read is skipped with a
+    /// warning naming its id. Whether the scope also shows what a report is
+    /// about is the caller's to check
+    /// ([`crate::benchmark::Subject::shown_among`]).
     pub fn benchmarks_visible(
         &self,
         scope: &Scope,
     ) -> anyhow::Result<Vec<Signed<BenchmarkReport>>> {
-        Ok(self
-            .benchmarks()?
-            .into_iter()
-            .filter(|(_, visibility)| visibility.visible_in(scope))
-            .map(|(report, _)| report)
-            .collect())
+        let mut visible = Vec::new();
+        for (benchmark_id, visibility, json) in self.benchmark_rows()? {
+            let read = visibility_of(&visibility).and_then(|visibility| {
+                if visibility.visible_in(scope) {
+                    report_of(&benchmark_id, &json).map(Some)
+                } else {
+                    Ok(None)
+                }
+            });
+            match read {
+                Ok(Some(report)) => visible.push(report),
+                Ok(None) => {}
+                Err(why) => warn!(
+                    %benchmark_id,
+                    error = %why,
+                    "skipping a benchmark report row that does not read"
+                ),
+            }
+        }
+        Ok(visible)
+    }
+
+    /// Every row: its id, visibility and report, as kept, by id.
+    fn benchmark_rows(&self) -> anyhow::Result<Vec<(String, String, Vec<u8>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT benchmark_id, visibility, report_json FROM benchmark_reports
+             ORDER BY benchmark_id",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 }
 
-/// The report of a row, verified, and its visibility.
-fn read(json: &[u8], visibility: &str) -> anyhow::Result<(Signed<BenchmarkReport>, Visibility)> {
+/// The visibility a row keeps, or why it does not parse.
+fn visibility_of(text: &str) -> Result<Visibility, String> {
+    serde_json::from_str(text).map_err(|_| "its visibility does not parse".to_owned())
+}
+
+/// The report of the row `id`, verified and of that id, or why not.
+fn report_of(id: &str, json: &[u8]) -> Result<Signed<BenchmarkReport>, String> {
     let report = Signed::<BenchmarkReport>::from_json(json)
-        .map_err(|err| anyhow!("a benchmark report kept that does not verify: {err}"))?;
-    let visibility = serde_json::from_str(visibility).with_context(|| {
-        format!(
-            "the visibility of {} does not read",
-            report.doc.benchmark_id
-        )
-    })?;
-    Ok((report, visibility))
+        .map_err(|err| format!("its report does not verify ({err})"))?;
+    if report.doc.benchmark_id != id {
+        return Err("its report has another id".to_owned());
+    }
+    Ok(report)
 }
 
 /// A visibility for projects names at least one, and each by a project
@@ -281,23 +341,65 @@ mod tests {
     }
 
     #[test]
-    fn a_kept_report_that_no_longer_verifies_is_an_error() {
+    fn a_row_that_does_not_read_hides_only_itself() {
         let key = AgentKey::generate();
         let store = Store::open_in_memory(key.id()).unwrap();
-        store
-            .benchmark_put(&report(&key, "r-1", 10.0), &Visibility::Public, NOW)
-            .unwrap();
+        for id in ["r-1", "r-2", "r-3", "r-4"] {
+            store
+                .benchmark_put(&report(&key, id, 10.0), &Visibility::Public, NOW)
+                .unwrap();
+        }
         let tampered = String::from_utf8(report(&key, "r-1", 10.0).to_json())
             .unwrap()
             .replace("\"value\":10", "\"value\":1");
-        store
-            .conn()
-            .execute(
-                "UPDATE benchmark_reports SET report_json = ?1",
-                [tampered.as_bytes()],
-            )
-            .unwrap();
-        assert!(store.benchmark("r-1").is_err());
-        assert!(store.benchmarks_visible(&Scope::Public).is_err());
+        let conn = store.conn();
+        let set = |column: &str, value: &dyn rusqlite::ToSql, id: &str| {
+            let sql = format!("UPDATE benchmark_reports SET {column} = ?1 WHERE benchmark_id = ?2");
+            assert_eq!(conn.execute(&sql, rusqlite::params![value, id]).unwrap(), 1);
+        };
+        set("report_json", &tampered.as_bytes(), "r-1");
+        set("visibility", &"everyone", "r-2");
+        set("report_json", &report(&key, "r-9", 10.0).to_json(), "r-3");
+        drop(conn);
+
+        // Those a scope sees: the row that reads.
+        let visible: Vec<String> = store
+            .benchmarks_visible(&Scope::Public)
+            .unwrap()
+            .into_iter()
+            .map(|report| report.doc.benchmark_id)
+            .collect();
+        assert_eq!(visible, ["r-4"]);
+        // Every row, those that do not read named so.
+        let rows: Vec<(String, Result<(), String>)> = store
+            .benchmarks()
+            .unwrap()
+            .into_iter()
+            .map(|kept| (kept.benchmark_id, kept.report.map(|_| ())))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (
+                    "r-1".to_owned(),
+                    Err("its report does not verify (bad signature)".to_owned())
+                ),
+                (
+                    "r-2".to_owned(),
+                    Err("its visibility does not parse".to_owned())
+                ),
+                (
+                    "r-3".to_owned(),
+                    Err("its report has another id".to_owned())
+                ),
+                ("r-4".to_owned(), Ok(())),
+            ]
+        );
+        // Asked for by its id: an error naming it.
+        for id in ["r-1", "r-2", "r-3"] {
+            let err = store.benchmark(id).unwrap_err();
+            assert!(format!("{err:#}").contains(id), "{err:#}");
+        }
+        assert!(store.benchmark("r-4").unwrap().is_some());
     }
 }

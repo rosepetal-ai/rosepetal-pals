@@ -78,7 +78,8 @@ Una consulta de servicio (`agentnet.service-query/1`, esquema [`service-query.sc
 Un informe de benchmark (`agentnet.benchmark-report/1`, esquema [`benchmark-report.schema.json`](../extensions/inventory-v1/benchmark-report.schema.json)) que el agente ya tiene, en `benchmark_report`, tal como lo firmó quien midió: los bytes que guardó al importarlo, que verifican con la clave de `provenance.measured_by` (ver [Informes de benchmark](../extensions/inventory-v1.md#informes-de-benchmark)).
 
 - **Visible en el ámbito.** El del grant presentado (§4). El ámbito ve un informe si la visibilidad que el agente le dio lo muestra en él y si el ámbito muestra lo que mide (el servicio, el modelo o el hardware), o si mide una pareja de nodos.
-- **Igual que si no existiera.** Un informe que el ámbito no ve, uno que no existe y un `benchmark_id` que no es un id de informe tienen la misma respuesta: `NOT_FOUND` con el mensaje «not found», que nunca repite el id.
+- **Igual que si no existiera.** Un informe que el ámbito no ve, uno que no existe, uno cuya fila no se puede leer y un `benchmark_id` que no es un id de informe tienen la misma respuesta: `NOT_FOUND` con el mensaje «not found», que nunca repite el id. El agente sirve exactamente los informes que lista la sección `benchmarks` de la vista del ámbito, con la misma regla que las referencias de sus ofertas.
+- **Una fila ilegible no afecta a las demás.** Un informe guardado que ya no verifica, o cuya visibilidad no se entiende, se salta con un aviso en el registro: las páginas y las ofertas se siguen sirviendo con los demás. `INTERNAL` solo si no se puede leer el almacén.
 - **Nunca mide.** El agente solo lee informes que ya existen: no arranca un LLM, una descarga ni un test de red, y nunca descarga la `evidence` de un informe (§9.7). Si no hay medidas, la vista dice `no_measurement`; nunca cero.
 
 Una petición sin operación es `BAD_REQUEST`.
