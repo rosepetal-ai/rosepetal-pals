@@ -1,11 +1,12 @@
 //! Grant authentication in front of the SDK's routers.
 //!
 //! Every request but the public Agent Card must present a grant as
-//! `Authorization: Bearer <token>`. The grant is checked with
-//! [`SignedGrant::check`] against the request: this agent as audience, the
-//! peer that the tunnel authenticated ([`PEER_HEADER`]) as subject, this
-//! agent or one of its trusted issuers as issuer, and the operation of the
-//! route ([`classify`]) on `skill:ask`. A grant that is itself unusable gets
+//! `Authorization: Bearer <token>`. The grant is accepted with
+//! [`accept_grant`], the rule the discovery protocol applies too, against
+//! the request: this agent as audience, the peer that the tunnel
+//! authenticated ([`PEER_HEADER`]) as subject, this agent or one of its
+//! trusted issuers as issuer, not revoked, and the operation of the route
+//! ([`classify`]) on `skill:ask`. A grant that is itself unusable gets
 //! `401` with a `WWW-Authenticate` challenge; a valid grant that does not
 //! cover the request gets `403`.
 //!
@@ -28,7 +29,7 @@ use axum::{Json, Router};
 use http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use http_body_util::{BodyExt, LengthLimitError, Limited};
-use pals_core::grant::{GrantCheck, GrantError, Operation, SignedGrant};
+use pals_core::grant::{AcceptError, Acceptance, GrantError, Need, Operation, accept_grant};
 use pals_core::identity::AgentId;
 use pals_core::inventory::Scope;
 use pals_core::store::Store;
@@ -202,40 +203,42 @@ impl Authenticator {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<AgentId>().ok())
             .ok_or(Refusal::Unauthenticated("unknown_peer"))?;
-        let token = bearer_token(headers).ok_or(Refusal::Unauthenticated("missing_token"))?;
-        let grant = SignedGrant::from_token(token).map_err(Refusal::from)?;
+        let token = bearer_token(headers)
+            .ok_or(Refusal::Unauthenticated("missing_token"))?
+            .to_owned();
 
-        let store = Arc::clone(&self.store);
-        let grant_id = grant.grant.grant_id.clone();
-        let revoked = tokio::task::spawn_blocking(move || store.is_revoked(&grant_id))
-            .await
-            .map_err(anyhow::Error::from)
-            .and_then(|revoked| revoked)
-            .map_err(|err| {
-                tracing::error!(error = %format!("{err:#}"), "cannot read revocations");
-                Refusal::Internal
-            })?;
-
-        // A route that needs no particular operation is checked as a read,
-        // and then only the grant's own validity counts.
-        let (operation, any_operation) = match class {
-            RouteClass::Op(operation) => (operation, false),
-            RouteClass::AuthOnly | RouteClass::Public => (Operation::TaskRead, true),
+        // A route that needs no particular operation: only the grant's own
+        // validity counts.
+        let operation = match class {
+            RouteClass::Op(operation) => Some(operation),
+            RouteClass::AuthOnly | RouteClass::Public => None,
         };
-        let check = GrantCheck {
-            now_unix: chrono::Utc::now().timestamp(),
-            audience: &self.audience,
-            subject: &subject,
-            accepted_issuers: &self.accepted_issuers,
-            operation,
-            resource: ASK_RESOURCE,
-            revoked,
+        let (store, audience) = (Arc::clone(&self.store), self.audience);
+        let accepted_issuers = Arc::clone(&self.accepted_issuers);
+        // The store is read for the revocations: off the async threads.
+        let accepted = tokio::task::spawn_blocking(move || {
+            let acceptance = Acceptance {
+                audience: &audience,
+                subject: &subject,
+                accepted_issuers: &accepted_issuers,
+                need: match operation {
+                    Some(operation) => Need::Operation(operation, ASK_RESOURCE),
+                    None => Need::AnyOperation,
+                },
+                now_unix: chrono::Utc::now().timestamp(),
+            };
+            accept_grant(&store, &token, &acceptance)
+        })
+        .await;
+        let grant = match accepted {
+            Ok(Ok(grant)) => grant,
+            Ok(Err(AcceptError::Grant(err))) => return Err(err.into()),
+            Ok(Err(AcceptError::Store)) => return Err(Refusal::Internal),
+            Err(err) => {
+                tracing::error!(error = %err, "the grant check did not finish");
+                return Err(Refusal::Internal);
+            }
         };
-        match grant.check(&check) {
-            Ok(()) => {}
-            Err(err) if any_operation && !err.is_authentication() => {}
-            Err(err) => return Err(err.into()),
-        }
 
         // Ids and project names a header cannot carry make the grant
         // unusable here.
@@ -270,20 +273,7 @@ enum Refusal {
 
 impl From<GrantError> for Refusal {
     fn from(err: GrantError) -> Self {
-        let reason = match err {
-            GrantError::Malformed => "malformed",
-            GrantError::TooLarge => "too_large",
-            GrantError::UnknownSchema => "unknown_schema",
-            GrantError::BadSignature => "bad_signature",
-            GrantError::IssuerNotAccepted => "issuer_not_accepted",
-            GrantError::WrongSubject => "wrong_subject",
-            GrantError::WrongAudience => "wrong_audience",
-            GrantError::NotYetValid => "not_yet_valid",
-            GrantError::Expired => "expired",
-            GrantError::Revoked => "revoked",
-            GrantError::OperationNotGranted => "operation_not_granted",
-            GrantError::ResourceNotGranted => "resource_not_granted",
-        };
+        let reason = err.reason();
         if err.is_authentication() {
             Self::Unauthenticated(reason)
         } else {
@@ -403,7 +393,7 @@ async fn read_body(body: Body, max_body_bytes: usize) -> Result<Bytes, (StatusCo
 #[cfg(test)]
 mod tests {
     use axum::routing::{get, post};
-    use pals_core::grant::{GRANT_SCHEMA, Grant, format_timestamp};
+    use pals_core::grant::{GRANT_SCHEMA, Grant, SignedGrant, format_timestamp};
     use pals_core::identity::AgentKey;
     use tower::ServiceExt;
 
