@@ -9,15 +9,15 @@ Este documento recoge dos ejecuciones de los casos del criterio de salida del hi
 
 ## Ejecución con Docker en el papel de la segunda máquina (2026-11-14)
 
-Los ocho casos, el paso intermedio y la limpieza del runbook, superados. El caso 3, por camino directo y por relay, en los dos sentidos. Ningún defecto de PALS. Sí aparecieron seis fallos del runbook, corregidos antes de esta ejecución (ver [«Correcciones al runbook»](#correcciones-al-runbook)).
+Los ocho casos, el paso intermedio y la limpieza del runbook, superados. El caso 3, por camino directo y por relay, en los dos sentidos. Ningún caso falló; quedan dos tiempos sin explicar (observaciones 3 y 4). Aparecieron seis fallos del runbook, corregidos antes de esta ejecución (ver [«Correcciones al runbook»](#correcciones-al-runbook)).
 
 | Caso | Resultado | Camino | Evidencia | Tiempo |
 |-|-|-|-|-|
 | 1. Pregunta útil | Superado | Directo | `claude -p` en B responde citando `README.md`, `Cargo.toml`, `crates/pals/src/config.rs`, la CI y `tests/interop/requirements.txt`, con líneas exactas; código 0 | 40 s |
-| Paso intermedio | Superado | Directo | `eco: hola`, código 0, sin volver a guardar el ticket de B | < 1 s |
+| Paso intermedio | Superado | Sin medir | `eco: hola`, código 0, sin volver a guardar el ticket de B | < 1 s |
 | 2. Transferencia autorizada | Superado | Directo | De A a B y vuelta: el mismo sha256 (`3b212fc4…`) enviado, recibido por B y devuelto; `200 268435456`. De B a A: `906aff5c…` en B y en A | 72 s y 2 s |
 | 3a. Corte de 10 s, camino directo | Superado, `bajada` y `subida` | Directo | Parada durante el corte (36306944 y 34372051 bytes), sigue después; hash correcto | 20 s y 32 s |
-| 3b. Corte de 10 s, por relay | Superado, `bajada` y `subida` | Relay (UDP saliente de A descartado) | Parada durante el corte (33652736 y 33572829 bytes), sigue después; hash correcto; 282 MB por TCP 443 y 0 B de UDP enviado | 1073 s y 1069 s |
+| 3b. Corte de 10 s, por relay | Superado, `bajada` y `subida` | Relay (UDP saliente de A descartado) | Parada durante el corte (33652736 y 33572829 bytes), sigue después; hash correcto; los 256 MiB pasan por TCP 443 (282,6 MB recibidos en `bajada`, 282,1 MB enviados en `subida`) | 1073 s y 1069 s |
 | 4. Reintento sin duplicar | Superado | Directo | Corte de 45 s; `he esperado 120 s`, código 0, 3 intentos; **un** `task.accepted` | 120 s |
 | 5. Caída del proveedor | Superado | Directo¹ | `pals ask` termina con código 3; `resume`: `TASK_STATE_FAILED: interrupted: daemon restarted`, código 2; un `task.accepted`; pregunta nueva, código 0 | 95 s |
 | 6. Revocación | Superado | Directo¹ | `pals: refused: HTTP 401: revoked`, código 2; `curl`: `401` con `error_description="revoked"` | < 1 s |
@@ -86,7 +86,7 @@ real	0m40.000s
 código 0
 ```
 
-La respuesta, de 45 líneas, cita ficheros y líneas del proyecto. Se comprobaron a mano algunas citas, y son exactas: las versiones fijadas en `Cargo.toml:15-23`, el arranque en `README.md:43-47`, `INIT_TEMPLATE` en `crates/pals/src/config.rs:29`, `a2a-sdk==1.3.0` en `tests/interop/requirements.txt:4` y la ausencia de `rust-toolchain.toml`. `claude` pudo leer ficheros sin `--allowedTools`. Fueron dos llamadas a `claude -p` en total: la comprobación y la pregunta. Camino: directo (UDP: 309 KB enviados y 345 KB recibidos por A; TCP 443: 18 KB y 20 KB).
+La respuesta, de 56 líneas (41 con texto), cita ficheros y líneas del proyecto. Se comprobaron a mano algunas citas, y son exactas: las versiones fijadas en `Cargo.toml:15-23`, el arranque en `README.md:43-47`, `INIT_TEMPLATE` en `crates/pals/src/config.rs:29`, `a2a-sdk==1.3.0` en `tests/interop/requirements.txt:4` y la ausencia de `rust-toolchain.toml`. `claude` pudo leer ficheros sin `--allowedTools`. Fueron dos llamadas a `claude -p` en total: la comprobación y la pregunta. Camino: directo (UDP: 309 KB enviados y 345 KB recibidos por A; TCP 443: 18 KB y 20 KB).
 
 ### Paso intermedio: B cambia al worker de pruebas: superado
 
@@ -163,7 +163,7 @@ camino: directo; por eth0 de A, UDP 294,7 MB enviados, 0,4 MB recibidos; TCP 443
 
 Después, `reglas_como_antes` imprimió `reglas del cortafuegos como antes`.
 
-**3b, por relay.** A añade las reglas del runbook (descartar el UDP saliente salvo DNS y loopback) y rearranca su daemon (`para` tardó menos de 1 s). Durante las dos transferencias, A no envió ni un byte de UDP por `eth0`: todo fue por TCP 443 al relay.
+**3b, por relay.** A añade las reglas del runbook (descartar el UDP saliente salvo DNS y loopback) y rearranca su daemon (`para` tardó menos de 1 s). La prueba de que el camino fue el relay es el TCP 443: por él pasaron los 256 MiB, 282,6 MB en `bajada` y 282,1 MB en `subida`. Que A no enviara UDP es consecuencia de la regla `DROP`: los contadores están detrás de ella y no ven lo que descarta.
 
 `bajada`:
 
@@ -322,7 +322,9 @@ La sección 6 del runbook: `para` en A y en B, `reglas_como_antes` en A (`reglas
 
 ### Camino de los casos 5 a 8
 
-El arnés de `040bc01`, con el que se hizo la ejecución completa, solo medía los contadores en los casos 1 a 4. Para los demás se añadió la medida, y una ejecución parcial (de 16:59 a 17:03 UTC, sin `claude`: preparación y casos 2 y 5 a 8) repitió los casos 5 a 8. Los cuatro se superaron otra vez, todos por camino directo:
+**Qué arnés dio qué resultado.** La ejecución completa (todos los resultados de arriba salvo el camino de los casos 5 a 8) se hizo con el arnés de `040bc01`. El camino de los casos 5 a 8 viene de una ejecución parcial con el arnés del commit siguiente, `5a1cb38`. Las correcciones posteriores del arnés (la «ronda de correcciones 1»: ficheros de PID comprobados, directorio marcado, etiquetas de Docker, desmontaje al interrumpir, camino del caso 3 comprobado) solo se han probado por partes, no de principio a fin; el `run.sh` de `5a1cb38` tampoco se ejecutó entero, ni su limpieza ni su desmontaje nuevos.
+
+El arnés de `040bc01` solo medía los contadores en los casos 1 a 4. Para los demás se añadió la medida, y una ejecución parcial (de 16:59 a 17:03 UTC, sin `claude`: preparación y casos 2 y 5 a 8) repitió los casos 5 a 8. Los cuatro se superaron otra vez, todos por camino directo:
 
 | Caso | UDP sin DNS, enviado / recibido por A | TCP 443, enviado / recibido |
 |-|-|-|
@@ -331,7 +333,7 @@ El arnés de `040bc01`, con el que se hizo la ejecución completa, solo medía l
 | 7 (lo que C habla con B; lo que habla con A no sale por `eth0`) | 156 KB / 121 KB | 12 KB / 25 KB |
 | 8 (solo `caso8.py`, sin la instalación desde PyPI) | 15 KB / 10 KB | 0,2 KB / 0,2 KB |
 
-Esa ejecución parcial encontró además dos fallos del arnés, corregidos en el commit siguiente a `040bc01`. Ninguno es de PALS ni del runbook, y ninguno cambia un resultado de la ejecución completa:
+Esa ejecución parcial encontró además dos fallos del arnés, corregidos en `5a1cb38`. Ninguno es de PALS ni del runbook, y ninguno cambia un resultado de la ejecución completa:
 
 - **El arnés buscaba la orden que sobrevive al `kill -9` del caso 5** con el `grep '[p]als-prueba'` del runbook. En un primer intento, ese `grep` encontró antes otro proceso ajeno a la prueba: la orden que lanzó el arnés, cuya línea contenía ese texto. Así terminó un grupo equivocado, y la orden real siguió viva hasta el caso 8. Ahora el arnés busca exactamente `sh <directorio de B>/pals-prueba.sh`. En la ejecución completa no pasó: listó el grupo correcto (`sh` y `sleep 300`), lo terminó, y el caso 8 contó 0 órdenes vivas.
 - **La limpieza tomaba el código de salida de `rm -rf ~/.pals-c`**, no el de `reglas_como_antes`. En la ejecución completa, `reglas_como_antes` imprimió `reglas del cortafuegos como antes`.
@@ -346,6 +348,8 @@ Una primera ejecución del arnés, de 15:43 a 16:11 UTC y sin el caso 1, encontr
 4. **`pals ask` dejaba de esperar antes de que acabara la subida por relay.** Los relays públicos de n0 limitan el tráfico de cada endpoint, y el daemon que envía lo avisa (`The relay is rate-limiting this endpoint; outbound relay traffic is being throttled`). En la primera ejecución, la descarga de 256 MiB por relay tardó 1156 s, unos 230 KB/s, más que los 600 s que espera `pals ask` por defecto. `caso3.sh subida` usa ahora `--wait 30m`, como el `blob_fetch_timeout_s = 1800` del paso 2.
 5. **Variables y funciones perdidas en una terminal nueva** (pendientes de una revisión anterior). `arranca`, `para`, `reglas_como_antes`, `$PROYECTO` y la ruta del clon van ahora en `~/pals-salida/funciones.sh`, que carga cada bloque que los usa. El caso 8 ya no supone que el clon está en `~/rosepetal-pals`.
 6. **Como root, sin `sudo`.** Las órdenes y los guiones usan `$SUDO`, vacío para root. `corte-red.sh` imprime además la hora del corte y la de la vuelta, y no falla si no hay `syslog`.
+
+Después de esta ejecución, una revisión corrigió algo más del runbook, sin volver a ejecutar la prueba completa: `para` comprueba que el PID guardado sigue siendo un `pals daemon` antes de enviarle la señal, espera como mucho 60 s y borra el fichero del PID; el caso 5, el caso 8 y la limpieza buscan la orden del worker de pruebas con `grupos_prueba` (exactamente `sh ~/pals-salida/pals-prueba.sh`, no un `grep` sobre `ps`), y el caso 5 pide comprobar su grupo antes de matarlo; el cambio de worker no escribe nada si falta `$PROYECTO`; y la vuelta atrás de 3b va en un bloque propio. `para` y `grupos_prueba` se probaron por separado con procesos señuelo.
 
 ### Desviaciones del runbook
 
@@ -363,7 +367,7 @@ Ninguna es un fallo de un caso, pero conviene tenerlas en cuenta en la prueba en
 2. **Los relays públicos de n0 limitan el tráfico de cada endpoint:** unos 250 KB/s. El daemon que envía lo avisa en su registro (`The relay is rate-limiting this endpoint; outbound relay traffic is being throttled`). Por relay, los 256 MiB tardaron unos 18 min en cada sentido.
 3. **La ida del caso 2 tardó 70 s** en la ejecución completa, frente a 14 s y 15 s en las otras dos ejecuciones, con una carga parecida de la máquina. La vuelta tardó siempre menos de 1 s. No se investigó la causa: la máquina era compartida, y la ida incluye la subida del fichero al gateway de A, su descarga por B y el trabajo del worker.
 4. **`para` en A tardó unos 30 s** en la primera ejecución, al rearrancar con el UDP ya descartado. En la ejecución completa tardó menos de 1 s las dos veces. No se investigó; el runbook ya avisa de que `para` puede tardar unos segundos.
-5. **Avisos de Iroh en el registro de A:** `failed closing path err=LastOpenPath` (de `noq_proto`), una vez durante el corte del caso 4 y otra tras el `kill -9` del caso 5. Ninguno afectó a un resultado.
+5. **Avisos de Iroh:** en el registro de A, `failed closing path err=LastOpenPath` (de `noq_proto`), una vez durante el corte del caso 4 y otra tras el `kill -9` del caso 5. En el de B (línea 11), `Ignoring connection: invalid handshake: aborted by peer` (de `iroh::protocol`) a las 16:52:00, al final del corte del caso 4 (la red de A volvió a las 16:52:01). Ninguno afectó a un resultado.
 6. **Con `relay = true`, un rearranque no invalida los tickets.** A alcanzó a B tras el paso intermedio y tras el caso 5, y B alcanzó a A tras los dos rearranques de A en el caso 3b, sin volver a guardar ningún ticket. Queda resuelta la observación 1 del ensayo anterior.
 7. **`pals ask` imprime en stderr su `messageId`** (`pals: message … kept; resume with: pals task resume …`) antes de esperar la respuesta, también cuando la petición se rechaza. Los resultados esperados del runbook solo citan la otra línea.
 8. **El daemon sigue sin informar del camino de red.** El camino se dedujo de los contadores de A, como se explica arriba.
@@ -377,6 +381,9 @@ Ninguna es un fallo de un caso, pero conviene tenerlas en cuenta en la prueba en
 - **Relojes**: A y B comparten reloj, así que no se ejercitó la tolerancia de 60 s de los grants.
 - **IPv6**: la red de Docker de A no tenía IPv6; todo fue por IPv4.
 - **Claude Code** respondió en el mismo anfitrión, con la sesión de quien ejecutó la prueba; no se probó con una clave de API ni con el guion envoltorio del paso 2.
+- **El camino con `sudo`.** A trabajó como root, así que `$SUDO` iba vacío: no se ejecutó ninguna orden ni ningún guion con `sudo` (`sudo -v`, `sudo setsid -f sh corte-red.sh`, `sudo iptables-save`).
+- **Las órdenes del runbook en B.** El arnés no ejecuta en B los bloques del runbook: los reimplementa con las rutas de B (`pb`, `arranca_b`, `para_b`, `write_b_config`) y nunca carga `funciones.sh` en B. Quedan sin probar tal como están escritos: el paso 2 en B, el bloque del cambio de worker (con su comprobación de `$PROYECTO`), la parte del caso 5 en B (`kill -9`, `grupos_prueba`, `kill -- -<PGID>`) y la limpieza en B.
+- **Las órdenes del runbook en A, fuera de los guiones.** Del runbook solo se extraen los seis guiones de `~/pals-salida` (`funciones.sh`, `pals-prueba.sh`, `corte-red.sh`, `caso3.sh`, `caso4-eventos.py` y `caso8.py`). Los bloques de órdenes de A (la configuración del paso 2, el reglaje del relay en 3b, los casos 2, 4, 6, 7 y 8) son copias dentro de `run.sh`: un cambio en esos bloques del runbook no lo prueba el arnés hasta que se copie a mano.
 
 ## Ensayo anterior en una sola máquina (2026-11-14, 10:38 a 10:57 UTC)
 
