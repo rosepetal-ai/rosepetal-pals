@@ -1,8 +1,8 @@
 # PALS: hoja de ruta de los hitos 2 a 4
 
-**Fecha:** 2026-11-14 · **Spec:** [`docs/plans/initial.md`](../../plans/initial.md) (revisión 3) · **Planes:** [hito 1](2026-11-14-hito-1-flujo-basico-a2a.md) (implementado) y [hito 2](2026-11-14-hito-2-consulta-de-servicios.md) (en curso)
+**Fecha:** 2026-11-14 · **Spec:** [`docs/plans/initial.md`](initial.md) (revisión 3) · **Planes:** [hito 1](2026-11-14-hito-1-flujo-basico-a2a.md) (implementado) y [hito 2](2026-11-14-hito-2-consulta-de-servicios.md) (en curso)
 
-Este documento no es un plan ejecutable. El spec cubre cuatro subsistemas que se construyen en orden y dice que «no se asignan tiempos de desarrollo o promesas de rendimiento sin construir y medir cada hito» (§14). Por eso cada hito recibe su propio plan paso a paso en `docs/superpowers/plans/` cuando el anterior está construido, porque sus interfaces dependen de código que todavía no existe y, en el hito 3, de una comparación cuyo resultado no se conoce. Los hitos 1 y 2 ya tienen el suyo. El del hito 2 se escribió a petición del responsable con el hito 1 implementado y su prueba de salida todavía en curso.
+Este documento no es un plan ejecutable. El spec cubre cuatro subsistemas que se construyen en orden y dice que «no se asignan tiempos de desarrollo o promesas de rendimiento sin construir y medir cada hito» (§14). Por eso cada hito recibe su propio plan paso a paso en `docs/plans/` cuando el anterior está construido, porque sus interfaces dependen de código que todavía no existe y, en el hito 3, de una comparación cuyo resultado no se conoce. Los hitos 1 y 2 ya tienen el suyo. El del hito 2 se escribió a petición del responsable con el hito 1 implementado y su prueba de salida todavía en curso.
 
 Aquí queda fijado lo que ya se puede decidir: qué implica para cada hito el requisito del 2026-11-14 («completamente compatible con A2A en su intercambio final»), qué hereda del hito 1, el esquema de tareas, el criterio de salida del spec y las decisiones que hay que tomar antes de escribir cada plan.
 

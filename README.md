@@ -175,8 +175,8 @@ Fuera del hito 1: la card firmada (JWS), las notificaciones *push*, el binding g
 ## Documentación
 
 - [`docs/plans/initial.md`](docs/plans/initial.md): diseño de la red, revisión 3.
-- [`docs/superpowers/plans/2026-11-14-hito-1-flujo-basico-a2a.md`](docs/superpowers/plans/2026-11-14-hito-1-flujo-basico-a2a.md): plan paso a paso del hito 1, con los cambios que impone el requisito de compatibilidad con A2A.
-- [`docs/superpowers/plans/2026-11-14-hoja-de-ruta-hitos-2-4.md`](docs/superpowers/plans/2026-11-14-hoja-de-ruta-hitos-2-4.md): hoja de ruta de los hitos 2 a 4.
+- [`docs/plans/2026-11-14-hito-1-flujo-basico-a2a.md`](docs/plans/2026-11-14-hito-1-flujo-basico-a2a.md): plan paso a paso del hito 1, con los cambios que impone el requisito de compatibilidad con A2A.
+- [`docs/plans/2026-11-14-hoja-de-ruta-hitos-2-4.md`](docs/plans/2026-11-14-hoja-de-ruta-hitos-2-4.md): hoja de ruta de los hitos 2 a 4.
 - [`docs/bindings/http-over-iroh-v1.md`](docs/bindings/http-over-iroh-v1.md): los bindings entre pares.
 - [`docs/extensions/idempotency-v1.md`](docs/extensions/idempotency-v1.md): la extensión de idempotencia.
 - [`docs/conformance/hito-1/README.md`](docs/conformance/hito-1/README.md): la conformidad con A2A (TCK y SDK de Python) y [`sdk-issues.md`](docs/conformance/hito-1/sdk-issues.md), los defectos del SDK de Rust.

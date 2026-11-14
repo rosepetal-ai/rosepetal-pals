@@ -80,8 +80,8 @@ Module headers (`//!`) document each component's contract in detail; read them b
 | Topic | File |
 |-|-|
 | Design (revision 3) | `docs/plans/initial.md` |
-| Hito 1 plan, with the spec-deviation table | `docs/superpowers/plans/2026-11-14-hito-1-flujo-basico-a2a.md` |
-| Roadmap, hitos 2 to 4 | `docs/superpowers/plans/2026-11-14-hoja-de-ruta-hitos-2-4.md` |
+| Hito 1 plan, with the spec-deviation table | `docs/plans/2026-11-14-hito-1-flujo-basico-a2a.md` |
+| Roadmap, hitos 2 to 4 | `docs/plans/2026-11-14-hoja-de-ruta-hitos-2-4.md` |
 | Peer bindings | `docs/bindings/http-over-iroh-v1.md` |
 | Idempotency extension | `docs/extensions/idempotency-v1.md` |
 | Conformance evidence and the exact claim | `docs/conformance/hito-1/README.md`, `sdk-issues.md` |
