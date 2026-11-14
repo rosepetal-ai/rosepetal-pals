@@ -128,6 +128,17 @@ async fn same_message_id_sent_twice_runs_once() {
     assert_eq!(res.json["result"]["totalSize"], 1, "{}", res.json);
 }
 
+/// How long a request made while a run is held may take: it must not wait
+/// for the run, so it fails the test instead of hanging when it does.
+const HELD_PATIENCE: Duration = Duration::from_secs(60);
+
+/// `request`, which must end while the gate holds the run.
+async fn while_held<T>(what: &str, request: impl Future<Output = T>) -> T {
+    tokio::time::timeout(HELD_PATIENCE, request)
+        .await
+        .unwrap_or_else(|_| panic!("{what} waited for the held run"))
+}
+
 /// Whether `b` serves a task in `WORKING`: its run has started.
 fn running(b: &TestNode) -> bool {
     !tasks_in(b, TaskState::Working).is_empty()
@@ -199,7 +210,7 @@ async fn retry_while_first_execution_is_running_attaches_to_it() {
     // which returns while the run is held: with the task as it is then.
     let retried = async {
         wait_until(|| running(&b)).await;
-        let retry = send().await;
+        let retry = while_held("the retry", send()).await;
         assert_eq!(
             task_of(&retry)["status"]["state"],
             "TASK_STATE_WORKING",
@@ -241,8 +252,10 @@ async fn streaming_retry_resubscribes_instead_of_reexecuting() {
                 serde_json::to_vec(&rpc_request("SendStreamingMessage", params.clone())).unwrap(),
             ))
             .unwrap();
-        let mut results = SseResults::new(a.send(&b, request).await);
-        let first = results.next().await.expect("a first event");
+        let mut results = SseResults::new(while_held("the retry", a.send(&b, request)).await);
+        let first = while_held("the retry's first event", results.next())
+            .await
+            .expect("a first event");
         assert_eq!(
             first["task"]["status"]["state"], "TASK_STATE_WORKING",
             "{first}"
@@ -299,9 +312,9 @@ async fn retry_of_a_long_unary_execution_attaches_to_it() {
     let retry = || a.rpc_idempotent(&b, Some(&g), "SendMessage", params.clone());
     let retries = async {
         wait_until(|| running(&b)).await;
-        let early = retry().await;
+        let early = while_held("the early retry", retry()).await;
         tokio::time::sleep(Duration::from_secs(DEDUP_INFLIGHT_WAIT_S + 1)).await;
-        let late = retry().await;
+        let late = while_held("the late retry", retry()).await;
         exec.release();
         (early, late)
     };

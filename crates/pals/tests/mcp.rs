@@ -657,7 +657,14 @@ async fn pals_ask_returns_a_message_id_before_a_slow_answer() {
     let mut meta = RequestMetaObject::default();
     meta.set_progress_token(ProgressToken(NumberOrString::String("ask-1".into())));
     params.meta = Some(meta);
-    let out = ok_json(&client.call_tool(params).await.expect("a tool result"));
+    // It must end with its wait, not with the held run.
+    let asked = tokio::time::timeout(Duration::from_secs(120), client.call_tool(params));
+    let out = ok_json(
+        &asked
+            .await
+            .expect("pals_ask waited for the held run")
+            .expect("a tool result"),
+    );
     let message_id = out["message_id"].as_str().expect("a message id").to_owned();
     let state = out["state"].as_str().unwrap();
     assert!(
