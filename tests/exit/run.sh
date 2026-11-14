@@ -14,19 +14,30 @@
 # repetition of case 3 forces the relay by dropping A's outgoing UDP except
 # DNS and loopback, as the runbook says.
 #
-# The scripts the runbook writes to ~/pals-salida (funciones.sh,
+# The six scripts the runbook writes to ~/pals-salida (funciones.sh,
 # pals-prueba.sh, corte-red.sh, caso3.sh, caso4-eventos.py, caso8.py) are
-# extracted from the runbook itself, so that this harness runs what the
-# runbook says. A follows the runbook literally, as root in its container
-# (~/.pals, ~/pals-salida); B runs the same commands with the paths below.
+# extracted from the runbook itself. The runbook's other commands are not:
+# A's are copied into this file and run as root in A's container (~/.pals,
+# ~/pals-salida, with funciones.sh loaded), and B's are reimplemented below
+# (pb, arranca_b, para_b, write_b_config) with B's paths. A change to those
+# blocks of the runbook has to be carried over here by hand.
 #
 # Usage:
-#   PALS_EXIT_DIR=<empty dir> tests/exit/run.sh [phase...]
+#   PALS_EXIT_DIR=<new or empty dir> tests/exit/run.sh [phase...]
 # Phases, in order: preparar caso1 cambio-worker caso2 caso3 caso4 caso5
 # caso6 caso7 caso8 limpieza desmontar; `todo` (the default) runs them all.
 # Each case prints `RESULTADO <case>: superado|FALLIDO`, collected in
 # $PALS_EXIT_DIR/registro/resultados.txt; the full log is
 # $PALS_EXIT_DIR/registro/run.log. See tests/exit/README.md.
+#
+# `preparar` only accepts a new or empty PALS_EXIT_DIR, and marks it with a
+# .pals-exit file; every other phase refuses a directory without that mark,
+# and `desmontar` deletes only what `preparar` made there. The container and
+# the network carry the label pals-exit.dir=<PALS_EXIT_DIR>, and `desmontar`
+# removes them only when the label is this directory. B's daemon is signalled
+# only after checking that the PID in its pid file is this run's `pals
+# daemon`. An interrupted run (Ctrl-C, SIGTERM) tears itself down; after any
+# other failure, run `desmontar` with the same PALS_EXIT_DIR.
 #
 # Environment:
 #   PALS_EXIT_DIR        required: B's PALS_HOME, B's ~/pals-salida, the
@@ -36,13 +47,18 @@
 #                        two `claude -p` calls; omitir: skip case 1
 #   PALS_EXIT_PROYECTO   B's project for case 1 [a clone of this repo at HEAD]
 #   PALS_EXIT_B_GATEWAY  B's gateway [127.0.0.1:17420]
+#   PALS_EXIT_LIMITE     the sender's limit in case 3 when a transfer ends
+#                        before the cut [50mbit]
 #   PALS_EXIT_KEEP_IMAGE 1 (default) keeps the image on `desmontar`; 0 removes it
 
 set -uo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 RUNBOOK=$REPO/docs/runbooks/hito-1-dos-maquinas.md
-WORK=${PALS_EXIT_DIR:?set PALS_EXIT_DIR to a directory for B and the logs}
+WORK=${PALS_EXIT_DIR:?set PALS_EXIT_DIR to a new or empty directory for B and the logs}
+# Absolute: B's config names files in it, and its commands run elsewhere.
+WORK=$(realpath -m -- "$WORK")
+MARKER=$WORK/.pals-exit
 PALS=${PALS_EXIT_BIN:-$REPO/target/release/pals}
 CASO1=${PALS_EXIT_CASO1:-claude}
 B_GATEWAY=${PALS_EXIT_B_GATEWAY:-127.0.0.1:17420}
@@ -61,6 +77,35 @@ B_PATH=$PATH
 B_LANG=${LANG:-C.UTF-8}
 FULL=268435456          # 256 MiB
 
+phases=("$@")
+[ ${#phases[@]} -gt 0 ] || phases=(todo)
+TODO=0
+if [ "${phases[0]}" = todo ]; then
+    TODO=1
+    phases=(preparar caso1 cambio-worker caso2 caso3 caso4 caso5 caso6 caso7 caso8 limpieza desmontar)
+fi
+for phase in "${phases[@]}"; do
+    case $phase in
+        preparar|caso[1-8]|cambio-worker|limpieza|desmontar) ;;
+        *) echo "run.sh: unknown phase $phase" >&2; exit 2 ;;
+    esac
+done
+# Checked before anything is written: `preparar` makes and marks a new or
+# empty directory; the other phases need that mark.
+if [[ " ${phases[*]:1} " == *" preparar "* ]]; then
+    echo "run.sh: preparar must be the first phase" >&2; exit 2
+fi
+if [ "${phases[0]}" = preparar ]; then
+    if [ -e "$WORK" ] && { [ ! -d "$WORK" ] || [ -n "$(ls -A -- "$WORK")" ]; }; then
+        echo "run.sh: $WORK exists and is not an empty directory: preparar needs a new or empty PALS_EXIT_DIR" >&2
+        exit 2
+    fi
+    mkdir -p -- "$WORK" && printf 'pals-exit harness\n' > "$MARKER" || exit 2
+elif [ ! -f "$MARKER" ]; then
+    echo "run.sh: $WORK has no .pals-exit mark: it was not made by \`preparar\`, and no phase but preparar touches it" >&2
+    exit 2
+fi
+
 mkdir -p "$LOGS"
 exec > >(tee -a "$LOGS/run.log") 2>&1
 
@@ -69,7 +114,11 @@ exec > >(tee -a "$LOGS/run.log") 2>&1
 ts() { date -u +%T; }
 say() { printf '\n[%s] == %s\n' "$(ts)" "$*"; }
 note() { printf '[%s] %s\n' "$(ts)" "$*"; }
-die() { note "ERROR: $*"; exit 1; }
+die() {
+    note "ERROR: $*"
+    [ "$TODO" = 1 ] || note "para limpiar: PALS_EXIT_DIR=$WORK $0 desmontar"
+    exit 1
+}
 result() {   # result CASE ok|fail [DETAIL]
     local verdict=superado
     [ "$2" = ok ] || verdict=FALLIDO
@@ -99,34 +148,77 @@ a_write() { docker exec -i "$A" sh -c "cat > $1"; }
 
 pb() { PALS_HOME=$B_HOME "$PALS" "$@"; }
 
+# is_b_daemon PID: whether PID is this run's B daemon: the command line
+# `$PALS daemon` and PALS_HOME=$B_HOME in its environment. A pid file can
+# outlive its process (a reboot, a crash) and name an unrelated one.
+is_b_daemon() {
+    local pid=$1
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    [ "$(tr '\0' ' ' 2> /dev/null < "/proc/$pid/cmdline")" = "$PALS daemon " ] || return 1
+    tr '\0' '\n' 2> /dev/null < "/proc/$pid/environ" | grep -qxF "PALS_HOME=$B_HOME"
+}
+# b_daemon_pid: the PID in B's pid file, if it is this run's B daemon.
+b_daemon_pid() {
+    local pid
+    pid=$(cat "$B_SAL/daemon.pid" 2> /dev/null) && is_b_daemon "$pid" && echo "$pid"
+}
+
 # Starts B's daemon in its own session, so that it outlives this script, with
 # the environment of a clean terminal.
 arranca_b() {
+    if b_daemon_pid > /dev/null; then die "B's daemon is already running ($(b_daemon_pid))"; fi
     env -i PATH="$B_PATH" HOME="$HOME" LANG="$B_LANG" PALS_HOME="$B_HOME" \
         ${RUST_LOG:+RUST_LOG="$RUST_LOG"} \
         setsid "$PALS" daemon >> "$B_SAL/daemon.log" 2>&1 < /dev/null &
-    echo $! > "$B_SAL/daemon.pid"
+    local pid=$!
+    echo "$pid" > "$B_SAL/daemon.pid"
     disown   # case 5 kills it: no job notice
     local _
     for _ in $(seq 1 120); do
         pb id --ticket > /dev/null 2>&1 && break
-        kill -0 "$(cat "$B_SAL/daemon.pid")" 2>/dev/null || die "B's daemon exited, see $B_SAL/daemon.log"
+        kill -0 "$pid" 2>/dev/null || die "B's daemon exited, see $B_SAL/daemon.log"
         sleep 0.5
     done
+    is_b_daemon "$pid" || die "B's daemon ($pid) is not running as expected"
     sleep 5   # the runbook: wait a few seconds, so that the ticket carries the relay
     grep 'pals daemon:' "$B_SAL/daemon.log" | tail -n 1
 }
+# Stops B's daemon, if its pid file names it: SIGTERM, then up to 60 s for it
+# to end. Removes the pid file once it has.
 para_b() {
-    local pid; pid=$(cat "$B_SAL/daemon.pid" 2>/dev/null) || return 0
-    kill "$pid" 2>/dev/null || return 0
-    while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
+    local pid _
+    if ! pid=$(b_daemon_pid); then
+        rm -f "$B_SAL/daemon.pid"
+        return 0
+    fi
+    kill "$pid"
+    for _ in $(seq 1 300); do
+        is_b_daemon "$pid" || { rm -f "$B_SAL/daemon.pid"; return 0; }
+        sleep 0.2
+    done
+    note "AVISO: el daemon de B ($pid) sigue vivo 60 s después de SIGTERM"
+    return 1
 }
 
+# A string as a literal in an extended regular expression.
+# (`]` first and `[` last in the bracket: `[.` would open a collating symbol.)
+ere_quote() { printf '%s' "$1" | sed 's/[].^$*+?(){}|\\[]/\\&/g'; }
 # The test worker's commands on B: the PIDs of the shells that run B's
 # pals-prueba.sh, matched by the start of their command line, so that no
 # other process that merely mentions the script counts (the runbook's
 # `grep '[p]als-prueba'` would).
-b_workers() { pgrep -f "^sh $B_SAL/pals-prueba\.sh" || true; }
+b_workers() { pgrep -f "^sh $(ere_quote "$B_SAL/pals-prueba.sh")( |\$)" || true; }
+# b_worker_of TASK_ID: the test worker's shell that runs that task, by the
+# PALS_TASK_ID the exec worker gives its command.
+b_worker_of() {
+    local p
+    for p in $(b_workers); do
+        if tr '\0' '\n' 2> /dev/null < "/proc/$p/environ" | grep -qxF "PALS_TASK_ID=$1"; then
+            echo "$p"; return 0
+        fi
+    done
+    return 1
+}
 # group_of PID: its process group; ps_groups PGID…: their processes, with a header.
 group_of() { ps -o pgid= -p "$1" | tr -d ' '; }
 ps_groups() { ps -eo pid,pgid,etime,args | awk -v gs=" $* " 'NR == 1 || index(gs, " " $2 " ")'; }
@@ -140,18 +232,28 @@ counters() {
         /pals-exit-443-out/ { to = $2 } /pals-exit-443-in/ { ti = $2 }
         END { print uo + 0, ui + 0, to + 0, ti + 0 }'
 }
-# path LABEL "BEFORE": prints the bytes since BEFORE and which path they say.
+# path LABEL "BEFORE": prints the bytes since BEFORE and which path they say,
+# and leaves that path in CAMINO: directo, relay or mixto.
+CAMINO=
 path() {
     local label=$1 b; read -r -a b <<< "$2"
     local a; read -r -a a <<< "$(counters)"
     local udp=$(( a[0] - b[0] + a[1] - b[1] )) tcp=$(( a[2] - b[2] + a[3] - b[3] ))
     local which=mixto
-    if [ "$udp" -gt $(( 4 * tcp )) ]; then which="directo (UDP)"
-    elif [ "$tcp" -gt $(( 4 * udp )) ]; then which="relay (TCP 443)"; fi
+    CAMINO=mixto
+    if [ "$udp" -gt $(( 4 * tcp )) ]; then which="directo (UDP)"; CAMINO=directo
+    elif [ "$tcp" -gt $(( 4 * udp )) ]; then which="relay (TCP 443)"; CAMINO=relay; fi
     note "camino $label: $which; por eth0 de A, UDP sin DNS: $(( a[0] - b[0] )) B enviados, $(( a[1] - b[1] )) B recibidos; TCP 443: $(( a[2] - b[2] )) B enviados, $(( a[3] - b[3] )) B recibidos"
 }
 
 elapsed() { echo $(( $(date +%s) - $1 )) s; }
+
+# The PALS_EXIT_DIR of the run that made container $A or network $NET, from
+# its label; empty when it does not exist.
+container_dir() { docker inspect -f '{{ index .Config.Labels "pals-exit.dir" }}' "$A" 2> /dev/null; }
+network_dir() { docker network inspect -f '{{ index .Labels "pals-exit.dir" }}' "$NET" 2> /dev/null; }
+container_exists() { docker ps -a --format '{{.Names}}' | grep -qx "$A"; }
+network_exists() { docker network ls --format '{{.Name}}' | grep -qx "$NET"; }
 
 # --- phases ----------------------------------------------------------------
 
@@ -162,9 +264,14 @@ preparar() {
     if [ "$CASO1" = claude ]; then
         command -v claude > /dev/null || die "case 1 needs claude on PATH (or PALS_EXIT_CASO1=omitir)"
     fi
-    [ ! -e "$B_HOME" ] || die "$B_HOME exists: run \`desmontar\` first, or use another PALS_EXIT_DIR"
-    if docker ps -a --format '{{.Names}}' | grep -qx "$A"; then
-        die "container $A exists: run \`desmontar\` first"
+    local owner
+    if container_exists; then
+        owner=$(container_dir)
+        die "the container $A exists, made by the run in ${owner:-an unknown directory}: another run may be in progress; if not, run \`desmontar\` with that PALS_EXIT_DIR"
+    fi
+    if network_exists; then
+        owner=$(network_dir)
+        die "the network $NET exists, made by the run in ${owner:-an unknown directory}: another run may be in progress; if not, run \`desmontar\` with that PALS_EXIT_DIR"
     fi
 
     note "fecha: $(date -u '+%F %T') UTC"
@@ -175,9 +282,9 @@ preparar() {
     note "rustc: $(rustc --version 2>/dev/null || echo 'no instalado')"
 
     docker build -q -t "$IMAGE" "$REPO/tests/exit" > /dev/null || die "docker build failed"
-    docker network create "$NET" > /dev/null || die "cannot create network $NET"
+    docker network create --label "pals-exit.dir=$WORK" "$NET" > /dev/null || die "cannot create network $NET"
     docker run -d --init --name "$A" --hostname "$A" --network "$NET" --cap-add NET_ADMIN \
-        "$IMAGE" > /dev/null || die "cannot start container $A"
+        --label "pals-exit.dir=$WORK" "$IMAGE" > /dev/null || die "cannot start container $A"
     docker cp "$PALS" "$A:/usr/local/bin/pals" > /dev/null || die "cannot copy pals into A"
     # The repository, as in this working tree, at A's ~/rosepetal-pals.
     git -C "$REPO" ls-files -z --cached --others --exclude-standard \
@@ -231,6 +338,7 @@ EOS
 
     say "Paso 2. Configuración de B"
     if [ -z "${PALS_EXIT_PROYECTO:-}" ]; then
+        echo proyecto >> "$MARKER"   # desmontar deletes the copy only with this line
         git clone -q --no-local "$REPO" "$PROYECTO" || die "cannot clone the project"
         git -C "$PROYECTO" checkout -q --detach "$(git -C "$REPO" rev-parse HEAD)"
         note "proyecto de B: una copia del repositorio en $(git -C "$PROYECTO" rev-parse --short HEAD)"
@@ -427,10 +535,11 @@ caso3_try() {
     path "caso 3 $label $1" "$before"
 }
 
-# caso3_run bajada|subida LABEL: the runbook's caso3.sh, checked; repeated
-# with the sender limited when the transfer ends before the cut.
+# caso3_run bajada|subida LABEL directo|relay: the runbook's caso3.sh,
+# checked, on the path it must take; repeated with the sender limited when
+# the transfer ends before the cut.
 caso3_run() {
-    local mode=$1 label=$2 before t0 out limited=no
+    local mode=$1 label=$2 expected=$3 before t0 out limited=no
     say "Caso 3, $label: caso3.sh $mode"
     caso3_try "$mode"
     local d2
@@ -464,7 +573,11 @@ caso3_run() {
             && [ "$stalled" = yes ]; then ok=ok; fi
         detail="sha256 enviado ${sent:0:8}…, recibido por B ${b_got:0:8}…"
     fi
-    result "caso 3 $label $mode" "$ok" "$detail; limitado: $limited; parada durante el corte: $stalled ($d1, $d2, tras el corte $after); $(elapsed "$t0")"
+    if [ "$CAMINO" != "$expected" ]; then
+        ok=fail
+        note "AVISO: el camino medido es $CAMINO, no $expected"
+    fi
+    result "caso 3 $label $mode" "$ok" "$detail; camino medido: $CAMINO; limitado: $limited; parada durante el corte: $stalled ($d1, $d2, tras el corte $after); $(elapsed "$t0")"
 }
 
 caso3() {
@@ -473,8 +586,8 @@ caso3() {
 $SUDO iptables-save | grep -- '^-' > ~/pals-salida/iptables.antes     # solo las reglas
 $SUDO ip6tables-save | grep -- '^-' > ~/pals-salida/ip6tables.antes
 EOS
-    caso3_run bajada "3a, camino directo"
-    caso3_run subida "3a, camino directo"
+    caso3_run bajada 3a directo
+    caso3_run subida 3a directo
     en_a <<< reglas_como_antes
     result "caso 3a, reglas como antes" "$( en_a <<< reglas_como_antes > /dev/null 2>&1 && echo ok || echo fail)"
 
@@ -486,8 +599,8 @@ for t in iptables ip6tables; do
 done
 t=$(date +%s); para; echo "para: $(( $(date +%s) - t )) s"; arranca
 EOS
-    caso3_run bajada "3b, relay"
-    caso3_run subida "3b, relay"
+    caso3_run bajada 3b relay
+    caso3_run subida 3b relay
     say "Caso 3b: se deshacen las reglas y A rearranca"
     en_a <<'EOS'
 for t in iptables ip6tables; do
@@ -552,14 +665,20 @@ echo "$(date -u +%T) fin"
 EOS
     local ask=$!
     sleep 15
-    en_a <<< 'pals task ls | tail -n 1'
-    msg=$(en_a <<< 'pals task ls | tail -n 1' | cut -f1)
-    local pgid
-    pgid=$(group_of "$(b_workers | head -n 1)")
-    note "En B: la orden de la tarea, grupo de procesos $pgid"
+    local row task worker pgid daemon
+    row=$(en_a <<< 'pals task ls | tail -n 1')
+    echo "$row"
+    msg=$(echo "$row" | cut -f1)
+    task=$(echo "$row" | cut -f4)
+    # The worker of this task, not one an earlier run may have left behind.
+    worker=$(b_worker_of "$task") || die "no test worker on B runs task $task"
+    pgid=$(group_of "$worker")
+    note "En B: la orden de la tarea $task, grupo de procesos $pgid"
     ps_groups "$pgid"
-    note "En B: kill -9 del daemon"
-    kill -9 "$(cat "$B_SAL/daemon.pid")"
+    daemon=$(b_daemon_pid) || die "B's pid file does not name this run's B daemon"
+    note "En B: kill -9 del daemon ($daemon)"
+    kill -9 "$daemon"
+    rm -f "$B_SAL/daemon.pid"
     sleep 1
     note "En B, tras el kill -9 (limitación conocida: la orden sigue viva)"
     ps_groups "$pgid"
@@ -589,10 +708,18 @@ EOS
         if echo "$ev" | grep -qx '  eventos task.accepted de esas tareas: 1' \
             && [ "$hello" = "eco: hola tras el rearranque" ] && [ "$hcode" = 0 ]; then ok=ok; fi
     fi
-    note "En B: se termina la orden que sobrevivió al kill -9 (grupo $pgid)"
-    [ -z "$pgid" ] || kill -- "-$pgid"
-    sleep 1
-    [ "$(ps_groups "$pgid" | wc -l)" -gt 1 ] && ps_groups "$pgid" || note "ningún proceso del grupo $pgid vivo"
+    # Looked up again: the group seen 80 s ago may be gone, and its id reused.
+    if worker=$(b_worker_of "$task"); then
+        pgid=$(group_of "$worker")
+        note "En B: se termina la orden que sobrevivió al kill -9 (tarea $task, grupo $pgid)"
+        ps_groups "$pgid"
+        kill -- "-$pgid"
+        sleep 1
+        if [ "$(ps_groups "$pgid" | wc -l)" -gt 1 ]; then ps_groups "$pgid"
+        else note "ningún proceso del grupo $pgid vivo"; fi
+    else
+        note "En B: la orden de la tarea $task ya no está viva"
+    fi
     path "caso 5" "$before"
     result "caso 5" "$ok" "pals ask: $(sed -n 's/^código //p' "$LOGS/caso5-ask.out"); resume: código $code; $(echo "$ev" | sed -n 's/^  eventos task.accepted de esas tareas: /task.accepted: /p'); ask nuevo: código $hcode; $(elapsed "$t0")"
 }
@@ -728,40 +855,69 @@ EOS
     result "limpieza" "$ok"
 }
 
+DESMONTADO=0
 desmontar() {
+    DESMONTADO=1
     say "Desmontaje"
-    if docker ps -a --format '{{.Names}}' | grep -qx "$A"; then
-        docker exec "$A" sh -c 'cat ~/pals-salida/daemon.log' > "$LOGS/a-daemon.log" 2> /dev/null
-        docker exec "$A" sh -c 'cat ~/pals-salida/daemon-c.log' > "$LOGS/c-daemon.log" 2> /dev/null
-        docker rm -f "$A" > /dev/null && note "contenedor $A eliminado"
+    local owner p
+    # Only what this run made: the label of the container and the network
+    # must be this PALS_EXIT_DIR.
+    if container_exists; then
+        owner=$(container_dir)
+        if [ "$owner" = "$WORK" ]; then
+            docker exec "$A" sh -c 'cat ~/pals-salida/daemon.log' > "$LOGS/a-daemon.log" 2> /dev/null
+            docker exec "$A" sh -c 'cat ~/pals-salida/daemon-c.log' > "$LOGS/c-daemon.log" 2> /dev/null
+            docker rm -f "$A" > /dev/null && note "contenedor $A eliminado"
+        else
+            note "AVISO: el contenedor $A es de otra ejecución (${owner:-sin etiqueta pals-exit.dir}): no se toca"
+        fi
     fi
-    if docker network ls --format '{{.Name}}' | grep -qx "$NET"; then
-        docker network rm "$NET" > /dev/null && note "red $NET eliminada"
+    if network_exists; then
+        owner=$(network_dir)
+        if [ "$owner" = "$WORK" ]; then
+            docker network rm "$NET" > /dev/null && note "red $NET eliminada"
+        else
+            note "AVISO: la red $NET es de otra ejecución (${owner:-sin etiqueta pals-exit.dir}): no se toca"
+        fi
     fi
-    if [ "$KEEP_IMAGE" = 0 ]; then
+    if [ "$KEEP_IMAGE" = 0 ] \
+        && [ -n "$(docker image inspect -f '{{ index .Config.Labels "pals-exit.image" }}' "$IMAGE" 2> /dev/null)" ]; then
         docker image rm "$IMAGE" > /dev/null && note "imagen $IMAGE eliminada"
     else
-        note "la imagen $IMAGE se conserva (docker image rm $IMAGE la elimina)"
+        note "la imagen $IMAGE se conserva (PALS_EXIT_KEEP_IMAGE=0 la elimina)"
     fi
     para_b
     # Any test-worker command still alive, from B's directory only.
-    local p
     for p in $(b_workers); do
         kill -- "-$(group_of "$p")" && note "grupo de procesos de la orden $p terminado"
     done
     [ ! -f "$B_SAL/daemon.log" ] || cp "$B_SAL/daemon.log" "$LOGS/b-daemon.log"
-    rm -rf "$B_HOME" "$B_SAL"
-    [ -n "${PALS_EXIT_PROYECTO:-}" ] || rm -rf "$PROYECTO"
-    note "borrados el PALS_HOME de B, su directorio de la prueba y la copia del proyecto; quedan los registros en $LOGS"
+    # Inside the marked PALS_EXIT_DIR (checked at start); the project copy only
+    # if preparar cloned it there.
+    rm -rf -- "$B_HOME" "$B_SAL"
+    local gone="el PALS_HOME de B y su directorio de la prueba"
+    if grep -qx proyecto "$MARKER" && [ "$PROYECTO" = "$WORK/proyecto" ] && [ -e "$PROYECTO" ]; then
+        rm -rf -- "$PROYECTO"
+        gone="$gone, y la copia del proyecto"
+    fi
+    note "borrados $gone; quedan los registros en $LOGS"
 }
 
 # --- main ------------------------------------------------------------------
 
-phases=("$@")
-[ ${#phases[@]} -gt 0 ] || phases=(todo)
-if [ "${phases[0]}" = todo ]; then
-    phases=(preparar caso1 cambio-worker caso2 caso3 caso4 caso5 caso6 caso7 caso8 limpieza desmontar)
+# Ctrl-C or SIGTERM tears the run down. `todo` also tears down when it stops
+# early; single phases leave the setup for the next phase.
+on_interrupt() {
+    trap - INT TERM
+    note "interrumpido: se desmonta"
+    [ "$DESMONTADO" = 1 ] || desmontar
+    exit 130
+}
+trap on_interrupt INT TERM
+if [ "$TODO" = 1 ]; then
+    trap '[ "$DESMONTADO" = 1 ] || desmontar' EXIT
 fi
+
 for phase in "${phases[@]}"; do
     case $phase in
         preparar) preparar ;;

@@ -11,7 +11,14 @@
 #
 # No sudo: A's shell is root, and the runbook's commands and scripts use
 # `$SUDO`, which is empty for root.
-FROM debian:trixie-slim
+
+# debian:trixie-slim as of 2026-11-04, pinned by the digest of its multi-arch
+# index; to update, `docker pull debian:trixie-slim` and take
+# `docker image inspect -f '{{index .RepoDigests 0}}' debian:trixie-slim`.
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
+
+# `run.sh desmontar` removes only an image with this label.
+LABEL pals-exit.image="machine A of the hito 1 exit test"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
