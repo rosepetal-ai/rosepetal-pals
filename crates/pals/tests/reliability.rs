@@ -19,11 +19,13 @@ use common::{
     spawn_node_in_with_executor, spawn_node_with_executor, stub_peer,
 };
 use pals::config::WorkerCfg;
-use pals::outbox::{ASK_MAX_ATTEMPTS, AskError, AskOutcome, AskRequest};
+use pals::outbox::{ASK_MAX_ATTEMPTS, AskError, AskOutcome, AskRequest, Outbox};
 use pals_core::grant::Operation::{self, TaskCancel, TaskRead, TaskSend};
 use pals_core::identity::AgentKey;
-use pals_core::store::{Contact, INTERRUPTED_MESSAGE, OutboxRow};
+use pals_core::store::{Contact, INTERRUPTED_MESSAGE, OutboxRow, Store};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 const OPS: [Operation; 3] = [TaskSend, TaskRead, TaskCancel];
 /// How long the asks of these tests wait for their answer.
@@ -459,4 +461,183 @@ async fn peer_task_id_that_is_not_safe_is_refused() {
     assert_eq!(rows[0].message_id, message_id);
     assert_eq!(rows[0].task_id, None);
     assert_eq!(rows[0].state, "pending");
+}
+
+/// A stand-in for the gateway whose `POST /blobs` holds every upload until
+/// `release` is notified, after notifying `uploading`; it records every
+/// request it gets in `seen`.
+async fn slow_gateway(seen: Seen, uploading: Arc<Notify>, release: Arc<Notify>) -> String {
+    let app = recording_app(seen, |_| None).route(
+        "/blobs",
+        axum::routing::post(move || {
+            let (uploading, release) = (Arc::clone(&uploading), Arc::clone(&release));
+            async move {
+                uploading.notify_one();
+                release.notified().await;
+                (
+                    axum::http::StatusCode::CREATED,
+                    axum::Json(serde_json::json!({"url": "http://gw.invalid/blobs/h/x"})),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    url
+}
+
+/// A question for an agent id, with one attachment, from an outbox that
+/// asks through the gateway at `gateway_url`.
+fn outbox_with_attachment(gateway_url: String, wait: Duration) -> (Outbox, AskRequest, Arc<Store>) {
+    let store = Arc::new(Store::open_in_memory(AgentKey::generate().id()).unwrap());
+    let outbox = Outbox::new(Arc::clone(&store), gateway_url);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), "some notes").unwrap();
+    let (_, path) = file.keep().unwrap();
+    let req = AskRequest {
+        peer: AgentKey::generate().id().to_string(),
+        question: "hola".to_owned(),
+        attachments: vec![path],
+        wait,
+    };
+    (outbox, req, store)
+}
+
+#[tokio::test]
+async fn an_ask_canceled_while_its_files_upload_keeps_and_sends_nothing() {
+    let (seen, uploading, release) = (Seen::default(), Arc::default(), Arc::new(Notify::new()));
+    let gateway = slow_gateway(seen.clone(), Arc::clone(&uploading), Arc::clone(&release)).await;
+    let (outbox, req, store) = outbox_with_attachment(gateway, WAIT);
+    let cancel = CancellationToken::new();
+    let kept = Arc::new(Mutex::new(None));
+
+    let asked = outbox.ask_kept(req, &cancel, {
+        let kept = Arc::clone(&kept);
+        move |message_id: &str| *kept.lock().unwrap() = Some(message_id.to_owned())
+    });
+    let canceling = async {
+        uploading.notified().await;
+        cancel.cancel();
+        release.notify_one();
+    };
+    let (asked, ()) = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(asked, canceling)
+    })
+    .await
+    .expect("the ask ended");
+    let Err(AskError::Local(reason)) = asked else {
+        panic!("not stopped: {asked:?}");
+    };
+    assert!(reason.contains("nothing was asked"), "{reason}");
+    assert_eq!(*kept.lock().unwrap(), None);
+    assert!(store.outbox_all().unwrap().is_empty());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.contains("/blobs")),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_wait_of_an_ask_counts_its_uploads() {
+    let (seen, uploading, release) = (Seen::default(), Arc::default(), Arc::new(Notify::new()));
+    let gateway = slow_gateway(seen.clone(), uploading, Arc::clone(&release)).await;
+    let (outbox, req, store) = outbox_with_attachment(gateway, Duration::from_secs(2));
+
+    let started = Instant::now();
+    let asked = tokio::time::timeout(Duration::from_secs(60), outbox.ask(req))
+        .await
+        .expect("the ask ended");
+    release.notify_one();
+    let Err(AskError::Local(reason)) = asked else {
+        panic!("not stopped: {asked:?}");
+    };
+    assert!(reason.contains("nothing was asked"), "{reason}");
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    assert!(store.outbox_all().unwrap().is_empty());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.contains("/blobs")),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn ask_cli_prints_the_message_id_as_soon_as_it_is_kept() {
+    use std::io::BufRead;
+
+    // A provider that takes a minute to answer.
+    let exec = CountingExecutor::new(Duration::from_secs(60));
+    let b = spawn_node_with_executor(exec.clone()).await;
+    let a = spawn_node(WorkerCfg::Echo).await;
+    connect(&a, &b);
+    let home = a.dir.path().to_owned();
+    let listen = a.gateway_url().replace("http://", "");
+    std::fs::write(
+        home.join("config.toml"),
+        format!("[gateway]\nlisten = \"{listen}\"\n\n[net]\nrelay = false\n"),
+    )
+    .unwrap();
+
+    /// A child process, killed when this value drops.
+    struct Killed(std::process::Child);
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Killed(
+        std::process::Command::new(assert_cmd::cargo::cargo_bin!("pals"))
+            .env_remove("PALS_HOME")
+            .args([
+                "--home",
+                home.to_str().unwrap(),
+                "ask",
+                "bob",
+                "hola",
+                "--wait",
+                "600s",
+            ])
+            .stderr(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("run pals ask"),
+    );
+    let stderr = child.0.stderr.take().unwrap();
+    // The first line comes while the question is still unanswered.
+    let first = tokio::task::spawn_blocking(move || {
+        let mut line = String::new();
+        std::io::BufReader::new(stderr)
+            .read_line(&mut line)
+            .map(|_| line)
+    });
+    let first = tokio::time::timeout(Duration::from_secs(60), first)
+        .await
+        .expect("a line before the answer")
+        .unwrap()
+        .unwrap();
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "the ask ended: {first}"
+    );
+    drop(child);
+
+    // The id of the question the outbox kept, and how to take it up again.
+    let rows = a.node.store.outbox_all().unwrap();
+    assert_eq!(rows.len(), 1);
+    let id = &rows[0].message_id;
+    assert_eq!(
+        first.trim_end(),
+        format!("pals: message {id} kept; resume with: pals task resume {id}")
+    );
 }

@@ -27,7 +27,11 @@
 //! An ask ends when its task does (`COMPLETED`, `FAILED`, `CANCELED`,
 //! `REJECTED`) or waits for the requester (`INPUT_REQUIRED`,
 //! `AUTH_REQUIRED`), with the task as it is then; or when its `wait` runs
-//! out, with the state last seen and the row still pending.
+//! out, with the state last seen and the row still pending. The wait counts
+//! from the call, the upload of the attachments included: when it runs out
+//! before the question is kept, or the caller cancels the ask then
+//! ([`Outbox::ask_kept`]), nothing is kept nor sent, so that asking again
+//! never runs the question twice.
 //!
 //! What a peer sends is used only once checked. A task id that is not
 //! [safe](is_safe_task_id) ends the attempt as refused, and is neither kept
@@ -64,6 +68,7 @@ use pals_core::store::{OUTBOX_PENDING, OUTBOX_REFUSED, OutboxRow, Store};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use crate::a2a::{IDEMPOTENCY_EXTENSION, is_safe_task_id};
 use crate::path_policy::open_attachment;
@@ -198,15 +203,21 @@ impl Outbox {
     /// or uploaded: one that is not a regular file, is inside the data
     /// directory or is a system file is refused.
     pub async fn ask(&self, req: AskRequest) -> Result<AskOutcome, AskError> {
-        self.ask_kept(req, |_| {}).await
+        self.ask_kept(req, &CancellationToken::new(), |_| {}).await
     }
 
     /// [`Outbox::ask`], calling `kept` with the question's message id as
     /// soon as the outbox keeps it, before the first attempt to send it:
     /// from then on, [`Outbox::resume`] takes it up by that id.
+    ///
+    /// Until then the ask can be called off: when `cancel` fires, or
+    /// `req.wait`, which counts from this call, runs out, while the
+    /// attachments upload or before the question is kept, it fails with
+    /// [`AskError::Local`] having kept and sent nothing.
     pub async fn ask_kept(
         &self,
         req: AskRequest,
+        cancel: &CancellationToken,
         kept: impl FnOnce(&str) + Send,
     ) -> Result<AskOutcome, AskError> {
         let AskRequest {
@@ -215,11 +226,28 @@ impl Outbox {
             attachments,
             wait,
         } = req;
-        let peer = self.resolve(peer).await?;
-        let mut parts = vec![Part::text(question)];
-        for path in &attachments {
-            parts.push(self.upload(path).await?);
-        }
+        let deadline = Instant::now() + wait;
+        let prepared = async {
+            let peer = self.resolve(peer).await?;
+            let mut parts = vec![Part::text(question)];
+            for path in &attachments {
+                parts.push(self.upload(path).await?);
+            }
+            Ok::<_, AskError>((peer, parts))
+        };
+        let (peer, parts) = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(nothing_asked("the ask was canceled")),
+            prepared = tokio::time::timeout_at(deadline, prepared) => match prepared {
+                Ok(prepared) => prepared?,
+                Err(_) => {
+                    return Err(nothing_asked(
+                        "the wait ran out while the attachments were uploading; ask again with \
+                         a longer wait",
+                    ));
+                }
+            },
+        };
         let message_id = new_message_id();
         let mut message = Message::new(Role::User, parts);
         message.message_id = message_id.clone();
@@ -244,6 +272,9 @@ impl Outbox {
             created_at: now,
             updated_at: now,
         };
+        if cancel.is_cancelled() {
+            return Err(nothing_asked("the ask was canceled"));
+        }
         self.with_store(move |store| store.outbox_insert(&row))
             .await?;
         kept(&message_id);
@@ -252,7 +283,7 @@ impl Outbox {
             peer,
             request,
             task_id: None,
-            wait,
+            deadline,
         })
         .await
     }
@@ -275,7 +306,7 @@ impl Outbox {
             peer: row.peer,
             request,
             task_id: row.task_id,
-            wait,
+            deadline: Instant::now() + wait,
         })
         .await
     }
@@ -338,7 +369,7 @@ impl Outbox {
     /// Attempts `ask` until it has an outcome, is refused, runs out of
     /// retries or of time.
     async fn drive(&self, mut ask: Ask) -> Result<AskOutcome, AskError> {
-        let deadline = Instant::now() + ask.wait;
+        let deadline = ask.deadline;
         let client = self.client(&ask.peer);
         let mut failures: u32 = 0;
         // The state last seen, by this call.
@@ -615,7 +646,8 @@ struct Ask {
     /// What every attempt that sends it sends.
     request: SendMessageRequest,
     task_id: Option<String>,
-    wait: Duration,
+    /// When its wait runs out.
+    deadline: Instant,
 }
 
 /// How an attempt ended.
@@ -831,6 +863,11 @@ impl Answer {
     fn text(&self) -> Option<String> {
         (!self.texts.is_empty()).then(|| self.texts.join("\n"))
     }
+}
+
+/// The error of an ask stopped before its question was kept, for `why`.
+fn nothing_asked(why: &str) -> AskError {
+    AskError::Local(format!("{why}: nothing was asked"))
 }
 
 /// Refuses a row whose task id is not [safe](is_safe_task_id), as a build

@@ -19,8 +19,11 @@
 //! the state reached when the wait ends first, tell the model to poll with
 //! `pals_task`, and, when the client asked for progress, send a progress
 //! notification with the `message_id` as soon as the question is kept,
-//! before it is sent. Both file rules are the path policy's
-//! (`crate::path_policy`): the outbox refuses attachments that are not
+//! before it is sent. The wait counts the upload of the attachments, and a
+//! call the client cancels before the question is kept asks nothing.
+//!
+//! Both file rules are the path policy's (`crate::path_policy`): the
+//! outbox refuses attachments that are not
 //! regular files, are inside the agent's data directory or are system
 //! files (`/proc`, `/sys`, `/dev`, procfs, sysfs); `pals_fetch` writes only
 //! inside the download directory (`[mcp] download_dir`, `~/Downloads/pals`
@@ -246,10 +249,14 @@ impl PalsMcp {
             attachments,
             wait,
         };
+        // A call the client gives up on before the question is kept, as
+        // when its timeout comes during a long upload, asks nothing.
         let asked = self
             .gateway
             .outbox()
-            .ask_kept(request, |message_id| announce_kept(&context, message_id))
+            .ask_kept(request, &context.ct, |message_id| {
+                announce_kept(&context, message_id)
+            })
             .await;
         Ok(outcome(asked))
     }

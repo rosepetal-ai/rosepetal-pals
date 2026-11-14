@@ -31,6 +31,7 @@ use pals_core::grant::{
 use pals_core::identity::{AgentId, AgentKey};
 use pals_core::store::{Contact, Store};
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
 #[command(
@@ -385,7 +386,15 @@ fn ask(
         wait,
     };
     with_outbox(home, |outbox| async move {
-        let asked = outbox.ask(request).await;
+        // At once, so that an interrupted command leaves the id to resume.
+        let kept = |message_id: &str| {
+            eprintln!(
+                "pals: message {message_id} kept; resume with: pals task resume {message_id}"
+            );
+        };
+        let asked = outbox
+            .ask_kept(request, &CancellationToken::new(), kept)
+            .await;
         report(&peer, wait, asked)
     })
 }
