@@ -1,6 +1,6 @@
 # Runbook: prueba de salida del hito 1 en dos máquinas
 
-Instrucciones para ejecutar la prueba que cierra el hito 1: dos daemons `pals` en dos máquinas Linux reales, A (pregunta) y B (responde), y los ocho casos del criterio de salida. Cada caso trae los comandos exactos y el resultado esperado. Los resultados se anotan en [`docs/conformance/hito-1/exit-test.md`](../conformance/hito-1/exit-test.md), que hoy recoge solo un ensayo en una máquina.
+Instrucciones para ejecutar la prueba que cierra el hito 1: dos daemons `pals` en dos máquinas Linux reales, A (pregunta) y B (responde), y los ocho casos del criterio de salida. Cada caso trae los comandos exactos y el resultado esperado. Los resultados se anotan en [`docs/conformance/hito-1/exit-test.md`](../conformance/hito-1/exit-test.md), que hoy recoge un ensayo en una máquina y una ejecución con Docker en el papel de la segunda máquina.
 
 | Caso | Qué se comprueba |
 |-|-|
@@ -15,11 +15,13 @@ Instrucciones para ejecutar la prueba que cierra el hito 1: dos daemons `pals` e
 
 Tiempo estimado: entre una y dos horas, más el cambio de red para la repetición por relay del caso 3.
 
+**Con Docker en una sola máquina.** [`tests/exit/`](../../tests/exit/README.md) ejecuta estos ocho casos con un contenedor como máquina A, en su propia red y con cortes de red reales dentro de ella, y la máquina anfitriona como B. Extrae del runbook los guiones de `~/pals-salida`, así que sirve también para probar un cambio en ellos. No sustituye a la prueba en dos máquinas: A y B comparten kernel e IP pública, y el relay se fuerza descartando UDP.
+
 ## 0. Requisitos
 
 En las dos máquinas:
 
-- Linux con `bash`, `curl`, `sha256sum`, `stat` de GNU coreutils, `ip` y `ss` (iproute2), `python3` con `venv`, y `sudo` (para cortar la red en los casos 3 y 4).
+- Linux con `bash`, `curl`, `sha256sum`, `stat` de GNU coreutils, `ip` y `ss` (iproute2), `iptables`, `python3` con `venv`, y `sudo` (para cortar la red en los casos 3 y 4). Si trabajas como root (por ejemplo, en un contenedor), no hace falta `sudo`: las órdenes de abajo lo escriben como `$SUDO`, que [`funciones.sh`](#1-instalación-a-y-b) deja vacío para root, y los guiones hacen lo mismo.
 - Rust 1.91 o posterior (`rustup`) y `git`. La compilación del hito 1 se comprobó con Rust 1.99.1.
 - Los relojes sincronizados: los grants toleran 60 s de diferencia. `timedatectl` debe decir `System clock synchronized: yes`.
 - Salida a internet hacia los relays públicos de Iroh (TCP 443) y UDP saliente permitido, para el camino directo.
@@ -48,20 +50,34 @@ mkdir -p ~/pals-salida
 
 Si la rama aún no está publicada, copia el repositorio a cada máquina por otro medio (`git bundle`, `rsync`) y comprueba el commit igual.
 
-Dos funciones para arrancar y parar el daemon dejan su PID y su registro en `~/pals-salida`. Defínelas en cada terminal donde las uses:
+Las funciones y variables de la prueba van en un fichero, `~/pals-salida/funciones.sh`, que se carga en cada terminal nueva con `. ~/pals-salida/funciones.sh`; los bloques de abajo que las usan empiezan por esa línea. Sin él, una terminal nueva no tendría `arranca`, `para`, `reglas_como_antes` (caso 3 y limpieza), `$SUDO`, la ruta del clon (`$REPO`, caso 8) ni la del proyecto de B (`$PROYECTO`). Desde el clon del repositorio:
 
 ```bash
-arranca() {
+pwd > ~/pals-salida/repo        # la ruta del clon, para el caso 8
+cat > ~/pals-salida/funciones.sh <<'EOF'
+# Funciones y variables de la prueba de salida del hito 1. Cárgalas en cada
+# terminal nueva con:  . ~/pals-salida/funciones.sh
+SUDO=sudo; [ "$(id -u)" -ne 0 ] || SUDO=     # como root, sin sudo
+REPO=$(cat ~/pals-salida/repo 2>/dev/null)
+PROYECTO=$(cat ~/pals-salida/proyecto 2>/dev/null)     # solo en B (paso 2)
+arranca() {     # arranca el daemon en segundo plano; PID y registro en ~/pals-salida
     nohup pals daemon >> ~/pals-salida/daemon.log 2>&1 &
     echo $! > ~/pals-salida/daemon.pid
     sleep 5
     grep 'pals daemon:' ~/pals-salida/daemon.log | tail -n 1
 }
-para() {
+para() {        # SIGTERM al daemon, y espera a que termine
     local pid; pid=$(cat ~/pals-salida/daemon.pid)
     kill "$pid"
     while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
 }
+reglas_como_antes() {     # en A: las reglas del cortafuegos como se guardaron en el caso 3
+    diff <($SUDO iptables-save | grep -- '^-') ~/pals-salida/iptables.antes \
+        && diff <($SUDO ip6tables-save | grep -- '^-') ~/pals-salida/ip6tables.antes \
+        && echo "reglas del cortafuegos como antes"
+}
+EOF
+. ~/pals-salida/funciones.sh
 ```
 
 `arranca` debe imprimir `pals daemon: agent <id> serving, gateway at http://127.0.0.1:7420`. `para` envía `SIGTERM` y espera a que el daemon termine, lo que puede llevar unos segundos: hasta entonces conserva el bloqueo de su directorio de datos, y un `arranca` inmediato fallaría con `a pals daemon is already running on this data directory`. El daemon usa `~/.pals` (o `$PALS_HOME`) para su configuración, su clave y su almacén.
@@ -77,6 +93,7 @@ El registro, `~/pals-salida/daemon.log`, recoge además los diagnósticos del da
 **En A:**
 
 ```bash
+. ~/pals-salida/funciones.sh
 mkdir -p ~/.pals
 cat > ~/.pals/config.toml <<'EOF'
 [agent]
@@ -98,7 +115,8 @@ A usa el gateway por defecto, `127.0.0.1:7420`, y el worker `echo`.
 **En B**, con `claude -p` para el caso 1:
 
 ```bash
-PROYECTO=/ruta/absoluta/al/proyecto      # el repositorio real del caso 1
+echo /ruta/absoluta/al/proyecto > ~/pals-salida/proyecto     # el repositorio real del caso 1
+. ~/pals-salida/funciones.sh            # define $PROYECTO
 mkdir -p ~/.pals
 cat > ~/.pals/config.toml <<EOF
 [agent]
@@ -233,6 +251,8 @@ case "$pregunta" in
         echo "eco: $pregunta" ;;
 esac
 EOF
+. ~/pals-salida/funciones.sh            # $PROYECTO, para y arranca, si es una terminal nueva
+: "${PROYECTO:?falta ~/pals-salida/proyecto, del paso 2}"
 para
 cat > ~/.pals/config.toml <<EOF
 [agent]
@@ -286,33 +306,30 @@ sha256sum generado.bin          # igual al que B escribió en su respuesta
 
 ### Caso 3. Interrupción de transferencia
 
-Dos guiones en A. `corte-red.sh` corta la red de A durante unos segundos, salvo loopback y SSH (puerto 22), y la restablece aunque se cierre la sesión SSH, porque se lanza con `setsid`. Si entras en A por Tailscale, la sesión se congela durante el corte y se recupera después. Este guion no se ha podido ejecutar en el ensayo: guarda antes las reglas del cortafuegos para comprobar después que quedan como estaban.
+Dos guiones en A. `corte-red.sh` corta la red de A durante unos segundos, salvo loopback y SSH (puerto 22), y la restablece aunque se cierre la sesión SSH, porque se lanza con `setsid`. Si entras en A por Tailscale, la sesión se congela durante el corte y se recupera después. Anota en el registro del sistema, y en la terminal, la hora del corte y la de la vuelta. Guarda antes las reglas del cortafuegos, para comprobar después con `reglas_como_antes` que quedan como estaban:
 
 ```bash
-sudo iptables-save | grep -v '^[#:]' > ~/pals-salida/iptables.antes
-sudo ip6tables-save | grep -v '^[#:]' > ~/pals-salida/ip6tables.antes
-reglas_como_antes() {
-    diff <(sudo iptables-save | grep -v '^[#:]') ~/pals-salida/iptables.antes \
-        && diff <(sudo ip6tables-save | grep -v '^[#:]') ~/pals-salida/ip6tables.antes \
-        && echo "reglas del cortafuegos como antes"
-}
+. ~/pals-salida/funciones.sh
+$SUDO iptables-save | grep -- '^-' > ~/pals-salida/iptables.antes     # solo las reglas
+$SUDO ip6tables-save | grep -- '^-' > ~/pals-salida/ip6tables.antes
 cat > ~/pals-salida/corte-red.sh <<'EOF'
 #!/bin/sh
 # Corta la red de esta máquina durante $1 segundos (10 por defecto), salvo
 # loopback y SSH (puerto 22), y después la restablece.
-# Uso: sudo setsid -f sh corte-red.sh 10
+# Uso: sudo setsid -f sh corte-red.sh 10     (como root, sin sudo)
 s=${1:-10}
+anota() { logger -t corte-red "$1" 2>/dev/null; echo "$(date -u +%T) corte-red: $1"; }
 for t in iptables ip6tables; do
     $t -I INPUT 1 -j DROP;  $t -I INPUT 1 -p tcp --dport 22 -j ACCEPT;  $t -I INPUT 1 -i lo -j ACCEPT
     $t -I OUTPUT 1 -j DROP; $t -I OUTPUT 1 -p tcp --sport 22 -j ACCEPT; $t -I OUTPUT 1 -o lo -j ACCEPT
 done
-logger -t corte-red "red cortada $s s"
+anota "red cortada $s s"
 sleep "$s"
 for t in iptables ip6tables; do
     $t -D INPUT -i lo -j ACCEPT;  $t -D INPUT -p tcp --dport 22 -j ACCEPT;  $t -D INPUT -j DROP
     $t -D OUTPUT -o lo -j ACCEPT; $t -D OUTPUT -p tcp --sport 22 -j ACCEPT; $t -D OUTPUT -j DROP
 done
-logger -t corte-red "red restablecida"
+anota "red restablecida"
 EOF
 ```
 
@@ -327,7 +344,8 @@ cat > ~/pals-salida/caso3.sh <<'EOF'
 #   bash caso3.sh subida   A adjunta un fichero nuevo y B lo descarga de A
 set -eu
 cd ~/pals-salida
-sudo -v                       # la contraseña de sudo ahora, no a mitad de la transferencia
+SUDO=sudo; [ "$(id -u)" -ne 0 ] || SUDO=     # como root, sin sudo
+[ -z "$SUDO" ] || sudo -v     # la contraseña de sudo ahora, no a mitad de la transferencia
 PID=$(cat daemon.pid)
 IFACE=$(ip route get 1.1.1.1 | awk '{for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1)}')
 relay() {   # bytes de las conexiones TCP del daemon al puerto 443 (los relays)
@@ -340,10 +358,17 @@ espera_y_corta() {   # $1: función que imprime los bytes transferidos; $2: PID 
         sleep 0.01
     done
     echo "$(date -u +%T) transferidos $($1) bytes: corte de 10 s"
-    sudo setsid -f sh ~/pals-salida/corte-red.sh 10
+    $SUDO setsid -f sh ~/pals-salida/corte-red.sh 10
     sleep 1; echo "$(date -u +%T) durante el corte: $($1) bytes"
-    sleep 5; echo "$(date -u +%T) durante el corte: $($1) bytes"
-    sleep 6; echo "$(date -u +%T) tras el corte: $($1) bytes"
+    sleep 5; local parado; parado=$($1); echo "$(date -u +%T) durante el corte: $parado bytes"
+    # La red vuelve a los 10 s; QUIC tarda unos segundos más en volver a probar
+    # el camino. Espera, hasta 60 s, a que la transferencia avance 1 MiB más.
+    sleep 4
+    local i=0
+    while [ "$($1)" -le $((parado + 1048576)) ] && kill -0 "$2" 2>/dev/null && [ "$i" -lt 600 ]; do
+        sleep 0.1; i=$((i + 1))
+    done
+    echo "$(date -u +%T) tras el corte: $($1) bytes"
 }
 relay
 case "${1:-bajada}" in
@@ -364,7 +389,7 @@ subida)
     sha256sum caso3.bin
     TX0=$(cat "/sys/class/net/$IFACE/statistics/tx_bytes")
     enviado() { echo $(( $(cat "/sys/class/net/$IFACE/statistics/tx_bytes") - TX0 )); }
-    pals ask b devuelve --attach caso3.bin > caso3.out &
+    pals ask b devuelve --attach caso3.bin --wait 30m > caso3.out &     # por relay tarda más de 600 s
     ASK=$!
     espera_y_corta enviado "$ASK"
     code=0; wait "$ASK" || code=$?
@@ -377,30 +402,35 @@ EOF
 **3a. Camino directo** (las dos máquinas en la misma red, o en redes distintas si Iroh consigue camino directo). En A:
 
 ```bash
+. ~/pals-salida/funciones.sh
 bash ~/pals-salida/caso3.sh bajada
 bash ~/pals-salida/caso3.sh subida
 reglas_como_antes
 ```
 
-**Esperado en `bajada`:** `curl: código 0, 200 268435456` y un `sha256sum` de `caso3.bin` igual al que B escribió en su respuesta. **En `subida`:** `pals ask: código 0` y, en `caso3.out`, el `sha256` que B recibió, igual al que se imprimió al principio. En los dos: las dos líneas `durante el corte` muestran la transferencia parada por debajo de 268435456 bytes, la línea `tras el corte` muestra que siguió, y la diferencia entre las dos líneas `relay:` dice el camino. Si la transferencia acaba antes del corte (`durante el corte` ya da el tamaño completo, o el guion dice que terminó antes), limita la subida de la máquina que envía durante la prueba (`sudo tc qdisc add dev <iface> root tbf rate 50mbit burst 64kb latency 400ms`, y después `sudo tc qdisc del dev <iface> root`) y repite.
+**Esperado en `bajada`:** `curl: código 0, 200 268435456` y un `sha256sum` de `caso3.bin` igual al que B escribió en su respuesta. **En `subida`:** `pals ask: código 0` y, en `caso3.out`, el `sha256` que B recibió, igual al que se imprimió al principio. En los dos: las dos líneas `durante el corte` muestran la transferencia parada por debajo de 268435456 bytes, la línea `tras el corte` muestra que siguió (y su hora, cuándo: QUIC vuelve a probar el camino unos segundos después de que vuelva la red), y la diferencia entre las dos líneas `relay:` dice el camino. Si la transferencia acaba antes del corte (`durante el corte` ya da el tamaño completo, o el guion dice que terminó antes), limita la subida de la máquina que envía durante la prueba (`sudo tc qdisc add dev <iface> root tbf rate 50mbit burst 64kb latency 400ms`, y después `sudo tc qdisc del dev <iface> root`) y repite.
 
-**3b. Por relay.** Pon las máquinas en redes distintas y repite `bajada` y `subida`. Si Iroh encuentra igualmente camino directo (las líneas `relay:` apenas cambian), fuerza el relay bloqueando el UDP saliente de A salvo DNS, y rearranca su daemon:
+**3b. Por relay.** Pon las máquinas en redes distintas y repite `bajada` y `subida`. Si Iroh encuentra igualmente camino directo (las líneas `relay:` apenas cambian), fuerza el relay bloqueando el UDP saliente de A salvo DNS y loopback, y rearranca su daemon. La excepción de loopback deja pasar las consultas al resolvedor local: el de systemd (`127.0.0.53`) recibe en el puerto 53, pero el de Docker (`127.0.0.11`) las recibe en otro puerto, al que las redirige el propio contenedor, y sin ella A se queda sin DNS y sin relay.
 
 ```bash
+. ~/pals-salida/funciones.sh
 for t in iptables ip6tables; do
-    sudo $t -I OUTPUT 1 -p udp -j DROP; sudo $t -I OUTPUT 1 -p udp --dport 53 -j ACCEPT
+    $SUDO $t -I OUTPUT 1 -p udp -j DROP; $SUDO $t -I OUTPUT 1 -p udp --dport 53 -j ACCEPT
+    $SUDO $t -I OUTPUT 1 -o lo -j ACCEPT
 done
 para; arranca
 bash ~/pals-salida/caso3.sh bajada
 bash ~/pals-salida/caso3.sh subida
 # deshacer:
 for t in iptables ip6tables; do
-    sudo $t -D OUTPUT -p udp --dport 53 -j ACCEPT; sudo $t -D OUTPUT -p udp -j DROP
+    $SUDO $t -D OUTPUT -o lo -j ACCEPT
+    $SUDO $t -D OUTPUT -p udp --dport 53 -j ACCEPT; $SUDO $t -D OUTPUT -p udp -j DROP
 done
 para; arranca
+reglas_como_antes
 ```
 
-**Esperado:** lo mismo que en 3a, con las líneas `relay:` creciendo en unos 268 MB. Anota en cada repetición el camino observado y cómo se dedujo.
+**Esperado:** lo mismo que en 3a, con las líneas `relay:` creciendo en unos 268 MB. Anota en cada repetición el camino observado y cómo se dedujo. Por los relays públicos de n0 la transferencia es lenta: limitan el tráfico de cada endpoint, y el daemon que envía lo avisa en su registro (`The relay is rate-limiting this endpoint; outbound relay traffic is being throttled`). En la prueba con Docker del 2026-11-14 fue de unos 2 Mbit/s: 256 MiB tardan cerca de 20 min en cada sentido. Por eso `caso3.sh subida` espera la respuesta hasta 30 min (`--wait 30m`, como `blob_fetch_timeout_s`), en lugar de los 600 s por defecto de `pals ask`.
 
 ### Caso 4. Reintento sin duplicar
 
@@ -431,9 +461,10 @@ EOF
 En A, una tarea de 120 s y, a los 15 s, un corte de 45 s, más largo que los 30 s tras los que Iroh da una conexión por perdida:
 
 ```bash
-sudo -v
+. ~/pals-salida/funciones.sh
+[ -z "$SUDO" ] || sudo -v
 pals ask b "espera 120" & ASK=$!
-sleep 15; sudo setsid -f sh ~/pals-salida/corte-red.sh 45
+sleep 15; $SUDO setsid -f sh ~/pals-salida/corte-red.sh 45
 wait $ASK; echo "código $?"
 pals task ls | tail -n 1        # messageId, estado, par, tarea, intentos
 ```
@@ -468,6 +499,7 @@ En A, `pals ask` reintenta y termina con código 3 (`b could not be reached; the
 # En A
 wait $ASK; echo "código $?"
 # En B
+. ~/pals-salida/funciones.sh
 arranca
 # En A
 pals task resume <messageId>; echo $?
@@ -537,7 +569,8 @@ kill "$(cat ~/pals-salida/daemon-c.pid)"
 En A, el SDK oficial de Python con las versiones fijadas en el repositorio, contra el gateway de A, con B como par. `tests/interop/python_client.py` hace estas mismas comprobaciones, pero arranca sus propios daemons en la máquina y no puede apuntar a un gateway que ya existe; `caso8.py` las hace contra A y B:
 
 ```bash
-cd ~/rosepetal-pals             # el clon del paso 1
+. ~/pals-salida/funciones.sh
+cd "$REPO"                      # el clon del paso 1
 python3 -m venv ~/pals-salida/venv
 ~/pals-salida/venv/bin/pip install -r tests/interop/requirements.txt
 cat > ~/pals-salida/caso8.py <<'EOF'
@@ -665,6 +698,7 @@ Un caso que falla es un defecto: se corrige, se repite el caso y se anota todo. 
 
 ```bash
 # En A y en B
+. ~/pals-salida/funciones.sh
 para
 # En B: ninguna orden viva
 ps -eo pid,pgid,args | grep '[p]als-prueba'
