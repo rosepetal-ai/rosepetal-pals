@@ -30,6 +30,8 @@ iroh-tickets.workspace = true
 pals-core.workspace = true
 percent-encoding.workspace = true
 reqwest.workspace = true
+# The MCP server, at `<gateway>/mcp`.
+rmcp = { workspace = true, features = ["transport-streamable-http-server"] }
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -54,6 +56,8 @@ libc.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
+# An MCP client, to use the gateway's MCP server as an AI application would.
+rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
 serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

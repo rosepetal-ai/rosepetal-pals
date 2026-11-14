@@ -12,6 +12,7 @@
 //! | any method, `/peers/{peer}/rest/{*rest}` | the peer's `/rest/{rest}` |
 //! | `POST /blobs` | stores the raw body as a blob: `201 {"url", "hash", "size"}` |
 //! | `GET /blobs/{holder}/{hash}` | the blob, fetched from its holder first if need be |
+//! | any method, `/mcp` | the local [MCP server](crate::mcp), Streamable HTTP |
 //!
 //! A request to a peer travels through [`PeerHttp`], never to the node's own
 //! app: method, path after `/peers/{peer}` and query exactly as received,
@@ -96,8 +97,9 @@ use iroh_blobs::Hash;
 use iroh_blobs::api::TempTag;
 use pals_core::grant::{Grant, Operation};
 use pals_core::identity::AgentId;
-use pals_core::store::Store;
+use pals_core::store::{Contact, Store};
 use serde_json::{Map, Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::a2a::auth::ASK_RESOURCE;
 use crate::a2a::gateway_view;
@@ -165,6 +167,8 @@ struct Inner {
     local_addr: SocketAddr,
     /// The questions this agent asks its peers, through this gateway.
     outbox: Outbox,
+    /// Cancelled when the gateway stops: ends the MCP sessions.
+    stopping: CancellationToken,
 }
 
 /// What the gateway of an agent works with besides its listener.
@@ -203,6 +207,7 @@ impl GatewayState {
                 limits,
                 local_addr,
                 outbox,
+                stopping: CancellationToken::new(),
             }),
         }
     }
@@ -215,6 +220,117 @@ impl GatewayState {
     /// The questions this agent asks its peers, through this gateway.
     pub fn outbox(&self) -> &Outbox {
         &self.inner.outbox
+    }
+
+    /// Cancelled when the gateway stops.
+    pub(crate) fn stopping(&self) -> &CancellationToken {
+        &self.inner.stopping
+    }
+
+    /// The port the gateway listens on.
+    pub(crate) fn port(&self) -> u16 {
+        self.inner.local_addr.port()
+    }
+
+    /// The agent's files.
+    pub(crate) fn blobs(&self) -> &BlobService {
+        &self.inner.blobs
+    }
+
+    /// This agent: `{"agent_id", "name", "ticket"}`, the ticket with the
+    /// addresses it is reachable at now.
+    pub(crate) fn identity(&self) -> Value {
+        let inner = &self.inner;
+        json!({
+            "agent_id": inner.id.to_string(),
+            "name": inner.name,
+            "ticket": ticket_of(&inner.endpoint),
+        })
+    }
+
+    /// Every contact, by name, and whether this agent holds an unexpired
+    /// grant for it that [serves tasks](serves_tasks).
+    pub(crate) async fn contacts(&self) -> Result<Vec<(Contact, bool)>, StoreUnavailable> {
+        let store = Arc::clone(&self.inner.store);
+        blocking(move || {
+            let now = chrono::Utc::now().timestamp();
+            store
+                .contacts()?
+                .into_iter()
+                .map(|contact| {
+                    let held = store.grants_held_for(&contact.agent_id, now)?;
+                    let has_grant = held.iter().any(|g| serves_tasks(&g.grant));
+                    Ok((contact, has_grant))
+                })
+                .collect()
+        })
+        .await
+    }
+
+    /// The holder and hash of `url` when it is a blob URL of this gateway,
+    /// spelled as the gateway writes them: `<base_url>/blobs/<holder>/<hash>`.
+    pub(crate) fn blob_of_url(&self, url: &str) -> Option<(AgentId, Hash)> {
+        rewrite::gateway_blob(url, &self.base_url())
+    }
+
+    /// Blob `hash` of `holder`, from this agent's store, into which the
+    /// gateway first fetches it from `holder`, within
+    /// `limits.blob_fetch_timeout_s`, when the store lacks it.
+    pub(crate) async fn obtain_blob(
+        &self,
+        holder: AgentId,
+        hash: Hash,
+    ) -> Result<HeldBlob, Refusal> {
+        let blobs = &self.inner.blobs;
+        // Held from before the download until it has been read, whatever
+        // tags hold it or not.
+        let held = match blobs.protect(hash).await {
+            Ok(held) => held,
+            Err(err) => {
+                tracing::warn!(error = %format!("{err:#}"), "cannot protect a blob to serve");
+                return Err(Refusal::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error",
+                ));
+            }
+        };
+        if let Some(size) = blobs.complete_size(hash).await {
+            return Ok(HeldBlob { hash, size, held });
+        }
+        if holder == self.inner.id {
+            return Err(Refusal::new(StatusCode::NOT_FOUND, "blob not found"));
+        }
+        let limits = &self.inner.limits;
+        // The URL declares no size: the limit bounds the download.
+        let blob = BlobRef {
+            holder,
+            hash,
+            size: limits.max_blob_bytes,
+        };
+        let addr = blobs.holder_addr(&holder).await;
+        let timeout = Duration::from_secs(limits.blob_fetch_timeout_s);
+        let fetched = tokio::time::timeout(timeout, blobs.fetch(&blob, addr, None))
+            .await
+            .unwrap_or(Err(BlobError::Timeout));
+        if let Err(failure) = fetched {
+            tracing::debug!(%holder, %hash, error = %failure, "the gateway could not fetch a blob");
+            let (status, message) = match failure {
+                BlobError::Denied => (StatusCode::FORBIDDEN, "the holder denied the blob"),
+                BlobError::Unreachable | BlobError::Timeout => {
+                    (StatusCode::BAD_GATEWAY, "peer unreachable")
+                }
+                BlobError::TooLarge => (StatusCode::BAD_GATEWAY, "blob too large"),
+                BlobError::Other(_) => (StatusCode::BAD_GATEWAY, "blob transfer failed"),
+            };
+            return Err(Refusal::new(status, message));
+        }
+        match blobs.complete_size(hash).await {
+            Some(size) => Ok(HeldBlob { hash, size, held }),
+            None => Err(Refusal::new(
+                StatusCode::BAD_GATEWAY,
+                "blob transfer failed",
+            )),
+        }
     }
 
     /// The agent `peer` names, a contact name or an agent id, and where to
@@ -258,6 +374,14 @@ fn base_url(local_addr: &SocketAddr) -> String {
     format!("http://{local_addr}")
 }
 
+/// A blob of the store, kept in it for as long as this value lives.
+pub(crate) struct HeldBlob {
+    pub(crate) hash: Hash,
+    pub(crate) size: u64,
+    /// Keeps the blob from the store's garbage collection.
+    pub(crate) held: TempTag,
+}
+
 /// Whether `grant` can serve a request of the bindings the gateway forwards:
 /// it allows at least one task operation, on a resource that covers
 /// `skill:ask`. A `blob.fetch` grant, for instance, cannot.
@@ -286,6 +410,7 @@ pub fn router(state: GatewayState) -> Router {
         .route("/peers/{peer}/rest/{*rest}", any(forward_rest))
         .route("/blobs", post(upload_blob))
         .route("/blobs/{holder}/{hash}", get(download_blob))
+        .route_service("/mcp", crate::mcp::service(state.clone()))
         .layer(middleware::from_fn_with_state(state.clone(), local_guard))
         // Outermost, so that it covers the guard's refusals too.
         .layer(middleware::from_fn(sandbox))
@@ -356,13 +481,7 @@ fn is_local_host(headers: &HeaderMap, uri: &Uri, port: u16) -> bool {
 }
 
 async fn healthz(State(state): State<GatewayState>) -> Response {
-    let inner = &state.inner;
-    Json(json!({
-        "agent_id": inner.id.to_string(),
-        "name": inner.name,
-        "ticket": ticket_of(&inner.endpoint),
-    }))
-    .into_response()
+    Json(state.identity()).into_response()
 }
 
 /// The peer's card as [`gateway_view`], fetched from the peer.
@@ -764,54 +883,16 @@ async fn download_blob(
     let (Ok(holder), Some(hash)) = (holder.parse::<AgentId>(), parse_hash(&hash)) else {
         return error(StatusCode::NOT_FOUND, "not a blob URL");
     };
-    let blobs = &state.inner.blobs;
-    // Held from before the download until the response is sent, whatever
-    // tags hold it or not.
-    let held = match blobs.protect(hash).await {
-        Ok(held) => held,
-        Err(err) => {
-            tracing::warn!(error = %format!("{err:#}"), "cannot protect a blob to serve");
-            return error(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
-        }
-    };
-    if let Some(size) = blobs.complete_size(hash).await {
-        return serve_blob(blobs, hash, size, held);
-    }
-    if holder == state.inner.id {
-        return error(StatusCode::NOT_FOUND, "blob not found");
-    }
-    let limits = &state.inner.limits;
-    // The URL declares no size: the limit bounds the download.
-    let blob = BlobRef {
-        holder,
-        hash,
-        size: limits.max_blob_bytes,
-    };
-    let addr = blobs.holder_addr(&holder).await;
-    let timeout = Duration::from_secs(limits.blob_fetch_timeout_s);
-    let fetched = tokio::time::timeout(timeout, blobs.fetch(&blob, addr, None))
-        .await
-        .unwrap_or(Err(BlobError::Timeout));
-    if let Err(failure) = fetched {
-        tracing::debug!(%holder, %hash, error = %failure, "the gateway could not fetch a blob");
-        return match failure {
-            BlobError::Denied => error(StatusCode::FORBIDDEN, "the holder denied the blob"),
-            BlobError::Unreachable | BlobError::Timeout => {
-                error(StatusCode::BAD_GATEWAY, "peer unreachable")
-            }
-            BlobError::TooLarge => error(StatusCode::BAD_GATEWAY, "blob too large"),
-            BlobError::Other(_) => error(StatusCode::BAD_GATEWAY, "blob transfer failed"),
-        };
-    }
-    match blobs.complete_size(hash).await {
-        Some(size) => serve_blob(blobs, hash, size, held),
-        None => error(StatusCode::BAD_GATEWAY, "blob transfer failed"),
+    match state.obtain_blob(holder, hash).await {
+        Ok(blob) => serve_blob(&state.inner.blobs, blob),
+        Err(refusal) => refusal.into_response(),
     }
 }
 
-/// `200` with the `size` bytes of `hash`, streamed from the store, which
-/// `held` keeps until the last of them is sent.
-fn serve_blob(blobs: &BlobService, hash: Hash, size: u64, held: TempTag) -> Response {
+/// `200` with the bytes of `blob`, streamed from the store, which keeps it
+/// until the last of them is sent.
+fn serve_blob(blobs: &BlobService, blob: HeldBlob) -> Response {
+    let HeldBlob { hash, size, held } = blob;
     let content = blobs.read(hash, size).map(move |chunk| {
         let _held = &held;
         chunk
@@ -908,11 +989,17 @@ fn error(status: StatusCode, message: impl Into<String>) -> Response {
 }
 
 /// A request the gateway answers itself: `status` with `{"error": message}`.
-struct Refusal(StatusCode, String);
+pub(crate) struct Refusal(StatusCode, String);
 
 impl Refusal {
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self(status, message.into())
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.1, self.0)
     }
 }
 
@@ -923,7 +1010,7 @@ impl IntoResponse for Refusal {
 }
 
 /// The store could not be read; the gateway answers `500`.
-struct StoreUnavailable;
+pub(crate) struct StoreUnavailable;
 
 impl IntoResponse for StoreUnavailable {
     fn into_response(self) -> Response {

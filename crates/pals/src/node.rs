@@ -21,6 +21,7 @@ use pals_core::store::{DEDUP_RETENTION_S, Store};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::a2a::auth::{Authenticator, JSONRPC_PATH, REST_PATH};
 use crate::a2a::{BindingExecutor, GuardedHandler, SqliteTaskStore, canonical_card};
@@ -154,16 +155,19 @@ impl Node {
         self.peer_http.close_all().await;
     }
 
-    /// Stops the gateway from accepting requests, stops purging, closes the
-    /// connections to peers, stops serving, closes the endpoint, lets the
-    /// gateway's open connections finish for up to
-    /// [`GATEWAY_STOP_TIMEOUT`], and releases the data directory.
+    /// Stops the gateway from accepting requests and ends its MCP sessions,
+    /// stops purging, closes the connections to peers, stops serving,
+    /// closes the endpoint, lets the gateway's open connections finish for
+    /// up to [`GATEWAY_STOP_TIMEOUT`], and releases the data directory.
     pub async fn shutdown(self) -> anyhow::Result<()> {
         let GatewayServer {
             url: _,
+            stopping,
             stop,
             mut task,
         } = self.gateway;
+        // The MCP sessions' streams would hold the server open.
+        stopping.cancel();
         // The server may have stopped already; then there is nothing to tell.
         let _ = stop.send(());
         drop(self.dedup_purge);
@@ -345,6 +349,8 @@ pub(crate) fn ticket_of(endpoint: &Endpoint) -> String {
 /// The gateway's HTTP server, running on its own task.
 struct GatewayServer {
     url: String,
+    /// Ends the MCP sessions.
+    stopping: CancellationToken,
     /// Tells the server to stop accepting and to close its connections once
     /// their requests are answered.
     stop: oneshot::Sender<()>,
@@ -355,6 +361,7 @@ struct GatewayServer {
 impl GatewayServer {
     fn start(listener: TcpListener, state: GatewayState) -> Self {
         let url = state.base_url();
+        let stopping = state.stopping().clone();
         let (stop, stopped) = oneshot::channel::<()>();
         let serve = axum::serve(listener, gateway::router(state)).with_graceful_shutdown(async {
             // Dropping the sender stops the server as well.
@@ -367,6 +374,7 @@ impl GatewayServer {
         });
         Self {
             url,
+            stopping,
             stop,
             task: AbortOnDrop(task),
         }

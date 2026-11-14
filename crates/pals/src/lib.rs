@@ -8,13 +8,15 @@
 //! the files that travel outside the control channel, [`config`] the
 //! configuration file and the single-instance lock, [`gateway`] the loopback
 //! entry through which standard A2A clients reach any peer, [`outbox`] the
-//! questions this agent asks them, and [`node`] puts them together into a
+//! questions this agent asks them, [`mcp`] the tools an AI application on
+//! this machine uses them with, and [`node`] puts them together into a
 //! running agent.
 
 pub mod a2a;
 pub mod blobs;
 pub mod config;
 pub mod gateway;
+pub mod mcp;
 pub mod net;
 pub mod node;
 pub mod outbox;

@@ -43,10 +43,16 @@ pub(crate) fn rewrite_to_gateway(value: &mut Value, base_url: &str) -> bool {
 /// [`to_wire`]; whether it changed anything.
 pub(crate) fn rewrite_to_wire(value: &mut Value, base_url: &str) -> bool {
     rewrite_urls(value, &mut |url| {
-        let path = url.strip_prefix(base_url)?.strip_prefix("/blobs/")?;
-        let (holder, hash) = parse_holder_and_hash(path)?;
+        let (holder, hash) = gateway_blob(url, base_url)?;
         Some(wire_url(&holder, &hash))
     })
+}
+
+/// The holder and hash of `url` when it is exactly a blob URL of the
+/// gateway at `base_url`: `<base_url>/blobs/<holder>/<hash hex>`.
+pub(crate) fn gateway_blob(url: &str, base_url: &str) -> Option<(AgentId, Hash)> {
+    let path = url.strip_prefix(base_url)?.strip_prefix("/blobs/")?;
+    parse_holder_and_hash(path)
 }
 
 /// `<base_url>/blobs/<holder>/<hash hex>`, where the gateway serves a blob.
