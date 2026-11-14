@@ -36,10 +36,13 @@
 //!   `.git/hooks/…`.
 //! - The file must be new: the caller creates it with `create_new`, so
 //!   nothing is ever written over, nor through a symbolic link.
-//! - Nothing is created for a call that is refused anyway: the caller
-//!   checks what it can first ([`check_dest`], the blob to write), and
-//!   [`download_path`] checks a relative `dest`'s parts before it creates
-//!   any directory.
+//! - Nothing is created for a call that is refused: [`check_download`]
+//!   makes every check that does not need the file without creating
+//!   anything (paths resolved as far as they exist, the rest taken by
+//!   name), the caller makes it before it even gets the blob to write, and
+//!   [`download_path`] makes it again before it creates the download
+//!   directory and the missing parts of `dest`. An absolute `dest` must be
+//!   in a directory that exists, or in the download directory itself.
 
 use std::fs::{File, Metadata};
 use std::path::{Component, Path, PathBuf};
@@ -147,16 +150,132 @@ pub(crate) fn check_dest(dest: &str) -> Result<(), String> {
     check_components(dest, path)
 }
 
+/// Refuses, without creating anything, a `dest` that [`download_path`]
+/// would refuse: its form ([`check_dest`]); a download directory that is
+/// not a directory or is inside `data_dir`; an absolute `dest` whose
+/// directory is outside the download directory, holds a part that starts
+/// with a dot below it, or does not exist (unless it is the download
+/// directory itself); a relative one with an existing part that leads out
+/// of the download directory or is not a directory; and a file inside
+/// `data_dir`.
+pub(crate) fn check_download(
+    download_dir: &Path,
+    data_dir: Option<&Path>,
+    dest: &str,
+) -> Result<(), String> {
+    check_dest(dest)?;
+    let root = resolve_existing(download_dir)?;
+    if root.exists() && !root.is_dir() {
+        return Err(format!(
+            "the download directory {} is not a directory",
+            download_dir.display()
+        ));
+    }
+    let data_dir = data_dir.and_then(|dir| std::fs::canonicalize(dir).ok());
+    if let Some(data_dir) = &data_dir
+        && root.starts_with(data_dir)
+    {
+        return Err(format!(
+            "the download directory {} is inside this agent's data directory {}: pals_fetch \
+             never writes there",
+            download_dir.display(),
+            data_dir.display()
+        ));
+    }
+    let outside = || {
+        format!(
+            "dest {dest} is outside this agent's download directory {}: pals_fetch writes only \
+             there; give a file name or a path inside it",
+            download_dir.display()
+        )
+    };
+    let dest_path = Path::new(dest);
+    let file = if dest_path.is_absolute() {
+        let (Some(parent), Some(name)) = (dest_path.parent(), dest_path.file_name()) else {
+            return Err(format!("dest {dest} names no file"));
+        };
+        let dir = resolve_existing(parent).map_err(|_| outside())?;
+        let Ok(inside) = dir.strip_prefix(&root) else {
+            return Err(outside());
+        };
+        check_components(dest, &inside.join(name))?;
+        if !parent.exists() && dir != root {
+            return Err(format!(
+                "the directory of dest {dest} does not exist: give a path inside the download \
+                 directory instead, whose missing directories are created"
+            ));
+        }
+        dir.join(name)
+    } else {
+        let mut current = root.clone();
+        let mut names: Vec<_> = dest_path.components().collect();
+        let file_name = names.pop();
+        for name in names {
+            let next = current.join(name);
+            if std::fs::symlink_metadata(&next).is_err() {
+                // From here on nothing exists: it will be created.
+                current = next;
+                continue;
+            }
+            current = std::fs::canonicalize(&next)
+                .map_err(|err| format!("cannot use {}: {err}", next.display()))?;
+            if !current.starts_with(&root) {
+                return Err(outside());
+            }
+            if !current.is_dir() {
+                return Err(format!("{} is not a directory", next.display()));
+            }
+        }
+        match file_name {
+            Some(name) => current.join(name),
+            None => return Err(format!("dest {dest} names no file")),
+        }
+    };
+    if let Some(data_dir) = &data_dir
+        && file.starts_with(data_dir)
+    {
+        return Err(outside());
+    }
+    Ok(())
+}
+
+/// `path` resolved as far as it exists (symbolic links and `..` included),
+/// and the rest of it taken by name; refused when a part that does not
+/// exist is not a plain name.
+fn resolve_existing(path: &Path) -> Result<PathBuf, String> {
+    let mut existing = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(mut resolved) = std::fs::canonicalize(&existing) {
+            resolved.extend(missing.iter().rev());
+            return Ok(resolved);
+        }
+        match existing.components().next_back() {
+            Some(Component::Normal(name)) => {
+                missing.push(name.to_owned());
+                existing.pop();
+            }
+            _ => {
+                return Err(format!(
+                    "{} climbs out of the directories that exist",
+                    path.display()
+                ));
+            }
+        }
+    }
+}
+
 /// Where `pals_fetch` writes the file `dest` names, as the writing rule
-/// says: inside `download_dir`, created first if missing, which must not be
-/// inside `data_dir` (resolved). Creates the missing directories of a
-/// relative `dest`; the file itself is the caller's to create, new.
+/// says: inside `download_dir`, which must not be inside `data_dir`
+/// (resolved), after [`check_download`]; creates the download directory if
+/// missing, and the missing directories of a relative `dest`. The file
+/// itself is the caller's to create, new.
 pub(crate) fn download_path(
     download_dir: &Path,
     data_dir: Option<&Path>,
     dest: &str,
 ) -> Result<PathBuf, String> {
-    check_dest(dest)?;
+    check_download(download_dir, data_dir, dest)?;
     let root = open_download_dir(download_dir, data_dir)?;
     let outside = || {
         format!(

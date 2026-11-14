@@ -371,6 +371,20 @@ async fn pals_fetch_writes_only_inside_the_download_dir() {
         "{instructions}"
     );
 
+    // A dest refused outright creates nothing, not even the download
+    // directory: outside it, climbing out of it, or in a directory of it
+    // that does not exist.
+    for dest in [
+        data_dir.join("planted.bin"),
+        elsewhere.path().join("planted.bin"),
+        downloads.join("..").join("planted.bin"),
+        downloads.join("missing").join("planted.bin"),
+    ] {
+        let refused = call(&client, "pals_fetch", json!({"url": url, "dest": dest})).await;
+        error_text(&refused);
+        assert!(!downloads.exists(), "{}", dest.display());
+    }
+
     // A file name, a relative path whose directories are created, and an
     // absolute path inside it.
     for (dest, expected) in [
@@ -439,6 +453,49 @@ async fn pals_fetch_writes_only_inside_the_download_dir() {
     ] {
         assert!(!planted.exists(), "{}", planted.display());
     }
+    client.cancel().await.expect("close the session");
+}
+
+#[tokio::test]
+async fn a_fetch_refused_for_its_dest_downloads_nothing() {
+    // A blob of bob's, shared with the requester, which does not hold it.
+    let (a, b) = pair().await;
+    let blob = b
+        .node
+        .blobs
+        .add_bytes(bytes::Bytes::from_static(b"remote contents"))
+        .await
+        .unwrap();
+    b.node.blobs.share(&blob, &a.id(), 3600).await.unwrap();
+    let url = format!(
+        "{}/blobs/{}/{}",
+        a.gateway_url(),
+        b.id(),
+        blob.hash.to_hex()
+    );
+    let client = mcp_client(&a).await;
+
+    // A dest it would never write to: nothing is fetched for it.
+    let refused = call(
+        &client,
+        "pals_fetch",
+        json!({"url": url, "dest": a.dir.path().join("remote.bin")}),
+    )
+    .await;
+    error_text(&refused);
+    assert_eq!(a.node.blobs.complete_size(blob.hash).await, None);
+
+    // A dest it writes to: fetched, and written.
+    let out = ok_json(
+        &call(
+            &client,
+            "pals_fetch",
+            json!({"url": url, "dest": "remote.bin"}),
+        )
+        .await,
+    );
+    assert_eq!(out["bytes"], 15, "{out}");
+    assert_eq!(a.node.blobs.complete_size(blob.hash).await, Some(15));
     client.cancel().await.expect("close the session");
 }
 

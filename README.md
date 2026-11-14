@@ -106,7 +106,7 @@ claude mcp add --transport http pals http://127.0.0.1:7420/mcp
 
 `pals_ask` espera 50 s por defecto, menos que el tiempo máximo de una llamada en los clientes MCP habituales, y la espera cuenta la subida de los adjuntos; si la respuesta tarda más, devuelve el `message_id` y la IA sigue con `pals_task`. Una llamada que el cliente cancela antes de que la pregunta quede guardada no pregunta nada. La CLI espera 600 s.
 
-`pals_fetch` solo escribe dentro del directorio de descargas, `[mcp] download_dir` en `config.toml` (`~/Downloads/pals` por defecto, creado con permisos `0700` la primera vez y nunca dentro del directorio de datos): un nombre de fichero, una ruta relativa dentro de él o una ruta absoluta que, resuelta, quede dentro; ninguna parte puede empezar por punto, y nunca sobrescribe. Las instrucciones del servidor MCP le dicen a la IA qué directorio es.
+`pals_fetch` solo escribe dentro del directorio de descargas, `[mcp] download_dir` en `config.toml` (`~/Downloads/pals` por defecto, creado con permisos `0700` la primera vez y nunca dentro del directorio de datos): un nombre de fichero, una ruta relativa dentro de él o una ruta absoluta que, resuelta, quede dentro, en un directorio que ya exista o en el propio directorio de descargas; ninguna parte puede empezar por punto, y nunca sobrescribe. Las instrucciones del servidor MCP le dicen a la IA qué directorio es.
 
 ## Clientes A2A estándar
 

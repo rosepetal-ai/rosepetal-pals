@@ -67,7 +67,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::gateway::{GatewayState, HeldBlob};
 use crate::outbox::{AskError, AskOutcome, AskRequest};
-use crate::path_policy::{check_dest, download_path};
+use crate::path_policy::{check_download, download_path};
 
 /// How long `pals_ask` and `pals_task` wait for an answer when `wait_s` is
 /// not given, in seconds: less than the tool timeouts of MCP clients.
@@ -325,14 +325,16 @@ impl PalsMcp {
                 self.gateway.base_url()
             )));
         };
-        if let Err(reason) = check_dest(&params.dest) {
-            return Ok(refused(reason));
-        }
+        // A call that cannot write fetches nothing.
+        let download_dir = match self.writable_dir(&params.dest).await {
+            Ok(dir) => dir,
+            Err(reason) => return Ok(refused(reason)),
+        };
         let blob = match self.gateway.obtain_blob(holder, hash).await {
             Ok(blob) => blob,
             Err(refusal) => return Ok(refused(format!("cannot get {}: {refusal}", params.url))),
         };
-        let dest = match self.resolve_dest(params.dest).await {
+        let dest = match self.resolve_dest(download_dir, params.dest).await {
             Ok(dest) => dest,
             Err(reason) => return Ok(refused(reason)),
         };
@@ -364,10 +366,20 @@ impl ServerHandler for PalsMcp {
 }
 
 impl PalsMcp {
-    /// Where `dest` is in the download directory, as the path policy's
-    /// writing rule allows, its missing directories created.
-    async fn resolve_dest(&self, dest: String) -> Result<PathBuf, String> {
-        let download_dir = self.gateway.download_dir()?;
+    /// The download directory a `pals_fetch` of `dest` writes in, once
+    /// [`writable_dir`] lets it, with nothing created.
+    async fn writable_dir(&self, dest: &str) -> Result<PathBuf, String> {
+        let download_dir = self.gateway.download_dir();
+        let data_dir = self.gateway.outbox().data_dir().map(Path::to_owned);
+        let dest = dest.to_owned();
+        tokio::task::spawn_blocking(move || writable_dir(download_dir, data_dir.as_deref(), &dest))
+            .await
+            .map_err(|err| format!("cannot check dest: {err}"))?
+    }
+
+    /// Where `dest` is in `download_dir`, as the path policy's writing rule
+    /// allows, its missing directories created.
+    async fn resolve_dest(&self, download_dir: PathBuf, dest: String) -> Result<PathBuf, String> {
         let data_dir = self.gateway.outbox().data_dir().map(Path::to_owned);
         tokio::task::spawn_blocking(move || {
             download_path(&download_dir, data_dir.as_deref(), &dest)
@@ -445,6 +457,19 @@ fn announce_kept(context: &RequestContext<RoleServer>, message_id: &str) {
     });
 }
 
+/// `download_dir`, the download directory or why there is none, when a
+/// `pals_fetch` of `dest` may write in it ([`check_download`]); why not,
+/// otherwise. Creates nothing.
+fn writable_dir(
+    download_dir: Result<PathBuf, String>,
+    data_dir: Option<&Path>,
+    dest: &str,
+) -> Result<PathBuf, String> {
+    let download_dir = download_dir?;
+    check_download(&download_dir, data_dir, dest)?;
+    Ok(download_dir)
+}
+
 /// `wait_s` as a duration: [`DEFAULT_WAIT_S`] when not given, else from 1
 /// to [`MAX_WAIT_S`].
 fn wait(wait_s: Option<u64>) -> Result<Duration, String> {
@@ -488,6 +513,27 @@ fn exists(dest: &Path) -> CallToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fetch_with_nowhere_to_write_is_refused_before_anything() {
+        // No home directory for the default download directory.
+        let no_home = "there is no home directory for the default mcp.download_dir: set it";
+        let refused = writable_dir(Err(no_home.to_owned()), None, "file.bin").unwrap_err();
+        assert!(refused.contains("mcp.download_dir"), "{refused}");
+
+        // A download directory not created yet: allowed or not, not created.
+        let parent = tempfile::tempdir().unwrap();
+        let downloads = parent.path().join("pals");
+        assert_eq!(
+            writable_dir(Ok(downloads.clone()), None, "file.bin"),
+            Ok(downloads.clone())
+        );
+        let elsewhere = parent.path().join("elsewhere.bin");
+        let refused =
+            writable_dir(Ok(downloads.clone()), None, elsewhere.to_str().unwrap()).unwrap_err();
+        assert!(refused.contains("outside"), "{refused}");
+        assert!(!downloads.exists());
+    }
 
     #[test]
     fn wait_is_50_by_default_and_at_most_3600() {
