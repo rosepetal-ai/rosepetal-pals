@@ -2,7 +2,7 @@
 
 Red entre pares para que agentes de IA se encuentren, se autoricen y trabajen juntos sin depender de un directorio central. Cada agente ejecuta un daemon, `pals`, que lo conecta con otros agentes, controla qué pueden pedirle y le entrega el trabajo autorizado. Los mensajes, las tareas, sus estados, el streaming y la cancelación son [A2A](https://a2a-protocol.org/) v1.0: un cliente A2A estándar llega a cualquier par por el gateway local con los bindings JSON-RPC y HTTP+JSON, y entre pares esos mismos bindings viajan dentro del binding propio `http-over-iroh/v1`. Los bytes de los ficheros van aparte, por iroh-blobs, fuera de A2A; los mensajes A2A los nombran con una URL.
 
-> **Estado:** hito 1 implementado. La conformidad con A2A, con el alcance exacto que fija el [informe](docs/conformance/hito-1/README.md#lo-que-queda-respaldado), está respaldada por el kit de conformidad oficial (TCK) y el SDK oficial de Python. La **prueba de salida en dos máquinas está pendiente**: de momento solo hay un [ensayo en una máquina](docs/conformance/hito-1/exit-test.md). Es un prototipo; lee las [limitaciones](#limitaciones-conocidas-del-hito-1) antes de usarlo.
+> **Estado:** hito 1 implementado. La conformidad con A2A, con el alcance exacto que fija el [informe](docs/conformance/hito-1/README.md#lo-que-queda-respaldado), está respaldada por el kit de conformidad oficial (TCK) y el SDK oficial de Python. La **prueba de salida en dos máquinas físicas está pendiente**. Los ocho casos se han [superado con un contenedor Docker en el papel de la segunda máquina](docs/conformance/hito-1/exit-test.md), con cortes de red reales y los relays públicos, pero en una sola máquina. Es un prototipo; lee las [limitaciones](#limitaciones-conocidas-del-hito-1) antes de usarlo.
 
 El documento de diseño llama al protocolo «Agentnet»; por eso los identificadores que viajan por la red conservan el prefijo `agentnet` (`agentnet.grant/1`, `agentnet-a2a-http/1`, `x-agentnet-peer`). El producto, el binario y los crates se llaman `pals`.
 
@@ -167,7 +167,7 @@ Fuera del hito 1: la card firmada (JWS), las notificaciones *push*, el binding g
 
 | Hito | Contenido | Estado |
 |-|-|-|
-| 1. Flujo básico | Dos daemons, identidad, grants, `ask`, MCP y worker, ficheros, intercambio A2A estándar | Implementado; prueba de salida en dos máquinas pendiente |
+| 1. Flujo básico | Dos daemons, identidad, grants, `ask`, MCP y worker, ficheros, intercambio A2A estándar | Implementado; prueba de salida superada con Docker como segunda máquina, en dos máquinas físicas pendiente |
 | 2. Consulta de servicios e inventario | Agent Cards firmadas, inventario filtrado por permisos, consultas `ServiceQuery` y ofertas `ServiceOffer` | Planificado |
 | 3. Descubrimiento | Encontrar proveedores sin contacto previo con Kademlia, tras comparar alternativas | Planificado |
 | 4. Colaboración privada | Catálogos privados sincronizados con P2panda | Solo si aparece un caso real |
@@ -180,7 +180,7 @@ Fuera del hito 1: la card firmada (JWS), las notificaciones *push*, el binding g
 - [`docs/bindings/http-over-iroh-v1.md`](docs/bindings/http-over-iroh-v1.md): los bindings entre pares.
 - [`docs/extensions/idempotency-v1.md`](docs/extensions/idempotency-v1.md): la extensión de idempotencia.
 - [`docs/conformance/hito-1/README.md`](docs/conformance/hito-1/README.md): la conformidad con A2A (TCK y SDK de Python) y [`sdk-issues.md`](docs/conformance/hito-1/sdk-issues.md), los defectos del SDK de Rust.
-- [`docs/runbooks/hito-1-dos-maquinas.md`](docs/runbooks/hito-1-dos-maquinas.md) y [`docs/conformance/hito-1/exit-test.md`](docs/conformance/hito-1/exit-test.md): la prueba de salida en dos máquinas y el ensayo en una.
+- [`docs/runbooks/hito-1-dos-maquinas.md`](docs/runbooks/hito-1-dos-maquinas.md) y [`docs/conformance/hito-1/exit-test.md`](docs/conformance/hito-1/exit-test.md): la prueba de salida en dos máquinas, su ejecución con Docker como segunda máquina ([`tests/exit/`](tests/exit/README.md)) y el ensayo anterior en una.
 
 ## Tecnología
 
