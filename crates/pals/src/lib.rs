@@ -6,7 +6,8 @@
 //! Card, grant authentication, task ownership, message idempotency and the
 //! durable task store, [`worker`] the executors that do the work, [`blobs`]
 //! the files that travel outside the control channel, [`config`] the
-//! configuration file and the single-instance lock, [`gateway`] the loopback
+//! configuration file and the single-instance lock, [`inventory`] what the
+//! agent offers and with what, as it serves it, [`gateway`] the loopback
 //! entry through which standard A2A clients reach any peer, [`outbox`] the
 //! questions this agent asks them, [`mcp`] the tools an AI application on
 //! this machine uses them with, and [`node`] puts them together into a
@@ -16,6 +17,7 @@ pub mod a2a;
 pub mod blobs;
 pub mod config;
 pub mod gateway;
+pub mod inventory;
 pub mod mcp;
 pub mod net;
 pub mod node;

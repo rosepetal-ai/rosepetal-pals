@@ -1,0 +1,471 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Inventario agentnet.inventory/1",
+  "description": "Forma JSON del inventario local de un agente PALS: lo que declara su inventory.toml, con los mismos bloques y claves. Todos los bloques son opcionales, y en cada entrada todos los campos salvo id, description y provenance: un campo ausente es desconocido, y PALS nunca lo escribe como cero, false ni vacío. Una cadena vacía no es un valor y se rechaza (salvo en extensions y en adapter.args). Toda cadena o clave ocupa como mucho 4096 bytes en UTF-8 (este esquema solo puede contar caracteres), cada bloque tiene como mucho 1000 entradas y el fichero como mucho 1 MiB. Un id nombra una sola entrada en todo el inventario, y los componentes de un servicio son entradas del mismo inventario; este esquema no puede expresar ninguna de las dos reglas. Ninguna entrada puede declarar operational: solo un adaptador lo observa. Es el inventario completo del operador: lo que ve un par es una vista filtrada por su ámbito, sin adapter.",
+  "type": "object",
+  "properties": {
+    "services": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": { "$ref": "#/$defs/service" },
+      "description": "Lo que el agente ofrece: cada servicio es un skill de su Agent Card en los ámbitos que su visibilidad muestra."
+    },
+    "skills": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": { "$ref": "#/$defs/skillEntry" },
+      "description": "Paquetes de skills instalados en el runtime: procedimientos, no skills de A2A."
+    },
+    "plugins": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": { "$ref": "#/$defs/pluginEntry" }
+    },
+    "mcp": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": { "$ref": "#/$defs/mcpEntry" },
+      "description": "Conexiones MCP."
+    },
+    "runtime": { "$ref": "#/$defs/runtimeEntry" },
+    "models": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": { "$ref": "#/$defs/modelEntry" }
+    },
+    "information": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": { "$ref": "#/$defs/informationEntry" },
+      "description": "Fuentes de información."
+    },
+    "hardware": { "$ref": "#/$defs/hardwareEntry" },
+    "network": { "$ref": "#/$defs/networkEntry" }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "description": "Cadena no vacía de hasta 4096 bytes."
+    },
+    "texts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/text" }
+    },
+    "entryId": {
+      "type": "string",
+      "pattern": "^(?!agentnet:)[a-z0-9._-]{1,64}:[A-Za-z0-9._/-]{1,128}$",
+      "description": "<espacio de nombres>:<nombre>: de 1 a 64 caracteres [a-z0-9._-] en el espacio de nombres, que no puede ser agentnet, y de 1 a 128 [A-Za-z0-9._/-] en el nombre. Ejemplos: example:repo-reader, project:repo-controller."
+    },
+    "serviceId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+      "not": { "const": "ask" },
+      "description": "Id de skill seguro, porque es el id del skill de la card, que el gateway del hito 1 comprueba como un id de tarea. Nunca ask, el skill propio de la card."
+    },
+    "capability": {
+      "type": "string",
+      "pattern": "^([a-z0-9._-]{1,128}|(?!agentnet:)[a-z0-9._-]{1,64}:[A-Za-z0-9._/-]{1,128})$",
+      "description": "Sin «:», del vocabulario común (vision.ocr), y viaja en la card como la etiqueta agentnet:capability:v1:<capacidad>. Con «:», del espacio de nombres de su proveedor (example:ocr), con la forma de un id de entrada, y viaja tal cual."
+    },
+    "toolName": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+      "description": "Nombre de herramienta MCP, con el juego de caracteres que recomienda MCP."
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$",
+      "description": "RFC 3339 en UTC con segundos enteros: 2026-11-14T00:00:00Z. En TOML, como cadena."
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "amount": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "projects": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "pattern": "^[!-~]+$",
+        "description": "Nombre de proyecto: ASCII imprimible sin espacios, como los de la configuración y los grants."
+      }
+    },
+    "visibility": {
+      "description": "Dónde se muestra: private (por defecto, en ningún ámbito), public (en todos), {\"project\": [...]} (en los ámbitos de proyecto y de tarea de esos proyectos) o {\"task\": [...]} (solo en los de tarea). PALS la escribe siempre.",
+      "oneOf": [
+        { "enum": ["private", "public"] },
+        {
+          "type": "object",
+          "properties": { "project": { "$ref": "#/$defs/projects" } },
+          "required": ["project"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": { "task": { "$ref": "#/$defs/projects" } },
+          "required": ["task"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "properties": {
+        "reference": { "$ref": "#/$defs/text" },
+        "hash": { "$ref": "#/$defs/text" }
+      },
+      "minProperties": 1,
+      "additionalProperties": false,
+      "description": "Referencia y hash de lo que respalda la declaración; al menos uno de los dos."
+    },
+    "extensions": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/entryId" },
+      "description": "Datos fuera de este esquema, bajo claves con espacio de nombres (example:tier); el valor es JSON cualquiera. Una clave desconocida fuera de extensions es un error."
+    },
+    "entry": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/entryId" },
+        "description": { "$ref": "#/$defs/text" },
+        "provenance": {
+          "$ref": "#/$defs/text",
+          "description": "Quién lo declara: operator en una declaración del fichero."
+        },
+        "version": {
+          "$ref": "#/$defs/text",
+          "description": "Versión o hash, si se conoce."
+        },
+        "visibility": { "$ref": "#/$defs/visibility" },
+        "expires_at": {
+          "$ref": "#/$defs/timestamp",
+          "description": "Cuándo deja de valer la declaración."
+        },
+        "evidence": { "$ref": "#/$defs/evidence" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      },
+      "required": ["id", "description", "provenance"],
+      "description": "Lo que tiene toda entrada de un bloque distinto de services. Los campos propios del bloque van al mismo nivel."
+    },
+    "service": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/serviceId" },
+        "name": { "$ref": "#/$defs/text" },
+        "description": { "$ref": "#/$defs/text" },
+        "capabilities": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/capability" }
+        },
+        "tags": { "$ref": "#/$defs/texts" },
+        "examples": { "$ref": "#/$defs/texts" },
+        "input_modes": {
+          "$ref": "#/$defs/texts",
+          "description": "Tipos MIME que acepta."
+        },
+        "output_modes": {
+          "$ref": "#/$defs/texts",
+          "description": "Tipos MIME que produce."
+        },
+        "languages": { "$ref": "#/$defs/texts" },
+        "processing_region": { "$ref": "#/$defs/text" },
+        "external_cloud_used": { "type": "boolean" },
+        "estimated_start_delay_ms": { "$ref": "#/$defs/amount" },
+        "estimated_duration_ms": { "$ref": "#/$defs/amount" },
+        "components": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/componentLink" }
+        },
+        "limitations": { "$ref": "#/$defs/texts" },
+        "visibility": { "$ref": "#/$defs/visibility" }
+      },
+      "required": ["id", "name", "description"],
+      "anyOf": [
+        { "properties": { "capabilities": { "minItems": 1 } }, "required": ["capabilities"] },
+        { "properties": { "tags": { "minItems": 1 } }, "required": ["tags"] }
+      ],
+      "additionalProperties": false,
+      "description": "Un servicio necesita nombre, descripción y al menos una capacidad o etiqueta: cada uno pasa a ser un skill de la card, que no admite esos campos vacíos."
+    },
+    "componentLink": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/entryId",
+          "description": "Una entrada del mismo inventario."
+        },
+        "role": { "enum": ["required", "optional", "alternative"] },
+        "group": {
+          "$ref": "#/$defs/text",
+          "description": "Agrupa las alternativas que se sustituyen entre sí."
+        }
+      },
+      "required": ["id", "role"],
+      "additionalProperties": false
+    },
+    "skillEntry": {
+      "$ref": "#/$defs/entry",
+      "properties": {
+        "package_id": { "$ref": "#/$defs/text" },
+        "name": { "$ref": "#/$defs/text" },
+        "offered_for": {
+          "$ref": "#/$defs/texts",
+          "description": "Tipos de tarea para los que se ofrece."
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "pluginEntry": {
+      "$ref": "#/$defs/entry",
+      "properties": {
+        "runtime": {
+          "$ref": "#/$defs/text",
+          "description": "Runtime compatible."
+        },
+        "components": {
+          "$ref": "#/$defs/texts",
+          "description": "Componentes que ofrece."
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "mcpTool": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "#/$defs/toolName" },
+        "description": { "$ref": "#/$defs/text" },
+        "annotations": {
+          "type": "object",
+          "description": "Anotaciones MCP: declaraciones, nunca una política de seguridad."
+        }
+      },
+      "required": ["name"],
+      "additionalProperties": false
+    },
+    "mcpAdapter": {
+      "description": "Cómo llega un adaptador de inventario al servidor. Es configuración del operador: nunca sale en una vista.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "transport": { "const": "http" },
+            "url": { "$ref": "#/$defs/text" }
+          },
+          "required": ["transport", "url"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "transport": { "const": "stdio" },
+            "command": { "$ref": "#/$defs/text" },
+            "args": {
+              "type": "array",
+              "items": { "type": "string", "maxLength": 4096 }
+            },
+            "env_passthrough": {
+              "$ref": "#/$defs/texts",
+              "description": "Nombres de las variables de entorno que recibe el proceso; nunca sus valores."
+            }
+          },
+          "required": ["transport", "command"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "mcpEntry": {
+      "$ref": "#/$defs/entry",
+      "properties": {
+        "server": { "$ref": "#/$defs/text" },
+        "server_version": { "$ref": "#/$defs/text" },
+        "tools": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/mcpTool" },
+          "description": "Herramientas declaradas por el operador, sin repetir nombre. Una vista solo nombra las ofrecidas."
+        },
+        "resources": { "$ref": "#/$defs/texts" },
+        "adapter": { "$ref": "#/$defs/mcpAdapter" },
+        "offered_tools": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/toolName" },
+          "description": "Las herramientas ofrecidas: lo único que una vista puede nombrar de la conexión."
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "runtimeEntry": {
+      "$ref": "#/$defs/entry",
+      "properties": {
+        "kind": { "$ref": "#/$defs/text" },
+        "modes": {
+          "$ref": "#/$defs/texts",
+          "description": "Modos de trabajo que admite."
+        },
+        "restrictions": { "$ref": "#/$defs/texts" }
+      },
+      "unevaluatedProperties": false
+    },
+    "modelEntry": {
+      "$ref": "#/$defs/entry",
+      "properties": {
+        "provider": { "$ref": "#/$defs/text" },
+        "model_id": { "$ref": "#/$defs/text" },
+        "revision": {
+          "$ref": "#/$defs/text",
+          "description": "Revisión fija o hash de los pesos."
+        },
+        "mutable_alias": {
+          "$ref": "#/$defs/text",
+          "description": "Alias mutable, cuando no hay revisión fija."
+        },
+        "role": { "enum": ["primary", "auxiliary", "offered"] },
+        "execution": {
+          "description": "Local, o en un proveedor externo: el hardware de este inventario no es el suyo.",
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": { "kind": { "const": "local" } },
+              "required": ["kind"],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": { "const": "external" },
+                "provider": { "$ref": "#/$defs/text" }
+              },
+              "required": ["kind", "provider"],
+              "additionalProperties": false
+            }
+          ]
+        },
+        "inference_runtime": { "$ref": "#/$defs/text" },
+        "quantization": { "$ref": "#/$defs/text" },
+        "precision": { "$ref": "#/$defs/text" },
+        "modalities": { "$ref": "#/$defs/texts" },
+        "context_tokens": { "$ref": "#/$defs/amount" },
+        "output_tokens": { "$ref": "#/$defs/amount" },
+        "dynamic_selection": {
+          "$ref": "#/$defs/text",
+          "description": "La política, cuando el modelo se elige en cada tarea."
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "informationEntry": {
+      "$ref": "#/$defs/entry",
+      "properties": {
+        "domains": { "$ref": "#/$defs/texts" },
+        "languages": { "$ref": "#/$defs/texts" },
+        "coverage": {
+          "$ref": "#/$defs/text",
+          "description": "Cobertura temporal o temática."
+        },
+        "updated_at": { "$ref": "#/$defs/timestamp" },
+        "live": {
+          "type": "boolean",
+          "description": "Datos en vivo (true) o una copia indexada (false)."
+        },
+        "formats": { "$ref": "#/$defs/texts" },
+        "schema_ref": { "$ref": "#/$defs/text" },
+        "approximate_volume": { "$ref": "#/$defs/text" },
+        "operations": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "answer_with_sources",
+              "search",
+              "query_records",
+              "aggregate",
+              "process_in_place",
+              "deliver_subset"
+            ]
+          }
+        },
+        "limits": {
+          "$ref": "#/$defs/texts",
+          "description": "Límites de filas, campos, exportación o retención."
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "hardwareEntry": {
+      "$ref": "#/$defs/entry",
+      "properties": {
+        "basis": {
+          "const": "declared",
+          "description": "Las cifras son nominales, declaradas por el operador, nunca medidas; las medidas son informes de benchmark. PALS lo escribe siempre."
+        },
+        "cpu": {
+          "type": "object",
+          "properties": {
+            "arch": { "$ref": "#/$defs/text" },
+            "model": { "$ref": "#/$defs/text" },
+            "cores": { "$ref": "#/$defs/count" }
+          },
+          "additionalProperties": false
+        },
+        "ram_mib": { "$ref": "#/$defs/amount" },
+        "accelerators": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "kind": { "$ref": "#/$defs/text" },
+              "model": { "$ref": "#/$defs/text" },
+              "count": { "$ref": "#/$defs/count" },
+              "memory_mib_each": { "$ref": "#/$defs/amount" }
+            },
+            "additionalProperties": false
+          }
+        },
+        "storage": {
+          "type": "object",
+          "properties": {
+            "kind": { "$ref": "#/$defs/text" },
+            "capacity_gib": { "$ref": "#/$defs/amount" }
+          },
+          "additionalProperties": false
+        },
+        "offered": {
+          "type": "object",
+          "properties": {
+            "cpu_cores": { "$ref": "#/$defs/count" },
+            "ram_mib": { "$ref": "#/$defs/amount" },
+            "vram_mib_each": { "$ref": "#/$defs/amount" },
+            "concurrency": { "$ref": "#/$defs/count" },
+            "accelerators": {
+              "$ref": "#/$defs/texts",
+              "description": "Los kind o model de los aceleradores ofrecidos."
+            }
+          },
+          "additionalProperties": false,
+          "description": "Lo que puede usar una tarea: los requisitos se comparan con esto, nunca con lo instalado."
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "networkEntry": {
+      "$ref": "#/$defs/entry",
+      "properties": {
+        "transports": { "$ref": "#/$defs/texts" },
+        "region": {
+          "$ref": "#/$defs/text",
+          "description": "Región aproximada que el operador autoriza a mostrar."
+        },
+        "direct_connectivity_observed": { "type": "boolean" }
+      },
+      "unevaluatedProperties": false
+    }
+  }
+}

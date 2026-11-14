@@ -20,7 +20,7 @@ use http_body_util::{BodyExt, Empty, Limited};
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
 use iroh_tickets::endpoint::EndpointTicket;
-use pals::config::{self, CONFIG_FILE, Config, INIT_TEMPLATE, is_header_safe};
+use pals::config::{self, CONFIG_FILE, Config, INIT_TEMPLATE, INVENTORY_TEMPLATE, is_header_safe};
 use pals::net::agent_id_of;
 use pals::node::{Node, STORE_FILE};
 use pals::outbox::{AskError, AskOutcome, AskRequest, Outbox};
@@ -50,7 +50,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create config.toml and agent.key, keeping any that already exist
+    /// Create config.toml, inventory.toml and agent.key, keeping any that
+    /// already exist
     Init,
     /// Print this agent's id
     Id {
@@ -217,25 +218,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 fn init(home: &Path) -> anyhow::Result<()> {
     create_private_dir(home)?;
     let config_path = home.join(CONFIG_FILE);
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&config_path)
-    {
-        Ok(mut file) => {
-            file.write_all(INIT_TEMPLATE.as_bytes())
-                .with_context(|| format!("cannot write {}", config_path.display()))?;
-            println!("created {}", config_path.display());
-        }
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            println!("kept the existing {}", config_path.display());
-        }
-        Err(err) => {
-            return Err(err).with_context(|| format!("cannot create {}", config_path.display()));
-        }
-    }
-
+    write_new(&config_path, INIT_TEMPLATE)?;
     let cfg = Config::load(&config_path)?;
+    write_new(&cfg.inventory.file, INVENTORY_TEMPLATE)?;
+
     create_private_dir(&cfg.data_dir)?;
     let key_path = cfg.key_path();
     let existed = key_path.exists();
@@ -248,6 +234,24 @@ fn init(home: &Path) -> anyhow::Result<()> {
     };
     println!("{verb} {}", key_path.display());
     println!("agent id: {}", key.id());
+    Ok(())
+}
+
+/// Writes `contents` to a new file at `path`, keeping one that exists.
+fn write_new(path: &Path, contents: &str) -> anyhow::Result<()> {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => {
+            file.write_all(contents.as_bytes())
+                .with_context(|| format!("cannot write {}", path.display()))?;
+            println!("created {}", path.display());
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            println!("kept the existing {}", path.display());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("cannot create {}", path.display()));
+        }
+    }
     Ok(())
 }
 

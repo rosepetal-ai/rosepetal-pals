@@ -38,7 +38,10 @@ use iroh::endpoint::{PortmapperConfig, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 use iroh_tickets::endpoint::EndpointTicket;
-use pals::config::{AgentCfg, Config, GatewayCfg, KEY_FILE, LimitsCfg, McpCfg, NetCfg, WorkerCfg};
+use pals::config::{
+    AgentCfg, Config, GatewayCfg, INVENTORY_FILE, InventoryCfg, KEY_FILE, LimitsCfg, McpCfg,
+    NetCfg, WorkerCfg,
+};
 use pals::net::{ALPN_A2A_HTTP, PEER_HEADER, PeerHttp, TunnelLimits, TunnelServer};
 use pals::node::Node;
 use pals::worker::echo::EchoExecutor;
@@ -261,8 +264,10 @@ pub struct TestNode {
 
 /// The configuration a [`TestNode`] runs with on `data_dir`: the defaults,
 /// `worker`, no relay, so the node binds to 127.0.0.1 only, the gateway on
-/// a free port of 127.0.0.1, and `pals_fetch` writing to
-/// `<temp dir>/pals-test-downloads` (a [`TestNode`] has its own).
+/// a free port of 127.0.0.1, `pals_fetch` writing to
+/// `<temp dir>/pals-test-downloads` (a [`TestNode`] has its own), and the
+/// inventory read from `inventory.toml` in `data_dir`, empty unless a test
+/// writes it there first.
 pub fn test_config(data_dir: &Path, worker: WorkerCfg) -> Config {
     Config {
         data_dir: data_dir.to_path_buf(),
@@ -276,6 +281,10 @@ pub fn test_config(data_dir: &Path, worker: WorkerCfg) -> Config {
         net: NetCfg { relay: false },
         mcp: McpCfg {
             download_dir: Some(std::env::temp_dir().join("pals-test-downloads")),
+        },
+        inventory: InventoryCfg {
+            file: data_dir.join(INVENTORY_FILE),
+            ..InventoryCfg::default()
         },
         trusted_issuers: Vec::new(),
     }

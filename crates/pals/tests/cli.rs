@@ -60,6 +60,42 @@ fn second_init_keeps_the_existing_key_and_config() {
 }
 
 #[test]
+fn init_writes_a_commented_inventory_and_keeps_an_existing_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = home_arg(dir.path());
+    let first_init = stdout_of(&mut pals(&["init", "--home", home]));
+    let inventory_path = dir.path().join("inventory.toml");
+    assert!(first_init.contains("created"), "{first_init}");
+    assert!(first_init.contains("inventory.toml"), "{first_init}");
+
+    // Only comments: the inventory is empty until the operator writes it.
+    let template = std::fs::read_to_string(&inventory_path).unwrap();
+    assert!(
+        template
+            .lines()
+            .all(|line| line.is_empty() || line.starts_with('#')),
+        "{template}"
+    );
+    assert_eq!(
+        pals_core::inventory::Inventory::from_toml(&template).unwrap(),
+        pals_core::inventory::Inventory::default()
+    );
+
+    std::fs::write(&inventory_path, "# edited\n").unwrap();
+    let second_init = stdout_of(&mut pals(&["init", "--home", home]));
+    assert!(
+        second_init
+            .lines()
+            .any(|line| line.contains("kept") && line.contains("inventory.toml")),
+        "{second_init}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&inventory_path).unwrap(),
+        "# edited\n"
+    );
+}
+
+#[test]
 fn pals_home_is_used_and_home_flag_overrides_it() {
     let env_dir = tempfile::tempdir().unwrap();
     let flag_dir = tempfile::tempdir().unwrap();
