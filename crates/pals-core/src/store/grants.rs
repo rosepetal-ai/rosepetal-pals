@@ -211,6 +211,25 @@ impl Store {
             .collect())
     }
 
+    /// Every grant other agents issued to the owner, expired alike, newest
+    /// `issued_at` first.
+    pub fn grants_held(&self) -> anyhow::Result<Vec<SignedGrant>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT grant_id, token FROM grants_held WHERE subject = ?1
+             ORDER BY issued_at DESC, grant_id, issuer",
+        )?;
+        let rows = stmt
+            .query_map([&self.owner], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .iter()
+            .filter_map(|(grant_id, token)| self.held_row(grant_id, token))
+            .collect())
+    }
+
     /// The grants other agents issued to the owner for use against
     /// `audience`, unexpired at `now_unix`, newest `issued_at` first.
     pub fn grants_held_for(

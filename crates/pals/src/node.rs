@@ -1,4 +1,5 @@
-//! [`Node`]: one running agent, the A2A server its peers reach over Iroh.
+//! [`Node`]: one running agent, the A2A server its peers reach over Iroh and
+//! the local gateway standard A2A clients reach its peers through.
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -15,11 +16,14 @@ use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 use iroh_tickets::endpoint::EndpointTicket;
 use pals_core::identity::{AgentId, AgentKey};
 use pals_core::store::{DEDUP_RETENTION_S, Store};
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::a2a::auth::{Authenticator, JSONRPC_PATH, REST_PATH};
 use crate::a2a::{BindingExecutor, GuardedHandler, SqliteTaskStore, canonical_card};
 use crate::config::{Config, DataDirLock, WorkerCfg};
+use crate::gateway::{self, GatewayState};
 use crate::net::{ALPN_A2A_HTTP, PeerHttp, TunnelLimits, TunnelServer};
 use crate::worker::echo::EchoExecutor;
 
@@ -30,8 +34,13 @@ pub const STORE_FILE: &str = "pals.db";
 /// [`DEDUP_RETENTION_S`], besides once when it starts.
 const DEDUP_PURGE_INTERVAL: Duration = Duration::from_secs(3600);
 
+/// How long [`Node::shutdown`] waits for the gateway's open connections to
+/// finish before dropping them.
+const GATEWAY_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A running agent: its A2A server, served to peers over Iroh on
-/// [`ALPN_A2A_HTTP`], and the client it reaches peers with.
+/// [`ALPN_A2A_HTTP`], the client it reaches peers with, and its local
+/// [gateway](crate::gateway) on `gateway.listen`.
 ///
 /// The server is the SDK's, with the [canonical card](canonical_card) at
 /// `/.well-known/agent-card.json`, JSON-RPC at `/jsonrpc` and HTTP+JSON at
@@ -44,6 +53,7 @@ pub struct Node {
     /// Requests to peers, from this agent's own endpoint and identity.
     pub peer_http: PeerHttp,
     router: Router,
+    gateway: GatewayServer,
     /// Purges old dedup rows every [`DEDUP_PURGE_INTERVAL`] while the node
     /// runs.
     dedup_purge: AbortOnDrop,
@@ -59,11 +69,14 @@ impl Node {
     /// holds it; loads the agent's key, creating it if missing; opens the
     /// store; fails the tasks a previous run left in progress; frees the
     /// dedup keys it left with no execution behind them, and purges the
-    /// dedup rows older than [`DEDUP_RETENTION_S`]; and only then binds the
-    /// Iroh endpoint with the agent's key and serves [`ALPN_A2A_HTTP`] on
-    /// it. With `net.relay` the endpoint uses Iroh's N0 preset and its
-    /// public relays; without it, it has no relay and is bound to 127.0.0.1
-    /// only. While it runs, the node purges the dedup rows again every hour.
+    /// dedup rows older than [`DEDUP_RETENTION_S`]; binds the gateway's
+    /// listener on `gateway.listen`, which must be a loopback address (port
+    /// 0 picks a free one, see [`Node::gateway_url`]); and only then binds
+    /// the Iroh endpoint with the agent's key, serves [`ALPN_A2A_HTTP`] on it
+    /// and starts the gateway. With `net.relay` the endpoint uses Iroh's N0
+    /// preset and its public relays; without it, it has no relay and is
+    /// bound to 127.0.0.1 only. While it runs, the node purges the dedup
+    /// rows again every hour.
     pub async fn spawn(cfg: Config) -> anyhow::Result<Node> {
         let executor = match cfg.worker {
             WorkerCfg::Echo => EchoExecutor,
@@ -77,6 +90,11 @@ impl Node {
         cfg: Config,
         executor: impl AgentExecutor,
     ) -> anyhow::Result<Node> {
+        ensure!(
+            cfg.gateway.listen.ip().is_loopback(),
+            "gateway.listen must be a loopback address, not {}",
+            cfg.gateway.listen
+        );
         let data_dir = cfg.data_dir.clone();
         let key_path = cfg.key_path();
         let (lock, key, store) = tokio::task::spawn_blocking(move || {
@@ -106,6 +124,13 @@ impl Node {
         let store = Arc::new(store);
         let id = key.id();
 
+        let listener = TcpListener::bind(cfg.gateway.listen)
+            .await
+            .with_context(|| format!("cannot listen on {} for the gateway", cfg.gateway.listen))?;
+        let gateway_addr = listener
+            .local_addr()
+            .context("the gateway listener has no address")?;
+
         let endpoint = bind_endpoint(&cfg, &key).await?;
         ensure!(
             endpoint.id().as_bytes() == id.as_bytes(),
@@ -119,12 +144,25 @@ impl Node {
         let router = Router::builder(endpoint.clone())
             .accept(ALPN_A2A_HTTP, TunnelServer::new(app, limits))
             .spawn();
+        let peer_http = PeerHttp::new(endpoint.clone());
+        let gateway = GatewayServer::start(
+            listener,
+            GatewayState::new(
+                id,
+                cfg.agent.name.clone(),
+                Arc::clone(&store),
+                peer_http.clone(),
+                endpoint,
+                gateway_addr,
+            ),
+        );
         let dedup_purge = AbortOnDrop(tokio::spawn(purge_dedup_hourly(Arc::clone(&store))));
         Ok(Node {
             id,
             store,
-            peer_http: PeerHttp::new(endpoint),
+            peer_http,
             router,
+            gateway,
             dedup_purge,
             _lock: lock,
         })
@@ -133,33 +171,96 @@ impl Node {
     /// The address peers dial this node at: its id and the direct addresses
     /// and relay it is reachable on.
     pub fn addr(&self) -> EndpointAddr {
-        let endpoint = self.router.endpoint();
-        let mut addr = endpoint.addr();
-        // The bound sockets are dialable when the endpoint is bound to a
-        // specific address, as without a relay.
-        for socket in endpoint.bound_sockets() {
-            if !socket.ip().is_unspecified() {
-                addr = addr.with_ip_addr(socket);
-            }
-        }
-        addr
+        dialable_addr(self.router.endpoint())
     }
 
     /// [`Node::addr`] as an Iroh endpoint ticket, to hand to a peer.
     pub fn ticket(&self) -> String {
-        EndpointTicket::new(self.addr()).to_string()
+        ticket_of(self.router.endpoint())
     }
 
-    /// Stops purging, closes the connections to peers, stops serving,
-    /// closes the endpoint and releases the data directory.
+    /// The URL of the local gateway, from the address it is bound to:
+    /// `http://127.0.0.1:<port>` with the default `gateway.listen`.
+    pub fn gateway_url(&self) -> String {
+        self.gateway.url.clone()
+    }
+
+    /// Stops the gateway from accepting requests, stops purging, closes the
+    /// connections to peers, stops serving, closes the endpoint, lets the
+    /// gateway's open connections finish for up to
+    /// [`GATEWAY_STOP_TIMEOUT`], and releases the data directory.
     pub async fn shutdown(self) -> anyhow::Result<()> {
+        let GatewayServer {
+            url: _,
+            stop,
+            mut task,
+        } = self.gateway;
+        // The server may have stopped already; then there is nothing to tell.
+        let _ = stop.send(());
         drop(self.dedup_purge);
         self.peer_http.close_all().await;
-        self.router
+        let stopped = self
+            .router
             .shutdown()
             .await
-            .context("the node did not shut down cleanly")?;
-        Ok(())
+            .context("the node did not shut down cleanly");
+        if tokio::time::timeout(GATEWAY_STOP_TIMEOUT, &mut task.0)
+            .await
+            .is_err()
+        {
+            tracing::debug!("dropping the gateway connections still open");
+        }
+        stopped
+    }
+}
+
+/// The address peers dial `endpoint` at: its id and the direct addresses and
+/// relay it is reachable on.
+fn dialable_addr(endpoint: &Endpoint) -> EndpointAddr {
+    let mut addr = endpoint.addr();
+    // The bound sockets are dialable when the endpoint is bound to a
+    // specific address, as without a relay.
+    for socket in endpoint.bound_sockets() {
+        if !socket.ip().is_unspecified() {
+            addr = addr.with_ip_addr(socket);
+        }
+    }
+    addr
+}
+
+/// [`dialable_addr`] as an Iroh endpoint ticket, to hand to a peer.
+pub(crate) fn ticket_of(endpoint: &Endpoint) -> String {
+    EndpointTicket::new(dialable_addr(endpoint)).to_string()
+}
+
+/// The gateway's HTTP server, running on its own task.
+struct GatewayServer {
+    url: String,
+    /// Tells the server to stop accepting and to close its connections once
+    /// their requests are answered.
+    stop: oneshot::Sender<()>,
+    /// Aborted if the node is dropped without [`Node::shutdown`].
+    task: AbortOnDrop,
+}
+
+impl GatewayServer {
+    fn start(listener: TcpListener, state: GatewayState) -> Self {
+        let url = state.base_url();
+        let (stop, stopped) = oneshot::channel::<()>();
+        let serve = axum::serve(listener, gateway::router(state)).with_graceful_shutdown(async {
+            // Dropping the sender stops the server as well.
+            let _ = stopped.await;
+        });
+        let task = tokio::spawn(async move {
+            if let Err(error) = serve.await {
+                tracing::warn!(%error, "the gateway stopped serving");
+            }
+        });
+        Self {
+            url,
+            stop,
+            task: AbortOnDrop(task),
+        }
     }
 }
 

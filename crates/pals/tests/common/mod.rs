@@ -1,14 +1,15 @@
 //! Shared helpers for the integration tests: Iroh endpoints on loopback with
 //! no relay, an echo agent served through the tunnel, a client that goes
 //! through the production `PeerHttp`, complete PALS nodes ([`TestNode`])
-//! with the grants that let them talk to each other, and an executor that
-//! counts its runs ([`CountingExecutor`]).
+//! with the grants that let them talk to each other, an executor that counts
+//! its runs ([`CountingExecutor`]), and a plain HTTP client for a node's
+//! loopback gateway ([`gateway_request`]).
 
 // Each test binary uses a different subset of these helpers.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -31,6 +32,8 @@ use axum::routing::post;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use http_body_util::BodyExt;
+use hyper::client::conn::http1 as client_http1;
+use hyper_util::rt::TokioIo;
 use iroh::endpoint::{PortmapperConfig, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, RelayMode};
@@ -40,7 +43,9 @@ use pals::node::Node;
 use pals::worker::echo::EchoExecutor;
 use pals_core::grant::{GRANT_SCHEMA, Grant, Operation, SignedGrant, format_timestamp};
 use pals_core::identity::{AgentId, AgentKey};
+use pals_core::store::Contact;
 use serde_json::{Value, json};
+use tokio::net::TcpStream;
 
 /// The echo agent as a standard A2A v1.0 server: a static card, the JSON-RPC
 /// binding at `/jsonrpc` and the HTTP+JSON binding at `/rest`.
@@ -241,12 +246,15 @@ pub struct TestNode {
 }
 
 /// The configuration a [`TestNode`] runs with on `data_dir`: the defaults,
-/// `worker`, and no relay, so the node binds to 127.0.0.1 only.
+/// `worker`, no relay, so the node binds to 127.0.0.1 only, and the gateway
+/// on a free port of 127.0.0.1.
 pub fn test_config(data_dir: &Path, worker: WorkerCfg) -> Config {
     Config {
         data_dir: data_dir.to_path_buf(),
         agent: AgentCfg::default(),
-        gateway: GatewayCfg::default(),
+        gateway: GatewayCfg {
+            listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        },
         worker,
         projects: BTreeMap::new(),
         limits: LimitsCfg::default(),
@@ -451,6 +459,34 @@ impl TestNode {
         self.node.id
     }
 
+    /// The URL of this node's loopback gateway, `http://127.0.0.1:<port>`.
+    pub fn gateway_url(&self) -> String {
+        self.node.gateway_url()
+    }
+
+    /// Saves `peer` as the contact `name`, with its ticket, as `pals contact
+    /// add` does.
+    pub fn add_contact(&self, name: &str, peer: &TestNode) {
+        let contact = Contact {
+            name: name.to_owned(),
+            agent_id: peer.id(),
+            ticket: Some(peer.node.ticket()),
+            added_at: now_unix(),
+        };
+        self.node
+            .store
+            .contact_put(&contact)
+            .expect("save the contact");
+    }
+
+    /// Keeps `g`, a grant issued to this node, as `pals grant import` does.
+    pub fn hold(&self, g: &SignedGrant) {
+        self.node
+            .store
+            .grant_held_put(g)
+            .expect("store the held grant");
+    }
+
     /// Sends `request` from this node to `to` through this node's
     /// `PeerHttp`, and returns the response with its body still streaming.
     pub async fn send(&self, to: &TestNode, request: Request<Body>) -> Response<Body> {
@@ -554,4 +590,59 @@ pub fn sse_results(res: &TestResponse) -> Vec<Value> {
             response["result"].clone()
         })
         .collect()
+}
+
+/// Sends `method path` to the gateway at `base` (`http://<host>:<port>`) over
+/// a new TCP connection, with `headers` and an optional JSON body, and
+/// returns the response with its body still streaming. `Host` is the base's
+/// `<host>:<port>` unless `headers` sets one.
+pub async fn gateway_send(
+    base: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&Value>,
+) -> Response<Body> {
+    let authority = base.strip_prefix("http://").expect("an http:// base URL");
+    let stream = TcpStream::connect(authority)
+        .await
+        .expect("connect to the gateway");
+    let (mut sender, connection) = client_http1::handshake(TokioIo::new(stream))
+        .await
+        .expect("HTTP/1.1 handshake with the gateway");
+    tokio::spawn(connection);
+    let mut request = Request::builder().method(method).uri(path);
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("host"))
+    {
+        request = request.header(header::HOST, authority);
+    }
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let body = match body {
+        Some(body) => {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+            Body::from(serde_json::to_vec(body).expect("serializable body"))
+        }
+        None => Body::empty(),
+    };
+    let request = request.body(body).expect("valid request");
+    sender
+        .send_request(request)
+        .await
+        .expect("a response from the gateway")
+        .map(Body::new)
+}
+
+/// [`gateway_send`], with the response read to the end.
+pub async fn gateway_request(
+    base: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&Value>,
+) -> TestResponse {
+    TestResponse::read(gateway_send(base, method, path, headers, body).await).await
 }

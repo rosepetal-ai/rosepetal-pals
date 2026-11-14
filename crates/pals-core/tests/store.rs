@@ -130,6 +130,36 @@ fn held_grants_exclude_expired_and_sort_newest_first() {
 }
 
 #[test]
+fn every_held_grant_is_listed_newest_first() {
+    let me = AgentKey::generate();
+    let store = Store::open_in_memory(me.id()).unwrap();
+    let peer = AgentKey::generate();
+    let other_peer = AgentKey::generate();
+    let held = |issuer: &AgentKey, grant_id: &str, issued_at: i64, expires_at: i64| {
+        let g = sign(
+            issuer,
+            Grant {
+                issued_at: ts(issued_at),
+                expires_at: ts(expires_at),
+                ..grant(issuer, grant_id, me.id(), issuer.id())
+            },
+        );
+        store.grant_held_put(&g).unwrap();
+    };
+    held(&peer, "g-older", NOW - 3 * HOUR, NOW + HOUR);
+    held(&other_peer, "g-newest", NOW - HOUR, NOW + HOUR);
+    held(&peer, "g-expired", NOW - 48 * HOUR, NOW - 24 * HOUR);
+    // A grant this agent issued is not held.
+    let issued = sign(&me, grant(&me, "g-issued", peer.id(), me.id()));
+    store.grant_issued_put(&issued).unwrap();
+
+    assert_eq!(
+        ids(&store.grants_held().unwrap()),
+        ["g-newest", "g-older", "g-expired"]
+    );
+}
+
+#[test]
 fn covering_grant_matches_subject_operation_and_resource() {
     let me = AgentKey::generate();
     let store = Store::open_in_memory(me.id()).unwrap();

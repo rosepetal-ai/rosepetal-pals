@@ -1,10 +1,11 @@
-//! The agent's public Agent Card.
+//! The agent's public Agent Card, and the view of a peer's card that the
+//! local gateway serves to standard clients.
 
 use std::collections::HashMap;
 
 use a2a::{
     AgentCapabilities, AgentCard, AgentInterface, AgentSkill, HttpAuthSecurityScheme,
-    SecurityScheme,
+    SecurityScheme, TRANSPORT_PROTOCOL_HTTP_JSON, TRANSPORT_PROTOCOL_JSONRPC,
 };
 use pals_core::grant::GRANT_SCHEMA;
 use pals_core::identity::AgentId;
@@ -73,5 +74,81 @@ pub fn canonical_card(cfg: &Config, id: &AgentId) -> AgentCard {
             Vec::new(),
         )])]),
         signatures: None,
+    }
+}
+
+/// `card`, a card of `peer`, as the local gateway at `base_url` serves it:
+/// the same card, except that it is reached through the gateway with the
+/// standard bindings, JSON-RPC at `<base_url>/peers/<peer>/jsonrpc` and
+/// HTTP+JSON at `<base_url>/peers/<peer>/rest` (protocol version 1.0), and
+/// that it declares no security, because the gateway presents the
+/// credential: no security schemes, no security requirements, on the card or
+/// on its skills, and no signatures, which covered the original.
+pub fn gateway_view(card: &AgentCard, base_url: &str, peer: &AgentId) -> AgentCard {
+    let base = base_url.trim_end_matches('/');
+    let mut view = card.clone();
+    // `new` sets the protocol version this SDK implements, 1.0.
+    view.supported_interfaces = vec![
+        AgentInterface::new(
+            format!("{base}/peers/{peer}/jsonrpc"),
+            TRANSPORT_PROTOCOL_JSONRPC,
+        ),
+        AgentInterface::new(
+            format!("{base}/peers/{peer}/rest"),
+            TRANSPORT_PROTOCOL_HTTP_JSON,
+        ),
+    ];
+    view.security_schemes = None;
+    view.security_requirements = None;
+    view.signatures = None;
+    for skill in &mut view.skills {
+        skill.security_requirements = None;
+    }
+    view
+}
+
+#[cfg(test)]
+mod tests {
+    use pals_core::identity::AgentKey;
+
+    use super::*;
+
+    #[test]
+    fn gateway_view_replaces_interfaces_and_drops_security_only() {
+        let peer = AgentKey::generate().id();
+        let cfg: Config = toml::from_str("[agent]\nname = \"bob\"\n").unwrap();
+        let mut card = canonical_card(&cfg, &peer);
+        card.skills[0].security_requirements = card.security_requirements.clone();
+
+        let view = gateway_view(&card, "http://127.0.0.1:7420/", &peer);
+        assert_eq!(
+            view.supported_interfaces,
+            vec![
+                AgentInterface {
+                    url: format!("http://127.0.0.1:7420/peers/{peer}/jsonrpc"),
+                    protocol_binding: "JSONRPC".to_owned(),
+                    protocol_version: "1.0".to_owned(),
+                    tenant: None,
+                },
+                AgentInterface {
+                    url: format!("http://127.0.0.1:7420/peers/{peer}/rest"),
+                    protocol_binding: "HTTP+JSON".to_owned(),
+                    protocol_version: "1.0".to_owned(),
+                    tenant: None,
+                },
+            ]
+        );
+        assert_eq!(view.security_schemes, None);
+        assert_eq!(view.security_requirements, None);
+        assert_eq!(view.signatures, None);
+        assert_eq!(view.skills[0].security_requirements, None);
+
+        // Everything else is the card as it came.
+        let mut back = view.clone();
+        back.supported_interfaces = card.supported_interfaces.clone();
+        back.security_schemes = card.security_schemes.clone();
+        back.security_requirements = card.security_requirements.clone();
+        back.skills[0].security_requirements = card.skills[0].security_requirements.clone();
+        assert_eq!(back, card);
     }
 }

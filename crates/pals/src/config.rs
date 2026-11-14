@@ -187,6 +187,13 @@ impl Config {
                 cfg.gateway.listen
             );
         }
+        if let Some(name) = cfg.projects.keys().find(|name| !is_header_safe(name)) {
+            bail!(
+                "invalid {}: the project name {name:?} must be printable ASCII without spaces, \
+                 because it travels in an HTTP header",
+                path.display()
+            );
+        }
         Ok(cfg)
     }
 
@@ -199,6 +206,13 @@ impl Config {
     pub fn key_path(&self) -> PathBuf {
         self.data_dir.join(KEY_FILE)
     }
+}
+
+/// Whether `text` can travel unchanged as an HTTP header value, as project
+/// names and grant ids do between peers: not empty, printable ASCII and no
+/// spaces.
+pub fn is_header_safe(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_graphic())
 }
 
 /// `$PALS_HOME` when it is set and not empty, else `~/.pals` (`.pals` in the
@@ -357,6 +371,23 @@ path = "/srv/demo"
         assert!(!cfg.net.relay);
         assert_eq!(cfg.limits.max_body_bytes, 2048);
         assert_eq!(cfg.projects["demo"].path, PathBuf::from("/srv/demo"));
+    }
+
+    #[test]
+    fn project_names_must_be_header_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["\"diseño\"", "\"two words\"", "\"\""] {
+            let text = format!("[projects.{name}]\npath = \"/srv/p\"\n");
+            let err = Config::load(&write_config(dir.path(), &text)).unwrap_err();
+            assert!(format!("{err:#}").contains("project"), "{name}: {err:#}");
+        }
+        let text = "[projects.my-repo_2]\npath = \"/srv/p\"\n";
+        assert!(Config::load(&write_config(dir.path(), text)).is_ok());
+
+        assert!(is_header_safe("a.b/c:d"));
+        for bad in ["", "diseño", "two words", "tab\there", "\u{7f}"] {
+            assert!(!is_header_safe(bad), "{bad:?}");
+        }
     }
 
     #[test]

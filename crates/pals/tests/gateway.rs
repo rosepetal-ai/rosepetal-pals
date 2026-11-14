@@ -1,0 +1,1000 @@
+//! The loopback gateway, the standard A2A entry: a stock A2A client reaches
+//! any PALS peer at `<gateway>/peers/<peer>` with the JSON-RPC or HTTP+JSON
+//! binding, the gateway presenting the grant it holds for that peer, behind
+//! the local guard (no `Origin`, a loopback `Host`); and the `daemon`,
+//! `id --ticket`, `contact` and `grant` commands that set it up.
+
+mod common;
+
+use std::path::PathBuf;
+use std::process::{Child, Stdio};
+use std::time::{Duration, Instant};
+
+use a2a::{
+    GetTaskRequest, Message, Part, Role, SendMessageRequest, SendMessageResponse, StreamResponse,
+    TRANSPORT_PROTOCOL_HTTP_JSON, Task, TaskState,
+};
+use a2a_client::A2AClientFactory;
+use a2a_client::agent_card::AgentCardResolver;
+use common::{
+    CountingExecutor, TestNode, TestResponse, gateway_request, gateway_send, grant, issue_grant,
+    message_params, now_unix, rpc_request, spawn_node, spawn_node_with_executor, test_config,
+};
+use futures::StreamExt;
+use http_body_util::BodyExt;
+use iroh::EndpointAddr;
+use iroh_tickets::endpoint::EndpointTicket;
+use pals::a2a::{canonical_card, gateway_view};
+use pals::config::WorkerCfg;
+use pals::net::endpoint_id_of;
+use pals_core::grant::Operation::{self, TaskCancel, TaskRead, TaskSend};
+use pals_core::grant::SignedGrant;
+use pals_core::identity::{AgentId, AgentKey};
+use pals_core::store::{Contact, Store};
+use serde_json::{Value, json};
+
+const SEND_AND_READ: [Operation; 2] = [TaskSend, TaskRead];
+
+/// A requester `a`, whose gateway the tests use, and a provider `b`, which
+/// `a` reaches as contact `bob` with a grant of `b` that `a` holds.
+async fn connected_pair() -> (TestNode, TestNode, SignedGrant) {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let b = spawn_node(WorkerCfg::Echo).await;
+    let g = connect(&a, &b);
+    (a, b, g)
+}
+
+/// Saves `b` in `a` as contact `bob`, and gives `a` a grant of `b` to send
+/// and read tasks, which `a` holds.
+fn connect(a: &TestNode, b: &TestNode) -> SignedGrant {
+    a.add_contact("bob", b);
+    let g = grant(b, a, &SEND_AND_READ, 3600);
+    a.hold(&g);
+    g
+}
+
+/// A JSON-RPC call to `peer` through `a`'s gateway, with `A2A-Version: 1.0`
+/// and `headers`.
+async fn gw_rpc(
+    a: &TestNode,
+    peer: &str,
+    headers: &[(&str, &str)],
+    method: &str,
+    params: Value,
+) -> TestResponse {
+    let mut all = vec![("a2a-version", "1.0")];
+    all.extend_from_slice(headers);
+    gateway_request(
+        &a.gateway_url(),
+        "POST",
+        &format!("/peers/{peer}/jsonrpc"),
+        &all,
+        Some(&rpc_request(method, params)),
+    )
+    .await
+}
+
+/// A resolver for Agent Cards, as a stock A2A client uses.
+///
+/// The stock client's HTTP client, reqwest, is built with rustls and no
+/// crypto provider (iroh's choice of features), so a provider is installed
+/// first: `ring`, the one iroh uses.
+fn card_resolver() -> AgentCardResolver {
+    // Another test may have installed it already.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    AgentCardResolver::new(None)
+}
+
+/// A `SendMessage` request with one text part.
+fn send_request(text: &str) -> SendMessageRequest {
+    SendMessageRequest {
+        message: Message::new(Role::User, vec![Part::text(text)]),
+        configuration: None,
+        metadata: None,
+        tenant: None,
+    }
+}
+
+fn task_of(reply: &SendMessageResponse) -> &Task {
+    match reply {
+        SendMessageResponse::Task(task) => task,
+        SendMessageResponse::Message(message) => panic!("a message instead of a task: {message:?}"),
+    }
+}
+
+fn state_of(reply: &SendMessageResponse) -> TaskState {
+    task_of(reply).status.state.clone()
+}
+
+/// The text of the first part of the task's first artifact.
+fn answer_of(task: &Task) -> &str {
+    task.artifacts.as_ref().expect("an artifact")[0].parts[0]
+        .as_text()
+        .expect("a text part")
+}
+
+/// The JSON of every `data:` line of an SSE body, in order.
+fn sse_data(body: &str) -> Vec<Value> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(|data| serde_json::from_str(data.trim()).expect("an SSE event is JSON"))
+        .collect()
+}
+
+#[tokio::test]
+async fn stock_a2a_client_talks_to_a_peer_through_the_gateway() {
+    let (a, b, _) = connected_pair().await;
+    let base = format!("{}/peers/{}", a.gateway_url(), b.id());
+    let card = card_resolver()
+        .resolve(&base)
+        .await
+        .expect("resolve the card through the gateway");
+    let client = A2AClientFactory::builder()
+        .build()
+        .create_from_card(&card)
+        .await
+        .expect("a client from the card");
+
+    let reply = client
+        .send_message(&send_request("hola"))
+        .await
+        .expect("SendMessage through the gateway");
+    assert_eq!(state_of(&reply), TaskState::Completed);
+    assert_eq!(answer_of(task_of(&reply)), "echo: hola");
+
+    // The same task, read back with GetTask.
+    let id = task_of(&reply).id.clone();
+    let task = client
+        .get_task(&GetTaskRequest {
+            id: id.clone(),
+            history_length: None,
+            tenant: None,
+        })
+        .await
+        .expect("GetTask through the gateway");
+    assert_eq!(task.id, id);
+    assert_eq!(task.status.state, TaskState::Completed);
+
+    // Streaming, with the same stock client: the task, its artifact and its
+    // completion.
+    let events: Vec<StreamResponse> = client
+        .send_streaming_message(&send_request("otra"))
+        .await
+        .expect("SendStreamingMessage through the gateway")
+        .map(|event| event.expect("a stream event"))
+        .collect()
+        .await;
+    assert!(
+        matches!(events.first(), Some(StreamResponse::Task(_))),
+        "{events:?}"
+    );
+    match events.last() {
+        Some(StreamResponse::StatusUpdate(update)) => {
+            assert_eq!(update.status.state, TaskState::Completed)
+        }
+        other => panic!("the stream did not end with a status update: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn rest_binding_works_through_the_gateway() {
+    let (a, b, _) = connected_pair().await;
+    let gw = a.gateway_url();
+    let headers = [("a2a-version", "1.0")];
+
+    let res = gateway_request(
+        &gw,
+        "POST",
+        &format!("/peers/{}/rest/message:send", b.id()),
+        &headers,
+        Some(&message_params("hola", None)),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let task = &res.json["task"];
+    assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED", "{task}");
+    assert_eq!(task["artifacts"][0]["parts"][0]["text"], "echo: hola");
+    let id = task["id"].as_str().expect("a task id");
+
+    // GET, with a path parameter, by contact name.
+    let path = format!("/peers/bob/rest/tasks/{id}");
+    let res = gateway_request(&gw, "GET", &path, &headers, None).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["id"], id);
+    assert!(
+        !res.json["history"].as_array().unwrap().is_empty(),
+        "{}",
+        res.json
+    );
+
+    // The query string reaches the peer as sent.
+    let res = gateway_request(
+        &gw,
+        "GET",
+        &format!("{path}?historyLength=0"),
+        &headers,
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["id"], id);
+    assert!(
+        res.json
+            .get("history")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty),
+        "{}",
+        res.json
+    );
+
+    // A stock client that prefers the HTTP+JSON binding.
+    let card = card_resolver()
+        .resolve(&format!("{gw}/peers/{}", b.id()))
+        .await
+        .expect("resolve the card through the gateway");
+    let (client, interface) = A2AClientFactory::builder()
+        .preferred_bindings(vec![TRANSPORT_PROTOCOL_HTTP_JSON.to_owned()])
+        .build()
+        .create_from_card_with_interface(&card)
+        .await
+        .expect("a client from the card");
+    assert_eq!(interface.protocol_binding, TRANSPORT_PROTOCOL_HTTP_JSON);
+    let reply = client
+        .send_message(&send_request("por rest"))
+        .await
+        .expect("SendMessage over HTTP+JSON");
+    assert_eq!(state_of(&reply), TaskState::Completed);
+    assert_eq!(answer_of(task_of(&reply)), "echo: por rest");
+}
+
+#[tokio::test]
+async fn gateway_view_declares_standard_bindings_and_no_security() {
+    // No grant is needed for the card: it is public.
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let b = spawn_node(WorkerCfg::Echo).await;
+    a.add_contact("bob", &b);
+    let gw = a.gateway_url();
+
+    let res = gateway_request(
+        &gw,
+        "GET",
+        &format!("/peers/{}/.well-known/agent-card.json", b.id()),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let card = &res.json;
+    assert_eq!(card["supportedInterfaces"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        card["supportedInterfaces"][0]["url"],
+        format!("{gw}/peers/{}/jsonrpc", b.id())
+    );
+    assert_eq!(card["supportedInterfaces"][0]["protocolBinding"], "JSONRPC");
+    assert_eq!(card["supportedInterfaces"][0]["protocolVersion"], "1.0");
+    assert_eq!(
+        card["supportedInterfaces"][1]["url"],
+        format!("{gw}/peers/{}/rest", b.id())
+    );
+    assert_eq!(
+        card["supportedInterfaces"][1]["protocolBinding"],
+        "HTTP+JSON"
+    );
+    assert_eq!(card["supportedInterfaces"][1]["protocolVersion"], "1.0");
+    assert!(card.get("securitySchemes").is_none());
+    assert!(card.get("securityRequirements").is_none());
+    assert!(card.get("signatures").is_none());
+
+    // Otherwise it is the peer's canonical card.
+    let canonical = canonical_card(&test_config(b.dir.path(), WorkerCfg::Echo), &b.id());
+    assert_eq!(
+        &serde_json::to_value(gateway_view(&canonical, &gw, &b.id())).unwrap(),
+        card
+    );
+    let mut rest = card.clone();
+    let mut expected = serde_json::to_value(&canonical).unwrap();
+    for value in [&mut rest, &mut expected] {
+        let object = value.as_object_mut().unwrap();
+        for key in [
+            "supportedInterfaces",
+            "securitySchemes",
+            "securityRequirements",
+            "signatures",
+        ] {
+            object.remove(key);
+        }
+    }
+    assert_eq!(rest, expected);
+
+    // By contact name, the same view: its URLs name the peer by its id.
+    let res = gateway_request(
+        &gw,
+        "GET",
+        "/peers/bob/.well-known/agent-card.json",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(&res.json, card);
+}
+
+#[tokio::test]
+async fn sse_events_arrive_before_the_task_finishes() {
+    // How long the executor works between its first event and the rest.
+    const DELAY: Duration = Duration::from_secs(5);
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let executor = CountingExecutor::new(DELAY);
+    let b = spawn_node_with_executor(executor.clone()).await;
+    connect(&a, &b);
+
+    let response = gateway_send(
+        &a.gateway_url(),
+        "POST",
+        "/peers/bob/jsonrpc",
+        &[("a2a-version", "1.0"), ("accept", "text/event-stream")],
+        Some(&rpc_request(
+            "SendStreamingMessage",
+            message_params("slow", None),
+        )),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let content_type = response.headers()[http::header::CONTENT_TYPE]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "{content_type}"
+    );
+
+    // The first event arrives on its own, while the executor still works.
+    let mut body = response.into_body();
+    let mut received = String::new();
+    while !received.contains("\n\n") {
+        let frame = body
+            .frame()
+            .await
+            .expect("an event before the end of the stream")
+            .expect("a readable stream");
+        if let Ok(data) = frame.into_data() {
+            received.push_str(std::str::from_utf8(&data).unwrap());
+        }
+    }
+    let first_at = Instant::now();
+    let first = &sse_data(&received)[0]["result"]["task"];
+    assert_eq!(first["status"]["state"], "TASK_STATE_WORKING", "{received}");
+    let id = first["id"].as_str().expect("a task id").to_owned();
+    let res = gw_rpc(&a, "bob", &[], "GetTask", json!({"id": id})).await;
+    assert_eq!(
+        res.json["result"]["status"]["state"], "TASK_STATE_WORKING",
+        "{}",
+        res.json
+    );
+
+    // The rest follows once the executor is done, well after the first
+    // event: a gateway that held the response back would deliver them
+    // together.
+    let rest = body
+        .collect()
+        .await
+        .expect("the rest of the stream")
+        .to_bytes();
+    let gap = first_at.elapsed();
+    assert!(
+        gap >= DELAY / 2,
+        "the end came {gap:?} after the first event"
+    );
+    received.push_str(std::str::from_utf8(&rest).unwrap());
+    let events = sse_data(&received);
+    let last = &events.last().unwrap()["result"]["statusUpdate"];
+    assert_eq!(
+        last["status"]["state"], "TASK_STATE_COMPLETED",
+        "{received}"
+    );
+    assert_eq!(executor.runs(), 1);
+}
+
+#[tokio::test]
+async fn no_held_grant_is_a_local_401_and_the_peer_is_not_contacted() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let b = spawn_node(WorkerCfg::Echo).await;
+    a.add_contact("bob", &b);
+    let gw = a.gateway_url();
+    let no_grant = json!({"error": format!("no grant held for {}", b.id())});
+
+    let res = gw_rpc(&a, "bob", &[], "SendMessage", message_params("hola", None)).await;
+    assert_eq!(res.status, 401, "{}", res.json);
+    assert_eq!(res.json, no_grant);
+    let res = gateway_request(
+        &gw,
+        "POST",
+        &format!("/peers/{}/rest/message:send", b.id()),
+        &[("a2a-version", "1.0")],
+        Some(&message_params("hola", None)),
+    )
+    .await;
+    assert_eq!(res.status, 401, "{}", res.json);
+    assert_eq!(res.json, no_grant);
+    assert_eq!(b.node.store.events_count("task.accepted").unwrap(), 0);
+
+    // A held grant for another peer does not count.
+    let c = spawn_node(WorkerCfg::Echo).await;
+    a.hold(&grant(&c, &a, &SEND_AND_READ, 3600));
+    // Nor does an expired one.
+    a.hold(&grant(&b, &a, &SEND_AND_READ, -3600));
+    let res = gw_rpc(&a, "bob", &[], "SendMessage", message_params("hola", None)).await;
+    assert_eq!(res.status, 401, "{}", res.json);
+    assert_eq!(res.json, no_grant);
+
+    // The client's own Authorization goes through intact: a bad one is the
+    // peer's refusal, a good one the peer's answer.
+    let res = gw_rpc(
+        &a,
+        "bob",
+        &[("authorization", "Bearer not-a-grant")],
+        "SendMessage",
+        message_params("hola", None),
+    )
+    .await;
+    assert_eq!(res.status, 401, "{}", res.json);
+    let challenge = res.header("www-authenticate");
+    assert!(challenge.contains("malformed"), "{challenge}");
+    let g = grant(&b, &a, &SEND_AND_READ, 3600);
+    let bearer = common::bearer(&g);
+    let res = gw_rpc(
+        &a,
+        "bob",
+        &[("authorization", bearer.as_str())],
+        "SendMessage",
+        message_params("hola", None),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(
+        res.json["result"]["task"]["status"]["state"],
+        "TASK_STATE_COMPLETED"
+    );
+
+    // With the peer gone, still a local 401 and not a 502: it is never
+    // dialed.
+    let TestNode { node, dir: _dir } = b;
+    let b_id = node.id;
+    node.shutdown().await.unwrap();
+    let started = Instant::now();
+    let res = gw_rpc(&a, "bob", &[], "SendMessage", message_params("hola", None)).await;
+    assert_eq!(res.status, 401, "{}", res.json);
+    assert_eq!(
+        res.json,
+        json!({"error": format!("no grant held for {b_id}")})
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[tokio::test]
+async fn unknown_peer_is_404_and_unreachable_peer_is_502() {
+    let (a, b, _) = connected_pair().await;
+    let gw = a.gateway_url();
+    let unknown = json!({"error": "unknown peer"});
+    let unreachable = json!({"error": "peer unreachable"});
+
+    // Neither a contact name nor an agent id.
+    for (method, path) in [
+        ("POST", "/peers/nobody/jsonrpc"),
+        ("POST", "/peers/nobody/rest/message:send"),
+        ("GET", "/peers/nobody/rest/tasks"),
+        ("GET", "/peers/nobody/.well-known/agent-card.json"),
+    ] {
+        let body =
+            (method == "POST").then(|| rpc_request("SendMessage", message_params("hola", None)));
+        let res =
+            gateway_request(&gw, method, path, &[("a2a-version", "1.0")], body.as_ref()).await;
+        assert_eq!(res.status, 404, "{path}: {}", res.json);
+        assert_eq!(res.json, unknown, "{path}");
+    }
+
+    // An agent id with no address known and no address lookup.
+    let stranger = AgentKey::generate();
+    let now = now_unix();
+    a.hold(&issue_grant(
+        &stranger,
+        a.id(),
+        stranger.id(),
+        &SEND_AND_READ,
+        now,
+        now + 3600,
+    ));
+    let res = gw_rpc(
+        &a,
+        &stranger.id().to_string(),
+        &[],
+        "SendMessage",
+        message_params("hola", None),
+    )
+    .await;
+    assert_eq!(res.status, 502, "{}", res.json);
+    assert_eq!(res.json, unreachable);
+
+    // Contacts saved for the stranger with another running agent's address,
+    // or with that agent's own ticket: that agent never answers for the
+    // stranger, card included.
+    let impostor = spawn_node(WorkerCfg::Echo).await;
+    let socket = *impostor.node.addr().ip_addrs().next().expect("an address");
+    let stranger_at_impostor =
+        EndpointTicket::new(EndpointAddr::new(endpoint_id_of(&stranger.id())).with_ip_addr(socket));
+    for (name, ticket) in [
+        ("stranger", stranger_at_impostor.to_string()),
+        ("mallory", impostor.node.ticket()),
+    ] {
+        a.node
+            .store
+            .contact_put(&Contact {
+                name: name.to_owned(),
+                agent_id: stranger.id(),
+                ticket: Some(ticket),
+                added_at: now,
+            })
+            .unwrap();
+        let rpc = gw_rpc(&a, name, &[], "SendMessage", message_params("hola", None)).await;
+        let card = gateway_request(
+            &gw,
+            "GET",
+            &format!("/peers/{name}/.well-known/agent-card.json"),
+            &[],
+            None,
+        )
+        .await;
+        for res in [rpc, card] {
+            assert_eq!(res.status, 502, "{name}: {}", res.json);
+            assert_eq!(res.json, unreachable, "{name}");
+        }
+    }
+    assert_eq!(
+        impostor.node.store.events_count("task.accepted").unwrap(),
+        0
+    );
+
+    // A contact whose daemon has stopped: nothing answers at its address.
+    let TestNode { node, dir: _dir } = b;
+    node.shutdown().await.unwrap();
+    let started = Instant::now();
+    let (rpc, card) = tokio::join!(
+        gw_rpc(&a, "bob", &[], "SendMessage", message_params("hola", None)),
+        gateway_request(
+            &gw,
+            "GET",
+            "/peers/bob/.well-known/agent-card.json",
+            &[],
+            None
+        ),
+    );
+    for res in [rpc, card] {
+        assert_eq!(res.status, 502, "{}", res.json);
+        assert_eq!(res.json, unreachable);
+    }
+    assert!(started.elapsed() < Duration::from_secs(20));
+}
+
+#[tokio::test]
+async fn request_with_origin_header_is_403() {
+    let (a, b, _) = connected_pair().await;
+    let gw = a.gateway_url();
+
+    // Without Origin, the health check answers.
+    let res = gateway_request(&gw, "GET", "/healthz", &[], None).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(
+        res.json,
+        json!({"agent_id": a.id().to_string(), "name": "pals", "ticket": a.node.ticket()})
+    );
+
+    for origin in ["http://evil.example", "null", &gw] {
+        let headers = [("origin", origin), ("a2a-version", "1.0")];
+        for (method, path) in [
+            ("GET", "/healthz".to_owned()),
+            (
+                "GET",
+                format!("/peers/{}/.well-known/agent-card.json", b.id()),
+            ),
+            ("POST", "/peers/bob/jsonrpc".to_owned()),
+            ("POST", "/peers/bob/rest/message:send".to_owned()),
+            ("GET", "/no/such/route".to_owned()),
+        ] {
+            let body = (method == "POST")
+                .then(|| rpc_request("SendMessage", message_params("hola", None)));
+            let res = gateway_request(&gw, method, &path, &headers, body.as_ref()).await;
+            assert_eq!(res.status, 403, "{origin} {path}: {}", res.json);
+        }
+    }
+    assert_eq!(b.node.store.events_count("task.accepted").unwrap(), 0);
+}
+
+#[tokio::test]
+async fn request_with_foreign_host_header_is_403() {
+    let (a, b, _) = connected_pair().await;
+    let gw = a.gateway_url();
+    let port = gw.rsplit(':').next().unwrap().to_owned();
+    let other_port = if port == "7420" { "7421" } else { "7420" };
+
+    for host in [
+        "evil.example:7420".to_owned(),
+        format!("evil.example:{port}"),
+        format!("127.0.0.1:{other_port}"),
+        format!("localhost.evil.example:{port}"),
+        "127.0.0.1".to_owned(),
+    ] {
+        let headers = [("host", host.as_str()), ("a2a-version", "1.0")];
+        for (method, path) in [
+            ("GET", "/healthz".to_owned()),
+            (
+                "GET",
+                format!("/peers/{}/.well-known/agent-card.json", b.id()),
+            ),
+            ("POST", "/peers/bob/jsonrpc".to_owned()),
+            ("POST", "/peers/bob/rest/message:send".to_owned()),
+        ] {
+            let body = (method == "POST")
+                .then(|| rpc_request("SendMessage", message_params("hola", None)));
+            let res = gateway_request(&gw, method, &path, &headers, body.as_ref()).await;
+            assert_eq!(res.status, 403, "{host} {path}: {}", res.json);
+        }
+    }
+    assert_eq!(b.node.store.events_count("task.accepted").unwrap(), 0);
+
+    // The loopback names of the gateway's own port are accepted.
+    for host in [
+        format!("127.0.0.1:{port}"),
+        format!("localhost:{port}"),
+        format!("LOCALHOST:{port}"),
+        format!("[::1]:{port}"),
+    ] {
+        let res = gateway_request(&gw, "GET", "/healthz", &[("host", host.as_str())], None).await;
+        assert_eq!(res.status, 200, "{host}: {}", res.json);
+    }
+}
+
+#[tokio::test]
+async fn contact_name_and_agent_id_address_the_same_peer() {
+    let (a, b, _) = connected_pair().await;
+    let gw = a.gateway_url();
+    let b_id = b.id().to_string();
+
+    let res = gw_rpc(&a, "bob", &[], "SendMessage", message_params("hola", None)).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let id = res.json["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // The task belongs to `a` at `b`, whichever name reaches it.
+    let res = gw_rpc(&a, &b_id, &[], "GetTask", json!({"id": id})).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["result"]["id"], id.as_str());
+    assert_eq!(
+        res.json["result"]["status"]["state"],
+        "TASK_STATE_COMPLETED"
+    );
+    let res = gw_rpc(&a, &b_id, &[], "ListTasks", json!({})).await;
+    let tasks = res.json["result"]["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 1, "{}", res.json);
+    assert_eq!(tasks[0]["id"], id.as_str());
+
+    let by_name = gateway_request(
+        &gw,
+        "GET",
+        "/peers/bob/.well-known/agent-card.json",
+        &[],
+        None,
+    )
+    .await;
+    let by_id = gateway_request(
+        &gw,
+        "GET",
+        &format!("/peers/{b_id}/.well-known/agent-card.json"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(by_name.status, 200, "{}", by_name.json);
+    assert_eq!(by_name.json, by_id.json);
+}
+
+/// What `pals grant issue` grants unless told otherwise.
+const DEFAULT_OPS: [Operation; 3] = [TaskSend, TaskRead, TaskCancel];
+
+/// An agent run by the `pals` binary, on its own `PALS_HOME`.
+struct CliAgent {
+    home: tempfile::TempDir,
+    port: u16,
+}
+
+impl CliAgent {
+    /// `pals init` on a fresh home, then a configuration with the gateway on
+    /// a free loopback port and no relay.
+    fn init(name: &str) -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let agent = Self {
+            port: free_port(),
+            home,
+        };
+        agent.run(&["init"]);
+        std::fs::write(
+            agent.home.path().join("config.toml"),
+            format!(
+                "[agent]\nname = \"{name}\"\n\n[gateway]\nlisten = \"127.0.0.1:{}\"\n\n\
+                 [net]\nrelay = false\n",
+                agent.port
+            ),
+        )
+        .unwrap();
+        agent
+    }
+
+    fn cmd(&self, args: &[&str]) -> assert_cmd::Command {
+        let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("pals");
+        cmd.env("PALS_HOME", self.home.path()).args(args);
+        cmd
+    }
+
+    /// `pals <args>`, which must succeed; its standard output.
+    fn run(&self, args: &[&str]) -> String {
+        let output = self
+            .cmd(args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(output).unwrap()
+    }
+
+    /// `pals <args>`, which must fail; its standard error.
+    fn fail(&self, args: &[&str]) -> String {
+        let output = self
+            .cmd(args)
+            .assert()
+            .failure()
+            .get_output()
+            .stderr
+            .clone();
+        String::from_utf8(output).unwrap()
+    }
+
+    fn id(&self) -> AgentId {
+        self.run(&["id"]).trim().parse().unwrap()
+    }
+
+    fn gateway_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    fn store(&self) -> Store {
+        Store::open(&self.home.path().join("pals.db"), self.id()).unwrap()
+    }
+
+    /// Starts `pals daemon` and waits until its gateway answers.
+    async fn start_daemon(&self) -> Daemon {
+        let log = self.home.path().join("daemon.log");
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_pals"))
+            .arg("daemon")
+            .env("PALS_HOME", self.home.path())
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(self.home.path().join("daemon.out")).unwrap())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .expect("start pals daemon");
+        let mut daemon = Daemon { child, log };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if tokio::net::TcpStream::connect(("127.0.0.1", self.port))
+                .await
+                .is_ok()
+            {
+                return daemon;
+            }
+            if let Some(status) = daemon.child.try_wait().unwrap() {
+                panic!("pals daemon exited with {status}: {}", daemon.log_text());
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pals daemon did not start: {}",
+                daemon.log_text()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// A `pals daemon` process, killed if it is still running when dropped.
+struct Daemon {
+    child: Child,
+    log: PathBuf,
+}
+
+impl Daemon {
+    fn log_text(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// Stops the daemon with SIGTERM; it must exit successfully.
+    async fn stop(mut self) {
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "pals daemon ignored SIGTERM");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(status.success(), "{status}: {}", self.log_text());
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A loopback port that was free a moment ago.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// `SendMessage` to `peer` through the gateway at `gateway`.
+async fn ask_through(gateway: &str, peer: &str) -> TestResponse {
+    gateway_request(
+        gateway,
+        "POST",
+        &format!("/peers/{peer}/jsonrpc"),
+        &[("a2a-version", "1.0")],
+        Some(&rpc_request("SendMessage", message_params("hola", None))),
+    )
+    .await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn grant_cli_issue_import_revoke_roundtrip() {
+    let alice = CliAgent::init("alice");
+    let bob = CliAgent::init("bob");
+    let (alice_id, bob_id) = (alice.id(), bob.id());
+
+    // Without a running daemon there is no ticket to give.
+    let err = bob.fail(&["id", "--ticket"]);
+    assert!(err.contains("pals daemon"), "{err}");
+
+    let alice_daemon = alice.start_daemon().await;
+    let bob_daemon = bob.start_daemon().await;
+
+    // Contacts, from each other's tickets.
+    let alice_ticket = alice.run(&["id", "--ticket"]).trim().to_owned();
+    let bob_ticket = bob.run(&["id", "--ticket"]).trim().to_owned();
+    alice.run(&["contact", "add", &bob_ticket, "--name", "bob"]);
+    bob.run(&["contact", "add", &alice_ticket, "--name", "alice"]);
+    let contacts = alice.run(&["contact", "ls"]);
+    assert!(contacts.contains("bob"), "{contacts}");
+    assert!(contacts.contains(&bob_id.to_string()), "{contacts}");
+    let err = alice.fail(&["contact", "add", "not-a-ticket", "--name", "x"]);
+    assert!(err.contains("ticket"), "{err}");
+
+    // Without a grant, bob's gateway refuses locally.
+    let res = ask_through(&bob.gateway_url(), "alice").await;
+    assert_eq!(res.status, 401, "{}", res.json);
+
+    // Alice issues bob a grant with the defaults.
+    let token = alice.run(&["grant", "issue", "--to", "bob", "--project", "demo"]);
+    let token = token.trim();
+    let g = SignedGrant::from_token(token).expect("a valid grant token");
+    assert_eq!(g.grant.issuer, alice_id);
+    assert_eq!(g.grant.subject, bob_id);
+    assert_eq!(g.grant.audience, alice_id);
+    assert_eq!(g.grant.project, "demo");
+    assert_eq!(g.grant.operations, DEFAULT_OPS);
+    assert_eq!(g.grant.resources, ["skill:ask"]);
+    let issued_at = pals_core::grant::parse_timestamp(&g.grant.issued_at).unwrap();
+    let expires_at = pals_core::grant::parse_timestamp(&g.grant.expires_at).unwrap();
+    assert_eq!(expires_at - issued_at, 24 * 3600);
+    let grant_id = g.grant.grant_id.clone();
+
+    // Only bob can import it, and only as signed.
+    let err = alice.fail(&["grant", "import", token]);
+    assert!(err.contains("subject"), "{err}");
+    let mut forged = g.clone();
+    forged.grant.project = "other".to_owned();
+    let err = bob.fail(&["grant", "import", &forged.to_token()]);
+    assert!(err.contains("signature"), "{err}");
+    bob.run(&["grant", "import", token]);
+    let held = bob.run(&["grant", "ls", "--held"]);
+    assert!(held.contains(&grant_id), "{held}");
+    let issued = alice.run(&["grant", "ls", "--issued"]);
+    assert!(issued.contains(&grant_id), "{issued}");
+    let all = alice.run(&["grant", "ls"]);
+    assert!(all.contains(&grant_id), "{all}");
+
+    // Bob's gateway now presents it, and alice answers.
+    let res = ask_through(&bob.gateway_url(), "alice").await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(
+        res.json["result"]["task"]["status"]["state"],
+        "TASK_STATE_COMPLETED"
+    );
+
+    // Revoked, the grant stops working on the next request.
+    alice.run(&["grant", "revoke", &grant_id]);
+    let res = ask_through(&bob.gateway_url(), "alice").await;
+    assert_eq!(res.status, 401, "{}", res.json);
+    assert!(
+        res.header("www-authenticate").contains("revoked"),
+        "{}",
+        res.header("www-authenticate")
+    );
+    let issued = alice.run(&["grant", "ls", "--issued"]);
+    assert!(issued.contains("revoked"), "{issued}");
+    let err = alice.fail(&["grant", "revoke", "no-such-grant"]);
+    assert!(err.contains("no-such-grant"), "{err}");
+
+    // Both are logged, with ids only.
+    let store = alice.store();
+    assert_eq!(store.events_count("grant.issued").unwrap(), 1);
+    assert_eq!(store.events_count("grant.revoked").unwrap(), 1);
+    let events = store.events_since(&alice_id, 0).unwrap();
+    let issued_event = events.iter().find(|e| e.kind == "grant.issued").unwrap();
+    assert_eq!(issued_event.payload["grant_id"], grant_id.as_str());
+    assert!(issued_event.payload.get("token").is_none());
+    let revoked_event = events.iter().find(|e| e.kind == "grant.revoked").unwrap();
+    assert_eq!(revoked_event.payload, json!({"grant_id": grant_id}));
+
+    // What `grant issue` refuses before signing.
+    for (args, expected) in [
+        (vec!["--project", "diseño"], "project"),
+        (vec!["--project", "two words"], "project"),
+        (vec!["--project", ""], "project"),
+        (vec!["--project", "demo", "--ttl", "0h"], "ttl"),
+        (vec!["--project", "demo", "--ttl", "soon"], "ttl"),
+        (vec!["--project", "demo", "--ops", ""], "ops"),
+        (vec!["--project", "demo", "--ops", "task.fly"], "task.fly"),
+        (vec!["--project", "demo", "--resources", ""], "resources"),
+    ] {
+        let mut full = vec!["grant", "issue", "--to", "bob"];
+        full.extend(args);
+        let err = alice.fail(&full);
+        assert!(err.contains(expected), "{full:?}: {err}");
+    }
+    let err = alice.fail(&["grant", "issue", "--to", "nobody", "--project", "demo"]);
+    assert!(err.contains("nobody"), "{err}");
+    assert_eq!(store.events_count("grant.issued").unwrap(), 1);
+
+    // An explicit blob.fetch grant is possible, never a default.
+    let token = alice.run(&[
+        "grant",
+        "issue",
+        "--to",
+        "bob",
+        "--project",
+        "demo",
+        "--ops",
+        "blob.fetch",
+        "--resources",
+        "blob:*",
+        "--ttl",
+        "30m",
+    ]);
+    let g = SignedGrant::from_token(token.trim()).unwrap();
+    assert_eq!(g.grant.operations, [Operation::BlobFetch]);
+    assert_eq!(g.grant.resources, ["blob:*"]);
+
+    bob_daemon.stop().await;
+    alice_daemon.stop().await;
+}

@@ -17,6 +17,7 @@ blake3.workspace = true
 chrono.workspace = true
 clap.workspace = true
 futures.workspace = true
+getrandom.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["client", "http1", "server"] }
@@ -28,13 +29,24 @@ percent-encoding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "rt", "sync", "time"] }
+tokio = { workspace = true, features = [
+    "io-util",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
 toml.workspace = true
 tower = { workspace = true, features = ["util"] }
 tracing.workspace = true
 
 [dev-dependencies]
+# The stock A2A client, to talk to peers through the gateway as any client would.
+a2a-client.workspace = true
 assert_cmd.workspace = true
+rustls.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

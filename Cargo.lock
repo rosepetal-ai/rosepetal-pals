@@ -3,6 +3,29 @@
 version = 4
 
 [[package]]
+name = "a2a-client-lf"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd39a97ef9acc3fe4fa34169992117237046104ae479d0898d248ef70fcaa4fc"
+dependencies = [
+ "a2a-lf",
+ "a2a-pb",
+ "async-trait",
+ "auto_impl",
+ "bytes",
+ "futures",
+ "pin-project-lite",
+ "reqwest",
+ "semver",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "a2a-lf"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -247,6 +270,17 @@ dependencies = [
  "http",
  "log",
  "url",
+]
+
+[[package]]
+name = "auto_impl"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "683bf733a032aec4f8954e5c0ec9d5c2183c341c49d0939ad77acc0a19fa338a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -2452,6 +2486,7 @@ checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
 name = "pals"
 version = "0.1.0"
 dependencies = [
+ "a2a-client-lf",
  "a2a-lf",
  "a2a-server-lf",
  "anyhow",
@@ -2462,6 +2497,7 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
+ "getrandom 0.4.3",
  "http",
  "http-body-util",
  "hyper",
@@ -2470,6 +2506,7 @@ dependencies = [
  "iroh-tickets",
  "pals-core",
  "percent-encoding",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
