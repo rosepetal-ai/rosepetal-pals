@@ -10,18 +10,25 @@ repository.workspace = true
 [dependencies]
 a2a.workspace = true
 a2a-server.workspace = true
+anyhow.workspace = true
 axum.workspace = true
+clap.workspace = true
 futures.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["client", "http1", "server"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 iroh.workspace = true
+pals-core.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "rt", "sync", "time"] }
+toml.workspace = true
 tower = { workspace = true, features = ["util"] }
 tracing.workspace = true
 
 [dev-dependencies]
+assert_cmd.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

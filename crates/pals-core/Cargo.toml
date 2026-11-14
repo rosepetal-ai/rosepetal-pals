@@ -8,3 +8,13 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# Only to check that an AgentId is byte for byte Iroh's EndpointId.
+iroh.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

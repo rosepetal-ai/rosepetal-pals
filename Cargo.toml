@@ -19,14 +19,26 @@ a2a-server = { package = "a2a-server-lf", version = "=0.5.3", default-features =
 a2a-client = { package = "a2a-client-lf", version = "=0.2.9", default-features = false }
 rmcp = "=3.10.0"
 
+pals-core = { path = "crates/pals-core" }
+
+anyhow = "=1.0.104"
 axum = "0.8"
+clap = { version = "=4.6.7", features = ["derive"] }
+ed25519-dalek = "=3.0.0"
 futures = "0.3"
+getrandom = "=0.4.3"
 http = "1"
 http-body-util = "0.1"
 hyper = "1"
 hyper-util = "0.1"
+serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = "1"
+toml = "=1.2.1"
 tower = "0.5"
 tracing = "0.1"
+
+# Test-only.
+assert_cmd = "=2.2.2"
+tempfile = "=3.27.0"
