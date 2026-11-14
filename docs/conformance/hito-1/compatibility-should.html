@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>A2A TCK Compatibility Report</title>
+<style>
+body { font-family: sans-serif; margin: 2em; color: #222; }
+h1, h2 { margin-top: 1.5em; }
+.section { margin-bottom: 2em; }
+.overall { font-size: 2.5em; font-weight: bold; margin: 0.3em 0; }
+table { border-collapse: collapse; width: 100%; margin-top: 0.5em; }
+th, td { border: 1px solid #ccc; padding: 6px 10px; text-align: left; }
+th { background: #f5f5f5; }
+.pass { background: #d4edda; color: #155724; }
+.fail { background: #f8d7da; color: #721c24; }
+.skipped { background: #e2e3e5; color: #383d41; }
+.manual { background: #fff3cd; color: #664d03; }
+.not-tested { background: #cce5ff; color: #004085; }
+.bar { background: #e9ecef; border-radius: 4px; height: 18px; width: 100%; }
+.bar-fill { background: #28a745; height: 100%; border-radius: 4px; }
+td a { color: inherit; text-decoration: underline; }
+.error-list { margin: 0; padding-left: 1.2em; list-style: disc; }
+.error-list li { margin: 2px 0; }
+.test-id { font-family: monospace; font-size: 0.85em; }
+.agent-card { background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 4px; padding: 1em; overflow-x: auto; font-size: 0.85em; }
+details summary { cursor: pointer; }
+</style>
+</head>
+<body>
+<div class="section">
+<h1>Executive Summary</h1>
+<p>Automated checks only. Pending manual obligations require separate verification.</p>
+<p>Pending manual verification: 9 (CARD-CLIENT-001, CARD-SIGN-001, CARD-SIGN-002, CARD-SIGN-003, CARD-SIGN-004, AUTH-TLS-001, AUTH-TLS-002, AUTH-SERVER-001, BIND-CUSTOM-002)</p>
+<div class="overall">2.5%</div>
+<table class="summary-table">
+<tr><th>Level</th><th>Compatibility</th></tr>
+<tr><td>MUST</td><td>0.0%</td></tr>
+<tr><td>SHOULD</td><td>37.5%</td></tr>
+<tr><td>MAY</td><td>0.0%</td></tr>
+</table>
+<p>Timestamp: 2026-11-14T09:31:29.878789+00:00</p>
+<p>SUT URL: <a href="http://127.0.0.1:39219/peers/540de99b35cc96e13f813af209d8e86fab9c0a83575cdf76afe45c848fd2f0bb">http://127.0.0.1:39219/peers/540de99b35cc96e13f813af209d8e86fab9c0a83575cdf76afe45c848fd2f0bb</a></p>
+<p>SUT Version: 0.1.0</p>
+</div>
+<div class="section">
+<details>
+<summary><h2 style="display:inline">Agent Card</h2></summary>
+<pre class="agent-card">{
+  &quot;name&quot;: &quot;pals-tck-provider&quot;,
+  &quot;description&quot;: &quot;PALS agent for the A2A TCK run (tck adapter)&quot;,
+  &quot;version&quot;: &quot;0.1.0&quot;,
+  &quot;supportedInterfaces&quot;: [
+    {
+      &quot;url&quot;: &quot;http://127.0.0.1:39219/peers/540de99b35cc96e13f813af209d8e86fab9c0a83575cdf76afe45c848fd2f0bb/jsonrpc&quot;,
+      &quot;protocolBinding&quot;: &quot;JSONRPC&quot;,
+      &quot;protocolVersion&quot;: &quot;1.0&quot;
+    },
+    {
+      &quot;url&quot;: &quot;http://127.0.0.1:39219/peers/540de99b35cc96e13f813af209d8e86fab9c0a83575cdf76afe45c848fd2f0bb/rest&quot;,
+      &quot;protocolBinding&quot;: &quot;HTTP+JSON&quot;,
+      &quot;protocolVersion&quot;: &quot;1.0&quot;
+    }
+  ],
+  &quot;capabilities&quot;: {
+    &quot;streaming&quot;: true,
+    &quot;pushNotifications&quot;: false,
+    &quot;extendedAgentCard&quot;: false
+  },
+  &quot;defaultInputModes&quot;: [
+    &quot;text/plain&quot;,
+    &quot;*/*&quot;
+  ],
+  &quot;defaultOutputModes&quot;: [
+    &quot;text/plain&quot;,
+    &quot;application/octet-stream&quot;
+  ],
+  &quot;skills&quot;: [
+    {
+      &quot;id&quot;: &quot;ask&quot;,
+      &quot;name&quot;: &quot;Ask&quot;,
+      &quot;description&quot;: &quot;Answers a question with the context of one authorized project.&quot;,
+      &quot;tags&quot;: [
+        &quot;ask&quot;
+      ]
+    }
+  ]
+}</pre>
+</details>
+</div>
+<div class="section">
+<h2>Per-Requirement Results</h2>
+<table class="req-table">
+<tr><th>Requirement</th><th>Level</th><th>Status</th><th>agent_card</th><th>grpc</th><th>http_json</th><th>jsonrpc</th><th>Test</th><th>Errors</th></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#58-custom-binding-identification">BIND-CUSTOM-001</a></td><td>SHOULD</td><td class="skipped">SKIPPED</td><td class="skipped">SKIPPED</td><td></td><td></td><td></td><td><a class="test-id" href="tck_report.html#tests/compatibility/agent_card/test_agent_card.py::TestCustomBindingIdentifiers::test_custom_binding_identifiers_are_uris" title="tests/compatibility/agent_card/test_agent_card.py::TestCustomBindingIdentifiers::test_custom_binding_identifiers_are_uris">TestCustomBindingIdentifiers::test_custom_binding_identifiers_are_uris</a></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#861-server-requirements">CARD-CACHE-001</a></td><td>SHOULD</td><td class="fail">FAIL</td><td class="fail">FAIL</td><td></td><td></td><td></td><td><a class="test-id" href="tck_report.html#tests/compatibility/agent_card/test_agent_card_caching.py::TestAgentCardCacheControl::test_cache_control_has_max_age" title="tests/compatibility/agent_card/test_agent_card_caching.py::TestAgentCardCacheControl::test_cache_control_has_max_age">TestAgentCardCacheControl::test_cache_control_has_max_age</a><br><a class="test-id" href="tck_report.html#tests/compatibility/agent_card/test_agent_card_caching.py::TestAgentCardCacheControl::test_cache_control_present" title="tests/compatibility/agent_card/test_agent_card_caching.py::TestAgentCardCacheControl::test_cache_control_present">TestAgentCardCacheControl::test_cache_control_present</a></td><td><ul class="error-list"><li><strong>agent_card</strong>: Agent Card response should include a Cache-Control header</li><li><strong>agent_card</strong>: Cache-Control should include max-age directive, got: &#x27;&#x27;</li></ul></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#861-server-requirements">CARD-CACHE-002</a></td><td>SHOULD</td><td class="fail">FAIL</td><td class="fail">FAIL</td><td></td><td></td><td></td><td><a class="test-id" href="tck_report.html#tests/compatibility/agent_card/test_agent_card_caching.py::TestAgentCardETag::test_etag_present" title="tests/compatibility/agent_card/test_agent_card_caching.py::TestAgentCardETag::test_etag_present">TestAgentCardETag::test_etag_present</a></td><td><ul class="error-list"><li><strong>agent_card</strong>: Agent Card response should include an ETag header</li></ul></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#57-field-presence-and-optionality">DM-SERIAL-005</a></td><td>SHOULD</td><td class="pass">PASS</td><td></td><td></td><td class="pass">PASS</td><td class="pass">PASS</td><td><a class="test-id" href="tck_report.html#tests/compatibility/core_operations/test_data_model.py::TestIgnoreUnrecognizedFields::test_extra_fields_ignored_jsonrpc" title="tests/compatibility/core_operations/test_data_model.py::TestIgnoreUnrecognizedFields::test_extra_fields_ignored_jsonrpc">TestIgnoreUnrecognizedFields::test_extra_fields_ignored_jsonrpc</a><br><a class="test-id" href="tck_report.html#tests/compatibility/core_operations/test_data_model.py::TestIgnoreUnrecognizedFields::test_extra_fields_ignored_rest" title="tests/compatibility/core_operations/test_data_model.py::TestIgnoreUnrecognizedFields::test_extra_fields_ignored_rest">TestIgnoreUnrecognizedFields::test_extra_fields_ignored_rest</a></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#324-history-length-semantics">CORE-HIST-001</a></td><td>SHOULD</td><td class="pass">PASS</td><td></td><td class="skipped">SKIPPED</td><td></td><td class="pass">PASS</td><td><a class="test-id" href="tck_report.html#tests/compatibility/core_operations/test_task_history.py::TestHistoryLengthZeroGetTask::test_get_task_history_length_zero[grpc]" title="tests/compatibility/core_operations/test_task_history.py::TestHistoryLengthZeroGetTask::test_get_task_history_length_zero[grpc]">TestHistoryLengthZeroGetTask::test_get_task_history_length_zero[grpc]</a><br><a class="test-id" href="tck_report.html#tests/compatibility/core_operations/test_task_history.py::TestHistoryLengthZeroGetTask::test_get_task_history_length_zero[jsonrpc]" title="tests/compatibility/core_operations/test_task_history.py::TestHistoryLengthZeroGetTask::test_get_task_history_length_zero[jsonrpc]">TestHistoryLengthZeroGetTask::test_get_task_history_length_zero[jsonrpc]</a></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#324-history-length-semantics">CORE-HIST-003</a></td><td>SHOULD</td><td class="skipped">SKIPPED</td><td></td><td class="skipped">SKIPPED</td><td></td><td></td><td><a class="test-id" href="tck_report.html#tests/compatibility/core_operations/test_task_history.py::TestHistoryLengthZeroSendMessage::test_send_message_history_length_zero[grpc]" title="tests/compatibility/core_operations/test_task_history.py::TestHistoryLengthZeroSendMessage::test_send_message_history_length_zero[grpc]">TestHistoryLengthZeroSendMessage::test_send_message_history_length_zero[grpc]</a></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#324-history-length-semantics">CORE-HIST-005</a></td><td>SHOULD</td><td class="skipped">SKIPPED</td><td></td><td class="skipped">SKIPPED</td><td></td><td></td><td><a class="test-id" href="tck_report.html#tests/compatibility/core_operations/test_task_history.py::TestHistoryOrdering::test_history_messages_in_chronological_order[grpc]" title="tests/compatibility/core_operations/test_task_history.py::TestHistoryOrdering::test_history_messages_in_chronological_order[grpc]">TestHistoryOrdering::test_history_messages_in_chronological_order[grpc]</a></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#324-history-length-semantics">CORE-HIST-006</a></td><td>SHOULD</td><td class="skipped">SKIPPED</td><td></td><td class="skipped">SKIPPED</td><td></td><td></td><td><a class="test-id" href="tck_report.html#tests/compatibility/core_operations/test_task_history.py::TestHistoryContent::test_history_content_matches_sent_messages[grpc]" title="tests/compatibility/core_operations/test_task_history.py::TestHistoryContent::test_history_content_matches_sent_messages[grpc]">TestHistoryContent::test_history_content_matches_sent_messages[grpc]</a></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#111-protocol-requirements">HTTP_JSON-SVC-001</a></td><td>SHOULD</td><td class="fail">FAIL</td><td></td><td></td><td class="fail">FAIL</td><td></td><td><a class="test-id" href="tck_report.html#tests/compatibility/core_operations/test_transport_behavior.py::TestRestFormat::test_response_content_type" title="tests/compatibility/core_operations/test_transport_behavior.py::TestRestFormat::test_response_content_type">TestRestFormat::test_response_content_type</a><br><a class="test-id" href="tck_report.html#tests/compatibility/http_json/test_problem_details.py::TestHttpJsonErrorMediaType::test_error_content_type" title="tests/compatibility/http_json/test_problem_details.py::TestHttpJsonErrorMediaType::test_error_content_type">TestHttpJsonErrorMediaType::test_error_content_type</a></td><td><ul class="error-list"><li><strong>http_json</strong>: Error Content-Type should be application/a2a+json</li></ul></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#95-error-handling">JSONRPC-ERR-003</a></td><td>SHOULD</td><td class="pass">PASS</td><td></td><td></td><td></td><td class="pass">PASS</td><td><a class="test-id" href="tck_report.html#tests/compatibility/jsonrpc/test_error_info.py::TestJsonRpcWellKnownErrorDetails::test_error_data_uses_well_known_type" title="tests/compatibility/jsonrpc/test_error_info.py::TestJsonRpcWellKnownErrorDetails::test_error_data_uses_well_known_type">TestJsonRpcWellKnownErrorDetails::test_error_data_uses_well_known_type</a></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#311-send-message">CORE-SEND-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#311-send-message">CORE-SEND-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#311-send-message">CORE-SEND-003</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#312-send-streaming-message">CORE-STREAM-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#312-send-streaming-message">CORE-STREAM-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#312-send-streaming-message">CORE-STREAM-003</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#313-get-task">CORE-GET-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#313-get-task">CORE-GET-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#314-list-tasks">CORE-LIST-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#314-list-tasks">CORE-LIST-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#314-list-tasks">CORE-LIST-003</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#314-list-tasks">CORE-LIST-004</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#314-list-tasks">CORE-LIST-005</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#315-cancel-task">CORE-CANCEL-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#315-cancel-task">CORE-CANCEL-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#315-cancel-task">CORE-CANCEL-003</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#322-sendmessageconfiguration">CORE-EXECUTION-MODE-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#322-sendmessageconfiguration">CORE-EXECUTION-MODE-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#332-error-handling">CORE-ERR-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#332-error-handling">CORE-ERR-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#334-capability-validation">CORE-CAP-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#334-capability-validation">CORE-CAP-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#334-capability-validation">CORE-CAP-003</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#334-capability-validation">CORE-CAP-004</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#341-context-identifier-semantics">CORE-MULTI-001</a></td><td>MAY</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#341-context-identifier-semantics">CORE-MULTI-001a</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#341-context-identifier-semantics">CORE-MULTI-002</a></td><td>MAY</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#341-context-identifier-semantics">CORE-MULTI-002a</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#342-task-identifier-semantics">CORE-MULTI-003</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#342-task-identifier-semantics">CORE-MULTI-004</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#343-multi-turn-conversation-patterns">CORE-MULTI-005</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#343-multi-turn-conversation-patterns">CORE-MULTI-006</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#324-history-length-semantics">CORE-HIST-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#324-history-length-semantics">CORE-HIST-004</a></td><td>MAY</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#411-task">DM-TASK-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#413-taskstate">DM-TASK-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#414-message">DM-MSG-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#415-role">DM-MSG-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#416-part">DM-PART-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#417-artifact">DM-ART-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#412-taskstatus">DM-STATUS-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#55-json-field-naming-convention">DM-SERIAL-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#55-json-field-naming-convention">DM-SERIAL-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#561-timestamps">DM-SERIAL-003</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#57-field-presence-and-optionality">DM-SERIAL-004</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#352-streaming-event-delivery">STREAM-ORDER-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#352-streaming-event-delivery">STREAM-ORDER-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#352-streaming-event-delivery">STREAM-ORDER-003</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#352-streaming-event-delivery">STREAM-ORDER-004</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#316-subscribe-to-task">STREAM-SUB-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#316-subscribe-to-task">STREAM-SUB-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#316-subscribe-to-task">STREAM-SUB-003</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#316-subscribe-to-task">STREAM-SUB-004</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#317-create-push-notification-config">PUSH-CREATE-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#317-create-push-notification-config">PUSH-CREATE-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#318-get-push-notification-config">PUSH-GET-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#318-get-push-notification-config">PUSH-GET-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#319-list-push-notification-configs">PUSH-LIST-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#3110-delete-push-notification-config">PUSH-DEL-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#3110-delete-push-notification-config">PUSH-DEL-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#433-push-notification-payload">PUSH-DELIVER-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#433-push-notification-payload">PUSH-DELIVER-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#433-push-notification-payload">PUSH-DELIVER-003</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#81-purpose">CARD-DISC-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#83-protocol-declaration-requirements">CARD-PROTO-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#831-supported-interfaces-declaration">CARD-PROTO-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#832-client-protocol-selection">CARD-CLIENT-001</a></td><td>MUST</td><td class="manual">MANUAL</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#441-agentcard">CARD-STRUCT-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#3111-get-extended-agent-card">CARD-EXT-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#3111-get-extended-agent-card">CARD-EXT-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#841-canonicalization-requirements">CARD-SIGN-001</a></td><td>MUST</td><td class="manual">MANUAL</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#841-canonicalization-requirements">CARD-SIGN-002</a></td><td>MUST</td><td class="manual">MANUAL</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#842-signature-format">CARD-SIGN-003</a></td><td>MUST</td><td class="manual">MANUAL</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#843-signature-verification">CARD-SIGN-004</a></td><td>MUST</td><td class="manual">MANUAL</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#861-server-requirements">CARD-CACHE-003</a></td><td>MAY</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#71-protocol-security">AUTH-TLS-001</a></td><td>MUST</td><td class="manual">MANUAL</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#71-protocol-security">AUTH-TLS-002</a></td><td>SHOULD</td><td class="manual">MANUAL</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#72-server-identity-verification">AUTH-SERVER-001</a></td><td>SHOULD</td><td class="manual">MANUAL</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#74-server-authentication-responsibilities">AUTH-SERVER-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#761-in-task-authorization-agent-responsibilities">AUTH-INTASK-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#761-in-task-authorization-agent-responsibilities">AUTH-INTASK-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#761-in-task-authorization-agent-responsibilities">AUTH-INTASK-003</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#761-in-task-authorization-agent-responsibilities">AUTH-INTASK-004</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#761-in-task-authorization-agent-responsibilities">AUTH-INTASK-005</a></td><td>SHOULD</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#761-in-task-authorization-agent-responsibilities">AUTH-INTASK-006</a></td><td>SHOULD</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#131-data-access-and-authorization-scoping">AUTH-SCOPE-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#131-data-access-and-authorization-scoping">AUTH-SCOPE-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#332-error-handling">AUTH-SCOPE-003</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#361-client-responsibilities">VER-CLIENT-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#362-server-responsibilities">VER-SERVER-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#362-server-responsibilities">VER-SERVER-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#362-server-responsibilities">VER-SERVER-003</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#36-versioning">VER-CLIENT-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#58-custom-binding-identification">BIND-CUSTOM-002</a></td><td>MUST</td><td class="manual">MANUAL</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#51-functional-equivalence-requirements">BIND-EQUIV-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#51-functional-equivalence-requirements">BIND-EQUIV-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#51-functional-equivalence-requirements">BIND-EQUIV-003</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#51-functional-equivalence-requirements">BIND-EQUIV-004</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#52-protocol-selection-and-negotiation">BIND-FIELD-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#91-protocol-requirements">JSONRPC-FMT-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#91-protocol-requirements">JSONRPC-FMT-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#91-protocol-requirements">JSONRPC-SVC-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#92-service-parameter-transmission">JSONRPC-SVC-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#95-error-handling">JSONRPC-ERR-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#95-error-handling">JSONRPC-ERR-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#942-sendstreamingmessage">JSONRPC-SSE-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#54-error-code-mappings">JSONRPC-SSE-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#101-protocol-requirements">GRPC-SVC-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#101-protocol-requirements">GRPC-SVC-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#101-protocol-requirements">GRPC-SVC-003</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#102-service-parameter-transmission">GRPC-META-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#106-error-handling">GRPC-ERR-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#54-error-code-mappings">GRPC-ERR-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#107-streaming">GRPC-ERR-003</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#113-url-patterns-and-http-methods">HTTP_JSON-URL-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#113-url-patterns-and-http-methods">HTTP_JSON-URL-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#112-service-parameter-transmission">HTTP_JSON-SVC-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#115-query-parameter-naming-for-request-parameters">HTTP_JSON-QP-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#116-error-handling">HTTP_JSON-ERR-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#116-error-handling">HTTP_JSON-ERR-002</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#54-error-code-mappings">HTTP_JSON-STATUS-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#114-requestresponse-format">HTTP_JSON-FMT-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td><a href="https://github.com/a2aproject/A2A/blob/3303592588e388e62e0f69f701af531d2f4e3991/docs/specification.md#117-streaming">HTTP_JSON-SSE-001</a></td><td>MUST</td><td class="not-tested">NOT TESTED</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+</table>
+</div>
+<div class="section">
+<h2>Per-Transport Summary</h2>
+<table>
+<tr><th>Transport</th><th>Passed</th><th>Failed</th><th>Skipped</th><th>Total</th><th>Progress</th></tr>
+<tr><td>agent_card</td><td>0</td><td>3</td><td>1</td><td>4</td><td><div class="bar"><div class="bar-fill" style="width:0%"></div></div></td></tr>
+<tr><td>jsonrpc</td><td>3</td><td>0</td><td>0</td><td>3</td><td><div class="bar"><div class="bar-fill" style="width:100%"></div></div></td></tr>
+<tr><td>http_json</td><td>2</td><td>1</td><td>0</td><td>3</td><td><div class="bar"><div class="bar-fill" style="width:67%"></div></div></td></tr>
+<tr><td>grpc</td><td>0</td><td>0</td><td>4</td><td>4</td><td><div class="bar"><div class="bar-fill" style="width:0%"></div></div></td></tr>
+</table>
+</div>
+<div class="section">
+<h2>Failed Tests</h2>
+<ul>
+<li><strong>CARD-CACHE-001</strong> [SHOULD]: <ul class="error-list"><li><strong>agent_card</strong>: Agent Card response should include a Cache-Control header</li><li><strong>agent_card</strong>: Cache-Control should include max-age directive, got: &#x27;&#x27;</li></ul></li>
+<li><strong>CARD-CACHE-002</strong> [SHOULD]: <ul class="error-list"><li><strong>agent_card</strong>: Agent Card response should include an ETag header</li></ul></li>
+<li><strong>HTTP_JSON-SVC-001</strong> [SHOULD]: <ul class="error-list"><li><strong>http_json</strong>: Error Content-Type should be application/a2a+json</li></ul></li>
+</ul>
+</div>
+</body>
+</html>
