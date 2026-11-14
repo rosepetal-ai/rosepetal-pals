@@ -16,11 +16,16 @@
 //! end-to-end headers and the body, streamed; the response streams back the
 //! same way, Server-Sent Events included. The gateway drops the hop-by-hop
 //! headers, `Host` and any `x-agentnet-*` header the client sent, which only
-//! the peer's tunnel sets. When the request carries no `Authorization`, the
-//! gateway presents the newest unexpired grant it holds for the peer, and
-//! answers `401 {"error":"no grant held for <agent_id>"}` itself, without
-//! contacting the peer, when it holds none; a client's own `Authorization`
-//! passes intact.
+//! the peer's tunnel sets, and the cookies a peer sets: every peer shares the
+//! gateway's origin. A2A bindings never redirect, so a peer's `3xx` is a
+//! protocol error, and its `Location` never reaches the client.
+//!
+//! When the request carries no `Authorization`, the gateway presents the
+//! newest unexpired grant it holds for the peer that allows a task operation
+//! on `skill:ask`, and answers `401 {"error":"no grant held for <agent_id>"}`
+//! itself, without contacting the peer, when it holds none; a client's own
+//! `Authorization` passes intact. It does not choose between projects: the
+//! newest such grant wins.
 //!
 //! A `<peer>` that is neither a contact nor an agent id gets
 //! `404 {"error":"unknown peer"}`; a peer that cannot be reached, within the
@@ -29,9 +34,15 @@
 //! error"}`.
 //!
 //! Every request, to any route, first passes the local guard: one with an
-//! `Origin` header (a web page) or with a `Host` other than `127.0.0.1`,
-//! `localhost` or `[::1]` with the gateway's port (DNS rebinding) gets
-//! `403`.
+//! `Origin` header (a web page), with a Fetch Metadata header
+//! (`Sec-Fetch-Site`, `Sec-Fetch-Mode` or `Sec-Fetch-Dest`: a browser, even
+//! navigating, where it sends no `Origin`), or with a `Host` other than
+//! `127.0.0.1`, `localhost` or `[::1]` with the gateway's port (DNS
+//! rebinding) gets `403`. Every response, whoever wrote it, carries
+//! `Content-Security-Policy: sandbox` and `X-Content-Type-Options: nosniff`,
+//! so that a browser never runs what a peer sends at the gateway's origin: a
+//! sandboxed page has an opaque origin, and its requests carry
+//! `Origin: null`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -45,14 +56,19 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
-use http::header::{AUTHORIZATION, CONNECTION, HOST, HeaderMap, HeaderName, HeaderValue, ORIGIN};
+use http::header::{
+    AUTHORIZATION, CONNECTION, CONTENT_SECURITY_POLICY, HOST, HeaderMap, HeaderName, HeaderValue,
+    ORIGIN, X_CONTENT_TYPE_OPTIONS,
+};
 use http::{StatusCode, Uri};
 use http_body_util::{BodyExt, Limited};
 use iroh::{Endpoint, EndpointAddr};
+use pals_core::grant::{Grant, Operation};
 use pals_core::identity::AgentId;
 use pals_core::store::Store;
 use serde_json::json;
 
+use crate::a2a::auth::ASK_RESOURCE;
 use crate::a2a::gateway_view;
 use crate::net::{PeerHttp, TunnelError, peer_addr};
 use crate::node::ticket_of;
@@ -65,6 +81,11 @@ const MAX_CARD_BYTES: usize = 1024 * 1024;
 const CARD_TIMEOUT: Duration = Duration::from_secs(20);
 /// The prefix of the headers only PALS sets.
 const OWN_HEADER_PREFIX: &str = "x-agentnet-";
+/// The Fetch Metadata headers a browser adds to its requests.
+const FETCH_METADATA: [&str; 3] = ["sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest"];
+/// Response headers of a peer that would apply to every peer, since they all
+/// share the gateway's origin.
+const PEER_COOKIES: [&str; 2] = ["set-cookie", "set-cookie2"];
 
 /// Headers that describe one connection, not the request (RFC 9110 §7.6.1),
 /// and are never forwarded, in either direction.
@@ -149,12 +170,14 @@ impl GatewayState {
         .await
     }
 
-    /// `Bearer <token>` of the newest unexpired grant held for `peer`.
+    /// `Bearer <token>` of the newest unexpired grant held for `peer` that
+    /// [serves tasks](serves_tasks).
     async fn held_bearer(&self, peer: AgentId) -> Result<Option<HeaderValue>, StoreUnavailable> {
         let store = Arc::clone(&self.inner.store);
         let held = blocking(move || {
             let now = chrono::Utc::now().timestamp();
-            Ok(store.grants_held_for(&peer, now)?.into_iter().next())
+            let held = store.grants_held_for(&peer, now)?;
+            Ok(held.into_iter().find(|g| serves_tasks(&g.grant)))
         })
         .await?;
         Ok(held.map(|g| {
@@ -162,6 +185,19 @@ impl GatewayState {
                 .expect("a base64url token is a valid header value")
         }))
     }
+}
+
+/// Whether `grant` can serve a request of the bindings the gateway forwards:
+/// it allows at least one task operation, on a resource that covers
+/// `skill:ask`. A `blob.fetch` grant, for instance, cannot.
+fn serves_tasks(grant: &Grant) -> bool {
+    let task_op = grant.operations.iter().any(|op| {
+        matches!(
+            op,
+            Operation::TaskSend | Operation::TaskRead | Operation::TaskCancel
+        )
+    });
+    task_op && grant.covers_resource(ASK_RESOURCE)
 }
 
 /// A peer, resolved.
@@ -178,13 +214,33 @@ pub fn router(state: GatewayState) -> Router {
         .route("/peers/{peer}/jsonrpc", post(forward_jsonrpc))
         .route("/peers/{peer}/rest/{*rest}", any(forward_rest))
         .layer(middleware::from_fn_with_state(state.clone(), local_guard))
+        // Outermost, so that it covers the guard's refusals too.
+        .layer(middleware::from_fn(sandbox))
         .with_state(state)
 }
 
-/// Refuses requests from web pages and from names other than loopback's.
+/// Makes every response inert in a browser: a sandboxed document with an
+/// opaque origin, its content type taken as declared. It replaces whatever
+/// policy a peer sent.
+async fn sandbox(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox"));
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    response
+}
+
+/// Refuses requests from web pages, from browsers and from names other than
+/// loopback's.
 async fn local_guard(State(state): State<GatewayState>, request: Request, next: Next) -> Response {
     if request.headers().contains_key(ORIGIN) {
         return error(StatusCode::FORBIDDEN, "requests from web pages are refused");
+    }
+    if FETCH_METADATA
+        .iter()
+        .any(|name| request.headers().contains_key(*name))
+    {
+        return error(StatusCode::FORBIDDEN, "browser requests are not accepted");
     }
     if !is_local_host(
         request.headers(),
@@ -325,9 +381,16 @@ async fn forward(state: GatewayState, peer: String, request: Request) -> Respons
     *outgoing.headers_mut() = headers;
 
     match state.inner.peer_http.send(target.addr, outgoing).await {
+        // A redirect would send the client, and the grant the gateway holds
+        // for another peer, wherever this peer chose.
+        Ok(response) if response.status().is_redirection() => {
+            let failure =
+                TunnelError::Protocol(format!("the peer redirected ({})", response.status()));
+            tunnel_failure(&target.id, &failure)
+        }
         Ok(response) => {
             let (mut parts, body) = response.into_parts();
-            parts.headers = end_to_end(&parts.headers);
+            parts.headers = incoming_headers(&parts.headers);
             Response::from_parts(parts, body)
         }
         Err(error) => tunnel_failure(&target.id, &error),
@@ -353,6 +416,15 @@ fn peer_target(uri: &Uri) -> Option<Uri> {
 fn outgoing_headers(incoming: &HeaderMap) -> HeaderMap {
     let mut headers = end_to_end(incoming);
     headers.retain_names(|name| !name.as_str().starts_with(OWN_HEADER_PREFIX));
+    headers
+}
+
+/// The headers of a peer's response that go on to the client: the
+/// [end-to-end](end_to_end) ones, but for the cookies it sets, which would
+/// apply to every peer.
+fn incoming_headers(peer: &HeaderMap) -> HeaderMap {
+    let mut headers = end_to_end(peer);
+    headers.retain_names(|name| !PEER_COOKIES.contains(&name.as_str()));
     headers
 }
 
@@ -547,6 +619,63 @@ mod tests {
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body, json!({ "error": message }));
         }
+    }
+
+    #[test]
+    fn incoming_headers_drop_the_peers_cookies() {
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("set-cookie", "a=1"),
+            ("set-cookie", "b=2"),
+            ("set-cookie2", "c=3"),
+            ("connection", "close"),
+            ("content-type", "text/event-stream"),
+            ("cache-control", "no-cache"),
+        ] {
+            headers.append(name, HeaderValue::from_static(value));
+        }
+        let kept = incoming_headers(&headers);
+        let mut names: Vec<&str> = kept.keys().map(HeaderName::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["cache-control", "content-type"]);
+    }
+
+    #[test]
+    fn only_grants_for_a_task_operation_on_skill_ask_serve_tasks() {
+        let issuer = pals_core::identity::AgentKey::generate().id();
+        let grant = |operations: Vec<Operation>, resource: &str| Grant {
+            schema: pals_core::grant::GRANT_SCHEMA.to_owned(),
+            grant_id: "g".to_owned(),
+            issuer,
+            subject: issuer,
+            audience: issuer,
+            project: "demo".to_owned(),
+            resources: vec![resource.to_owned()],
+            operations,
+            issued_at: "2026-11-14T00:00:00Z".to_owned(),
+            expires_at: "2026-11-15T00:00:00Z".to_owned(),
+        };
+        for op in [
+            Operation::TaskSend,
+            Operation::TaskRead,
+            Operation::TaskCancel,
+        ] {
+            assert!(serves_tasks(&grant(vec![op], "skill:ask")), "{op:?}");
+        }
+        assert!(serves_tasks(&grant(
+            vec![Operation::BlobFetch, Operation::TaskRead],
+            "skill:*"
+        )));
+        assert!(!serves_tasks(&grant(
+            vec![Operation::BlobFetch],
+            "skill:ask"
+        )));
+        assert!(!serves_tasks(&grant(vec![Operation::BlobFetch], "blob:*")));
+        assert!(!serves_tasks(&grant(vec![Operation::TaskSend], "blob:*")));
+        assert!(!serves_tasks(&grant(
+            vec![Operation::TaskSend],
+            "skill:other"
+        )));
     }
 
     #[test]

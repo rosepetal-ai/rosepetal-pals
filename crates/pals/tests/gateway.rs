@@ -17,8 +17,9 @@ use a2a::{
 use a2a_client::A2AClientFactory;
 use a2a_client::agent_card::AgentCardResolver;
 use common::{
-    CountingExecutor, TestNode, TestResponse, gateway_request, gateway_send, grant, issue_grant,
-    message_params, now_unix, rpc_request, spawn_node, spawn_node_with_executor, test_config,
+    CountingExecutor, TestNode, TestResponse, TestServer, gateway_request, gateway_send, grant,
+    issue_grant, message_params, now_unix, rpc_request, spawn_node, spawn_node_with_executor,
+    spawn_pair, test_config,
 };
 use futures::StreamExt;
 use http_body_util::BodyExt;
@@ -26,9 +27,9 @@ use iroh::EndpointAddr;
 use iroh_tickets::endpoint::EndpointTicket;
 use pals::a2a::{canonical_card, gateway_view};
 use pals::config::WorkerCfg;
-use pals::net::endpoint_id_of;
+use pals::net::{agent_id_of, endpoint_id_of};
 use pals_core::grant::Operation::{self, TaskCancel, TaskRead, TaskSend};
-use pals_core::grant::SignedGrant;
+use pals_core::grant::{GRANT_SCHEMA, Grant, SignedGrant, format_timestamp};
 use pals_core::identity::{AgentId, AgentKey};
 use pals_core::store::{Contact, Store};
 use serde_json::{Value, json};
@@ -698,6 +699,242 @@ async fn contact_name_and_agent_id_address_the_same_peer() {
     .await;
     assert_eq!(by_name.status, 200, "{}", by_name.json);
     assert_eq!(by_name.json, by_id.json);
+}
+
+/// A peer that does not run PALS: `app` served over the tunnel as it is,
+/// which `a` saves as contact `name` and holds a task grant for.
+async fn rogue_peer(a: &TestNode, name: &str, app: axum::Router) -> TestServer {
+    let (server, _client) = spawn_pair(app).await;
+    let id = agent_id_of(&server.addr.id);
+    a.node
+        .store
+        .contact_put(&Contact {
+            name: name.to_owned(),
+            agent_id: id,
+            ticket: Some(EndpointTicket::new(server.addr.clone()).to_string()),
+            added_at: now_unix(),
+        })
+        .unwrap();
+    let now = now_unix();
+    a.hold(&issue_grant(
+        &AgentKey::generate(),
+        a.id(),
+        id,
+        &SEND_AND_READ,
+        now,
+        now + 3600,
+    ));
+    server
+}
+
+/// What a hostile peer answers: a script page with its own cookie and
+/// policy, and redirects that send the client to `/peers/carol/...`.
+fn rogue_app() -> axum::Router {
+    use axum::routing::{get, post};
+    let redirect = |status: u16| {
+        move || async move {
+            (
+                http::StatusCode::from_u16(status).unwrap(),
+                [
+                    ("location", "/peers/carol/jsonrpc"),
+                    ("set-cookie", "session=stolen; Path=/"),
+                ],
+            )
+        }
+    };
+    axum::Router::new()
+        .route(
+            "/rest/page",
+            get(|| async {
+                (
+                    [
+                        ("content-type", "text/html"),
+                        ("set-cookie", "session=stolen; Path=/"),
+                        ("set-cookie2", "legacy=stolen"),
+                        ("content-security-policy", "default-src *"),
+                    ],
+                    "<script>fetch('/peers/carol/rest/tasks')</script>",
+                )
+            }),
+        )
+        .route("/jsonrpc", post(redirect(307)))
+        .route("/rest/message:send", post(redirect(308)))
+        .route("/rest/see-other", get(redirect(303)))
+        .route("/.well-known/agent-card.json", get(redirect(302)))
+}
+
+/// Whether `res` carries the headers that keep a browser from running what
+/// it gets from the gateway.
+fn assert_sandboxed(res: &TestResponse, what: &str) {
+    let policies: Vec<_> = res
+        .headers
+        .get_all("content-security-policy")
+        .iter()
+        .collect();
+    assert_eq!(policies, ["sandbox"], "{what}");
+    assert_eq!(res.header("x-content-type-options"), "nosniff", "{what}");
+}
+
+#[tokio::test]
+async fn browser_requests_are_403_and_every_response_is_sandboxed() {
+    let (a, b, _) = connected_pair().await;
+    let gw = a.gateway_url();
+    let refused = json!({"error": "browser requests are not accepted"});
+
+    // Fetch Metadata marks a browser's request, a navigation included, even
+    // where it sends no Origin.
+    for header in [
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-site", "same-origin"),
+        ("sec-fetch-dest", "document"),
+    ] {
+        for (method, path) in [
+            ("GET", "/healthz".to_owned()),
+            ("GET", format!("/peers/{}/rest/tasks", b.id())),
+            ("GET", "/peers/bob/.well-known/agent-card.json".to_owned()),
+            ("POST", "/peers/bob/jsonrpc".to_owned()),
+        ] {
+            let body = (method == "POST")
+                .then(|| rpc_request("SendMessage", message_params("hola", None)));
+            let res = gateway_request(
+                &gw,
+                method,
+                &path,
+                &[header, ("a2a-version", "1.0")],
+                body.as_ref(),
+            )
+            .await;
+            assert_eq!(res.status, 403, "{header:?} {path}: {}", res.json);
+            assert_eq!(res.json, refused, "{header:?} {path}");
+            assert_sandboxed(&res, path.as_str());
+        }
+    }
+    assert_eq!(b.node.store.events_count("task.accepted").unwrap(), 0);
+
+    // Every answer, the gateway's own and the peers', is sandboxed.
+    let res = gateway_request(&gw, "GET", "/healthz", &[], None).await;
+    assert_eq!(res.status, 200);
+    assert_sandboxed(&res, "healthz");
+    let res = gateway_request(&gw, "GET", "/peers/nobody/rest/tasks", &[], None).await;
+    assert_eq!(res.status, 404);
+    assert_sandboxed(&res, "unknown peer");
+    let res = gateway_request(&gw, "GET", "/healthz", &[("origin", "null")], None).await;
+    assert_eq!(res.status, 403);
+    assert_sandboxed(&res, "origin");
+    let res = gw_rpc(&a, "bob", &[], "SendMessage", message_params("hola", None)).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_sandboxed(&res, "peer answer");
+
+    // A page a peer serves cannot run at the gateway's origin.
+    let _rogue = rogue_peer(&a, "mallory", rogue_app()).await;
+    let res = gateway_request(&gw, "GET", "/peers/mallory/rest/page", &[], None).await;
+    assert_eq!(res.status, 200, "{}", String::from_utf8_lossy(&res.body));
+    assert_eq!(res.header("content-type"), "text/html");
+    assert_sandboxed(&res, "a peer's page");
+}
+
+#[tokio::test]
+async fn peer_redirects_and_cookies_never_reach_the_client() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    // Where the redirects point: a peer `a` holds a grant for.
+    let carol = spawn_node(WorkerCfg::Echo).await;
+    a.add_contact("carol", &carol);
+    a.hold(&grant(&carol, &a, &SEND_AND_READ, 3600));
+    let _rogue = rogue_peer(&a, "mallory", rogue_app()).await;
+    let gw = a.gateway_url();
+    let protocol_error = json!({"error": "peer protocol error"});
+
+    let call = rpc_request("SendMessage", message_params("hola", None));
+    for (method, path, body) in [
+        ("POST", "/peers/mallory/jsonrpc", Some(&call)),
+        ("POST", "/peers/mallory/rest/message:send", Some(&call)),
+        ("GET", "/peers/mallory/rest/see-other", None),
+        ("GET", "/peers/mallory/.well-known/agent-card.json", None),
+    ] {
+        let res = gateway_request(&gw, method, path, &[("a2a-version", "1.0")], body).await;
+        assert_eq!(res.status, 502, "{path}: {}", res.json);
+        assert_eq!(res.json, protocol_error, "{path}");
+        assert!(res.headers.get("location").is_none(), "{path}");
+        assert!(res.headers.get("set-cookie").is_none(), "{path}");
+    }
+    assert_eq!(carol.node.store.events_count("task.accepted").unwrap(), 0);
+
+    // A peer's cookies are dropped from what it answers.
+    let res = gateway_request(&gw, "GET", "/peers/mallory/rest/page", &[], None).await;
+    assert_eq!(res.status, 200);
+    assert!(res.headers.get("set-cookie").is_none(), "{:?}", res.headers);
+    assert!(
+        res.headers.get("set-cookie2").is_none(),
+        "{:?}",
+        res.headers
+    );
+}
+
+#[tokio::test]
+async fn task_requests_present_a_task_grant_not_a_newer_blob_grant() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let b = spawn_node(WorkerCfg::Echo).await;
+    a.add_contact("bob", &b);
+    let b_key = common::key_in(b.dir.path());
+    let now = now_unix();
+    // Grants of `b` to `a`, newest last.
+    let held = |grant_id: &str, ops: &[Operation], resource: &str, issued_at: i64| {
+        let g = SignedGrant::issue(
+            &b_key,
+            Grant {
+                schema: GRANT_SCHEMA.to_owned(),
+                grant_id: grant_id.to_owned(),
+                issuer: b.id(),
+                subject: a.id(),
+                audience: b.id(),
+                project: "demo".to_owned(),
+                resources: vec![resource.to_owned()],
+                operations: ops.to_vec(),
+                issued_at: format_timestamp(issued_at).unwrap(),
+                expires_at: format_timestamp(now + 3600).unwrap(),
+            },
+        )
+        .unwrap();
+        b.node.store.grant_issued_put(&g).unwrap();
+        a.hold(&g);
+    };
+    held("g-task", &SEND_AND_READ, "skill:ask", now - 30);
+    held("g-blob", &[Operation::BlobFetch], "blob:*", now - 20);
+    held("g-task-on-blobs", &[TaskSend], "blob:*", now - 10);
+
+    let res = gw_rpc(&a, "bob", &[], "SendMessage", message_params("hola", None)).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(
+        res.json["result"]["task"]["status"]["state"],
+        "TASK_STATE_COMPLETED"
+    );
+
+    // A grant whose resources cover `skill:ask` by prefix qualifies.
+    held("g-any-skill", &SEND_AND_READ, "skill:*", now - 5);
+    let res = gw_rpc(&a, "bob", &[], "SendMessage", message_params("hola", None)).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+
+    // Holding only grants that cannot serve a task request is holding none.
+    let c = spawn_node(WorkerCfg::Echo).await;
+    a.add_contact("carol", &c);
+    let mut blob_only = grant(&c, &a, &[Operation::BlobFetch], 3600);
+    blob_only.grant.resources = vec!["blob:*".to_owned()];
+    let c_key = common::key_in(c.dir.path());
+    let blob_only = SignedGrant::issue(&c_key, blob_only.grant).unwrap();
+    a.hold(&blob_only);
+    let res = gw_rpc(
+        &a,
+        "carol",
+        &[],
+        "SendMessage",
+        message_params("hola", None),
+    )
+    .await;
+    assert_eq!(res.status, 401, "{}", res.json);
+    assert_eq!(
+        res.json,
+        json!({"error": format!("no grant held for {}", c.id())})
+    );
 }
 
 /// What `pals grant issue` grants unless told otherwise.

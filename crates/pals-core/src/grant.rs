@@ -241,14 +241,20 @@ impl SignedGrant {
         if !grant.operations.contains(&c.operation) {
             return Err(GrantError::OperationNotGranted);
         }
-        if !grant
-            .resources
-            .iter()
-            .any(|granted| resource_matches(granted, c.resource))
-        {
+        if !grant.covers_resource(c.resource) {
             return Err(GrantError::ResourceNotGranted);
         }
         Ok(())
+    }
+}
+
+impl Grant {
+    /// Whether one of the grant's resources covers `resource`: the same
+    /// resource, or one ending in `*` whose prefix `resource` starts with.
+    pub fn covers_resource(&self, resource: &str) -> bool {
+        self.resources
+            .iter()
+            .any(|granted| resource_matches(granted, resource))
     }
 }
 
@@ -311,6 +317,20 @@ mod tests {
             issued_at: "2026-11-14T00:00:00Z".to_owned(),
             expires_at: "2026-11-15T00:00:00Z".to_owned(),
         }
+    }
+
+    #[test]
+    fn covers_resource_by_equality_or_star_prefix() {
+        let grant = Grant {
+            resources: vec!["skill:ask".to_owned(), "blob:ab*".to_owned()],
+            ..grant_for(&AgentKey::generate())
+        };
+        assert!(grant.covers_resource("skill:ask"));
+        assert!(grant.covers_resource("blob:ab01"));
+        assert!(grant.covers_resource("blob:ab"));
+        assert!(!grant.covers_resource("skill:asked"));
+        assert!(!grant.covers_resource("blob:ba01"));
+        assert!(!grant.covers_resource("skill:"));
     }
 
     #[test]

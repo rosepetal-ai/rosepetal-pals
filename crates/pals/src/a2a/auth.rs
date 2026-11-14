@@ -44,7 +44,7 @@ pub(crate) const JSONRPC_PATH: &str = "/jsonrpc";
 pub(crate) const REST_PATH: &str = "/rest";
 
 /// The resource every A2A operation of milestone 1 is checked against.
-const ASK_RESOURCE: &str = "skill:ask";
+pub(crate) const ASK_RESOURCE: &str = "skill:ask";
 /// The prefix of the headers only PALS sets.
 const OWN_HEADER_PREFIX: &str = "x-agentnet-";
 
