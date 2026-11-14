@@ -152,7 +152,7 @@ tests/interop/{card_signatures.py,check_schemas.py}, tests/interop/card_signatur
 
 ## Preparación
 
-El worktree `/workspace/pals/rosepetal-pals-hito2` está en `feat/hito-2`, creada desde `feat/hito-1` en `5d4db29`. Cuando la PR del hito 1 entre en `dev`, se rebasa `feat/hito-2` sobre `dev`; la PR del hito 2 va contra `dev`. Antes de la tarea 1:
+El trabajo se hace en la rama `feat/hito-2`, creada desde `feat/hito-1` en `5d4db29` (en un worktree aparte del clon del hito 1). Cuando la PR del hito 1 entre en `dev`, se rebasa `feat/hito-2` sobre `dev`; la PR del hito 2 va contra `dev`. Antes de la tarea 1:
 
 ```bash
 cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --locked
