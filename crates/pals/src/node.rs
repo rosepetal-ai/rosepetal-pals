@@ -1,7 +1,9 @@
 //! [`Node`]: one running agent, the A2A server its peers reach over Iroh, the
-//! blobs it serves them, its signed cards and records, and the local gateway
-//! standard A2A clients reach its peers through.
+//! blobs it serves them, its signed cards and records, what it answers about
+//! itself on `agentnet-discovery/0`, and the local gateway standard A2A
+//! clients reach its peers through.
 
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
@@ -13,12 +15,16 @@ use a2a_server::rest::rest_router;
 use a2a_server::{AgentExecutor, DefaultRequestHandler};
 use anyhow::{Context, ensure};
 use axum::middleware::from_fn;
+use futures::StreamExt;
 use iroh::endpoint::{PortmapperConfig, presets};
 use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
+use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, Watcher};
 use iroh_tickets::endpoint::EndpointTicket;
 use pals_core::card_jws::CardSigner;
+use pals_core::clock::{Clock, SystemClock};
+use pals_core::discovery::{ALPN_DISCOVERY, DiscoveryContext, Load, LoadProbe, PUBLIC_CARD};
 use pals_core::identity::{AgentId, AgentKey};
+use pals_core::inventory::view::{CursorKey, ViewCache};
 use pals_core::store::{DEDUP_RETENTION_S, Store};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -32,7 +38,10 @@ use crate::a2a::{
 };
 use crate::blobs::{BLOBS_DIR, BlobService};
 use crate::config::{Config, DataDirLock, WorkerCfg};
-use crate::discovery::{ContactSource, Records, announced_capabilities, iroh_contact};
+use crate::discovery::{
+    ContactSource, DiscoveryClient, DiscoveryHook, DiscoveryServer, Quotas, Records,
+    announced_capabilities, iroh_contact, renew_on_change,
+};
 use crate::gateway::{self, GatewayParts, GatewayState};
 use crate::inventory::InventoryState;
 use crate::net::{ALPN_A2A_HTTP, PeerHttp, TunnelLimits, TunnelServer};
@@ -60,9 +69,34 @@ const RECORD_RENEW_INTERVAL: Duration = Duration::from_secs(3600);
 /// finish before dropping them.
 const GATEWAY_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// What a node runs with besides its configuration and executor: the clock
+/// its quotas, records and pages follow, the load its offers report, and,
+/// for tests, a hook in its discovery server and other quotas.
+pub struct NodeOptions {
+    pub clock: Arc<dyn Clock>,
+    /// The worker's load; none for a worker without bounds.
+    pub load: Option<Arc<dyn LoadProbe>>,
+    /// Awaited before every discovery answer. Tests only.
+    pub discovery_hook: Option<Arc<dyn DiscoveryHook>>,
+    pub quotas: Quotas,
+}
+
+impl Default for NodeOptions {
+    /// The system's clock, no load, no hook and the default quotas.
+    fn default() -> Self {
+        Self {
+            clock: Arc::new(SystemClock),
+            load: None,
+            discovery_hook: None,
+            quotas: Quotas::default(),
+        }
+    }
+}
+
 /// A running agent: its A2A server, served to peers over Iroh on
 /// [`ALPN_A2A_HTTP`], its blobs, served on [`iroh_blobs::ALPN`] to the peers
-/// it shared them with, the client it reaches peers with, and its local
+/// it shared them with, what it answers about itself on [`ALPN_DISCOVERY`]
+/// ([`DiscoveryServer`]), the clients it reaches peers with, and its local
 /// [gateway](crate::gateway) on `gateway.listen`.
 ///
 /// The server is the SDK's, with the signed [public card](CardSet::public)
@@ -79,6 +113,8 @@ pub struct Node {
     pub peer_http: PeerHttp,
     /// The agent's files, in `<data_dir>/`[`BLOBS_DIR`].
     pub blobs: BlobService,
+    /// Discovery requests to peers.
+    discovery: DiscoveryClient,
     /// The questions this agent asks its peers, through its gateway.
     outbox: Outbox,
     /// The inventory, as read when the node started.
@@ -89,12 +125,14 @@ pub struct Node {
     records: Records,
     router: Router,
     gateway: GatewayServer,
-    /// Purges old dedup rows every [`DEDUP_PURGE_INTERVAL`] while the node
-    /// runs.
+    /// Purges old dedup rows and expired pages of peers' views every
+    /// [`DEDUP_PURGE_INTERVAL`] while the node runs.
     dedup_purge: AbortOnDrop,
     /// Renews the records every [`RECORD_RENEW_INTERVAL`] while the node
     /// runs.
     records_renewal: AbortOnDrop,
+    /// Renews the records when the endpoint's addresses change.
+    address_renewal: AbortOnDrop,
     /// Held while the node runs.
     _lock: DataDirLock,
 }
@@ -124,26 +162,29 @@ impl Node {
     /// the Iroh endpoint with the agent's key and opens the blob store in
     /// `<data_dir>/`[`BLOBS_DIR`]; takes up its contact and announce records,
     /// issuing those that need it ([`Records::start`]); and only then serves
-    /// [`ALPN_A2A_HTTP`] and [`iroh_blobs::ALPN`] on the endpoint and starts
-    /// the gateway. With `net.relay` the endpoint uses Iroh's N0 preset and
-    /// its public relays; without it, it has no relay and is bound to
-    /// 127.0.0.1 only. While it runs, the node purges the dedup rows again
-    /// and renews its records every hour.
+    /// [`ALPN_A2A_HTTP`], [`iroh_blobs::ALPN`] and [`ALPN_DISCOVERY`] on the
+    /// endpoint and starts the gateway. With `net.relay` the endpoint uses
+    /// Iroh's N0 preset and its public relays; without it, it has no relay
+    /// and is bound to 127.0.0.1 only. While it runs, the node purges the
+    /// dedup rows and the expired pages of peers' views again and renews its
+    /// records every hour, and renews them too whenever the endpoint's
+    /// addresses change.
     pub async fn spawn(cfg: Config) -> anyhow::Result<Node> {
         #[cfg(not(unix))]
         if matches!(cfg.worker, WorkerCfg::Exec(_)) {
             anyhow::bail!("the exec worker adapter needs a Unix system");
         }
-        let opened = Opened::open(&cfg).await?;
+        let opts = NodeOptions::default();
+        let opened = Opened::open(&cfg, &opts).await?;
         match &cfg.worker {
-            WorkerCfg::Echo => Ok(opened.start(&cfg, EchoExecutor)),
-            WorkerCfg::Tck => Ok(opened.start(&cfg, TckExecutor::from_env())),
+            WorkerCfg::Echo => Ok(opened.start(&cfg, EchoExecutor, opts)),
+            WorkerCfg::Tck => Ok(opened.start(&cfg, TckExecutor::from_env(), opts)),
             #[cfg(unix)]
             WorkerCfg::Exec(exec) => {
                 let adapter = Arc::new(ExecAdapter::new(exec.clone(), &cfg.projects));
                 let executor =
                     WorkerExecutor::new(adapter, &cfg, Capacity::from(exec), opened.blobs.clone());
-                Ok(opened.start(&cfg, executor))
+                Ok(opened.start(&cfg, executor, opts))
             }
             #[cfg(not(unix))]
             WorkerCfg::Exec(_) => unreachable!("refused above"),
@@ -156,7 +197,16 @@ impl Node {
         cfg: Config,
         executor: impl AgentExecutor,
     ) -> anyhow::Result<Node> {
-        Ok(Opened::open(&cfg).await?.start(&cfg, executor))
+        Self::spawn_with_options(cfg, executor, NodeOptions::default()).await
+    }
+
+    /// [`Node::spawn_with_executor`], with `opts`.
+    pub async fn spawn_with_options(
+        cfg: Config,
+        executor: impl AgentExecutor,
+        opts: NodeOptions,
+    ) -> anyhow::Result<Node> {
+        Ok(Opened::open(&cfg, &opts).await?.start(&cfg, executor, opts))
     }
 
     /// The address peers dial this node at: its id and the direct addresses
@@ -179,6 +229,11 @@ impl Node {
     /// The questions this agent asks its peers, through its gateway.
     pub fn outbox(&self) -> &Outbox {
         &self.outbox
+    }
+
+    /// The client this agent asks its peers with on `agentnet-discovery/0`.
+    pub fn discovery(&self) -> &DiscoveryClient {
+        &self.discovery
     }
 
     /// The agent's cards, signed when the node started.
@@ -221,6 +276,7 @@ impl Node {
             store,
             peer_http,
             blobs,
+            discovery,
             outbox,
             inventory,
             cards,
@@ -229,6 +285,7 @@ impl Node {
             gateway,
             dedup_purge,
             records_renewal,
+            address_renewal,
             _lock: lock,
         } = self;
         let GatewayServer {
@@ -243,7 +300,9 @@ impl Node {
         let _ = stop.send(());
         dedup_purge.stop().await;
         records_renewal.stop().await;
+        address_renewal.stop().await;
         peer_http.close_all().await;
+        discovery.close_all().await;
         let stopped = router
             .shutdown()
             .await
@@ -256,7 +315,9 @@ impl Node {
             gateway_task.stop().await;
         }
         blobs.shutdown().await;
-        drop((outbox, blobs, peer_http, inventory, cards, records));
+        drop((
+            outbox, blobs, peer_http, discovery, inventory, cards, records,
+        ));
         tracing::debug!(
             handles = Arc::strong_count(&store),
             "the store's handles at shutdown, this one included"
@@ -282,14 +343,16 @@ struct Opened {
 }
 
 impl Opened {
-    /// Everything [`Node::spawn`] does before it serves.
-    async fn open(cfg: &Config) -> anyhow::Result<Self> {
+    /// Everything [`Node::spawn`] does before it serves, at the time of
+    /// `opts`' clock.
+    async fn open(cfg: &Config, opts: &NodeOptions) -> anyhow::Result<Self> {
         ensure!(
             cfg.gateway.listen.ip().is_loopback(),
             "gateway.listen must be a loopback address, not {}",
             cfg.gateway.listen
         );
         let blocking_cfg = cfg.clone();
+        let started = opts.clock.now_unix();
         let (lock, key, store, inventory, cards, capabilities) =
             tokio::task::spawn_blocking(move || {
                 let cfg = blocking_cfg;
@@ -326,6 +389,8 @@ impl Opened {
                     tracing::info!(unbound, "freed the dedup keys a restart left unbound");
                 }
                 purge_dedup(&store).context("cannot purge the old dedup rows")?;
+                purge_inventory_cache(&store, started)
+                    .context("cannot purge the expired pages of peers' views")?;
                 let pending = store
                     .outbox_pending()
                     .context("cannot read the outbox")?
@@ -366,8 +431,8 @@ impl Opened {
                 Arc::new(move || iroh_contact(id, &dialable_addr(&dialed)));
             let (key, store) = (Arc::clone(&key), Arc::clone(&store));
             let card_hash = cards.public().hash.clone();
+            let now = opts.clock.now_unix();
             tokio::task::spawn_blocking(move || {
-                let now = chrono::Utc::now().timestamp();
                 Records::start(key, store, contact_source, card_hash, capabilities, now)
             })
             .await?
@@ -387,9 +452,9 @@ impl Opened {
         })
     }
 
-    /// Serves the A2A server with `executor` and the blobs on the endpoint,
-    /// and starts the gateway.
-    fn start(self, cfg: &Config, executor: impl AgentExecutor) -> Node {
+    /// Serves the A2A server with `executor`, the blobs and the discovery
+    /// protocol on the endpoint, and starts the gateway.
+    fn start(self, cfg: &Config, executor: impl AgentExecutor, opts: NodeOptions) -> Node {
         let Self {
             lock,
             key,
@@ -407,18 +472,47 @@ impl Opened {
             max_body_bytes: cfg.limits.max_body_bytes,
             ..TunnelLimits::default()
         };
+        let NodeOptions {
+            clock,
+            load,
+            discovery_hook,
+            quotas,
+        } = opts;
         let app = app(cfg, &key, &store, &cards, executor);
+        let discovery_server = {
+            let ctx = discovery_context(cfg, &key, &store, &inventory, &cards, &records, load);
+            let server = DiscoveryServer::new(ctx, quotas, Arc::clone(&clock));
+            match discovery_hook {
+                Some(hook) => server.with_hook(hook),
+                None => server,
+            }
+        };
         let router = Router::builder(endpoint.clone())
             .accept(ALPN_A2A_HTTP, TunnelServer::new(app, limits))
             .accept(iroh_blobs::ALPN, blobs.protocol())
+            .accept(ALPN_DISCOVERY, discovery_server)
             .spawn();
         let peer_http = PeerHttp::new(endpoint.clone());
+        let discovery = DiscoveryClient::new(endpoint.clone(), Arc::clone(&store))
+            .with_clock(Arc::clone(&clock));
+        // The endpoint's addresses now, and then each change of them: the
+        // first relay or direct address it learns after it is bound, also
+        // one learnt since the records were taken up, which the first item
+        // catches (an item that changes nothing issues nothing).
+        let address_changes = endpoint.watch_addr().stream().map(|_| ());
+        let address_renewal = AbortOnDrop(tokio::spawn(renew_on_change(
+            records.clone(),
+            address_changes,
+            Arc::clone(&clock),
+        )));
         let state = GatewayState::new(
             GatewayParts {
                 id,
                 name: cfg.agent.name.clone(),
                 store: Arc::clone(&store),
                 peer_http: peer_http.clone(),
+                discovery: discovery.clone(),
+                clock: Arc::clone(&clock),
                 endpoint,
                 blobs: blobs.clone(),
                 limits: cfg.limits.clone(),
@@ -429,13 +523,18 @@ impl Opened {
         );
         let outbox = state.outbox().clone();
         let gateway = GatewayServer::start(listener, state);
-        let dedup_purge = AbortOnDrop(tokio::spawn(purge_dedup_hourly(Arc::clone(&store))));
-        let records_renewal = AbortOnDrop(tokio::spawn(renew_records_hourly(records.clone())));
+        let dedup_purge = AbortOnDrop(tokio::spawn(purge_hourly(
+            Arc::clone(&store),
+            Arc::clone(&clock),
+        )));
+        let records_renewal =
+            AbortOnDrop(tokio::spawn(renew_records_hourly(records.clone(), clock)));
         Node {
             id,
             store,
             peer_http,
             blobs,
+            discovery,
             outbox,
             inventory,
             cards,
@@ -444,8 +543,49 @@ impl Opened {
             gateway,
             dedup_purge,
             records_renewal,
+            address_renewal,
             _lock: lock,
         }
+    }
+}
+
+/// What the node's discovery server answers with: the agent's key and
+/// store, its inventory and records as they are at each answer (never as
+/// they were at start), the hash of each card, the issuers it accepts
+/// grants of (itself and `trusted_issuers`), whether it shows its public
+/// view, this run's cursor key and page cache, and the worker's load.
+fn discovery_context(
+    cfg: &Config,
+    key: &Arc<AgentKey>,
+    store: &Arc<Store>,
+    inventory: &InventoryState,
+    cards: &CardSet,
+    records: &Records,
+    load: Option<Arc<dyn LoadProbe>>,
+) -> DiscoveryContext {
+    let mut card_hashes: BTreeMap<String, _> = cards.scoped_hashes();
+    card_hashes.insert(PUBLIC_CARD.to_owned(), cards.public().hash.clone());
+    let snapshot = {
+        let inventory = inventory.clone();
+        Arc::new(move || inventory.snapshot())
+    };
+    let current = {
+        let records = records.clone();
+        Arc::new(move || records.current())
+    };
+    DiscoveryContext {
+        key: Arc::clone(key),
+        store: Arc::clone(store),
+        inventory: snapshot,
+        card_hashes,
+        records: current,
+        accepted_issuers: std::iter::once(key.id())
+            .chain(cfg.trusted_issuers.iter().copied())
+            .collect(),
+        public: cfg.discovery.public,
+        cursor_key: CursorKey::random(),
+        views: ViewCache::new(),
+        load: load.unwrap_or_else(|| Arc::new(Load::unbounded())),
     }
 }
 
@@ -528,39 +668,52 @@ fn purge_dedup(store: &Store) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// [`purge_dedup`] every [`DEDUP_PURGE_INTERVAL`], for as long as it runs. A
-/// failed purge is logged, and the next one tries again.
-async fn purge_dedup_hourly(store: Arc<Store>) {
+/// Deletes the pages of peers' views expired at `now_unix`.
+fn purge_inventory_cache(store: &Store, now_unix: i64) -> anyhow::Result<()> {
+    let purged = store.inventory_cache_purge(now_unix)?;
+    if purged > 0 {
+        tracing::debug!(purged, "purged expired pages of peers' views");
+    }
+    Ok(())
+}
+
+/// [`purge_dedup`], and [`purge_inventory_cache`] at `clock`'s time, every
+/// [`DEDUP_PURGE_INTERVAL`], for as long as it runs. A failed purge is
+/// logged, and the next one tries again.
+async fn purge_hourly(store: Arc<Store>, clock: Arc<dyn Clock>) {
     let start = tokio::time::Instant::now() + DEDUP_PURGE_INTERVAL;
     let mut ticks = tokio::time::interval_at(start, DEDUP_PURGE_INTERVAL);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticks.tick().await;
         let store = Arc::clone(&store);
-        let purged = tokio::task::spawn_blocking(move || purge_dedup(&store)).await;
+        let now = clock.now_unix();
+        let purged = tokio::task::spawn_blocking(move || {
+            purge_dedup(&store).context("cannot purge the old dedup rows")?;
+            purge_inventory_cache(&store, now)
+                .context("cannot purge the expired pages of peers' views")
+        })
+        .await;
         match purged {
             Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                tracing::warn!(error = %format!("{err:#}"), "cannot purge the old dedup rows")
-            }
-            Err(err) => tracing::warn!(error = %err, "the dedup purge did not finish"),
+            Ok(Err(err)) => tracing::warn!(error = %format!("{err:#}"), "purge failed"),
+            Err(err) => tracing::warn!(error = %err, "the purge did not finish"),
         }
     }
 }
 
-/// [`Records::renew`] every [`RECORD_RENEW_INTERVAL`], for as long as it
-/// runs. A failed renewal is logged, and the next one tries again; the
-/// records in force stay meanwhile.
-async fn renew_records_hourly(records: Records) {
+/// [`Records::renew`] at `clock`'s time every [`RECORD_RENEW_INTERVAL`], for
+/// as long as it runs. A failed renewal is logged, and the next one tries
+/// again; the records in force stay meanwhile.
+async fn renew_records_hourly(records: Records, clock: Arc<dyn Clock>) {
     let start = tokio::time::Instant::now() + RECORD_RENEW_INTERVAL;
     let mut ticks = tokio::time::interval_at(start, RECORD_RENEW_INTERVAL);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticks.tick().await;
         let records = records.clone();
-        let renewed =
-            tokio::task::spawn_blocking(move || records.renew(chrono::Utc::now().timestamp()))
-                .await;
+        let now = clock.now_unix();
+        let renewed = tokio::task::spawn_blocking(move || records.renew(now)).await;
         match renewed {
             Ok(Ok(_)) => {}
             Ok(Err(err)) => {

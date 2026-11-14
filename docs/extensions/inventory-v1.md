@@ -10,7 +10,7 @@ Extensión opcional de A2A con la que un agente PALS describe, además de lo que
 | Perfil | `agentnet.inventory/1` |
 | Declaración | `capabilities.extensions` de la card pública, sin `required`, con `params = {"profile": "agentnet.inventory/1", "discoveryAlpn": "agentnet-discovery/0"}` (solo cadenas) |
 | Cuándo se declara | Solo cuando el daemon sirve el ALPN de `discoveryAlpn`: la card declara únicamente lo que el agente sirve |
-| Transporte | El inventario no viaja por A2A: lo sirve, en vistas firmadas y filtradas por el permiso de quien pregunta, el protocolo de descubrimiento que nombra `discoveryAlpn` |
+| Transporte | El inventario no viaja por A2A: lo sirve, en vistas firmadas y filtradas por el permiso de quien pregunta, el protocolo de descubrimiento que nombra `discoveryAlpn`, [`agentnet-discovery/0`](../protocols/agentnet-discovery-0.md) |
 | Esquema | [`inventory-v1/inventory.schema.json`](inventory-v1/inventory.schema.json) (JSON Schema 2020-12), con el vector `crates/pals-core/tests/vectors/inventory-v1.json` |
 | Vistas | `agentnet.inventory-view/1`, dominio de firma `agentnet.inventory-view/1\n`: [`inventory-v1/inventory-view.schema.json`](inventory-v1/inventory-view.schema.json), con el vector `crates/pals-core/tests/vectors/view-v1.json` |
 

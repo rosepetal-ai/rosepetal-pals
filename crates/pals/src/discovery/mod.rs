@@ -1,17 +1,25 @@
 //! What agents learn of each other before any task: peers' Agent Cards, read
-//! and verified ([`PeerCards`]), and this agent's own signed contact and
-//! announce records, issued and kept current ([`Records`]), which the
-//! discovery protocol, `agentnet-discovery/0`, carries in every answer.
+//! and verified ([`PeerCards`]); this agent's own signed contact and
+//! announce records, issued and kept current ([`Records`]), also when its
+//! addresses change ([`renew_on_change`]); and the discovery protocol,
+//! `agentnet-discovery/0`, which carries those records in every answer: the
+//! server that answers on its ALPN ([`DiscoveryServer`]) and the client
+//! that asks peers ([`DiscoveryClient`]).
 
 pub mod cards;
+pub mod client;
+pub mod server;
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use anyhow::{Context, anyhow, ensure};
+use futures::{Stream, StreamExt};
 use iroh::{EndpointAddr, TransportAddr};
 use pals_core::card_jws::CardHash;
+use pals_core::clock::Clock;
+use pals_core::discovery::ALPN_DISCOVERY;
 use pals_core::grant::{format_timestamp, parse_timestamp};
 use pals_core::identity::{AgentId, AgentKey};
 use pals_core::inventory::{Inventory, Visibility};
@@ -23,13 +31,19 @@ use pals_core::signed::{Signed, SignedDoc};
 use pals_core::store::Store;
 
 pub use cards::{CardFetchError, PeerCards, signed_card_json};
+pub use client::{DiscoveryClient, DiscoveryError, Reply};
+pub use server::{DiscoveryHook, DiscoveryServer, Quotas};
 
-/// The ALPN of the discovery protocol, which the announce record names.
-pub const DISCOVERY_ALPN: &str = "agentnet-discovery/0";
+/// The ALPN of the discovery protocol, [`ALPN_DISCOVERY`] as text, which the
+/// announce record and the card's inventory extension name.
+pub const DISCOVERY_ALPN: &str = match std::str::from_utf8(ALPN_DISCOVERY) {
+    Ok(alpn) => alpn,
+    Err(_) => panic!("the discovery ALPN is text"),
+};
 /// The store's name for the contact record.
-const CONTACT: &str = "contact";
+pub(crate) const CONTACT: &str = "contact";
 /// The store's name for the announce record.
-const ANNOUNCE: &str = "announce";
+pub(crate) const ANNOUNCE: &str = "announce";
 
 /// Where this agent's endpoint can be dialed now, for its contact record.
 pub type ContactSource = Arc<dyn Fn() -> IrohContact + Send + Sync>;
@@ -351,4 +365,85 @@ impl Parts<'_> {
 /// read.
 fn due(expires_at: &str, now_unix: i64) -> bool {
     parse_timestamp(expires_at).is_none_or(|at| at - now_unix < RECORD_RENEW_BEFORE_S)
+}
+
+/// [`Records::renew`] at `clock`'s time on every item of `changes`, the
+/// changes of the endpoint's addresses, until it ends: the contact record
+/// says the addresses the endpoint has now, not only those it had when it
+/// started, before it knew its relay or its direct addresses. A change that
+/// leaves the contact record's addresses as they were issues nothing. A
+/// failed renewal is logged; the next change, or the hourly renewal, tries
+/// again.
+pub async fn renew_on_change<S>(records: Records, changes: S, clock: Arc<dyn Clock>)
+where
+    S: Stream<Item = ()> + Unpin,
+{
+    let mut changes = changes;
+    while changes.next().await.is_some() {
+        let records = records.clone();
+        let now = clock.now_unix();
+        match tokio::task::spawn_blocking(move || records.renew(now)).await {
+            Ok(Ok(true)) => tracing::info!("renewed this agent's records: its addresses changed"),
+            Ok(Ok(false)) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(error = %format!("{err:#}"), "cannot renew this agent's records")
+            }
+            Err(err) => tracing::warn!(error = %err, "the record renewal did not finish"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pals_core::clock::ManualClock;
+    use pals_core::grant::format_timestamp;
+    use pals_core::store::Store;
+
+    use super::*;
+
+    /// 2026-11-14T00:00:00Z.
+    const NOW: i64 = 1_794_614_400;
+
+    #[tokio::test]
+    async fn records_are_renewed_when_the_addresses_change() {
+        let key = Arc::new(AgentKey::generate());
+        let id = key.id();
+        let store = Arc::new(Store::open_in_memory(id).unwrap());
+        // The endpoint knows no address of its own yet.
+        let addrs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let source: ContactSource = {
+            let addrs = Arc::clone(&addrs);
+            Arc::new(move || IrohContact {
+                endpoint_id: id,
+                relay_url: None,
+                direct_addrs: addrs.lock().unwrap().clone(),
+            })
+        };
+        let hash: CardHash = format!("blake3:{}", "0".repeat(64)).parse().unwrap();
+        let records = Records::start(key, store, source, hash, Vec::new(), NOW).unwrap();
+        let contact_of = |records: &Records| {
+            Signed::<ContactRecord>::from_json(&records.current().0)
+                .unwrap()
+                .doc
+        };
+        let first = contact_of(&records);
+        assert!(first.iroh.direct_addrs.is_empty());
+
+        // It learns one, and says so: the contact record is issued again, at
+        // the clock's time, with it.
+        addrs.lock().unwrap().push("192.0.2.10:4433".to_owned());
+        let clock = Arc::new(ManualClock::new(NOW + 5));
+        let one_change = futures::stream::iter([()]);
+        renew_on_change(records.clone(), one_change, Arc::clone(&clock) as _).await;
+        let second = contact_of(&records);
+        assert_eq!(second.iroh.direct_addrs, ["192.0.2.10:4433"]);
+        assert_eq!(second.seq, first.seq + 1);
+        assert_eq!(second.issued_at, format_timestamp(NOW + 5).unwrap());
+
+        // A change that leaves the addresses as they were issues nothing.
+        let (contact, announce) = records.current();
+        clock.advance(5);
+        renew_on_change(records.clone(), futures::stream::iter([(), ()]), clock).await;
+        assert_eq!(records.current(), (contact, announce));
+    }
 }

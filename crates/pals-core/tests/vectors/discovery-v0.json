@@ -1,0 +1,55 @@
+{
+  "description": "Frozen frames of agentnet-discovery/0: each is a u32 big-endian length of the protobuf body that follows it (docs/protocols/agentnet-discovery-0.proto). Field numbers, enumeration values and limits never change meaning: an incompatible change is agentnet-discovery/1.",
+  "alpn": "agentnet-discovery/0",
+  "version": 0,
+  "max_request_frame_bytes": 20480,
+  "max_response_frame_bytes": 81920,
+  "frames": [
+    {
+      "name": "get_inventory_request",
+      "message": "Request",
+      "fields": {
+        "version": 0,
+        "get_inventory": {
+          "sections": ["mcp"]
+        }
+      },
+      "hex": "0000000752050a036d6370"
+    },
+    {
+      "name": "unsupported_version_error",
+      "message": "Response",
+      "fields": {
+        "version": 0,
+        "error": {
+          "code": "UNSUPPORTED_VERSION",
+          "supported_versions": [0]
+        }
+      },
+      "hex": "000000077a0508011a0100"
+    },
+    {
+      "name": "unsupported_version_error_with_limits",
+      "message": "Response",
+      "fields": {
+        "version": 0,
+        "limits": {
+          "max_request_bytes": 20480,
+          "max_response_bytes": 81920,
+          "max_query_bytes": 8192,
+          "max_offer_bytes": 16384,
+          "max_page_bytes": 65536,
+          "max_page_entries": 100,
+          "max_query_total_bytes": 1048576,
+          "max_card_bytes": 32768
+        },
+        "error": {
+          "code": "UNSUPPORTED_VERSION",
+          "message": "unsupported version",
+          "supported_versions": [0]
+        }
+      },
+      "hex": "0000003b121d0880a001108080051880402080800128808004306438808040408080027a1a08011213756e737570706f727465642076657273696f6e1a0100"
+    }
+  ]
+}

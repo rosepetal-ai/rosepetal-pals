@@ -16,7 +16,7 @@ use pals::config::{AlreadyRunning, WorkerCfg};
 use pals::node::Node;
 use pals_core::card_jws::CardSigner;
 use pals_core::grant::Operation::{self, TaskCancel, TaskRead, TaskSend};
-use pals_core::inventory::Inventory;
+use pals_core::inventory::{INVENTORY_EXTENSION, Inventory};
 use pals_core::store::{INTERRUPTED_MESSAGE, Store};
 use serde_json::{Value, json};
 
@@ -75,11 +75,15 @@ async fn card_is_public_and_declares_only_what_is_served() {
     assert_eq!(card["capabilities"]["streaming"], true);
     assert_eq!(card["capabilities"]["pushNotifications"], false);
     assert_eq!(card["capabilities"]["extendedAgentCard"], true);
-    // The optional idempotency extension, and no other.
+    // The optional idempotency and inventory extensions, and no other.
     let extensions = card["capabilities"]["extensions"].as_array().unwrap();
-    assert_eq!(extensions.len(), 1, "{card}");
+    assert_eq!(extensions.len(), 2, "{card}");
     assert_eq!(extensions[0]["uri"], IDEMPOTENCY_EXTENSION);
-    assert!(extensions[0].get("required").is_none(), "{card}");
+    assert_eq!(extensions[1]["uri"], INVENTORY_EXTENSION);
+    assert!(
+        extensions.iter().all(|e| e.get("required").is_none()),
+        "{card}"
+    );
     // Text, and files of any media type.
     assert_eq!(card["defaultInputModes"], json!(["text/plain", "*/*"]));
     assert_eq!(

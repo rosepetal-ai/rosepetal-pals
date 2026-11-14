@@ -90,6 +90,12 @@ file = "inventory.toml"
 # Seconds between two checks of the MCP connections the inventory configures.
 refresh_interval_s = 900
 
+[discovery]
+# Peers ask this agent what it offers over agentnet-discovery/0, its own
+# Iroh ALPN: they get the view of the inventory their grant gives, signed.
+# true: a peer without a grant sees the public view; false: an empty one.
+public = true
+
 [limits]
 max_body_bytes = 1048576      # 1 MiB
 max_blob_bytes = 2147483648   # 2 GiB
@@ -271,6 +277,8 @@ pub struct Config {
     pub mcp: McpCfg,
     #[serde(default)]
     pub inventory: InventoryCfg,
+    #[serde(default)]
+    pub discovery: DiscoveryCfg,
     /// Issuers whose grants this agent accepts, besides itself.
     #[serde(default)]
     pub trusted_issuers: Vec<AgentId>,
@@ -469,6 +477,23 @@ impl Default for InventoryCfg {
             file: PathBuf::from(INVENTORY_FILE),
             refresh_interval_s: 900,
         }
+    }
+}
+
+/// What the discovery protocol, `agentnet-discovery/0`, shows, see
+/// [`pals_core::discovery`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiscoveryCfg {
+    /// Whether a peer without a grant sees the public view of the
+    /// inventory; without it, it sees an empty one. A grant's view is shown
+    /// either way.
+    pub public: bool,
+}
+
+impl Default for DiscoveryCfg {
+    fn default() -> Self {
+        Self { public: true }
     }
 }
 
@@ -788,6 +813,22 @@ path = "/srv/demo"
         assert!(!cfg.net.relay);
         assert_eq!(cfg.limits.max_body_bytes, 2048);
         assert_eq!(cfg.projects["demo"].path, PathBuf::from("/srv/demo"));
+    }
+
+    #[test]
+    fn discovery_shows_the_public_view_unless_told_not_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load(&write_config(dir.path(), "")).unwrap();
+        assert!(cfg.discovery.public);
+        let text = "[discovery]\npublic = false\n";
+        let cfg = Config::load(&write_config(dir.path(), text)).unwrap();
+        assert!(!cfg.discovery.public);
+        let err =
+            Config::load(&write_config(dir.path(), "[discovery]\nforward = true\n")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unknown field `forward`"),
+            "{err:#}"
+        );
     }
 
     #[test]

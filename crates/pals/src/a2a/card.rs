@@ -31,11 +31,14 @@ use anyhow::{Context, anyhow};
 use pals_core::card_jws::{CardError, CardHash, CardSigner, card_hash, normalize, sign_card};
 use pals_core::grant::GRANT_SCHEMA;
 use pals_core::identity::AgentId;
-use pals_core::inventory::{Inventory, Scope, Service, Visibility, capability_tag};
-use serde_json::Value;
+use pals_core::inventory::{
+    INVENTORY_EXTENSION, INVENTORY_PROFILE, Inventory, Scope, Service, Visibility, capability_tag,
+};
+use serde_json::{Value, json};
 
 use super::auth::{ASK_RESOURCE, SCOPE_HEADER};
 use crate::config::Config;
+use crate::discovery::DISCOVERY_ALPN;
 
 /// The custom protocol binding (A2A §5.8) with which peers reach the
 /// agent's JSON-RPC interface, at `iroh://<agent id>/jsonrpc`: the standard
@@ -74,7 +77,9 @@ pub const DEFAULT_DESCRIPTION: &str = "A PALS agent";
 /// at `iroh://<agent id>/jsonrpc` ([`BINDING_URI_JSONRPC`]) and, second, the
 /// HTTP+JSON binding over Iroh at `iroh://<agent id>/rest`
 /// ([`BINDING_URI_HTTP_JSON`]), streaming, no push notifications, the
-/// extended card, the optional [`IDEMPOTENCY_EXTENSION`], text and files of
+/// extended card, the optional [`IDEMPOTENCY_EXTENSION`] and, second, the
+/// optional [`INVENTORY_EXTENSION`], whose `params` name its profile and the
+/// ALPN of the discovery protocol that serves it, text and files of
 /// any media type as input (`*/*`: a question comes with any files, sent as
 /// blobs, and a part's media type never refuses it), and grants as bearer
 /// tokens that must cover `skill:ask`. Its skills are `ask` and a skill for
@@ -109,10 +114,24 @@ pub fn extended_card(
         required: None,
         params: None,
     };
+    // Declared because the node serves `agentnet-discovery/0` on the ALPN it
+    // names (`crate::node`); strings only, so that every SDK reads its
+    // params alike.
+    let inventory_extension = AgentExtension {
+        uri: INVENTORY_EXTENSION.to_owned(),
+        description: Some(
+            "Signed inventory views and service queries over agentnet-discovery/0.".to_owned(),
+        ),
+        required: None,
+        params: Some(HashMap::from([
+            ("profile".to_owned(), json!(INVENTORY_PROFILE)),
+            ("discoveryAlpn".to_owned(), json!(DISCOVERY_ALPN)),
+        ])),
+    };
     let capabilities = AgentCapabilities {
         streaming: Some(true),
         push_notifications: Some(false),
-        extensions: Some(vec![idempotency]),
+        extensions: Some(vec![idempotency, inventory_extension]),
         extended_agent_card: Some(true),
     };
     let skills = std::iter::once(ask_skill())

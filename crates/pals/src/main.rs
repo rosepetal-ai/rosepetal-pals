@@ -2,8 +2,8 @@
 //!
 //! Only `pals daemon` takes the data directory's lock; every other command
 //! opens the store directly, which a running daemon shares. `pals ask`,
-//! `pals task resume|cancel` and `pals card show <peer>` reach peers through
-//! the running daemon's gateway.
+//! `pals task resume|cancel`, `pals card show <peer>` and `pals inventory
+//! get` reach peers through the running daemon's gateway.
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -33,7 +33,7 @@ use pals_core::grant::{
     parse_timestamp,
 };
 use pals_core::identity::{AgentId, AgentKey};
-use pals_core::inventory::view::{INVENTORY_SECTIONS, render};
+use pals_core::inventory::view::{INVENTORY_SECTIONS, render, verify_page};
 use pals_core::inventory::{Scope, Section};
 use pals_core::store::{Contact, Store};
 use serde_json::{Value, json};
@@ -118,6 +118,21 @@ enum InventoryCommand {
         /// runtime, models, information, hardware, network [default: all]
         #[arg(long, value_delimiter = ',')]
         sections: Vec<String>,
+    },
+    /// Print a peer's inventory, as this agent's grant lets it see it, read
+    /// over agentnet-discovery/0 through the running daemon's gateway: each
+    /// page as the peer signed it, then `verified: <agent id> <scope> seq
+    /// <revision>`
+    Get {
+        /// The peer, by contact name or agent id
+        peer: String,
+        /// The sections, comma separated: services, skills, plugins, mcp,
+        /// runtime, models, information, hardware, network [default: all]
+        #[arg(long, value_delimiter = ',')]
+        sections: Vec<String>,
+        /// Every page, following each page's cursor, instead of the first
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -264,6 +279,11 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Inventory(InventoryCommand::Show { scope, sections }) => {
             inventory_show(&home, &scope, &sections)
         }
+        Command::Inventory(InventoryCommand::Get {
+            peer,
+            sections,
+            all,
+        }) => inventory_get(&home, &peer, &sections, all),
     };
     done.map(|()| ExitCode::SUCCESS)
 }
@@ -369,8 +389,39 @@ async fn gateway_health(listen: SocketAddr) -> anyhow::Result<Value> {
         .map_err(|_| anyhow!("/healthz did not answer within {TIMEOUT:?}"))?
 }
 
-/// The largest answer `pals card show` reads from the gateway.
-const MAX_CARD_ANSWER_BYTES: usize = 256 * 1024;
+/// The largest answer `pals card show` and `pals inventory get` read from
+/// the gateway: a card or a page, re-encoded in ASCII.
+const MAX_GATEWAY_ANSWER_BYTES: usize = 256 * 1024;
+
+/// The most pages `pals inventory get --all` follows: far more than a chain
+/// of cursors serves within its 1 MiB.
+const MAX_PAGES: usize = 1024;
+
+/// The agent `peer` names: an agent id, or a contact's name.
+fn peer_id(store: &Store, peer: &str) -> anyhow::Result<AgentId> {
+    match peer.parse::<AgentId>() {
+        Ok(id) => Ok(id),
+        Err(_) => Ok(store
+            .contact_by_name(peer)?
+            .ok_or_else(|| {
+                anyhow!("unknown contact {peer}: save it first with `pals contact add`")
+            })?
+            .agent_id),
+    }
+}
+
+/// Fails unless a daemon of the agent `id` answers at `listen`.
+async fn this_daemon(listen: SocketAddr, id: &AgentId) -> anyhow::Result<()> {
+    let health = gateway_health(listen).await.with_context(|| {
+        format!("no pals daemon answers at http://{listen}: start it with `pals daemon`")
+    })?;
+    let running = health["agent_id"].as_str().unwrap_or_default();
+    ensure!(
+        running == id.to_string(),
+        "the pals daemon at http://{listen} runs agent {running}, not this agent {id}"
+    );
+    Ok(())
+}
 
 /// Prints a signed card and the agent it was verified as signed by: this
 /// agent's own when `peer` is `None`, else `peer`'s public card, or its
@@ -392,28 +443,10 @@ fn card_show(home: &Path, peer: Option<&str>, extended: bool) -> anyhow::Result<
         print_card(card, &key.id(), verified.hash.as_str())?;
         return Ok(());
     };
-    let peer_id = match peer.parse::<AgentId>() {
-        Ok(id) => id,
-        Err(_) => {
-            store
-                .contact_by_name(peer)?
-                .ok_or_else(|| {
-                    anyhow!("unknown contact {peer}: save it first with `pals contact add`")
-                })?
-                .agent_id
-        }
-    };
+    let peer_id = peer_id(&store, peer)?;
     let listen = cfg.gateway.listen;
     runtime(false)?.block_on(async move {
-        let health = gateway_health(listen).await.with_context(|| {
-            format!("no pals daemon answers at http://{listen}: start it with `pals daemon`")
-        })?;
-        let running = health["agent_id"].as_str().unwrap_or_default();
-        ensure!(
-            running == key.id().to_string(),
-            "the pals daemon at http://{listen} runs agent {running}, not this agent {}",
-            key.id()
-        );
+        this_daemon(listen, &key.id()).await?;
         if extended {
             let call =
                 json!({"jsonrpc": "2.0", "id": 1, "method": "GetExtendedAgentCard", "params": {}});
@@ -451,10 +484,26 @@ fn inventory_show(home: &Path, scope: &str, sections: &[String]) -> anyhow::Resu
     let scope = Scope::from_key(scope).ok_or_else(|| {
         anyhow!("unknown scope {scope:?}: public, project:<project> or task:<project>")
     })?;
-    let mut sections = if sections.is_empty() {
+    let sections = inventory_sections(sections)?;
+    let (cfg, key) = load_agent(home)?;
+    let store = Arc::new(open_store(&cfg, &key)?);
+    let snapshot = InventoryState::load(&cfg, store)?.snapshot();
+    let view = json!({
+        "scope": scope.key(),
+        "sections": sections,
+        "entries": render(&snapshot, &scope, &sections),
+    });
+    println!("{}", serde_json::to_string_pretty(&view)?);
+    Ok(())
+}
+
+/// The inventory sections `names` names, in order and without repeats; all
+/// of them when it names none.
+fn inventory_sections(names: &[String]) -> anyhow::Result<Vec<Section>> {
+    let mut sections = if names.is_empty() {
         INVENTORY_SECTIONS.to_vec()
     } else {
-        sections
+        names
             .iter()
             .map(|name| {
                 serde_json::from_value::<Section>(json!(name))
@@ -471,17 +520,61 @@ fn inventory_show(home: &Path, scope: &str, sections: &[String]) -> anyhow::Resu
     };
     sections.sort_unstable();
     sections.dedup();
+    Ok(sections)
+}
 
+/// Prints the pages of `peer`'s inventory view of `sections` (all when
+/// empty) the running daemon's gateway reads, verified here again as the
+/// peer's pages for this agent: the first, or with `all` every page of the
+/// chain of cursors. Each page is printed as the peer signed it, then
+/// `verified: <agent id> <scope> seq <revision>`.
+fn inventory_get(home: &Path, peer: &str, sections: &[String], all: bool) -> anyhow::Result<()> {
+    let sections = inventory_sections(sections)?;
+    let names: Vec<String> = sections
+        .iter()
+        .map(|section| match serde_json::to_value(section) {
+            Ok(Value::String(name)) => name,
+            other => unreachable!("a section is named by a string, not {other:?}"),
+        })
+        .collect();
     let (cfg, key) = load_agent(home)?;
-    let store = Arc::new(open_store(&cfg, &key)?);
-    let snapshot = InventoryState::load(&cfg, store)?.snapshot();
-    let view = json!({
-        "scope": scope.key(),
-        "sections": sections,
-        "entries": render(&snapshot, &scope, &sections),
-    });
-    println!("{}", serde_json::to_string_pretty(&view)?);
-    Ok(())
+    let store = open_store(&cfg, &key)?;
+    let peer_id = peer_id(&store, peer)?;
+    let (listen, own) = (cfg.gateway.listen, key.id());
+    runtime(false)?.block_on(async move {
+        this_daemon(listen, &own).await?;
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let mut path = format!(
+                "/discovery/inventory/{peer_id}?sections={}",
+                names.join(",")
+            );
+            if let Some(cursor) = &cursor {
+                let encoded = percent_encoding::utf8_percent_encode(
+                    cursor,
+                    percent_encoding::NON_ALPHANUMERIC,
+                );
+                path.push_str(&format!("&cursor={encoded}"));
+            }
+            let (status, _, body) = gateway_call(listen, http::Method::GET, &path, None).await?;
+            let signed = gateway_json(status, &body)?;
+            // The JCS of what the gateway re-encoded is what the peer signed.
+            let page = verify_page(
+                &pals_core::jcs::canonical(&signed),
+                &peer_id,
+                Some(&own),
+                now_unix(),
+            )
+            .map_err(|err| anyhow!("a page of {peer} does not verify: {err}"))?;
+            println!("{}", serde_json::to_string_pretty(&signed)?);
+            println!("verified: {peer_id} {} seq {}", page.scope, page.seq);
+            match page.next_cursor {
+                Some(next) if all => cursor = Some(next),
+                _ => return Ok(()),
+            }
+        }
+        bail!("{peer} keeps sending pages: stopped after {MAX_PAGES}")
+    })
 }
 
 /// Prints `card`, then `verified: <signer> <hash>`.
@@ -510,7 +603,7 @@ fn gateway_json(status: http::StatusCode, body: &[u8]) -> anyhow::Result<Value> 
 
 /// `method path` of the gateway listening on `listen`, with `body` as JSON:
 /// the status, headers and body of its answer, read up to
-/// [`MAX_CARD_ANSWER_BYTES`].
+/// [`MAX_GATEWAY_ANSWER_BYTES`].
 async fn gateway_call(
     listen: SocketAddr,
     method: http::Method,
@@ -537,7 +630,7 @@ async fn gateway_call(
         };
         let response = sender.send_request(request.body(Full::new(bytes))?).await?;
         let (parts, body) = response.into_parts();
-        let body = Limited::new(body, MAX_CARD_ANSWER_BYTES)
+        let body = Limited::new(body, MAX_GATEWAY_ANSWER_BYTES)
             .collect()
             .await
             .map_err(|err| anyhow!("cannot read the gateway's answer: {err}"))?

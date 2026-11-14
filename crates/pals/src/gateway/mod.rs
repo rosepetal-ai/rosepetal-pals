@@ -11,6 +11,7 @@
 //! | `GET /peers/{peer}/signed-agent-card.json` | the peer's card, verified, as the peer signed it ([`signed_card_json`]): signatures and `iroh://` interfaces included, for tools that check the signature themselves |
 //! | `POST /peers/{peer}/jsonrpc`, or `/jsonrpc/` | the peer's `/jsonrpc` |
 //! | any method, `/peers/{peer}/rest/{*rest}` | the peer's `/rest/{rest}` |
+//! | `GET /discovery/inventory/{peer}?sections=a,b&cursor=…` | a page of the peer's inventory view, over `agentnet-discovery/0`, verified, as the peer signed it |
 //! | `POST /blobs` | stores the raw body as a blob: `201 {"url", "hash", "size"}` |
 //! | `GET /blobs/{holder}/{hash}` | the blob, fetched from its holder first if need be |
 //! | any method, `/mcp` | the local [MCP server](crate::mcp), Streamable HTTP |
@@ -38,6 +39,20 @@
 //! `/rest/agent-card/extended`) is verified the same way and goes on as its
 //! [`gateway_view`], with [`CARD_HASH_HEADER`] naming the card verified
 //! ([`checks`]); one that does not verify is a protocol error.
+//!
+//! **Inventory.** `GET /discovery/inventory/{peer}` asks the peer for a page
+//! of its inventory view ([`DiscoveryClient`]), presenting the grant it
+//! would present to the peer's A2A server (below), or none, and answers with
+//! the page as the peer signed it, re-encoded in ASCII, once it verifies as
+//! the peer's page for this agent ([`verify_page`]). `sections` are names
+//! of the inventory's sections, comma separated (all when left out);
+//! `cursor` is a page's `next_cursor`. The page is kept
+//! ([`Store::inventory_cache_put`]) under the request and the grant it was
+//! asked with, `public` without one, and served again while it lasts to a
+//! request with the same grant: never to one with another grant, or none.
+//! An unknown section is `400`; the peer's refusal is `400` for a bad
+//! request or cursor, `429` with `Retry-After` when rate limited, `502`
+//! otherwise, with its message cut to printable ASCII.
 //!
 //! When the request carries no `Authorization`, the gateway presents the
 //! newest unexpired grant it holds for the peer that allows a task operation
@@ -111,7 +126,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::body::{Body, BodyDataStream, Bytes};
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -120,7 +135,7 @@ use futures::StreamExt;
 use http::header::{
     AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH,
     CONTENT_SECURITY_POLICY, CONTENT_TYPE, ETAG, HOST, HeaderMap, HeaderName, HeaderValue,
-    IF_NONE_MATCH, ORIGIN, X_CONTENT_TYPE_OPTIONS,
+    IF_NONE_MATCH, ORIGIN, RETRY_AFTER, X_CONTENT_TYPE_OPTIONS,
 };
 use http::{StatusCode, Uri};
 use http_body_util::{BodyExt, LengthLimitError, Limited};
@@ -128,9 +143,15 @@ use iroh::{Endpoint, EndpointAddr};
 use iroh_blobs::Hash;
 use iroh_blobs::api::TempTag;
 use pals_core::card_jws::VerifiedCard;
-use pals_core::grant::{Grant, Operation};
+use pals_core::clock::Clock;
+use pals_core::discovery::DISCOVERY_VERSION;
+use pals_core::discovery::wire::{self, ErrorCode, request, response};
+use pals_core::grant::{Grant, Operation, SignedGrant, parse_timestamp};
 use pals_core::identity::AgentId;
+use pals_core::inventory::Section;
+use pals_core::inventory::view::{INVENTORY_SECTIONS, verify_page};
 use pals_core::store::{Contact, Store};
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -141,7 +162,10 @@ use crate::a2a::gateway_view;
 use crate::a2a::is_safe_task_id;
 use crate::blobs::{BLOB_META_KEY, BLOB_SHARE_TTL_S, BlobError, BlobRef, BlobService, parse_hash};
 use crate::config::LimitsCfg;
-use crate::discovery::{CardFetchError, PeerCards, signed_card_json};
+use crate::discovery::cards::PUBLIC_CONTEXT;
+use crate::discovery::{
+    CardFetchError, DiscoveryClient, DiscoveryError, PeerCards, signed_card_json,
+};
 use crate::net::{PeerHttp, TunnelError, peer_addr};
 use crate::node::ticket_of;
 use crate::outbox::Outbox;
@@ -173,6 +197,11 @@ const JSON: &str = "application/json";
 const A2A_JSON: &str = "application/a2a+json";
 /// The type of every blob the gateway serves, whatever its content.
 const OCTET_STREAM: &str = "application/octet-stream";
+/// How long asking a peer for a page of its inventory may take, dialing
+/// included.
+const INVENTORY_TIMEOUT: Duration = Duration::from_secs(20);
+/// The longest refusal message of a peer the gateway passes on.
+const MAX_PEER_MESSAGE_BYTES: usize = 256;
 
 /// Headers that describe one connection, not the request (RFC 9110 §7.6.1),
 /// and are never forwarded, in either direction.
@@ -214,6 +243,10 @@ struct Inner {
     outbox: Outbox,
     /// Peers' cards, read, verified and kept.
     cards: PeerCards,
+    /// Discovery requests to peers.
+    discovery: DiscoveryClient,
+    /// The node's clock, which pages of peers' views are judged by.
+    clock: Arc<dyn Clock>,
     /// The only directory `pals_fetch` writes to, when configured.
     download_dir: Option<PathBuf>,
     /// Cancelled when the gateway stops: ends the MCP sessions.
@@ -226,6 +259,10 @@ pub struct GatewayParts {
     pub name: String,
     pub store: Arc<Store>,
     pub peer_http: PeerHttp,
+    /// Discovery requests to peers.
+    pub discovery: DiscoveryClient,
+    /// The node's clock.
+    pub clock: Arc<dyn Clock>,
     /// The agent's own endpoint.
     pub endpoint: Endpoint,
     pub blobs: BlobService,
@@ -245,6 +282,8 @@ impl GatewayState {
             name,
             store,
             peer_http,
+            discovery,
+            clock,
             endpoint,
             blobs,
             limits,
@@ -266,6 +305,8 @@ impl GatewayState {
                 local_addr,
                 outbox,
                 cards,
+                discovery,
+                clock,
                 download_dir,
                 stopping: CancellationToken::new(),
             }),
@@ -422,16 +463,21 @@ impl GatewayState {
         .await
     }
 
-    /// `Bearer <token>` of the newest unexpired grant held for `peer` that
-    /// [serves tasks](serves_tasks).
-    async fn held_bearer(&self, peer: AgentId) -> Result<Option<HeaderValue>, StoreUnavailable> {
+    /// The newest unexpired grant held for `peer` that [serves
+    /// tasks](serves_tasks).
+    async fn held_grant(&self, peer: AgentId) -> Result<Option<SignedGrant>, StoreUnavailable> {
         let store = Arc::clone(&self.inner.store);
-        let held = blocking(move || {
+        blocking(move || {
             let now = chrono::Utc::now().timestamp();
             let held = store.grants_held_for(&peer, now)?;
             Ok(held.into_iter().find(|g| serves_tasks(&g.grant)))
         })
-        .await?;
+        .await
+    }
+
+    /// `Bearer <token>` of [`GatewayState::held_grant`].
+    async fn held_bearer(&self, peer: AgentId) -> Result<Option<HeaderValue>, StoreUnavailable> {
+        let held = self.held_grant(peer).await?;
         Ok(held.map(|g| {
             HeaderValue::from_str(&format!("Bearer {}", g.to_token()))
                 .expect("a base64url token is a valid header value")
@@ -483,6 +529,7 @@ pub fn router(state: GatewayState) -> Router {
         .route("/peers/{peer}/jsonrpc", post(forward_jsonrpc))
         .route("/peers/{peer}/jsonrpc/", post(forward_jsonrpc))
         .route("/peers/{peer}/rest/{*rest}", any(forward_rest))
+        .route("/discovery/inventory/{peer}", get(peer_inventory))
         .route("/blobs", post(upload_blob))
         .route("/blobs/{holder}/{hash}", get(download_blob))
         .route_service("/mcp", crate::mcp::service(state.clone()))
@@ -647,6 +694,195 @@ impl GatewayState {
         {
             Ok(verified) => Ok((target, verified)),
             Err(failure) => Err(NoCard::Fetch(target.id, failure)),
+        }
+    }
+}
+
+/// The query of `GET /discovery/inventory/{peer}`.
+#[derive(Debug, Deserialize)]
+struct InventoryQuery {
+    /// Section names, comma separated; all when left out.
+    sections: Option<String>,
+    /// A page's `next_cursor`.
+    cursor: Option<String>,
+}
+
+/// A page of `peer`'s inventory view, verified as its page for this agent:
+/// kept from an earlier request with the same grant while it lasts, else
+/// asked for on `agentnet-discovery/0` with the grant the gateway holds for
+/// the peer, if any, and kept.
+async fn peer_inventory(
+    State(state): State<GatewayState>,
+    Path(peer): Path<String>,
+    Query(query): Query<InventoryQuery>,
+) -> Response {
+    let Some(sections) = inventory_sections(query.sections.as_deref()) else {
+        return error(StatusCode::BAD_REQUEST, "unknown section");
+    };
+    let names: Vec<String> = sections.iter().map(|s| section_name(*s)).collect();
+    let cursor = query.cursor.unwrap_or_default();
+    let target = match state.resolve(peer).await {
+        Ok(Some(target)) => target,
+        Ok(None) => return unknown_peer(),
+        Err(failure) => return failure.into_response(),
+    };
+    let grant = match state.held_grant(target.id).await {
+        Ok(grant) => grant,
+        Err(failure) => return failure.into_response(),
+    };
+    let context = grant.as_ref().map_or_else(
+        || PUBLIC_CONTEXT.to_owned(),
+        |g| format!("grant:{}/{}", g.grant.issuer, g.grant.grant_id),
+    );
+    let key = inventory_request_key(&names, &cursor);
+    let (own, now) = (state.inner.id, state.inner.clock.now_unix());
+
+    let kept = {
+        let (store, context, key) = (Arc::clone(&state.inner.store), context.clone(), key.clone());
+        blocking(move || store.inventory_cache(&target.id, &context, &key, now)).await
+    };
+    match kept {
+        Ok(Some(page)) if verify_page(&page, &target.id, Some(&own), now).is_ok() => {
+            return page_response(&page);
+        }
+        Ok(_) => {}
+        Err(failure) => return failure.into_response(),
+    }
+
+    let req = wire::Request {
+        version: DISCOVERY_VERSION,
+        max_response_bytes: 0,
+        grant_token: grant
+            .as_ref()
+            .map(SignedGrant::to_token)
+            .unwrap_or_default(),
+        op: Some(request::Op::GetInventory(wire::GetInventory {
+            sections: names,
+            cursor,
+            page_entries: 0,
+        })),
+    };
+    let discovery = &state.inner.discovery;
+    let reply = match discovery
+        .call(&target.id, target.addr.clone(), req, INVENTORY_TIMEOUT)
+        .await
+    {
+        Ok(reply) => reply,
+        Err(failure) => return discovery_failure(&target.id, &failure),
+    };
+    let Some(response::Result::InventoryPage(page)) = reply.response.result else {
+        return error(StatusCode::BAD_GATEWAY, "peer protocol error");
+    };
+    let expires_at = match verify_page(&page, &target.id, Some(&own), now) {
+        Ok(verified) => parse_timestamp(&verified.expires_at).unwrap_or(now),
+        Err(err) => {
+            tracing::debug!(peer = %target.id, error = %err, "an inventory page that does not verify");
+            return error(
+                StatusCode::BAD_GATEWAY,
+                format!("peer inventory page invalid: {err}"),
+            );
+        }
+    };
+    let store = Arc::clone(&state.inner.store);
+    let (kept_page, peer) = (page.clone(), target.id);
+    // A page that cannot be kept is still good to serve.
+    let _ =
+        blocking(move || store.inventory_cache_put(&peer, &context, &key, &kept_page, expires_at))
+            .await;
+    page_response(&page)
+}
+
+/// A verified page as the gateway serves it: its JSON, re-encoded in ASCII.
+fn page_response(page: &[u8]) -> Response {
+    let value: Value = serde_json::from_slice(page).expect("a verified page is JSON");
+    (
+        [(CONTENT_TYPE, HeaderValue::from_static(JSON))],
+        checks::ascii_json(&value),
+    )
+        .into_response()
+}
+
+/// The inventory sections a comma separated list names, in order and without
+/// repeats; all of them when it names none; `None` when one is not an
+/// inventory section.
+fn inventory_sections(list: Option<&str>) -> Option<Vec<Section>> {
+    let names: Vec<&str> = list
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect();
+    if names.is_empty() {
+        return Some(INVENTORY_SECTIONS.to_vec());
+    }
+    let mut sections = names
+        .into_iter()
+        .map(|name| {
+            serde_json::from_value::<Section>(json!(name))
+                .ok()
+                .filter(|section| INVENTORY_SECTIONS.contains(section))
+        })
+        .collect::<Option<Vec<Section>>>()?;
+    sections.sort_unstable();
+    sections.dedup();
+    Some(sections)
+}
+
+/// The name a section travels by.
+fn section_name(section: Section) -> String {
+    match serde_json::to_value(section) {
+        Ok(Value::String(name)) => name,
+        other => unreachable!("a section is named by a string, not {other:?}"),
+    }
+}
+
+/// What a request for a page is kept under: `blake3:` and the hex of
+/// BLAKE3 over the JCS of its sections and cursor.
+fn inventory_request_key(sections: &[String], cursor: &str) -> String {
+    let request = json!({"sections": sections, "cursor": cursor});
+    format!(
+        "blake3:{}",
+        blake3::hash(&pals_core::jcs::canonical(&request)).to_hex()
+    )
+}
+
+/// The answer to a discovery call to `peer` that got no page.
+fn discovery_failure(peer: &AgentId, failure: &DiscoveryError) -> Response {
+    tracing::debug!(%peer, error = %failure, "no inventory page from the peer");
+    match failure {
+        DiscoveryError::Unreachable(_) | DiscoveryError::Timeout => {
+            error(StatusCode::BAD_GATEWAY, "peer unreachable")
+        }
+        DiscoveryError::TooLarge | DiscoveryError::Protocol(_) => {
+            error(StatusCode::BAD_GATEWAY, "peer protocol error")
+        }
+        DiscoveryError::BadRecord(_) => error(StatusCode::BAD_GATEWAY, "peer record invalid"),
+        DiscoveryError::Regression { .. } => {
+            error(StatusCode::BAD_GATEWAY, "peer record regression")
+        }
+        DiscoveryError::Remote(refusal) => {
+            // The peer's words are data: printable ASCII only, and short.
+            let said: String = refusal
+                .message
+                .chars()
+                .filter(|c| c.is_ascii_graphic() || *c == ' ')
+                .take(MAX_PEER_MESSAGE_BYTES)
+                .collect();
+            let message = format!("peer refused: {said}");
+            match refusal.code() {
+                ErrorCode::BadRequest | ErrorCode::InvalidCursor => {
+                    error(StatusCode::BAD_REQUEST, message)
+                }
+                ErrorCode::RateLimited => {
+                    let seconds = refusal.retry_after_ms.div_ceil(1000).max(1);
+                    let mut response = error(StatusCode::TOO_MANY_REQUESTS, message);
+                    response
+                        .headers_mut()
+                        .insert(RETRY_AFTER, HeaderValue::from(seconds));
+                    response
+                }
+                _ => error(StatusCode::BAD_GATEWAY, message),
+            }
         }
     }
 }

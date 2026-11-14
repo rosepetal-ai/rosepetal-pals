@@ -17,7 +17,7 @@ use common::{
     stub_peer, test_config,
 };
 use pals::a2a::auth::SCOPE_HEADER;
-use pals::a2a::{CardSet, IDEMPOTENCY_EXTENSION, SECURITY_SCHEME, gateway_view};
+use pals::a2a::{CardSet, SECURITY_SCHEME, gateway_view};
 use pals::config::{INVENTORY_FILE, WorkerCfg};
 use pals::discovery::{CardFetchError, PeerCards};
 use pals::node::Node;
@@ -275,11 +275,7 @@ async fn card_declares_the_extended_card() {
     assert_eq!(card["capabilities"]["extendedAgentCard"], true);
     assert_eq!(card["capabilities"]["streaming"], true);
     assert_eq!(card["capabilities"]["pushNotifications"], false);
-    // Only the idempotency extension, which no request has to activate.
-    let extensions = card["capabilities"]["extensions"].as_array().unwrap();
-    assert_eq!(extensions.len(), 1, "{card}");
-    assert_eq!(extensions[0]["uri"], IDEMPOTENCY_EXTENSION);
-    assert!(extensions[0].get("required").is_none(), "{card}");
+    // Its extensions: `discovery::card_declares_the_inventory_extension_once_it_is_served`.
     // The grant must cover `skill:ask`.
     assert_eq!(
         card["securityRequirements"],

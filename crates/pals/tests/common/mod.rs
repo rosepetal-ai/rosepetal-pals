@@ -2,8 +2,9 @@
 //! no relay, an echo agent served through the tunnel, a client that goes
 //! through the production `PeerHttp`, complete PALS nodes ([`TestNode`])
 //! with the grants that let them talk to each other, an executor that counts
-//! its runs ([`CountingExecutor`]), and a plain HTTP client for a node's
-//! loopback gateway ([`gateway_request`]).
+//! its runs ([`CountingExecutor`]), peers that speak only the discovery
+//! protocol, as the tests script them ([`stub_discovery_peer`]), and a plain
+//! HTTP client for a node's loopback gateway ([`gateway_request`]).
 
 // Each test binary uses a different subset of these helpers.
 #![allow(dead_code)]
@@ -11,8 +12,8 @@
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use a2a::{
@@ -34,22 +35,30 @@ use futures::stream::{self, BoxStream};
 use http_body_util::BodyExt;
 use hyper::client::conn::http1 as client_http1;
 use hyper_util::rt::TokioIo;
-use iroh::endpoint::{PortmapperConfig, presets};
-use iroh::protocol::Router;
+use iroh::endpoint::{Connection, PortmapperConfig, RecvStream, SendStream, presets};
+use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 use iroh_tickets::endpoint::EndpointTicket;
 use pals::config::{
-    AgentCfg, Config, GatewayCfg, INVENTORY_FILE, InventoryCfg, KEY_FILE, LimitsCfg, McpCfg,
-    NetCfg, WorkerCfg,
+    AgentCfg, Config, DiscoveryCfg, GatewayCfg, INVENTORY_FILE, InventoryCfg, KEY_FILE, LimitsCfg,
+    McpCfg, NetCfg, WorkerCfg,
 };
-use pals::net::{ALPN_A2A_HTTP, PEER_HEADER, PeerHttp, TunnelLimits, TunnelServer};
-use pals::node::Node;
+use pals::net::{ALPN_A2A_HTTP, PEER_HEADER, PeerHttp, TunnelLimits, TunnelServer, agent_id_of};
+use pals::node::{Node, NodeOptions};
 use pals::worker::echo::EchoExecutor;
+use pals_core::discovery::{
+    ALPN_DISCOVERY, MAX_REQUEST_FRAME_BYTES, decode, encode_frame, frame_len, wire,
+};
 use pals_core::grant::{GRANT_SCHEMA, Grant, Operation, SignedGrant, format_timestamp};
 use pals_core::identity::{AgentId, AgentKey};
+use pals_core::records::{
+    ANNOUNCE_SCHEMA, AnnounceRecord, CONTACT_SCHEMA, ContactRecord, IrohContact, RECORD_TTL_S,
+};
+use pals_core::signed::Signed;
 use pals_core::store::Contact;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
+use tokio::sync::{Notify, watch};
 
 /// The URI of PALS's idempotency extension, which a request activates with
 /// `A2A-Extensions`. A literal, so that the tests pin the wire value.
@@ -286,6 +295,7 @@ pub fn test_config(data_dir: &Path, worker: WorkerCfg) -> Config {
             file: data_dir.join(INVENTORY_FILE),
             ..InventoryCfg::default()
         },
+        discovery: DiscoveryCfg::default(),
         trusted_issuers: Vec::new(),
     }
 }
@@ -337,10 +347,28 @@ pub async fn spawn_node_in_with_executor(
     dir: tempfile::TempDir,
     executor: impl AgentExecutor,
 ) -> TestNode {
+    spawn_node_in_with_options(dir, executor, NodeOptions::default()).await
+}
+
+/// A node whose work `executor` does, with `opts` (its clock, its load, a
+/// hook in its discovery server, its discovery quotas), on a fresh data
+/// directory.
+pub async fn spawn_node_with_options(executor: impl AgentExecutor, opts: NodeOptions) -> TestNode {
+    let dir = tempfile::tempdir().expect("create a data directory");
+    spawn_node_in_with_options(dir, executor, opts).await
+}
+
+/// [`spawn_node_with_options`] on `dir`, which may already hold a key, a
+/// store and an inventory.
+pub async fn spawn_node_in_with_options(
+    dir: tempfile::TempDir,
+    executor: impl AgentExecutor,
+    opts: NodeOptions,
+) -> TestNode {
     let downloads = tempfile::tempdir().expect("create a downloads directory");
     let mut cfg = test_config(dir.path(), WorkerCfg::Echo);
     cfg.mcp.download_dir = Some(download_dir_in(&downloads));
-    let node = Node::spawn_with_executor(cfg, executor)
+    let node = Node::spawn_with_options(cfg, executor, opts)
         .await
         .expect("spawn the node");
     TestNode {
@@ -512,6 +540,235 @@ pub async fn stub_peer(a: &TestNode, name: &str, key: &AgentKey, app: axum::Rout
             TunnelServer::new(app, TunnelLimits::default()),
         )
         .spawn()
+}
+
+/// What a [`stub_discovery_peer`] does with each request it reads.
+pub enum StubMode {
+    /// Holds the stream until the test notifies (`notify_waiters`, for every
+    /// stream held then, or `notify_one`), then ends it without an answer.
+    Hold(Arc<Notify>),
+    /// Keeps the request and answers the response given. Its contact and
+    /// announce records, when left empty, are the stub's own, valid now.
+    Record(Arc<Mutex<Vec<wire::Request>>>, wire::Response),
+    /// Reads the request and never answers.
+    Silent,
+}
+
+/// A peer that serves only `agentnet-discovery/0`, as the test scripts it
+/// ([`StubMode`]). It never serves the A2A binding: a connection on
+/// [`ALPN_A2A_HTTP`] is only counted and closed. It runs until dropped.
+pub struct StubPeer {
+    pub key: AgentKey,
+    pub id: AgentId,
+    addr: EndpointAddr,
+    seen: Arc<StubSeen>,
+    /// Keeps accepting connections until dropped.
+    router: Router,
+}
+
+/// What a stub peer has seen.
+#[derive(Debug)]
+struct StubSeen {
+    /// Connections accepted, on either ALPN.
+    connections: AtomicUsize,
+    /// Requests read whole.
+    requests: watch::Sender<usize>,
+}
+
+impl StubPeer {
+    /// Where the stub is dialed.
+    pub fn addr(&self) -> EndpointAddr {
+        self.addr.clone()
+    }
+
+    /// The connections made to the stub so far, on either ALPN.
+    pub fn connections(&self) -> usize {
+        self.seen.connections.load(Ordering::SeqCst)
+    }
+
+    /// The requests the stub has read whole so far.
+    pub fn requests(&self) -> usize {
+        *self.seen.requests.borrow()
+    }
+
+    /// Waits until the stub has read `count` requests, for up to 60 s.
+    pub async fn wait_for_requests(&self, count: usize) {
+        let mut seen = self.seen.requests.subscribe();
+        tokio::time::timeout(Duration::from_secs(60), seen.wait_for(|n| *n >= count))
+            .await
+            .expect("the stub peer read the requests in time")
+            .expect("the stub peer is alive");
+    }
+}
+
+/// The stub's discovery side.
+#[derive(Clone)]
+struct StubDiscovery {
+    mode: Arc<StubMode>,
+    seen: Arc<StubSeen>,
+    /// The stub's own signed contact and announce records.
+    records: (Vec<u8>, Vec<u8>),
+}
+
+impl std::fmt::Debug for StubDiscovery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StubDiscovery")
+    }
+}
+
+impl ProtocolHandler for StubDiscovery {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        self.seen.connections.fetch_add(1, Ordering::SeqCst);
+        let mut streams = tokio::task::JoinSet::new();
+        while let Ok((send, recv)) = connection.accept_bi().await {
+            let stub = self.clone();
+            streams.spawn(async move { stub.serve(send, recv).await });
+        }
+        Ok(())
+    }
+}
+
+impl StubDiscovery {
+    async fn serve(&self, mut send: SendStream, mut recv: RecvStream) {
+        let mut prefix = [0u8; 4];
+        if recv.read_exact(&mut prefix).await.is_err() {
+            return;
+        }
+        let Ok(len) = frame_len(prefix, MAX_REQUEST_FRAME_BYTES) else {
+            return;
+        };
+        let mut body = vec![0u8; len];
+        if recv.read_exact(&mut body).await.is_err() {
+            return;
+        }
+        let request = decode::<wire::Request>(&body);
+        self.seen.requests.send_modify(|n| *n += 1);
+        match self.mode.as_ref() {
+            StubMode::Hold(release) => {
+                release.notified().await;
+                let _ = send.finish();
+            }
+            StubMode::Record(kept, response) => {
+                if let Ok(request) = request {
+                    kept.lock().unwrap().push(request);
+                }
+                let mut response = response.clone();
+                if response.contact_record.is_empty() {
+                    response.contact_record = self.records.0.clone();
+                }
+                if response.announce_record.is_empty() {
+                    response.announce_record = self.records.1.clone();
+                }
+                let _ = send.write_all(&encode_frame(&response)).await;
+                let _ = send.finish();
+                // Until the requester has read it all.
+                let _ = send.stopped().await;
+            }
+            StubMode::Silent => std::future::pending::<()>().await,
+        }
+    }
+}
+
+/// Counts the connections made on the A2A binding, and closes them.
+#[derive(Clone, Debug)]
+struct StubRefusal(Arc<StubSeen>);
+
+impl ProtocolHandler for StubRefusal {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        self.0.connections.fetch_add(1, Ordering::SeqCst);
+        connection.close(0u32.into(), b"not served");
+        Ok(())
+    }
+}
+
+/// A stub peer that serves only `agentnet-discovery/0` as `mode` says, saved
+/// in `a` as contact `name` with its address, and a grant of it to send,
+/// read and cancel tasks that `a` holds, as [`stub_peer`] does.
+pub async fn stub_discovery_peer(a: &TestNode, name: &str, mode: StubMode) -> StubPeer {
+    let key = AgentKey::generate();
+    let endpoint = Endpoint::builder(presets::Minimal)
+        .secret_key(SecretKey::from_bytes(&key.to_bytes()))
+        .relay_mode(RelayMode::Disabled)
+        .portmapper_config(PortmapperConfig::Disabled)
+        .clear_ip_transports()
+        .bind_addr((Ipv4Addr::LOCALHOST, 0))
+        .expect("loopback bind address")
+        .bind()
+        .await
+        .expect("bind the stub's endpoint");
+    let socket = *endpoint.bound_sockets().first().expect("a bound socket");
+    let addr = EndpointAddr::new(endpoint.id()).with_ip_addr(socket);
+    let id = key.id();
+    let now = now_unix();
+    let contact = ContactRecord {
+        schema: CONTACT_SCHEMA.to_owned(),
+        agent_id: id,
+        iroh: IrohContact {
+            endpoint_id: id,
+            relay_url: None,
+            direct_addrs: vec![socket.to_string()],
+        },
+        seq: 1,
+        issued_at: format_timestamp(now).expect("a timestamp"),
+        expires_at: format_timestamp(now + RECORD_TTL_S).expect("a timestamp"),
+    };
+    let announce = AnnounceRecord {
+        schema: ANNOUNCE_SCHEMA.to_owned(),
+        agent_id: id,
+        seq: 1,
+        agent_card_hash: format!("blake3:{}", "0".repeat(64))
+            .parse()
+            .expect("a card hash"),
+        capabilities: Vec::new(),
+        discovery_alpn: "agentnet-discovery/0".to_owned(),
+        issued_at: format_timestamp(now).expect("a timestamp"),
+        expires_at: format_timestamp(now + RECORD_TTL_S).expect("a timestamp"),
+    };
+    let records = (
+        Signed::issue(&key, contact)
+            .expect("sign the stub's contact")
+            .to_json(),
+        Signed::issue(&key, announce)
+            .expect("sign the stub's announce")
+            .to_json(),
+    );
+    let seen = Arc::new(StubSeen {
+        connections: AtomicUsize::new(0),
+        requests: watch::Sender::new(0),
+    });
+    let discovery = StubDiscovery {
+        mode: Arc::new(mode),
+        seen: Arc::clone(&seen),
+        records,
+    };
+    let ops = [
+        Operation::TaskSend,
+        Operation::TaskRead,
+        Operation::TaskCancel,
+    ];
+    a.hold(&issue_grant(&key, a.id(), id, &ops, now, now + 3600));
+    a.node
+        .store
+        .contact_put(&Contact {
+            name: name.to_owned(),
+            agent_id: id,
+            ticket: Some(EndpointTicket::new(addr.clone()).to_string()),
+            added_at: now,
+        })
+        .expect("save the stub");
+    let router = Router::builder(endpoint)
+        .accept(ALPN_DISCOVERY, discovery)
+        .accept(ALPN_A2A_HTTP, StubRefusal(Arc::clone(&seen)))
+        .spawn();
+    // Its connections come from whoever dials it; this one is its own.
+    debug_assert_eq!(agent_id_of(&router.endpoint().id()), id);
+    StubPeer {
+        key,
+        id,
+        addr,
+        seen,
+        router,
+    }
 }
 
 /// The tasks `node` serves that are in `state`, as its store has them.

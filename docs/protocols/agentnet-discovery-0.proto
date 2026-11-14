@@ -1,0 +1,87 @@
+// agentnet-discovery/0: los mensajes del protocolo de descubrimiento de PALS.
+//
+// Cada stream bidireccional del ALPN `agentnet-discovery/0` lleva un frame de
+// petición (Request), que el solicitante cierra con FIN, y un frame de
+// respuesta (Response), que el servidor cierra con FIN. Un frame es la
+// longitud del mensaje codificado, en un u32 big-endian, seguida del mensaje.
+// Petición de 20 KiB como mucho; respuesta de 80 KiB como mucho.
+//
+// Los números de campo y los valores de las enumeraciones quedan fijados aquí
+// (spec §10) y no cambian de significado: un cambio incompatible es
+// `agentnet-discovery/1`. El vector `crates/pals-core/tests/vectors/discovery-v0.json`
+// congela su codificación. En Rust son estructuras escritas a mano con el
+// derive de `prost` (`crates/pals-core/src/discovery/wire.rs`), sin protoc.
+// Especificación: `agentnet-discovery-0.md`.
+
+syntax = "proto3";
+
+package agentnet.discovery.v0;
+
+message Request {
+  uint32 version = 1;              // 0
+  uint32 max_response_bytes = 2;   // 0: el límite del servidor
+  string grant_token = 3;          // opcional: un token agentnet.grant/1, ≤ 8 KiB
+  oneof op {
+    GetInventory get_inventory = 10;
+    GetBenchmarkReport get_benchmark_report = 11;
+    ServiceQuery service_query = 12;
+  }
+}
+
+message GetInventory {
+  repeated string sections = 1;    // vacío: todas las del inventario
+  string cursor = 2;               // el next_cursor de la página anterior; vacío: la primera
+  uint32 page_entries = 3;         // 0: las que quepan, como mucho 100
+}
+
+message GetBenchmarkReport {
+  string benchmark_id = 1;
+}
+
+message ServiceQuery {
+  bytes query = 1;                 // JCS de agentnet.service-query/1
+}
+
+message Response {
+  uint32 version = 1;              // 0
+  Limits limits = 2;               // los del servidor
+  bytes contact_record = 3;        // Signed<ContactRecord> en JSON
+  bytes announce_record = 4;       // Signed<AnnounceRecord> en JSON
+  oneof result {
+    bytes inventory_page = 10;     // página firmada agentnet.inventory-view/1, en JSON
+    bytes benchmark_report = 11;   // agentnet.benchmark-report/1 firmado, en JSON
+    bytes service_offer = 12;      // agentnet.service-offer/1 firmada, en JSON
+    Error error = 15;
+  }
+}
+
+message Limits {
+  uint32 max_request_bytes = 1;     // 20480
+  uint32 max_response_bytes = 2;    // 81920
+  uint32 max_query_bytes = 3;       // 8192
+  uint32 max_offer_bytes = 4;       // 16384
+  uint32 max_page_bytes = 5;        // 65536
+  uint32 max_page_entries = 6;      // 100
+  uint32 max_query_total_bytes = 7; // 1048576
+  uint32 max_card_bytes = 8;        // 32768
+}
+
+message Error {
+  ErrorCode code = 1;
+  string message = 2;                     // ≤ 256 bytes; nunca nombra nada privado
+  repeated uint32 supported_versions = 3; // con UNSUPPORTED_VERSION
+  uint32 retry_after_ms = 4;              // con RATE_LIMITED
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  UNSUPPORTED_VERSION = 1;
+  BAD_REQUEST = 2;
+  TOO_LARGE = 3;
+  RATE_LIMITED = 4;
+  NOT_FOUND = 5;
+  INVALID_CURSOR = 6;
+  UNAUTHENTICATED = 7;
+  UNSUPPORTED_OPERATION = 8;
+  INTERNAL = 9;
+}
