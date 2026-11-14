@@ -36,6 +36,7 @@ use pals::blobs::{BLOB_META_KEY, BLOB_SCHEME, BLOB_SHARE_TTL_S, BlobError, BlobR
 use pals::config::{ExecCfg, ProjectCfg, WorkerCfg};
 use pals::gateway::rewrite::{to_gateway, to_wire};
 use pals::net::{PeerHttp, agent_id_of};
+use pals::worker::MAX_INPUT_BLOBS;
 use pals_core::grant::Operation::{BlobFetch, TaskRead, TaskSend};
 use pals_core::grant::{GRANT_SCHEMA, Grant, SignedGrant, format_timestamp};
 use pals_core::identity::{AgentId, AgentKey};
@@ -665,7 +666,7 @@ async fn unreachable_holder_fails_the_task_within_the_timeout() {
     assert_eq!(res.status, 200, "{}", res.json);
     let task = &res.json["result"]["task"];
     assert_eq!(state(task), "TASK_STATE_FAILED", "{task}");
-    assert_eq!(status_text(task), "blob fetch timed out");
+    assert_eq!(status_text(task), "input fetch timed out");
     // The 2 s configured, not the default 120 s, bounded the wait.
     assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
     assert!(elapsed < Duration::from_secs(60), "{elapsed:?}");
@@ -759,6 +760,150 @@ async fn hostile_filenames_stay_inside_in_dir() {
     let task = send(&a, &b, &g, params_with_file("hi", file_part(&blob, ""))).await;
     assert_eq!(state(&task), "TASK_STATE_COMPLETED", "{task}");
     assert_eq!(answer(&task).trim(), blob.hash.to_hex());
+}
+
+#[tokio::test]
+async fn a_local_copy_needs_the_holder_to_prove_it_has_the_blob() {
+    // W runs a command that sends its input back, the best a thief could
+    // hope for.
+    let (r, w, g, project) = exec_pair(
+        r#"touch ran; cp "$PALS_IN_DIR/secret.bin" "$PALS_OUT_DIR/secret.bin""#,
+        |_| {},
+    )
+    .await;
+    let ran = project.path().join("ran");
+    let secret = random_bytes(256 * 1024);
+    // W holds H as its own upload; R knows H, and claims to hold it.
+    let own = w.node.blobs.add_bytes(secret.clone()).await.unwrap();
+    let claimed = BlobRef {
+        holder: r.id(),
+        ..own
+    };
+    assert!(!r.node.blobs.has(own.hash).await);
+    let shared = |node: &TestNode| node.node.store.events_count("blob.shared").unwrap();
+
+    // Without a share from R: refused, as any download from R would be.
+    let params = || params_with_file("hi", file_part(&claimed, "secret.bin"));
+    let task = send(&r, &w, &g, params()).await;
+    assert_eq!(state(&task), "TASK_STATE_FAILED", "{task}");
+    assert_eq!(status_text(&task), "blob fetch denied by its holder");
+    assert!(!ran.exists(), "the command ran");
+    assert_eq!(shared(&w), 0);
+
+    // R shares the hash it does not hold: it cannot prove it holds it.
+    r.node.blobs.share(&claimed, &w.id(), 3600).await.unwrap();
+    let task = send(&r, &w, &g, params()).await;
+    assert_eq!(state(&task), "TASK_STATE_FAILED", "{task}");
+    assert_eq!(status_text(&task), "blob fetch failed");
+    assert!(!ran.exists(), "the command ran");
+    assert_eq!(shared(&w), 0);
+    assert!(!r.node.blobs.has(own.hash).await);
+
+    // Once R does hold it, it proves so, and W uses its own copy.
+    let held = r.node.blobs.add_bytes(secret).await.unwrap();
+    assert_eq!(held.hash, own.hash);
+    let task = send(&r, &w, &g, params()).await;
+    assert_eq!(state(&task), "TASK_STATE_COMPLETED", "{task}");
+    assert!(ran.exists(), "the command did not run");
+    assert_eq!(shared(&w), 1);
+}
+
+#[tokio::test]
+async fn too_many_input_blobs_fail_before_fetching() {
+    let (a, b, g, project) = exec_pair(MARK_RUN, |_| {}).await;
+    let blob = a.node.blobs.add_bytes(random_bytes(2048)).await.unwrap();
+    a.node.blobs.share(&blob, &b.id(), 3600).await.unwrap();
+    let with_files = |count: usize| {
+        let mut params = message_params("hi", None);
+        let parts = params["message"]["parts"].as_array_mut().unwrap();
+        for n in 0..count {
+            parts.push(file_part(&blob, &format!("f{n}.bin")));
+        }
+        params
+    };
+
+    let task = send(&a, &b, &g, with_files(MAX_INPUT_BLOBS + 1)).await;
+    assert_eq!(state(&task), "TASK_STATE_FAILED", "{task}");
+    assert_eq!(status_text(&task), "too many input blobs");
+    assert!(!b.node.blobs.has(blob.hash).await, "it was fetched");
+    assert!(!project.path().join("ran").exists(), "the command ran");
+
+    // The limit itself is allowed.
+    let task = send(&a, &b, &g, with_files(MAX_INPUT_BLOBS)).await;
+    assert_eq!(state(&task), "TASK_STATE_COMPLETED", "{task}");
+}
+
+#[tokio::test]
+async fn inputs_over_the_limit_together_fail_before_fetching() {
+    let (a, b, g, project) = exec_pair(MARK_RUN, |cfg| cfg.limits.max_blob_bytes = 1024).await;
+    let mut params = message_params("hi", None);
+    let mut blobs = Vec::new();
+    for n in 0..2 {
+        // Each within the limit; together, beyond it.
+        let blob = a.node.blobs.add_bytes(random_bytes(600)).await.unwrap();
+        a.node.blobs.share(&blob, &b.id(), 3600).await.unwrap();
+        let part = file_part(&blob, &format!("f{n}.bin"));
+        params["message"]["parts"]
+            .as_array_mut()
+            .unwrap()
+            .push(part);
+        blobs.push(blob);
+    }
+
+    let task = send(&a, &b, &g, params).await;
+    assert_eq!(state(&task), "TASK_STATE_FAILED", "{task}");
+    assert_eq!(status_text(&task), "inputs too large");
+    for blob in &blobs {
+        assert!(!b.node.blobs.has(blob.hash).await, "it was fetched");
+    }
+    assert!(!project.path().join("ran").exists(), "the command ran");
+
+    // Naming one blob again, under a smaller size, does not get more of it
+    // in: each part is held to its own declaration.
+    let blob = blobs[0];
+    let mut params = message_params("hi", None);
+    for (n, size) in [600, 1].into_iter().enumerate() {
+        let part = file_part(&BlobRef { size, ..blob }, &format!("f{n}.bin"));
+        params["message"]["parts"]
+            .as_array_mut()
+            .unwrap()
+            .push(part);
+    }
+    let task = send(&a, &b, &g, params).await;
+    assert_eq!(state(&task), "TASK_STATE_FAILED", "{task}");
+    assert_eq!(status_text(&task), "blob too large");
+    assert!(!project.path().join("ran").exists(), "the command ran");
+}
+
+#[tokio::test]
+async fn input_tags_are_released_after_the_task() {
+    let (a, b, g, _project) = exec_pair(r#"wc -c < "$PALS_IN_DIR/data.bin""#, |_| {}).await;
+    let blob = a.node.blobs.add_bytes(random_bytes(4096)).await.unwrap();
+    a.node.blobs.share(&blob, &b.id(), 3600).await.unwrap();
+
+    let task = send(
+        &a,
+        &b,
+        &g,
+        params_with_file("hi", file_part(&blob, "data.bin")),
+    )
+    .await;
+    assert_eq!(state(&task), "TASK_STATE_COMPLETED", "{task}");
+    assert_eq!(answer(&task).trim(), "4096");
+
+    // No tag holds the input any longer: the store may reclaim it.
+    let tags = b.node.blobs.tags().await.unwrap();
+    assert!(
+        tags.iter().all(|(_, hash)| *hash != blob.hash),
+        "a tag still holds the input: {tags:?}"
+    );
+    assert!(
+        tags.iter().all(|(name, _)| !name.starts_with("input/")),
+        "{tags:?}"
+    );
+    // The holder keeps its upload.
+    let kept = a.node.blobs.tags().await.unwrap();
+    assert!(kept.iter().any(|(_, hash)| *hash == blob.hash), "{kept:?}");
 }
 
 #[test]

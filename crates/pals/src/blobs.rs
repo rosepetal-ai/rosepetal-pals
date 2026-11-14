@@ -10,7 +10,18 @@
 //! it has [shared](BlobService::share) it with, through a grant it issued,
 //! as for tasks: `blob.fetch` on `blob:<hash hex>`, with the holder as issuer
 //! and audience. Every request is checked before any byte is sent, against
-//! the peer that the connection's handshake authenticated.
+//! the peer that the connection's handshake authenticated. Nor does a
+//! reference to a blob this agent happens to store already make its copy
+//! the referrer's: [`BlobService::fetch`] uses what the store holds only once
+//! the named holder proves, now, that it holds that blob too.
+//!
+//! The store keeps what is tagged: the files an agent adds (uploads through
+//! the gateway, the files its tasks answer with), under `kept/<hash hex>`,
+//! for as long as the store lasts, since their retention is not decided yet;
+//! and the inputs of a task in progress, under `input/<task id>/<hash hex>`,
+//! until they are in its `in_dir`. Garbage collection, every
+//! [`BLOB_GC_INTERVAL`], removes the rest: inputs once used, downloads left
+//! unfinished, blobs the gateway fetched once it has served them.
 //!
 //! In A2A messages a blob is a `url` part ([`BlobRef::to_part`]): between
 //! peers its URL is `iroh-blob://<holder agent id>/<hash hex>`
@@ -30,16 +41,20 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
+use iroh_blobs::api::TempTag;
 use iroh_blobs::api::blobs::{AddProgressItem, BlobStatus};
 use iroh_blobs::api::proto::ExportRangesItem;
 use iroh_blobs::api::remote::GetProgressItem;
 use iroh_blobs::get::GetError;
-use iroh_blobs::protocol::{ERR_PERMISSION, GetRequest};
+use iroh_blobs::protocol::{ChunkRanges, ChunkRangesExt, ERR_PERMISSION, GetRequest};
 use iroh_blobs::provider::events::{
     AbortReason, ConnectMode, EventMask, EventSender, ObserveMode, ProviderMessage, RequestMode,
     ThrottleMode,
 };
+use iroh_blobs::store::GcConfig;
 use iroh_blobs::store::fs::FsStore;
+use iroh_blobs::store::fs::options::Options;
+use iroh_blobs::store::mem::MemStore;
 use iroh_blobs::{BlobsProtocol, Hash, HashAndFormat};
 use pals_core::grant::{GRANT_SCHEMA, Grant, Operation, SignedGrant, format_timestamp};
 use pals_core::identity::{AgentId, AgentKey};
@@ -62,6 +77,17 @@ pub const BLOBS_DIR: &str = "blobs";
 /// The project of the grants [`BlobService::share`] issues.
 pub const BLOB_PROJECT: &str = "blobs";
 
+/// How often the store removes the blobs no tag holds.
+pub const BLOB_GC_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// The prefix of the tags of the blobs the store keeps.
+const KEPT_TAG_PREFIX: &str = "kept/";
+/// The prefix of the tags of the inputs of tasks in progress.
+const INPUT_TAG_PREFIX: &str = "input/";
+/// How many chunks, besides the last one, a holder proves it holds.
+const POSSESSION_SAMPLES: usize = 3;
+/// The size of a BLAKE3 chunk.
+const CHUNK_BYTES: u64 = 1024;
 /// How long dialing a blob's holder may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How many provider events may wait for the authorizer.
@@ -217,7 +243,9 @@ struct Inner {
 
 impl BlobService {
     /// Opens the blob store in `dir`, creating it if missing, for the agent
-    /// of `key`, whose `endpoint` and `store` these are.
+    /// of `key`, whose `endpoint` and `store` these are, with garbage
+    /// collection every [`BLOB_GC_INTERVAL`]. The input tags a previous run
+    /// left are dropped: their tasks are over.
     ///
     /// Its [`protocol`](BlobService::protocol) serves only what the agent
     /// shared, as the grants in `store` say.
@@ -233,9 +261,18 @@ impl BlobService {
             "the endpoint is not the agent's"
         );
         ensure!(*store.owner() == id, "the store is not the agent's");
-        let fs = FsStore::load(dir)
+        let mut options = Options::new(dir);
+        options.gc = Some(GcConfig {
+            interval: BLOB_GC_INTERVAL,
+            add_protected: None,
+        });
+        let fs = FsStore::load_with_opts(dir.join("blobs.db"), options)
             .await
             .map_err(|err| anyhow!("cannot open the blob store {}: {err}", dir.display()))?;
+        fs.tags()
+            .delete_prefix(INPUT_TAG_PREFIX)
+            .await
+            .map_err(|err| anyhow!("cannot drop the input tags of a previous run: {err}"))?;
         let (events, requests) = EventSender::channel(EVENT_CAPACITY, PROVIDER_EVENTS);
         tokio::spawn(authorize(requests, Arc::clone(&store)));
         let protocol = BlobsProtocol::new(&fs, Some(events));
@@ -293,7 +330,7 @@ impl BlobService {
             .context("cannot add the stream to the blob store")
     }
 
-    /// The blob an import ends with, kept under a tag of its hash.
+    /// The blob an import ends with, [kept](BlobService::keep).
     async fn added(
         &self,
         progress: impl Stream<Item = AddProgressItem>,
@@ -319,14 +356,55 @@ impl BlobService {
         bail!("the blob store stopped before the import finished")
     }
 
-    /// Tags `hash` with its own hex, so that the store keeps it.
+    /// Tags `hash` as `kept/<hash hex>`, so that the store keeps it.
+    ///
+    /// What this agent adds, uploads and the files its tasks answer with, is
+    /// kept for as long as the store lasts: their retention policy is beyond
+    /// milestone 1.
     async fn keep(&self, hash: Hash) -> anyhow::Result<()> {
         self.inner
             .fs
             .tags()
-            .set(hash.to_hex(), HashAndFormat::raw(hash))
+            .set(
+                format!("{KEPT_TAG_PREFIX}{}", hash.to_hex()),
+                HashAndFormat::raw(hash),
+            )
             .await
             .map_err(|err| anyhow!("cannot tag blob {hash}: {err}"))
+    }
+
+    /// Holds `hash` in the store, against garbage collection, for as long as
+    /// the returned tag lives.
+    pub(crate) async fn protect(&self, hash: Hash) -> anyhow::Result<TempTag> {
+        self.inner
+            .fs
+            .tags()
+            .temp_tag(HashAndFormat::raw(hash))
+            .await
+            .map_err(|err| anyhow!("cannot protect blob {hash}: {err}"))
+    }
+
+    /// Holds `hash` in the store as an input of task `task_id`, until
+    /// [`release_inputs`](BlobService::release_inputs).
+    pub(crate) async fn hold_input(&self, task_id: &str, hash: Hash) -> anyhow::Result<()> {
+        self.inner
+            .fs
+            .tags()
+            .set(
+                format!("{INPUT_TAG_PREFIX}{task_id}/{}", hash.to_hex()),
+                HashAndFormat::raw(hash),
+            )
+            .await
+            .map_err(|err| anyhow!("cannot hold input {hash}: {err}"))
+    }
+
+    /// Lets go of the inputs of task `task_id`, which garbage collection may
+    /// then remove.
+    pub(crate) async fn release_inputs(&self, task_id: &str) {
+        let prefix = format!("{INPUT_TAG_PREFIX}{task_id}/");
+        if let Err(err) = self.inner.fs.tags().delete_prefix(prefix).await {
+            warn!(%task_id, error = %err, "cannot release the inputs of a task");
+        }
     }
 
     /// Lets agent `with` fetch `blob`, which this agent holds, for `ttl_s`
@@ -372,14 +450,26 @@ impl BlobService {
         .context("the share did not finish")?
     }
 
-    /// Downloads `blob` from its holder, at `holder`, into the store, unless
-    /// the store has it already; `progress` is told the bytes received.
+    /// Gets `blob` into the store from its holder, at `holder`; `progress`
+    /// is told the bytes received.
     ///
-    /// Only what the store lacks is requested, so a download that was
-    /// interrupted resumes. The declared size bounds it: a blob that turns
-    /// out larger, in the store already or as it arrives, is
-    /// [`BlobError::TooLarge`], and a download stops then. It does not bound
-    /// the time it takes, beyond dialing.
+    /// What the store holds already is used only if the holder proves it
+    /// holds the blob too: a hash this agent stores, its own or fetched
+    /// from another holder, is not the holder's to have because it names
+    /// it. When the store holds all of it, the holder must send, verified
+    /// against the hash, its last chunk and three chunks chosen at random,
+    /// into a scratch store; when it holds part of it, the
+    /// holder sends the rest, and then the same proof. Otherwise the holder
+    /// sends it all. A holder that cannot fails the fetch.
+    ///
+    /// So a download that was interrupted resumes from what it verified. The
+    /// declared size bounds it: a blob that turns out larger, in the store
+    /// already or as it arrives, is [`BlobError::TooLarge`], and a download
+    /// stops then. It does not bound the time it takes, beyond dialing.
+    ///
+    /// The store keeps what arrives only while the download lasts: a caller
+    /// that needs it longer tags it first, as the worker does with the
+    /// inputs of a task.
     pub async fn fetch(
         &self,
         blob: &BlobRef,
@@ -391,37 +481,75 @@ impl BlobService {
                 "the address is not the holder's".to_owned(),
             ));
         }
-        if let Some(size) = self.complete_size(blob.hash).await {
-            return within_declared(size, blob);
-        }
         if blob.holder == self.inner.id {
-            return Err(BlobError::Other("this agent holds no such blob".to_owned()));
+            // This agent's own blob: its store is the only source.
+            return match self.complete_size(blob.hash).await {
+                Some(size) => within_declared(size, blob),
+                None => Err(BlobError::Other("this agent holds no such blob".to_owned())),
+            };
         }
-        let dial = self.inner.endpoint.connect(holder, iroh_blobs::ALPN);
-        let connection = match tokio::time::timeout(CONNECT_TIMEOUT, dial).await {
-            Ok(Ok(connection)) => connection,
-            Ok(Err(err)) => {
-                debug!(holder = %blob.holder, error = %err, "cannot dial a blob's holder");
-                return Err(BlobError::Unreachable);
-            }
-            Err(_) => return Err(BlobError::Unreachable),
-        };
-        let downloaded = self.download(&connection, blob, progress).await;
+        let _downloading = self.protect(blob.hash).await.map_err(store_failure)?;
+        let local = self
+            .inner
+            .fs
+            .remote()
+            .local(blob.hash)
+            .await
+            .map_err(|err| BlobError::Other(format!("cannot read the blob store: {err}")))?;
+        if local.is_complete() {
+            let size = self
+                .complete_size(blob.hash)
+                .await
+                .ok_or_else(|| BlobError::Other("cannot read the blob store".to_owned()))?;
+            within_declared(size, blob)?;
+            let connection = self.dial(holder, &blob.holder).await?;
+            let proved = prove_possession(&connection, blob.hash, size).await;
+            connection.close(0u32.into(), b"done");
+            return proved;
+        }
+        let had_some = local.local_bytes() > 0;
+        let connection = self.dial(holder, &blob.holder).await?;
+        let mut fetched = self
+            .download(&connection, blob, local.missing(), progress)
+            .await;
+        if had_some && fetched.is_ok() {
+            // Part of it was in the store already, from whoever sent it.
+            fetched = match self.complete_size(blob.hash).await {
+                Some(size) => prove_possession(&connection, blob.hash, size).await,
+                None => Err(BlobError::Other("the download ended incomplete".to_owned())),
+            };
+        }
         connection.close(0u32.into(), b"done");
-        downloaded
+        fetched
     }
 
+    /// A connection to `holder`, at `addr`, for blobs.
+    async fn dial(&self, addr: EndpointAddr, holder: &AgentId) -> Result<Connection, BlobError> {
+        let dial = self.inner.endpoint.connect(addr, iroh_blobs::ALPN);
+        match tokio::time::timeout(CONNECT_TIMEOUT, dial).await {
+            Ok(Ok(connection)) => Ok(connection),
+            Ok(Err(err)) => {
+                debug!(%holder, error = %err, "cannot dial a blob's holder");
+                Err(BlobError::Unreachable)
+            }
+            Err(_) => Err(BlobError::Unreachable),
+        }
+    }
+
+    /// Gets what `request` asks for of `blob` over `connection` into the
+    /// store, which must then hold all of it, within its declared size.
     async fn download(
         &self,
         connection: &Connection,
         blob: &BlobRef,
+        request: GetRequest,
         mut progress: Option<ProgressFn>,
     ) -> Result<(), BlobError> {
         let items = self
             .inner
             .fs
             .remote()
-            .fetch(connection.clone(), blob.hash)
+            .execute_get(connection.clone(), request)
             .stream();
         let mut items = std::pin::pin!(items);
         while let Some(item) = items.next().await {
@@ -437,13 +565,10 @@ impl BlobService {
                     }
                 }
                 GetProgressItem::Done(_) => {
-                    let Some(size) = self.complete_size(blob.hash).await else {
-                        return Err(BlobError::Other("the download ended incomplete".to_owned()));
+                    return match self.complete_size(blob.hash).await {
+                        Some(size) => within_declared(size, blob),
+                        None => Err(BlobError::Other("the download ended incomplete".to_owned())),
                     };
-                    self.keep(blob.hash)
-                        .await
-                        .map_err(|err| BlobError::Other(format!("{err:#}")))?;
-                    return within_declared(size, blob);
                 }
                 GetProgressItem::Error(err) => return Err(download_failure(&err, connection)),
             }
@@ -451,6 +576,24 @@ impl BlobService {
         Err(BlobError::Other(
             "the download ended without a result".to_owned(),
         ))
+    }
+
+    /// Every tag of the store, by name, and the blob it holds.
+    pub async fn tags(&self) -> anyhow::Result<Vec<(String, Hash)>> {
+        let tags = self.inner.fs.tags();
+        let mut listed = tags
+            .list()
+            .await
+            .map_err(|err| anyhow!("cannot list the tags: {err}"))?;
+        let mut found = Vec::new();
+        while let Some(tag) = listed.next().await {
+            let tag = tag.map_err(|err| anyhow!("cannot list the tags: {err}"))?;
+            found.push((
+                String::from_utf8_lossy(tag.name.as_ref()).into_owned(),
+                tag.hash,
+            ));
+        }
+        Ok(found)
     }
 
     /// Whether the store holds all of `hash`.
@@ -525,6 +668,55 @@ impl BlobService {
         };
         peer_addr(holder, ticket.as_deref())
     }
+}
+
+/// Asks the holder at the other end of `connection` for the last chunk of
+/// `hash`, `size` bytes long, and [`POSSESSION_SAMPLES`] chunks chosen at
+/// random, into a scratch store, the agent's own untouched: `Ok` when they
+/// all arrive, verified against the hash.
+async fn prove_possession(connection: &Connection, hash: Hash, size: u64) -> Result<(), BlobError> {
+    let chunks = size.div_ceil(CHUNK_BYTES);
+    if chunks == 0 {
+        // The empty blob holds nothing to give away.
+        return Ok(());
+    }
+    let mut ranges = ChunkRanges::chunk(chunks - 1);
+    for _ in 0..POSSESSION_SAMPLES {
+        ranges |= ChunkRanges::chunk(random_below(chunks));
+    }
+    let scratch = MemStore::new();
+    let request = GetRequest::blob_ranges(hash, ranges.clone());
+    let received = scratch
+        .remote()
+        .execute_get(connection.clone(), request)
+        .complete()
+        .await;
+    if let Err(err) = received {
+        return Err(download_failure(&err, connection));
+    }
+    let proved =
+        scratch.blobs().observe(hash).await.is_ok_and(|held| {
+            held.ranges.is_superset(&ranges) && held.validated_size() == Some(size)
+        });
+    if proved {
+        Ok(())
+    } else {
+        Err(BlobError::Other(
+            "the holder did not prove it holds the blob".to_owned(),
+        ))
+    }
+}
+
+/// A random number below `bound`, which is not 0.
+fn random_below(bound: u64) -> u64 {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).expect("the OS random number generator failed");
+    u64::from_le_bytes(bytes) % bound
+}
+
+/// A failure of the blob store, as a [`BlobError`].
+fn store_failure(err: anyhow::Error) -> BlobError {
+    BlobError::Other(format!("{err:#}"))
 }
 
 /// `Ok` when a blob of `size` bytes is within the size `blob` declares.

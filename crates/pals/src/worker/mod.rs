@@ -21,6 +21,7 @@ use a2a_server::{AgentExecutor, ExecutorContext, ServiceParams};
 use async_trait::async_trait;
 use futures::FutureExt;
 use futures::stream::{self, BoxStream, StreamExt};
+use iroh_blobs::Hash;
 use pals_core::identity::AgentId;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -37,6 +38,9 @@ pub const TASKS_DIR: &str = "tasks";
 
 /// The name of the artifact that holds the answer.
 pub const ANSWER_ARTIFACT: &str = "answer";
+
+/// The most files a question may come with.
+pub const MAX_INPUT_BLOBS: usize = 32;
 
 /// How long [`WorkerExecutor`]'s `cancel` waits for the run it stops to be
 /// over before it reports the task `CANCELED` anyway.
@@ -134,12 +138,18 @@ impl From<&ExecCfg> for Capacity {
 ///
 /// | Rule | Reason the task fails with |
 /// |-|-|
+/// | At most [`MAX_INPUT_BLOBS`] such parts, checked before fetching | `too many input blobs` |
 /// | The part declares its blob's hash and size ([`BlobRef::from_part`]) | `invalid blob reference` |
 /// | The blob's holder is the peer that asks: no one else's files are fetched on its behalf | `blob holder must be the requester` |
 /// | The declared size is at most `limits.max_blob_bytes`, checked before fetching; the download stops if the blob turns out larger than declared | `blob too large` |
-/// | Each download ends within `limits.blob_fetch_timeout_s` | `blob fetch timed out` |
-/// | The holder lets it be fetched, and can be reached | `blob fetch denied by its holder`, `blob holder unreachable` |
+/// | The declared sizes add up to at most `limits.max_blob_bytes`, checked before fetching | `inputs too large` |
+/// | All the downloads end within `limits.blob_fetch_timeout_s`, together | `input fetch timed out` |
+/// | The holder lets it be fetched, can be reached, and holds it: a copy this agent stores already is used only once the holder proves it holds it too ([`BlobService::fetch`]) | `blob fetch denied by its holder`, `blob holder unreachable`, `blob fetch failed` |
 /// | The file's name is the last component of the part's `filename` (the hash, without one), neither empty, `.` nor `..`, and no other file's | `invalid file name`, `duplicate file name` |
+///
+/// The store holds a task's inputs from before their download until they
+/// are in `in`, whatever the outcome; then its garbage collection may
+/// remove them.
 ///
 /// After the adapter, each file it answered with is added to the agent's
 /// store and [shared](BlobService::share) with the peer for
@@ -251,15 +261,18 @@ fn input_files(
     max_blob_bytes: u64,
 ) -> Result<Vec<InputFile>, AdapterError> {
     let failed = |reason: &str| AdapterError::Failed(reason.to_owned());
+    let blob_parts: Vec<&Part> = message
+        .parts
+        .iter()
+        .filter(|part| matches!(&part.content, PartContent::Url(url) if is_blob_url(url)))
+        .collect();
+    if blob_parts.len() > MAX_INPUT_BLOBS {
+        return Err(failed("too many input blobs"));
+    }
     let mut files = Vec::new();
     let mut names = HashSet::new();
-    for part in &message.parts {
-        let PartContent::Url(url) = &part.content else {
-            continue;
-        };
-        if !is_blob_url(url) {
-            continue;
-        }
+    let mut total: u64 = 0;
+    for part in blob_parts {
         let blob = BlobRef::from_part(part).ok_or_else(|| failed("invalid blob reference"))?;
         if blob.holder != *peer {
             return Err(failed("blob holder must be the requester"));
@@ -276,7 +289,11 @@ fn input_files(
         if !names.insert(name.clone()) {
             return Err(failed("duplicate file name"));
         }
+        total = total.saturating_add(blob.size);
         files.push(InputFile { blob, name });
+    }
+    if total > max_blob_bytes {
+        return Err(failed("inputs too large"));
     }
     Ok(files)
 }
@@ -468,8 +485,10 @@ async fn run_task(
         let fetched = tokio::select! {
             biased;
             () = cancel.cancelled() => Err(canceled()),
-            fetched = files.fetch_inputs(&inputs, &input.in_dir) => fetched,
+            fetched = files.fetch_inputs(&input.task_id, &inputs, &input.in_dir) => fetched,
         };
+        // In `in_dir` or not, the inputs are no longer the store's to keep.
+        files.blobs.release_inputs(&input.task_id).await;
         if let Err(err) = fetched {
             remove_dir(&task_dir).await;
             return Err(err);
@@ -500,24 +519,72 @@ fn canceled() -> AdapterError {
 }
 
 impl Files {
-    /// Fetches each of `inputs` from its holder, the requester, into
-    /// `in_dir`, each within the fetch timeout.
-    async fn fetch_inputs(&self, inputs: &[InputFile], in_dir: &Path) -> Result<(), AdapterError> {
-        for input in inputs {
-            let blob = &input.blob;
-            let holder = self.blobs.holder_addr(&blob.holder).await;
-            let fetched =
-                tokio::time::timeout(self.fetch_timeout, self.blobs.fetch(blob, holder, None))
-                    .await
-                    .unwrap_or(Err(BlobError::Timeout));
-            fetched.map_err(|err| fetch_failure(&err))?;
-            let dest = in_dir.join(&input.name);
-            if let Err(err) = self.blobs.export(blob.hash, &dest).await {
-                error!(dest = %dest.display(), error = %format!("{err:#}"), "cannot write an input file");
-                return Err(AdapterError::Failed(
-                    "cannot write an input file".to_owned(),
-                ));
+    /// Fetches each of `inputs` of task `task_id` from its holder, the
+    /// requester, into `in_dir`, all of them within the fetch timeout. Each
+    /// is [held](BlobService::hold_input) in the store from before its
+    /// download until the caller releases the task's inputs.
+    async fn fetch_inputs(
+        &self,
+        task_id: &str,
+        inputs: &[InputFile],
+        in_dir: &Path,
+    ) -> Result<(), AdapterError> {
+        let all = async {
+            let mut fetched = HashMap::new();
+            for input in inputs {
+                self.fetch_input(task_id, input, in_dir, &mut fetched)
+                    .await?;
             }
+            Ok(())
+        };
+        tokio::time::timeout(self.fetch_timeout, all)
+            .await
+            .unwrap_or_else(|_| Err(AdapterError::Failed("input fetch timed out".to_owned())))
+    }
+
+    /// Fetches `input` into `in_dir`, unless this task fetched the same
+    /// blob already: `fetched` has the size of each blob it did. Each part is
+    /// held to its own declared size.
+    async fn fetch_input(
+        &self,
+        task_id: &str,
+        input: &InputFile,
+        in_dir: &Path,
+        fetched: &mut HashMap<Hash, u64>,
+    ) -> Result<(), AdapterError> {
+        let blob = &input.blob;
+        let size = match fetched.get(&blob.hash) {
+            Some(size) => *size,
+            None => {
+                if let Err(err) = self.blobs.hold_input(task_id, blob.hash).await {
+                    error!(error = %format!("{err:#}"), "cannot hold an input in the store");
+                    return Err(AdapterError::Failed(
+                        "cannot write an input file".to_owned(),
+                    ));
+                }
+                let holder = self.blobs.holder_addr(&blob.holder).await;
+                self.blobs
+                    .fetch(blob, holder, None)
+                    .await
+                    .map_err(|err| fetch_failure(&err))?;
+                let size = self
+                    .blobs
+                    .complete_size(blob.hash)
+                    .await
+                    .ok_or_else(|| AdapterError::Failed("blob fetch failed".to_owned()))?;
+                fetched.insert(blob.hash, size);
+                size
+            }
+        };
+        if size > blob.size {
+            return Err(fetch_failure(&BlobError::TooLarge));
+        }
+        let dest = in_dir.join(&input.name);
+        if let Err(err) = self.blobs.export(blob.hash, &dest).await {
+            error!(dest = %dest.display(), error = %format!("{err:#}"), "cannot write an input file");
+            return Err(AdapterError::Failed(
+                "cannot write an input file".to_owned(),
+            ));
         }
         Ok(())
     }

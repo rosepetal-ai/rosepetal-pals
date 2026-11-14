@@ -93,6 +93,7 @@ use http::{StatusCode, Uri};
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use iroh::{Endpoint, EndpointAddr};
 use iroh_blobs::Hash;
+use iroh_blobs::api::TempTag;
 use pals_core::grant::{Grant, Operation};
 use pals_core::identity::AgentId;
 use pals_core::store::Store;
@@ -749,8 +750,17 @@ async fn download_blob(
         return error(StatusCode::NOT_FOUND, "not a blob URL");
     };
     let blobs = &state.inner.blobs;
+    // Held from before the download until the response is sent, whatever
+    // tags hold it or not.
+    let held = match blobs.protect(hash).await {
+        Ok(held) => held,
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "cannot protect a blob to serve");
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
+    };
     if let Some(size) = blobs.complete_size(hash).await {
-        return serve_blob(blobs, hash, size);
+        return serve_blob(blobs, hash, size, held);
     }
     if holder == state.inner.id {
         return error(StatusCode::NOT_FOUND, "blob not found");
@@ -779,18 +789,23 @@ async fn download_blob(
         };
     }
     match blobs.complete_size(hash).await {
-        Some(size) => serve_blob(blobs, hash, size),
+        Some(size) => serve_blob(blobs, hash, size, held),
         None => error(StatusCode::BAD_GATEWAY, "blob transfer failed"),
     }
 }
 
-/// `200` with the `size` bytes of `hash`, streamed from the store.
-fn serve_blob(blobs: &BlobService, hash: Hash, size: u64) -> Response {
+/// `200` with the `size` bytes of `hash`, streamed from the store, which
+/// `held` keeps until the last of them is sent.
+fn serve_blob(blobs: &BlobService, hash: Hash, size: u64, held: TempTag) -> Response {
+    let content = blobs.read(hash, size).map(move |chunk| {
+        let _held = &held;
+        chunk
+    });
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, OCTET_STREAM)
         .header(CONTENT_LENGTH, size)
-        .body(Body::from_stream(blobs.read(hash, size)))
+        .body(Body::from_stream(content))
         .expect("a valid response")
 }
 
