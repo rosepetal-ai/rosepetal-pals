@@ -529,7 +529,8 @@ impl TestNode {
         TestResponse::read(self.send(to, request).await).await
     }
 
-    /// `GET path` to `to`, presenting `grant` when given.
+    /// `GET path` to `to` with `A2A-Version: 1.0`, presenting `grant` when
+    /// given.
     pub async fn get(
         &self,
         to: &TestNode,
@@ -537,10 +538,10 @@ impl TestNode {
         grant: Option<&SignedGrant>,
     ) -> TestResponse {
         let bearer = grant.map(bearer);
-        let headers: Vec<(&str, &str)> = bearer
-            .iter()
-            .map(|value| ("authorization", value.as_str()))
-            .collect();
+        let mut headers = vec![("a2a-version", "1.0")];
+        if let Some(value) = &bearer {
+            headers.push(("authorization", value.as_str()));
+        }
         self.request(to, "GET", path, &headers, None).await
     }
 

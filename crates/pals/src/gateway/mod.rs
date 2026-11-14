@@ -7,7 +7,7 @@
 //! | Route | Behavior |
 //! |-|-|
 //! | `GET /healthz` | `200 {"agent_id", "name", "ticket"}` |
-//! | `GET /peers/{peer}/.well-known/agent-card.json` | the peer's card, as [`gateway_view`] |
+//! | `GET /peers/{peer}/.well-known/agent-card.json` | the peer's card, as [`gateway_view`], with `Cache-Control: max-age=300` and an `ETag`; `304` when `If-None-Match` names it |
 //! | `POST /peers/{peer}/jsonrpc`, or `/jsonrpc/` | the peer's `/jsonrpc` |
 //! | any method, `/peers/{peer}/rest/{*rest}` | the peer's `/rest/{rest}` |
 //! | `POST /blobs` | stores the raw body as a blob: `201 {"url", "hash", "size"}` |
@@ -90,8 +90,9 @@ use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
 use http::header::{
-    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST,
-    HeaderMap, HeaderName, HeaderValue, ORIGIN, X_CONTENT_TYPE_OPTIONS,
+    AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_SECURITY_POLICY,
+    CONTENT_TYPE, ETAG, HOST, HeaderMap, HeaderName, HeaderValue, IF_NONE_MATCH, ORIGIN,
+    X_CONTENT_TYPE_OPTIONS,
 };
 use http::{StatusCode, Uri};
 use http_body_util::{BodyExt, LengthLimitError, Limited};
@@ -116,6 +117,9 @@ use crate::outbox::Outbox;
 const A2A_VERSION: &str = "1.0";
 /// The largest Agent Card the gateway reads from a peer.
 const MAX_CARD_BYTES: usize = 1024 * 1024;
+/// How long a client may cache a peer's card view, as the SDK lets a node's
+/// own card be cached.
+const CARD_MAX_AGE: &str = "max-age=300";
 /// How long fetching a peer's card may take in all, dialing included.
 const CARD_TIMEOUT: Duration = Duration::from_secs(20);
 /// The prefix of the headers only PALS sets.
@@ -496,8 +500,14 @@ async fn healthz(State(state): State<GatewayState>) -> Response {
 ///
 /// The card comes from the endpoint whose id is the peer's: the connection
 /// is dialed to that id, and Iroh's handshake proves the key at the other
-/// end.
-async fn peer_card(State(state): State<GatewayState>, Path(peer): Path<String>) -> Response {
+/// end. The response may be cached for [`CARD_MAX_AGE`] and carries a
+/// strong `ETag`, the BLAKE3 of its body; a request whose `If-None-Match`
+/// names it gets `304 Not Modified` (A2A §8.6).
+async fn peer_card(
+    State(state): State<GatewayState>,
+    Path(peer): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     let target = match state.resolve(peer).await {
         Ok(Some(target)) => target,
         Ok(None) => return unknown_peer(),
@@ -528,7 +538,39 @@ async fn peer_card(State(state): State<GatewayState>, Path(peer): Path<String>) 
         Ok(Err(error)) => return tunnel_failure(&target.id, &error),
         Err(_) => return tunnel_failure(&target.id, &TunnelError::Timeout),
     };
-    Json(gateway_view(&card, &state.base_url(), &target.id)).into_response()
+    let view = gateway_view(&card, &state.base_url(), &target.id);
+    let body = serde_json::to_vec(&view).expect("an Agent Card serializes");
+    let etag = format!("\"{}\"", blake3::hash(&body).to_hex());
+    let etag = HeaderValue::from_str(&etag).expect("hex digits in quotes are a valid header");
+    let cached = HeaderValue::from_static(CARD_MAX_AGE);
+    if if_none_match(&headers, &etag) {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [(ETAG, etag), (CACHE_CONTROL, cached)],
+        )
+            .into_response();
+    }
+    (
+        [
+            (CONTENT_TYPE, HeaderValue::from_static("application/json")),
+            (ETAG, etag),
+            (CACHE_CONTROL, cached),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// Whether `If-None-Match` in `headers` names `etag`, or is `*`.
+fn if_none_match(headers: &HeaderMap, etag: &HeaderValue) -> bool {
+    let etag = etag.to_str().unwrap_or_default();
+    headers
+        .get_all(IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|tag| tag.trim().trim_start_matches("W/"))
+        .any(|tag| tag == "*" || tag == etag)
 }
 
 /// `POST /peers/{peer}/jsonrpc`, or `/jsonrpc/`: both go to the peer's

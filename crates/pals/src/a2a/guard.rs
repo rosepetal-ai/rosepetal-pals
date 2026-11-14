@@ -10,8 +10,8 @@ use a2a::{
     A2AError, AgentCard, CancelTaskRequest, DeleteTaskPushNotificationConfigRequest,
     GetExtendedAgentCardRequest, GetTaskPushNotificationConfigRequest, GetTaskRequest,
     ListTaskPushNotificationConfigsRequest, ListTaskPushNotificationConfigsResponse,
-    ListTasksRequest, ListTasksResponse, Message, SendMessageRequest, SendMessageResponse,
-    StreamResponse, SubscribeToTaskRequest, Task, TaskPushNotificationConfig,
+    ListTasksRequest, ListTasksResponse, Message, Role, SendMessageRequest, SendMessageResponse,
+    StreamResponse, SubscribeToTaskRequest, Task, TaskPushNotificationConfig, error_code,
 };
 use a2a_server::{RequestHandler, ServiceParams};
 use anyhow::Context;
@@ -38,6 +38,9 @@ const REUSED_MESSAGE_ID: &str = "messageId reused with different content";
 const STILL_IN_FLIGHT: &str = "the first request with this messageId is still in progress";
 /// How often a repeated request looks again for the outcome of the first.
 const INFLIGHT_POLL: Duration = Duration::from_millis(50);
+/// How often a subscription to a task with no execution looks at the task
+/// again ([`follow`]).
+const FOLLOW_POLL: Duration = Duration::from_millis(250);
 /// The service parameter a client activates extensions with (A2A §3.2.6).
 const EXTENSIONS_PARAM: &str = "a2a-extensions";
 /// Events of a first streaming request held for a requester that reads
@@ -46,8 +49,9 @@ const EVENT_BUFFER: usize = 32;
 
 type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 
-/// A [`RequestHandler`] that confines each peer to its own tasks and runs
-/// each message once when the request asks for it.
+/// A [`RequestHandler`] that confines each peer to its own tasks, runs each
+/// message once when the request asks for it, and makes up for defects of
+/// the pinned SDK that break A2A conformance.
 ///
 /// **Ownership.** The owner of a task is the peer, [`PEER_HEADER`], whose
 /// request created it. The [`BindingExecutor`](super::BindingExecutor)
@@ -58,6 +62,10 @@ type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 /// with `SendMessage`, fails with `TaskNotFoundError`, exactly as for a task
 /// that does not exist. `ListTasks` never reaches the inner handler: it
 /// lists the requesting peer's tasks only.
+///
+/// **Validation.** A `SendMessage` or `SendStreamingMessage` whose message
+/// has no `messageId`, no `role` or no parts, all REQUIRED in A2A, fails
+/// with `InvalidParamsError` before anything else ([`check_message`]).
 ///
 /// **Idempotency**, the opt-in [`IDEMPOTENCY_EXTENSION`]. A request that does
 /// not activate it with the `A2A-Extensions` service parameter
@@ -93,6 +101,11 @@ type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 ///   execution started, the key stays bound to its task whatever happens to
 ///   it. A key a restart left with no execution behind it is freed when the
 ///   node starts again ([`Store::dedup_clear_unbound`]).
+///
+/// **Subscription to a task with no execution.** `SubscribeToTask` on a task
+/// that is not terminal and has no live execution, such as one waiting for
+/// input, streams the task as it is now and then follows it until it ends
+/// ([`follow`]); the SDK would answer `TaskNotFoundError`.
 ///
 /// Push notification configs and the extended card go to the inner handler
 /// unchecked, and it refuses them because the agent card declares neither.
@@ -388,6 +401,27 @@ pub(crate) fn idempotency_requested(params: &ServiceParams) -> bool {
         .any(|uri| uri.trim() == IDEMPOTENCY_EXTENSION)
 }
 
+/// Fails with `InvalidParamsError` unless `message` has the fields A2A makes
+/// REQUIRED: `messageId`, `role` and at least one part.
+///
+/// SDK defect (a2a-pb 0.3.2, `pbconv::from_proto_send_message_request`):
+/// a request with no `message` at all reaches the handler as
+/// `Message::new(Role::User, vec![])`, with a fresh `messageId`, and
+/// a2a-server-lf 0.5.3 validates no REQUIRED field. Such a message has no
+/// parts, so it is refused here, in either binding.
+fn check_message(message: &Message) -> Result<(), A2AError> {
+    let missing = if message.parts.is_empty() {
+        "message.parts"
+    } else if message.message_id.is_empty() {
+        "message.messageId"
+    } else if message.role == Role::Unspecified {
+        "message.role"
+    } else {
+        return Ok(());
+    };
+    Err(A2AError::invalid_params(format!("{missing} is required")))
+}
+
 /// `events`, each task they name recorded as `peer`'s before the event goes
 /// out; if that fails, the stream ends with the error.
 fn owning(events: Events, store: Arc<Store>, peer: AgentId) -> Events {
@@ -410,6 +444,121 @@ fn owning(events: Events, store: Arc<Store>, peer: AgentId) -> Events {
             Some((item, (Some(events), store, owned)))
         },
     ))
+}
+
+/// The `GetTask` request for the task of `req`.
+fn get_request(req: &SubscribeToTaskRequest) -> GetTaskRequest {
+    GetTaskRequest {
+        id: req.id.clone(),
+        history_length: None,
+        tenant: req.tenant.clone(),
+    }
+}
+
+/// What [`follow`] is doing.
+struct Following<H> {
+    inner: Arc<H>,
+    params: ServiceParams,
+    req: SubscribeToTaskRequest,
+    /// The task as the subscriber saw it last.
+    last: Task,
+    /// Not yet sent: the first event.
+    first: Option<Task>,
+    /// The live execution being followed, if any.
+    live: Option<Events>,
+    done: bool,
+}
+
+/// A subscription to `task`, which is not terminal and had no live
+/// execution: the task as it is now, then, until the task is terminal,
+/// the events of each execution it gets, as `SubscribeToTask` streams them,
+/// and between executions the task again whenever its status changes, as
+/// seen every [`FOLLOW_POLL`].
+fn follow<H: RequestHandler>(
+    inner: Arc<H>,
+    params: ServiceParams,
+    req: SubscribeToTaskRequest,
+    task: Task,
+) -> Events {
+    let state = Following {
+        inner,
+        params,
+        req,
+        last: task.clone(),
+        first: Some(task),
+        live: None,
+        done: false,
+    };
+    Box::pin(stream::unfold(state, |mut state| async move {
+        loop {
+            if state.done {
+                return None;
+            }
+            if let Some(task) = state.first.take() {
+                return Some((Ok(StreamResponse::Task(task)), state));
+            }
+            if let Some(events) = state.live.as_mut() {
+                match events.next().await {
+                    Some(Ok(event)) => {
+                        state.done = is_terminal(&event);
+                        return Some((Ok(event), state));
+                    }
+                    Some(Err(err)) => {
+                        state.done = true;
+                        return Some((Err(err), state));
+                    }
+                    // The execution ended, the task not terminal: it may get
+                    // another.
+                    None => state.live = None,
+                }
+            }
+            match state
+                .inner
+                .subscribe_to_task(&state.params, state.req.clone())
+                .await
+            {
+                Ok(events) => {
+                    state.live = Some(events);
+                    continue;
+                }
+                // No execution, or the task ended between two looks: the
+                // store tells which.
+                Err(err)
+                    if err.code == error_code::TASK_NOT_FOUND
+                        || err.code == error_code::UNSUPPORTED_OPERATION => {}
+                Err(err) => {
+                    state.done = true;
+                    return Some((Err(err), state));
+                }
+            }
+            let task = match state
+                .inner
+                .get_task(&state.params, get_request(&state.req))
+                .await
+            {
+                Ok(task) => task,
+                Err(err) => {
+                    state.done = true;
+                    return Some((Err(err), state));
+                }
+            };
+            if task.status != state.last.status {
+                state.done = task.status.state.is_terminal();
+                state.last = task.clone();
+                return Some((Ok(StreamResponse::Task(task)), state));
+            }
+            tokio::time::sleep(FOLLOW_POLL).await;
+        }
+    }))
+}
+
+/// Whether `event` puts its task in a terminal state.
+fn is_terminal(event: &StreamResponse) -> bool {
+    match event {
+        StreamResponse::Task(task) => task.status.state.is_terminal(),
+        StreamResponse::StatusUpdate(update) => update.status.state.is_terminal(),
+        StreamResponse::ArtifactUpdate(_) | StreamResponse::Message(_) => false,
+    }
 }
 
 /// The dedup key of a message request, and the hash of its content.
@@ -619,6 +768,7 @@ impl<H: RequestHandler> RequestHandler for GuardedHandler<H> {
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
         let peer = peer(params)?;
+        check_message(&req.message)?;
         if let Some(task_id) = &req.message.task_id {
             self.ensure_owner(peer, task_id).await?;
         }
@@ -646,6 +796,7 @@ impl<H: RequestHandler> RequestHandler for GuardedHandler<H> {
         req: SendMessageRequest,
     ) -> Result<Events, A2AError> {
         let peer = peer(params)?;
+        check_message(&req.message)?;
         if let Some(task_id) = &req.message.task_id {
             self.ensure_owner(peer, task_id).await?;
         }
@@ -696,7 +847,23 @@ impl<H: RequestHandler> RequestHandler for GuardedHandler<H> {
         req: SubscribeToTaskRequest,
     ) -> Result<Events, A2AError> {
         self.ensure_owner(peer(params)?, &req.id).await?;
-        self.inner.subscribe_to_task(params, req).await
+        match self.inner.subscribe_to_task(params, req.clone()).await {
+            Err(err) if err.code == error_code::TASK_NOT_FOUND => {}
+            subscribed => return subscribed,
+        }
+        // SDK defect (a2a-server-lf 0.5.3, `DefaultRequestHandler::
+        // subscribe_to_task`): a task that exists, is not terminal and has
+        // no live execution, such as one waiting for input, gets
+        // `TaskNotFoundError`. A2A §3.1.6 wants the task as the first event,
+        // then its updates until it ends.
+        let task = self.inner.get_task(params, get_request(&req)).await?;
+        if task.status.state.is_terminal() {
+            return Err(A2AError::unsupported_operation(format!(
+                "task {} has already reached a terminal state",
+                req.id
+            )));
+        }
+        Ok(follow(Arc::clone(&self.inner), params.clone(), req, task))
     }
 
     async fn create_push_config(
@@ -884,6 +1051,27 @@ mod tests {
             assert!(!idempotency_requested(&params(off)), "{off:?}");
         }
         assert!(!idempotency_requested(&ServiceParams::new()));
+    }
+
+    #[test]
+    fn a_message_needs_an_id_a_role_and_parts() {
+        let ok = Message::new(Role::User, vec![Part::text("hola")]);
+        assert!(check_message(&ok).is_ok());
+        let mut no_parts = ok.clone();
+        no_parts.parts.clear();
+        let mut no_id = ok.clone();
+        no_id.message_id.clear();
+        let mut no_role = ok.clone();
+        no_role.role = Role::Unspecified;
+        for (message, field) in [
+            (no_parts, "message.parts"),
+            (no_id, "message.messageId"),
+            (no_role, "message.role"),
+        ] {
+            let err = check_message(&message).unwrap_err();
+            assert_eq!(err.code, error_code::INVALID_PARAMS);
+            assert!(err.message.contains(field), "{}", err.message);
+        }
     }
 
     #[tokio::test]

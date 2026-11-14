@@ -10,11 +10,13 @@ pub mod auth;
 mod binding;
 mod card;
 mod guard;
+mod rest_shim;
 mod task_store;
 
 pub(crate) use binding::BindingExecutor;
 pub use card::{BINDING_URI, IDEMPOTENCY_EXTENSION, SECURITY_SCHEME, canonical_card, gateway_view};
 pub use guard::GuardedHandler;
+pub(crate) use rest_shim::rest_shim;
 pub use task_store::SqliteTaskStore;
 
 /// The longest task id PALS accepts, from a peer or for its own tasks.
