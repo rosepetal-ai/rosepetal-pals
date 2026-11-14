@@ -43,12 +43,17 @@ const REAP_WAIT: Duration = Duration::from_secs(10);
 /// | Exit code other than 0 | `Failed` with the last [`STDERR_TAIL_BYTES`] of stderr |
 /// | Time | Beyond `timeout_s`, the process group is killed: `Failed("timeout after <n>s")` |
 /// | Cancellation | The process group is killed |
+/// | Normal exit | Whatever the command left running in its process group is killed |
 /// | Command not found | `Failed("worker command not found")` |
 /// | Load | `max_concurrent` running and `max_queue` waiting, kept by the [`WorkerExecutor`](super::WorkerExecutor); beyond them, `Rejected("busy")` |
 ///
 /// The command leads a process group of its own, so that a kill reaches
 /// whatever it started too. A run dropped before the command ends, as when
 /// the daemon stops, kills the group as well.
+///
+/// Known limit: a descendant that leaves the group, with `setsid()` or
+/// `setpgid()`, escapes every one of these kills. Containing those would
+/// take a subreaper or a cgroup.
 pub struct ExecAdapter {
     cfg: ExecCfg,
     projects: BTreeMap<String, PathBuf>,
@@ -125,6 +130,14 @@ impl Adapter for ExecAdapter {
                 read_head(stdout, max_output_bytes),
                 read_tail(stderr, STDERR_TAIL_BYTES),
             );
+            // Then its exit, without reaping it: while its zombie keeps the
+            // group id its own, the group is killed, and with it anything the
+            // command left running in the background with its pipes closed.
+            // Only then is it reaped.
+            match exited_unreaped(running.pgid).await {
+                Ok(()) => running.kill_group(),
+                Err(err) => warn!(error = %err, "cannot wait for the worker command to exit"),
+            }
             let status = running.child.wait().await;
             (stdout, stderr, status)
         };
@@ -235,6 +248,33 @@ impl Drop for Running {
         // Before `child` drops, whose own kill reaches the leader only.
         self.kill_group();
     }
+}
+
+/// Waits, on a blocking thread, until the child `pid` has exited, and leaves
+/// it unreaped (`WNOWAIT`): until it is reaped, its pid, and so the id of
+/// the group it leads, cannot be reused. POSIX `waitid`, as on Linux and
+/// macOS.
+async fn exited_unreaped(pid: libc::pid_t) -> io::Result<()> {
+    let id = libc::id_t::try_from(pid).map_err(io::Error::other)?;
+    tokio::task::spawn_blocking(move || {
+        loop {
+            // SAFETY: an all-zero `siginfo_t` is a valid value of this plain
+            // C struct, which `waitid` only writes to.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: `info` is valid for writes for the whole call.
+            let done =
+                unsafe { libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOWAIT) };
+            if done == 0 {
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 /// The reason a command could not be started.

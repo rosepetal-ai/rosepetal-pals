@@ -248,6 +248,20 @@ async fn cancel_kills_the_process_group() {
 }
 
 #[tokio::test]
+async fn background_children_die_with_the_command() {
+    // The child lets go of every pipe, so the command's output ends and the
+    // command exits normally while the child would sleep on.
+    let s = setup(sh(
+        "sleep 600 >/dev/null 2>&1 & echo $! > sleeper.pid; echo hi",
+    ))
+    .await;
+    let task = s.ask("hola").await;
+    assert_eq!(state(&task), "TASK_STATE_COMPLETED", "{task}");
+    assert_eq!(answer(&task), "hi\n");
+    wait_gone(&[s.pid_in("sleeper.pid").await]).await;
+}
+
+#[tokio::test]
 async fn missing_command_fails_and_daemon_keeps_serving() {
     // The command is a path where nothing is yet.
     let tools = tempfile::tempdir().unwrap();
