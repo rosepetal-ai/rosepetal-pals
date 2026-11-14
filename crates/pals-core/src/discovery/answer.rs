@@ -16,10 +16,14 @@
 //!    public one, or an empty public view when the agent shows none: a view
 //!    of revision 1 whose pages are never cached, so that it and the public
 //!    view a grant gives never stand for each other.
-//! 4. **Operation.** `GetInventory` is a signed page of the scope's view.
-//!    `ServiceQuery` is a signed offer ([`service_query`]).
-//!    `GetBenchmarkReport` is `UNSUPPORTED_OPERATION` in this version of
-//!    the daemon; none is `BAD_REQUEST`.
+//! 4. **Operation.** `GetInventory` is a signed page of the scope's view,
+//!    its `benchmarks` section included when asked for. `ServiceQuery` is a
+//!    signed offer ([`service_query`]), which refers to the reports of its
+//!    service the scope sees. `GetBenchmarkReport` is a report the agent
+//!    holds, as its measurer signed it, when the scope sees it
+//!    ([`get_benchmark_report`]); one it does not see is `NOT_FOUND`, as
+//!    one that does not exist. Nothing is ever measured to answer. None is
+//!    `BAD_REQUEST`.
 //!
 //! Every response carries the agent's limits and its signed records in
 //! force. An error message is a fixed text of at most
@@ -39,14 +43,16 @@ use super::matching::evaluate;
 use super::query::{OfferParts, QueryError, ServiceOffer, ServiceQuery, query_hash, sign_offer};
 use super::wire::{self, ErrorCode, request, response};
 use super::{DISCOVERY_VERSION, DiscoveryContext, MAX_RESPONSE_FRAME_BYTES, PUBLIC_CARD};
+use crate::benchmark::{BenchmarkReport, is_benchmark_id, references_for};
 use crate::card_jws::CardHash;
 use crate::grant::{AcceptError, Acceptance, GrantError, Need, accept_grant};
 use crate::identity::AgentId;
 use crate::inventory::view::{
-    INVENTORY_SECTIONS, PageRequest, VIEW_TTL_S, ViewEntry, ViewError, content_hash, page, render,
-    sign_page,
+    INVENTORY_SECTIONS, PageRequest, VIEW_TTL_S, ViewEntry, ViewError, benchmark_subjects,
+    content_hash, page, render, render_benchmarks, sign_page,
 };
 use crate::inventory::{InventorySnapshot, Scope, Section};
+use crate::signed::Signed;
 use prost::Message;
 
 /// How long a signed page is served again from the cache: half its life, so
@@ -126,10 +132,10 @@ fn outcome(
             service_query(ctx, peer, &viewer, &query.query, now_unix)
                 .map(response::Result::ServiceOffer)
         }
-        Some(request::Op::GetBenchmarkReport(_)) => Err(wire::Error::new(
-            ErrorCode::UnsupportedOperation,
-            "unsupported operation",
-        )),
+        Some(request::Op::GetBenchmarkReport(get)) => {
+            get_benchmark_report(ctx, &viewer, &get.benchmark_id)
+                .map(response::Result::BenchmarkReport)
+        }
         None => Err(bad_request("no operation")),
     }
 }
@@ -210,7 +216,8 @@ fn get_inventory(
     let (all, revision) = if viewer.empty {
         (Vec::new(), EMPTY_VIEW_REVISION)
     } else {
-        view_revision(ctx, &(ctx.inventory)(), scope, now_unix)?
+        let view = scope_view(ctx, &(ctx.inventory)(), scope, now_unix)?;
+        (view.entries, view.revision)
     };
     let req = PageRequest {
         scope,
@@ -246,7 +253,8 @@ fn get_inventory(
 /// otherwise. Its scope is the viewer's for the project it names
 /// ([`Viewer::scope_for`]); it is matched against the inventory as that
 /// scope shows it and the worker's load ([`evaluate`]), and the offer names
-/// the scope, its card, its view's revision and the query's hash, lasts
+/// the scope, its card, its view's revision and the query's hash, refers to
+/// the reports of its service the scope sees ([`references_for`]), lasts
 /// [`DiscoveryContext::offer_valid_for_ms`] and is cut to fit
 /// ([`sign_offer`]). Nothing runs: the matching reads metadata only.
 fn service_query(
@@ -262,12 +270,13 @@ fn service_query(
     })?;
     let scope = viewer.scope_for(query.project.as_deref());
     // The empty view shows nothing: no service of any capability.
-    let (snapshot, revision) = if viewer.empty {
-        (Arc::new(InventorySnapshot::default()), EMPTY_VIEW_REVISION)
+    let (snapshot, revision, reports) = if viewer.empty {
+        let snapshot = Arc::new(InventorySnapshot::default());
+        (snapshot, EMPTY_VIEW_REVISION, Vec::new())
     } else {
         let snapshot = (ctx.inventory)();
-        let (_, revision) = view_revision(ctx, &snapshot, &scope, now_unix)?;
-        (snapshot, revision)
+        let view = scope_view(ctx, &snapshot, &scope, now_unix)?;
+        (snapshot, view.revision, view.reports)
     };
     let evaluation = evaluate(&query, &snapshot, &scope, ctx.load.load(), now_unix);
     let parts = OfferParts {
@@ -282,10 +291,13 @@ fn service_query(
         valid_for_ms: ctx.offer_valid_for_ms,
         now_unix,
     };
-    let offer = ServiceOffer::new(parts, evaluation).ok_or_else(|| {
+    let mut offer = ServiceOffer::new(parts, evaluation).ok_or_else(|| {
         tracing::warn!(now_unix, "cannot date an offer");
         internal()
     })?;
+    if let Some(service) = &offer.skill_id {
+        offer.benchmark_refs = references_for(&reports, service);
+    }
     let signed = sign_offer(&ctx.key, offer).map_err(|err| {
         tracing::warn!(error = %err, "cannot sign an offer");
         internal()
@@ -305,23 +317,79 @@ fn new_offer_id() -> String {
     format!("offer-{hex}")
 }
 
-/// What `scope` shows of `snapshot`, every section of it, and its
-/// revision: it follows every section the scope shows, whatever is asked.
-fn view_revision(
+/// What a scope shows: every entry of its view, the benchmark reports it
+/// sees, and its revision.
+struct ScopeView {
+    entries: Vec<ViewEntry>,
+    reports: Vec<Signed<BenchmarkReport>>,
+    revision: u64,
+}
+
+/// What `scope` shows of `snapshot` and of the reports the agent holds:
+/// every section, benchmarks last, and its revision, which follows every
+/// section the scope shows, whatever is asked. A report shows when its
+/// visibility shows it in the scope and it is about something the scope
+/// shows, or about a pair of nodes ([`benchmark_subjects`]).
+fn scope_view(
     ctx: &DiscoveryContext,
     snapshot: &InventorySnapshot,
     scope: &Scope,
     now_unix: i64,
-) -> Result<(Vec<ViewEntry>, u64), wire::Error> {
-    let all = render(snapshot, scope, &INVENTORY_SECTIONS);
+) -> Result<ScopeView, wire::Error> {
+    let subjects = benchmark_subjects(snapshot, scope);
+    let reports: Vec<_> = ctx
+        .store
+        .benchmarks_visible(scope)
+        .map_err(|err| {
+            tracing::warn!(error = %format!("{err:#}"), "cannot read the benchmark reports");
+            internal()
+        })?
+        .into_iter()
+        .filter(|report| report.doc.subject.shown_among(&subjects))
+        .collect();
+    let mut entries = render(snapshot, scope, &INVENTORY_SECTIONS);
+    entries.extend(render_benchmarks(&reports, &subjects));
     let revision = ctx
         .store
-        .view_revision(&scope.key(), &content_hash(&all), now_unix)
+        .view_revision(&scope.key(), &content_hash(&entries), now_unix)
         .map_err(|err| {
             tracing::warn!(error = %format!("{err:#}"), "cannot read a view's revision");
             internal()
         })?;
-    Ok((all, revision))
+    Ok(ScopeView {
+        entries,
+        reports,
+        revision,
+    })
+}
+
+/// The report `id` the agent holds, as its measurer signed it, when
+/// `viewer`'s scope sees it: its visibility shows it in the scope, and it is
+/// about something the scope shows or about a pair of nodes. Otherwise,
+/// whether it exists or not, and whatever the id is, `NOT_FOUND`, the same
+/// answer. A report is only ever read: nothing is measured, and its
+/// evidence is never fetched.
+fn get_benchmark_report(
+    ctx: &DiscoveryContext,
+    viewer: &Viewer,
+    id: &str,
+) -> Result<Vec<u8>, wire::Error> {
+    let not_found = || wire::Error::new(ErrorCode::NotFound, "not found");
+    if viewer.empty || !is_benchmark_id(id) {
+        return Err(not_found());
+    }
+    let kept = ctx.store.benchmark(id).map_err(|err| {
+        tracing::warn!(error = %format!("{err:#}"), "cannot read a benchmark report");
+        internal()
+    })?;
+    let Some((report, visibility)) = kept else {
+        return Err(not_found());
+    };
+    let subjects = benchmark_subjects(&(ctx.inventory)(), &viewer.scope);
+    if !visibility.visible_in(&viewer.scope) || !report.doc.subject.shown_among(&subjects) {
+        return Err(not_found());
+    }
+    Ok(report.to_json())
 }
 
 /// The hash of the card of `scope`, or of the public card when the scope
@@ -336,8 +404,9 @@ fn card_hash<'a>(ctx: &'a DiscoveryContext, scope: &Scope) -> Result<&'a CardHas
         })
 }
 
-/// The inventory sections `names` lists, in order and without repeats; all
-/// when it lists none.
+/// The sections `names` lists, in order and without repeats; when it lists
+/// none, the inventory's ([`INVENTORY_SECTIONS`]): `benchmarks` only when
+/// named.
 fn sections(names: &[String]) -> Result<Vec<Section>, wire::Error> {
     if names.is_empty() {
         return Ok(INVENTORY_SECTIONS.to_vec());
@@ -349,10 +418,7 @@ fn sections(names: &[String]) -> Result<Vec<Section>, wire::Error> {
         .iter()
         .map(|name| {
             let name: StrDeserializer<'_, NotASection> = name.as_str().into_deserializer();
-            Section::deserialize(name)
-                .ok()
-                .filter(|section: &Section| INVENTORY_SECTIONS.contains(section))
-                .ok_or_else(|| bad_request("unknown section"))
+            Section::deserialize(name).map_err(|_| bad_request("unknown section"))
         })
         .collect::<Result<Vec<Section>, wire::Error>>()?;
     sections.sort_unstable();

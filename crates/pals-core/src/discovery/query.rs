@@ -44,6 +44,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::matching::Evaluation;
+use crate::benchmark::{
+    MAX_OFFER_BENCHMARK_REFS, is_benchmark_id, is_measurement_kind, is_profile,
+};
 use crate::card_jws::CardHash;
 use crate::grant::{format_timestamp, parse_timestamp};
 use crate::identity::{AgentId, AgentKey};
@@ -401,16 +404,23 @@ pub struct ServiceOffer {
     pub issued_at: String,
     pub expires_at: String,
     pub limitations: Vec<String>,
-    /// The benchmark reports the offer refers to.
+    /// The benchmark reports of the service the requester's scope sees, at
+    /// most [`MAX_OFFER_BENCHMARK_REFS`], the most recently measured first;
+    /// a requester asks for each with `GetBenchmarkReport`.
     pub benchmark_refs: Vec<BenchmarkRef>,
 }
 
-/// A benchmark report an offer refers to.
+/// A benchmark report an offer refers to
+/// ([`crate::benchmark::BenchmarkReport::reference`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BenchmarkRef {
+    /// 1 to 128 characters `[A-Za-z0-9._-]`.
     pub benchmark_id: String,
+    /// One of the profiles of design §9.7, or a namespaced one.
     pub profile: String,
+    /// `declared_spec`, `own_measurement` or `peer_observation`, as the
+    /// report was signed: a declared specification is never a measurement.
     pub measurement_kind: String,
     /// As a grant timestamp.
     pub measured_at: String,
@@ -550,7 +560,10 @@ impl SignedDoc for ServiceOffer {
     /// `valid_for_ms` from 1 to [`MAX_OFFER_VALID_FOR_MS`], which
     /// `expires_at` follows `issued_at` by, rounded up to a second;
     /// `compatible` exactly when it is `available` or `busy`; a safe skill
-    /// id; timestamps in the grant form.
+    /// id; timestamps in the grant form; at most
+    /// [`MAX_OFFER_BENCHMARK_REFS`] references to reports, each with a
+    /// benchmark id, a known or namespaced profile and a kind of
+    /// measurement.
     fn validate(&self) -> Result<(), SignedError> {
         let (Some(issued_at), Some(expires_at)) = (
             parse_timestamp(&self.issued_at),
@@ -568,8 +581,12 @@ impl SignedDoc for ServiceOffer {
             && expires_at - issued_at == i64::from(self.valid_for_ms.div_ceil(1000))
             && self.compatible == compatible
             && self.skill_id.as_deref().is_none_or(is_service_id)
+            && self.benchmark_refs.len() <= MAX_OFFER_BENCHMARK_REFS
             && self.benchmark_refs.iter().all(|reference| {
-                parse_timestamp(&reference.measured_at).is_some()
+                is_benchmark_id(&reference.benchmark_id)
+                    && is_profile(&reference.profile)
+                    && is_measurement_kind(&reference.measurement_kind)
+                    && parse_timestamp(&reference.measured_at).is_some()
                     && parse_timestamp(&reference.expires_at).is_some()
             });
         if valid {

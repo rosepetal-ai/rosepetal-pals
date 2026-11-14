@@ -1,21 +1,25 @@
-//! What a scope shows of the inventory ([`render`]), and the hash its
+//! What a scope shows of the inventory ([`render`]) and of the benchmark
+//! reports the agent holds ([`render_benchmarks`]), and the hash its
 //! revision follows ([`content_hash`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::{Dimensions, INVENTORY_SECTIONS, OPERATOR, ViewEntry, to_value};
+use crate::benchmark::{BenchmarkReport, MeasurementKind, Subject};
 use crate::inventory::{
     ComponentLink, ComponentRole, DETAIL_MISSING_TOOLS, Entry, InventorySnapshot, McpConnection,
     McpTool, Observation, Scope, Section, Service,
 };
 use crate::jcs::canonical;
+use crate::signed::Signed;
 
 /// What `scope` shows of `inv` in `sections`: in the order of
 /// [`INVENTORY_SECTIONS`], and in each, in the inventory's order. Only the
-/// inventory's sections: [`Section::Benchmarks`] shows nothing here.
+/// inventory's sections: [`Section::Benchmarks`] shows nothing here, but in
+/// [`render_benchmarks`].
 ///
 /// An entry renders the same whichever sections are asked for: which links
 /// and tools it shows depends only on the scope and the snapshot.
@@ -276,4 +280,160 @@ pub fn content_hash(entries: &[ViewEntry]) -> String {
         "blake3:{}",
         blake3::hash(&canonical(&to_value(entries))).to_hex()
     )
+}
+
+/// The subjects of benchmark reports that `scope` shows of `inv`, in this
+/// order: its services, its models and its hardware, each in the
+/// inventory's order. A report about anything else of the inventory never
+/// shows in the scope ([`Subject::shown_among`]).
+pub fn benchmark_subjects(inv: &InventorySnapshot, scope: &Scope) -> Vec<Subject> {
+    let inventory = &inv.inventory;
+    let services = inventory
+        .services
+        .iter()
+        .filter(|service| service.visibility.visible_in(scope))
+        .map(|service| Subject::Service(service.id.clone()));
+    let models = inventory
+        .models
+        .iter()
+        .filter(|entry| entry.visibility.visible_in(scope))
+        .map(|entry| Subject::Model(entry.id.clone()));
+    let hardware = inventory
+        .hardware
+        .iter()
+        .filter(|entry| entry.visibility.visible_in(scope))
+        .map(|entry| Subject::Hardware(entry.id.clone()));
+    services.chain(models).chain(hardware).collect()
+}
+
+/// The `benchmarks` section of a view, for `reports`, those its scope sees,
+/// and `subjects`, what it shows that reports may be about
+/// ([`benchmark_subjects`]): for each subject, a reference to each of its
+/// reports, or, when it has none, `{"subject": …, "status":
+/// "no_measurement"}`, never a zero; then a reference to each report about
+/// a pair of nodes. A report about anything else is left out
+/// ([`Subject::shown_among`]). Reports keep the order they are given in.
+///
+/// A reference names the report by its `benchmark_id`, its measurer as
+/// provenance, and in its body what it measured, its kind, its profile and
+/// when; it expires with the report. A declared specification says so: it
+/// is never presented as a measurement. Neither a reference nor a
+/// `no_measurement` is ever authorized: a report is no permission.
+pub fn render_benchmarks(
+    reports: &[Signed<BenchmarkReport>],
+    subjects: &[Subject],
+) -> Vec<ViewEntry> {
+    let mut entries = Vec::new();
+    let mut seen = BTreeSet::new();
+    for subject in subjects {
+        if !seen.insert(subject) {
+            continue;
+        }
+        let before = entries.len();
+        entries.extend(
+            reports
+                .iter()
+                .filter(|report| report.doc.subject == *subject)
+                .map(|report| reference(&report.doc)),
+        );
+        if entries.len() == before {
+            entries.push(no_measurement(subject));
+        }
+    }
+    entries.extend(
+        reports
+            .iter()
+            .filter(|report| {
+                matches!(report.doc.subject, Subject::NodePair { .. })
+                    && !seen.contains(&report.doc.subject)
+            })
+            .map(|report| reference(&report.doc)),
+    );
+    entries
+}
+
+/// The body of a reference to a report in a view.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ReportBody {
+    pub subject: Subject,
+    pub measurement_kind: MeasurementKind,
+    pub profile: String,
+    pub profile_version: String,
+    pub measured_at: String,
+}
+
+/// The body of a subject without reports in a view.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct NoMeasurementBody {
+    pub subject: Subject,
+    pub status: NoMeasurement,
+}
+
+/// The one status of a subject without reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum NoMeasurement {
+    NoMeasurement,
+}
+
+/// [`ViewEntry::provenance`] of a subject without reports: the agent says
+/// it holds none.
+pub(super) const NO_MEASUREMENT_PROVENANCE: &str = "agent";
+
+fn reference(report: &BenchmarkReport) -> ViewEntry {
+    let procedure = &report.procedure;
+    let kind = match report.measurement_kind {
+        MeasurementKind::DeclaredSpec => "a declared specification, not a measurement",
+        MeasurementKind::OwnMeasurement => "the measurer's own measurement",
+        MeasurementKind::PeerObservation => "a peer's observation",
+    };
+    let body = ReportBody {
+        subject: report.subject.clone(),
+        measurement_kind: report.measurement_kind,
+        profile: procedure.profile.clone(),
+        profile_version: procedure.profile_version.clone(),
+        measured_at: report.measured_at.clone(),
+    };
+    ViewEntry {
+        section: Section::Benchmarks,
+        id: report.benchmark_id.clone(),
+        description: format!(
+            "{} {} report: {kind}",
+            procedure.profile, procedure.profile_version
+        ),
+        provenance: report.provenance.measured_by.to_string(),
+        version: None,
+        dimensions: unauthorized(),
+        body: to_value(&body),
+        expires_at: Some(report.expires_at.clone()),
+    }
+}
+
+fn no_measurement(subject: &Subject) -> ViewEntry {
+    let body = NoMeasurementBody {
+        subject: subject.clone(),
+        status: NoMeasurement::NoMeasurement,
+    };
+    ViewEntry {
+        section: Section::Benchmarks,
+        id: subject.key(),
+        description: "No benchmark report: its performance is unknown".to_owned(),
+        provenance: NO_MEASUREMENT_PROVENANCE.to_owned(),
+        version: None,
+        dimensions: unauthorized(),
+        body: to_value(&body),
+        expires_at: None,
+    }
+}
+
+/// Shown, and never authorized.
+fn unauthorized() -> Dimensions {
+    Dimensions {
+        installed: true,
+        operational: None,
+        offered: true,
+        authorized: false,
+    }
 }

@@ -99,7 +99,9 @@
         },
         "benchmark_refs": {
           "type": "array",
-          "items": { "$ref": "#/$defs/benchmarkRef" }
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/benchmarkRef" },
+          "description": "Los informes de benchmark del servicio que ve el ámbito del solicitante, los medidos más recientemente primero, 16 como mucho; cada uno se pide entero con GetBenchmarkReport. Sin informes, vacío: nunca un cero en lugar de una medición."
         }
       },
       "required": [
@@ -163,9 +165,15 @@
     "benchmarkRef": {
       "type": "object",
       "properties": {
-        "benchmark_id": { "type": "string", "minLength": 1 },
-        "profile": { "type": "string", "minLength": 1 },
-        "measurement_kind": { "type": "string", "minLength": 1 },
+        "benchmark_id": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$" },
+        "profile": {
+          "type": "string",
+          "pattern": "^(compute\\.inference|compute\\.llm|storage\\.io|network\\.rtt|network\\.transfer|service\\.task|(?!agentnet:)[a-z0-9._-]{1,64}:[A-Za-z0-9._/-]{1,128})$"
+        },
+        "measurement_kind": {
+          "enum": ["declared_spec", "own_measurement", "peer_observation"],
+          "description": "Tal como lo firmó quien midió: una especificación declarada nunca es una medición."
+        },
         "measured_at": { "$ref": "#/$defs/timestamp" },
         "expires_at": { "$ref": "#/$defs/timestamp" }
       },

@@ -517,7 +517,8 @@ async fn error_messages_are_at_most_256_bytes() {
         (bad_token, ErrorCode::Unauthenticated, Some("tttt")),
         (bad_cursor, ErrorCode::InvalidCursor, Some("cccc")),
         (no_op, ErrorCode::BadRequest, None),
-        (benchmark, ErrorCode::UnsupportedOperation, Some("bbbb")),
+        // A report this agent does not hold, under an id no report has.
+        (benchmark, ErrorCode::NotFound, Some("bbbb")),
     ] {
         let error = remote(call(&a, &b, req).await);
         assert_eq!(error.code(), code);

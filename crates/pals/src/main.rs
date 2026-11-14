@@ -1,13 +1,14 @@
 //! The `pals` command line.
 //!
-//! Only `pals daemon` takes the data directory's lock; every other command
-//! opens the store directly, which a running daemon shares. `pals ask`,
-//! `pals task resume|cancel`, `pals card show <peer>`, `pals inventory get`
-//! and `pals query` reach peers through the running daemon's gateway.
+//! Only `pals daemon` takes the data directory's lock; every other command,
+//! `pals benchmark import|ls` included, opens the store directly, which a
+//! running daemon shares. `pals ask`, `pals task resume|cancel`, `pals card
+//! show <peer>`, `pals inventory get` and `pals query` reach peers through
+//! the running daemon's gateway.
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -27,6 +28,7 @@ use pals::inventory::InventoryState;
 use pals::net::agent_id_of;
 use pals::node::{Node, STORE_FILE};
 use pals::outbox::{AskError, AskOutcome, AskRequest, Outbox};
+use pals_core::benchmark::{BenchmarkReport, MAX_REPORT_BYTES};
 use pals_core::card_jws::{CardSigner, verify_card};
 use pals_core::discovery::query::{
     MAX_QUERY_BYTES, MAX_REPLY_TIMEOUT_MS, QUERY_SCHEMA, Requirements, ServiceQuery, accept_offer,
@@ -37,7 +39,8 @@ use pals_core::grant::{
 };
 use pals_core::identity::{AgentId, AgentKey};
 use pals_core::inventory::view::{INVENTORY_SECTIONS, render, verify_page};
-use pals_core::inventory::{Scope, Section};
+use pals_core::inventory::{Scope, Section, Visibility};
+use pals_core::signed::{Signed, SignedError};
 use pals_core::store::{Contact, Store};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -104,6 +107,11 @@ enum Command {
     /// This agent's inventory
     #[command(subcommand)]
     Inventory(InventoryCommand),
+    /// Benchmark reports this agent holds, its own or imported, each as its
+    /// measurer signed it. Peers read them over agentnet-discovery/0, as
+    /// their visibility lets them; reading one never measures anything
+    #[command(subcommand)]
+    Benchmark(BenchmarkCommand),
     /// Ask a peer whether it can serve a case, over agentnet-discovery/0
     /// through the running daemon's gateway, which keeps its offer: print
     /// the offer as the peer signed it for this agent, then `verified:
@@ -165,6 +173,26 @@ enum InventoryCommand {
         #[arg(long)]
         all: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum BenchmarkCommand {
+    /// Keep a signed benchmark report (agentnet.benchmark-report/1) read from
+    /// a JSON file, as its measurer signed it: it must verify with the key
+    /// of its provenance.measured_by, whoever that is. Importing the same
+    /// report again only changes who sees it; another report under an id
+    /// kept already is refused
+    Import {
+        /// The signed report: {"report": {...}, "signature": "..."}
+        file: PathBuf,
+        /// Who sees it: public, project:<project>, task:<project> or
+        /// private. Kept beside the report, never in it
+        #[arg(long, default_value = "private")]
+        visibility: String,
+    },
+    /// List the reports kept, by id: id, kind, profile and version, subject,
+    /// measurer, measured_at, expires_at and visibility, tab separated
+    Ls,
 }
 
 #[derive(Subcommand)]
@@ -315,6 +343,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             sections,
             all,
         }) => inventory_get(&home, &peer, &sections, all),
+        Command::Benchmark(BenchmarkCommand::Import { file, visibility }) => {
+            benchmark_import(&home, &file, &visibility)
+        }
+        Command::Benchmark(BenchmarkCommand::Ls) => benchmark_ls(&home),
         Command::Query {
             peer,
             capability,
@@ -623,6 +655,106 @@ fn inventory_get(home: &Path, peer: &str, sections: &[String], all: bool) -> any
         }
         bail!("{peer} keeps sending pages: stopped after {MAX_PAGES}")
     })
+}
+
+/// The largest file `pals benchmark import` reads: a signed report is at
+/// most [`MAX_REPORT_BYTES`] once canonical, whatever whitespace its file
+/// has.
+const MAX_REPORT_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Keeps the signed report in `file`, seen by `visibility`, as its measurer
+/// signed it. The file may spell it any way JSON allows: what is signed is
+/// the JCS of the report.
+fn benchmark_import(home: &Path, file: &Path, visibility: &str) -> anyhow::Result<()> {
+    let visibility = parse_visibility(visibility)?;
+    let mut bytes = Vec::new();
+    fs::File::open(file)
+        .with_context(|| format!("cannot read {}", file.display()))?
+        .take(MAX_REPORT_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("cannot read {}", file.display()))?;
+    ensure!(
+        bytes.len() as u64 <= MAX_REPORT_FILE_BYTES,
+        "{} is larger than {MAX_REPORT_FILE_BYTES} bytes: not a benchmark report",
+        file.display()
+    );
+    let json: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("{} is not JSON", file.display()))?;
+    let report =
+        Signed::<BenchmarkReport>::from_json(&pals_core::jcs::canonical(&json)).map_err(|err| {
+            match err {
+                SignedError::BadSignature => anyhow!(
+                    "the report in {} is not signed by its measurer (provenance.measured_by)",
+                    file.display()
+                ),
+                SignedError::TooLarge => anyhow!(
+                    "the report in {} is larger than {MAX_REPORT_BYTES} bytes: raw results go \
+                 as evidence, a hash and a blob reference",
+                    file.display()
+                ),
+                other => anyhow!(
+                    "{} is not a benchmark report (agentnet.benchmark-report/1): {other}",
+                    file.display()
+                ),
+            }
+        })?;
+    let (cfg, key) = load_agent(home)?;
+    open_store(&cfg, &key)?.benchmark_put(&report, &visibility, now_unix())?;
+    let doc = &report.doc;
+    println!(
+        "kept {}: {} of {}, measured by {}, {}",
+        doc.benchmark_id,
+        doc.measurement_kind.as_str(),
+        doc.subject.key(),
+        doc.provenance.measured_by,
+        visibility_name(&visibility)
+    );
+    Ok(())
+}
+
+/// Lists the reports kept, one per line.
+fn benchmark_ls(home: &Path) -> anyhow::Result<()> {
+    let (cfg, key) = load_agent(home)?;
+    for (report, visibility) in open_store(&cfg, &key)?.benchmarks()? {
+        let doc = &report.doc;
+        println!(
+            "{}\t{}\t{} {}\t{}\t{}\t{}\t{}\t{}",
+            doc.benchmark_id,
+            doc.measurement_kind.as_str(),
+            doc.procedure.profile,
+            doc.procedure.profile_version,
+            doc.subject.key(),
+            doc.provenance.measured_by,
+            doc.measured_at,
+            doc.expires_at,
+            visibility_name(&visibility)
+        );
+    }
+    Ok(())
+}
+
+/// The visibility `text` names: `public`, `private`, `project:<project>` or
+/// `task:<project>`.
+fn parse_visibility(text: &str) -> anyhow::Result<Visibility> {
+    match (text, Scope::from_key(text)) {
+        ("private", _) => Ok(Visibility::Private),
+        (_, Some(Scope::Public)) => Ok(Visibility::Public),
+        (_, Some(Scope::Project(project))) => Ok(Visibility::Project(vec![project])),
+        (_, Some(Scope::Task(project))) => Ok(Visibility::Task(vec![project])),
+        (_, None) => bail!(
+            "unknown visibility {text:?}: public, private, project:<project> or task:<project>"
+        ),
+    }
+}
+
+/// `visibility` as `--visibility` names it, its projects comma separated.
+fn visibility_name(visibility: &Visibility) -> String {
+    match visibility {
+        Visibility::Private => "private".to_owned(),
+        Visibility::Public => "public".to_owned(),
+        Visibility::Project(projects) => format!("project:{}", projects.join(",")),
+        Visibility::Task(projects) => format!("task:{}", projects.join(",")),
+    }
 }
 
 /// What `pals query` asks.
@@ -1390,6 +1522,27 @@ fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visibilities_take_the_names_of_scopes() {
+        assert_eq!(parse_visibility("private").unwrap(), Visibility::Private);
+        assert_eq!(parse_visibility("public").unwrap(), Visibility::Public);
+        let demo = || vec!["demo".to_owned()];
+        assert_eq!(
+            parse_visibility("project:demo").unwrap(),
+            Visibility::Project(demo())
+        );
+        assert_eq!(
+            parse_visibility("task:demo").unwrap(),
+            Visibility::Task(demo())
+        );
+        for text in ["", "friends", "project:", "project:two words", "PUBLIC"] {
+            assert!(parse_visibility(text).is_err(), "{text:?}");
+        }
+        for text in ["private", "public", "project:demo", "task:demo"] {
+            assert_eq!(visibility_name(&parse_visibility(text).unwrap()), text);
+        }
+    }
 
     #[test]
     fn ttl_takes_a_positive_number_and_a_unit() {

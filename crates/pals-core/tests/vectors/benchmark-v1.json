@@ -1,0 +1,136 @@
+{
+  "agent_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+  "canonical_hex": "7b2262656e63686d61726b5f6964223a2262656e63682d6f63722d7461736b2d303031222c226475726174696f6e5f6d73223a3132303030302c22656e7669726f6e6d656e74223a7b2263616368655f7374617465223a227761726d222c2268617264776172655f726566223a226578616d706c653a776f726b73746174696f6e222c226c6f6164223a2269646c65222c226d6f64656c5f7265766973696f6e223a226f63722d6d6574616c20323032362e3131222c2270656572223a2238313339373730656138376431373566353661333534363663333463376563636362386438613931623465653337613235646636306635623866633962333934222c22726f757465223a22646972656374222c2272756e74696d65223a226f6e6e7872756e74696d6520312e3230222c227761726d7570223a22332072756e73227d2c2265766964656e6365223a7b22626c6f62223a22626c6f623a65666566656665666566656665666566656665666566656665666566656665666566656665666566656665666566656665666566656665666566656665666566222c2268617368223a22626c616b65333a63646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364227d2c22657870697265735f6174223a22323032362d31322d31345430303a30303a30305a222c226d656173757265645f6174223a22323032362d31312d31345430303a30303a30305a222c226d6561737572656d656e745f6b696e64223a226f776e5f6d6561737572656d656e74222c2270726f636564757265223a7b22636f6e666967223a7b22636f6e63757272656e6379223a312c22696d616765223a7b227769647468223a313032347d2c227461736b223a226f63722d73657269616c2d7632227d2c22696e707574735f68617368223a22626c616b65333a61626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162222c2270726f66696c65223a22736572766963652e7461736b222c2270726f66696c655f76657273696f6e223a2231222c2272756e6e6572223a2270616c732d62656e636820302e31227d2c2270726f76656e616e6365223a7b226d656173757265645f6279223a2238613838653364643734303966313935666435326462326433636261356437326361363730396266316439343132316266333734383830316234306636663563222c226d6574686f64223a2270616c732d62656e63682072756e206f6e20746865206e6f646520697473656c66227d2c22726573756c7473223a5b7b226572726f7273223a302c226d6574726963223a22746f74616c5f74696d65222c22737461746973746963223a22703530222c22756e6365727461696e7479223a31322e32352c22756e6974223a226d73222c2276616c7565223a313138302e357d2c7b226d6574726963223a22746f74616c5f74696d65222c22737461746973746963223a22703935222c22756e6974223a226d73222c2276616c7565223a313733307d5d2c2273616d706c6573223a3130302c22736368656d61223a226167656e746e65742e62656e63686d61726b2d7265706f72742f31222c227375626a656374223a7b2273657276696365223a226f63722d6d6574616c2d7631227d7d",
+  "description": "agentnet.benchmark-report/1: the OCR agent of inventory-v1.json (key 0x01) measures its own public service ocr-metal-v1 under the profile service.task, version 1, at 2026-11-14T00:00:00Z, in force for 30 days, with every optional field present. The signature is Ed25519 over the domain followed by the JCS of report; signed is what travels, as its JCS; reference is what a service offer carries of it.",
+  "domain": "agentnet.benchmark/1\n",
+  "reference": {
+    "benchmark_id": "bench-ocr-task-001",
+    "expires_at": "2026-12-14T00:00:00Z",
+    "measured_at": "2026-11-14T00:00:00Z",
+    "measurement_kind": "own_measurement",
+    "profile": "service.task"
+  },
+  "report": {
+    "benchmark_id": "bench-ocr-task-001",
+    "duration_ms": 120000,
+    "environment": {
+      "cache_state": "warm",
+      "hardware_ref": "example:workstation",
+      "load": "idle",
+      "model_revision": "ocr-metal 2026.11",
+      "peer": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+      "route": "direct",
+      "runtime": "onnxruntime 1.20",
+      "warmup": "3 runs"
+    },
+    "evidence": {
+      "blob": "blob:efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+      "hash": "blake3:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+    },
+    "expires_at": "2026-12-14T00:00:00Z",
+    "measured_at": "2026-11-14T00:00:00Z",
+    "measurement_kind": "own_measurement",
+    "procedure": {
+      "config": {
+        "concurrency": 1,
+        "image": {
+          "width": 1024
+        },
+        "task": "ocr-serial-v2"
+      },
+      "inputs_hash": "blake3:abababababababababababababababababababababababababababababababab",
+      "profile": "service.task",
+      "profile_version": "1",
+      "runner": "pals-bench 0.1"
+    },
+    "provenance": {
+      "measured_by": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "method": "pals-bench run on the node itself"
+    },
+    "results": [
+      {
+        "errors": 0,
+        "metric": "total_time",
+        "statistic": "p50",
+        "uncertainty": 12.25,
+        "unit": "ms",
+        "value": 1180.5
+      },
+      {
+        "metric": "total_time",
+        "statistic": "p95",
+        "unit": "ms",
+        "value": 1730.0
+      }
+    ],
+    "samples": 100,
+    "schema": "agentnet.benchmark-report/1",
+    "subject": {
+      "service": "ocr-metal-v1"
+    }
+  },
+  "signature": "BYFBPNAEbF0ULOBD-PTGH1RP5bWgUfAoF7I3DrqH4z0tKQQuI0Ndwx8pkbuFz_xw1T1rTaHC8M_6ifrwhw1_BA",
+  "signed": {
+    "report": {
+      "benchmark_id": "bench-ocr-task-001",
+      "duration_ms": 120000,
+      "environment": {
+        "cache_state": "warm",
+        "hardware_ref": "example:workstation",
+        "load": "idle",
+        "model_revision": "ocr-metal 2026.11",
+        "peer": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "route": "direct",
+        "runtime": "onnxruntime 1.20",
+        "warmup": "3 runs"
+      },
+      "evidence": {
+        "blob": "blob:efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+        "hash": "blake3:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+      },
+      "expires_at": "2026-12-14T00:00:00Z",
+      "measured_at": "2026-11-14T00:00:00Z",
+      "measurement_kind": "own_measurement",
+      "procedure": {
+        "config": {
+          "concurrency": 1,
+          "image": {
+            "width": 1024
+          },
+          "task": "ocr-serial-v2"
+        },
+        "inputs_hash": "blake3:abababababababababababababababababababababababababababababababab",
+        "profile": "service.task",
+        "profile_version": "1",
+        "runner": "pals-bench 0.1"
+      },
+      "provenance": {
+        "measured_by": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+        "method": "pals-bench run on the node itself"
+      },
+      "results": [
+        {
+          "errors": 0,
+          "metric": "total_time",
+          "statistic": "p50",
+          "uncertainty": 12.25,
+          "unit": "ms",
+          "value": 1180.5
+        },
+        {
+          "metric": "total_time",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 1730.0
+        }
+      ],
+      "samples": 100,
+      "schema": "agentnet.benchmark-report/1",
+      "subject": {
+        "service": "ocr-metal-v1"
+      }
+    },
+    "signature": "BYFBPNAEbF0ULOBD-PTGH1RP5bWgUfAoF7I3DrqH4z0tKQQuI0Ndwx8pkbuFz_xw1T1rTaHC8M_6ifrwhw1_BA"
+  },
+  "signing_key_hex": "0101010101010101010101010101010101010101010101010101010101010101"
+}

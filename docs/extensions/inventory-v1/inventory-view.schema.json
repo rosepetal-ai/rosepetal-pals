@@ -187,8 +187,115 @@
               }
             }
           }
+        },
+        {
+          "if": { "properties": { "section": { "const": "benchmarks" } } },
+          "then": {
+            "properties": {
+              "dimensions": {
+                "properties": { "authorized": { "const": false } },
+                "not": { "required": ["operational"] }
+              }
+            },
+            "not": { "required": ["version"] },
+            "oneOf": [
+              {
+                "description": "Referencia a un informe que el ámbito ve: su benchmark_id, quien midió como provenance, y caduca con el informe.",
+                "properties": {
+                  "id": { "$ref": "#/$defs/benchmarkId" },
+                  "provenance": { "$ref": "#/$defs/agentId" },
+                  "body": { "$ref": "#/$defs/benchmarkReference" }
+                },
+                "required": ["expires_at"]
+              },
+              {
+                "description": "Un servicio, modelo o hardware que el ámbito muestra y del que no hay informes: sin medición, nunca cero.",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^(service|model|hardware|node_pair):",
+                    "description": "El nombre del sujeto: service:<id>, model:<id>, hardware:<id> o node_pair:<a>:<b>."
+                  },
+                  "provenance": { "const": "agent" },
+                  "body": { "$ref": "#/$defs/noMeasurement" }
+                },
+                "not": { "required": ["expires_at"] }
+              }
+            ]
+          }
         }
       ]
+    },
+    "benchmarkId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,128}$"
+    },
+    "benchmarkSubject": {
+      "description": "Lo medido, con una sola clave, como en agentnet.benchmark-report/1.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": { "service": { "$ref": "#/$defs/serviceId" } },
+          "required": ["service"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": { "model": { "$ref": "#/$defs/entryId" } },
+          "required": ["model"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": { "hardware": { "$ref": "#/$defs/entryId" } },
+          "required": ["hardware"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "node_pair": {
+              "type": "object",
+              "properties": {
+                "a": { "$ref": "#/$defs/agentId" },
+                "b": { "$ref": "#/$defs/agentId" }
+              },
+              "required": ["a", "b"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["node_pair"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "benchmarkReference": {
+      "type": "object",
+      "properties": {
+        "subject": { "$ref": "#/$defs/benchmarkSubject" },
+        "measurement_kind": {
+          "enum": ["declared_spec", "own_measurement", "peer_observation"],
+          "description": "Tal como lo firmó quien midió: una especificación declarada nunca es una medición."
+        },
+        "profile": {
+          "type": "string",
+          "pattern": "^(compute\\.inference|compute\\.llm|storage\\.io|network\\.rtt|network\\.transfer|service\\.task|(?!agentnet:)[a-z0-9._-]{1,64}:[A-Za-z0-9._/-]{1,128})$"
+        },
+        "profile_version": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$" },
+        "measured_at": { "$ref": "#/$defs/timestamp" }
+      },
+      "required": ["subject", "measurement_kind", "profile", "profile_version", "measured_at"],
+      "additionalProperties": false,
+      "description": "El informe entero se pide con GetBenchmarkReport."
+    },
+    "noMeasurement": {
+      "type": "object",
+      "properties": {
+        "subject": { "$ref": "#/$defs/benchmarkSubject" },
+        "status": { "const": "no_measurement" }
+      },
+      "required": ["subject", "status"],
+      "additionalProperties": false
     },
     "dimensions": {
       "type": "object",

@@ -1,6 +1,6 @@
 # Protocolo `agentnet-discovery/0`
 
-Especificación del protocolo con el que un agente PALS pregunta a otro qué ofrece antes de encargarle ninguna tarea: su inventario, filtrado según el permiso de quien pregunta, si puede atender un caso concreto (una consulta de servicio, que se contesta con una oferta firmada) y, en una tarea posterior del hito 2, sus informes de benchmark (diseño §7, §9.8 y §10). Es un protocolo propio de PALS, no una parte de A2A: la tarea elegida se envía después, como en el hito 1, con los bindings estándar de A2A v1.0.
+Especificación del protocolo con el que un agente PALS pregunta a otro qué ofrece antes de encargarle ninguna tarea: su inventario, filtrado según el permiso de quien pregunta, si puede atender un caso concreto (una consulta de servicio, que se contesta con una oferta firmada) y sus informes de benchmark, los que ya tiene (diseño §7, §9.7, §9.8 y §10). Es un protocolo propio de PALS, no una parte de A2A: la tarea elegida se envía después, como en el hito 1, con los bindings estándar de A2A v1.0.
 
 Los valores que aparecen aquí son los del código: `crates/pals-core/src/discovery/` (mensajes, frames y respuesta) y `crates/pals/src/discovery/{server,client}.rs` (transporte, cuotas y cliente). Los mensajes están en [`agentnet-discovery-0.proto`](agentnet-discovery-0.proto), y el vector `crates/pals-core/tests/vectors/discovery-v0.json` congela su codificación.
 
@@ -57,11 +57,11 @@ Lo que ve quien pregunta sale del grant que presenta y de nada más que envíe.
 
 Una página firmada de la vista del ámbito (`agentnet.inventory-view/1`, ver [Vistas](../extensions/inventory-v1.md#vistas)), en `inventory_page`.
 
-- `sections`: los nombres de las secciones (`services`, `skills`, `plugins`, `mcp`, `runtime`, `models`, `information`, `hardware`, `network`), en cualquier orden y con repeticiones, como mucho 32 nombres; la página las lleva ordenadas y sin repetir. Vacío: todas. Un nombre que no es una sección del inventario es `BAD_REQUEST` («unknown section»), sin repetirlo.
+- `sections`: los nombres de las secciones (`services`, `skills`, `plugins`, `mcp`, `runtime`, `models`, `information`, `hardware`, `network` y `benchmarks`), en cualquier orden y con repeticiones, como mucho 32 nombres; la página las lleva ordenadas y sin repetir. Vacío: las nueve del inventario; `benchmarks` solo sale si se nombra. Un nombre que no es una sección es `BAD_REQUEST` («unknown section»), sin repetirlo.
 - `cursor`: el `next_cursor` de la página anterior; vacío para la primera. Uno que no sirve para este solicitante, ámbito, secciones y revisión es `INVALID_CURSOR`, sin decir por qué.
 - `page_entries`: cuántas entradas como mucho; `0`, las que quepan hasta 100.
 
-Una página privada lleva en `audience` al solicitante; una pública no lleva `audience`. `seq` es la revisión del ámbito sobre todas sus secciones, y `agent_card_hash` el hash de la card de ese ámbito (la pública si el ámbito no tiene card propia). El agente guarda las páginas que firma por todo lo que las distingue, solicitante incluido, durante la mitad de su vida (150 s): una página servida desde la caché siempre tiene al menos la mitad de su vida por delante, y nunca se sirve a otro solicitante. Una entrada que no cabe sola en una página es `TOO_LARGE`.
+Una página privada lleva en `audience` al solicitante; una pública no lleva `audience`. `seq` es la revisión del ámbito sobre todas sus secciones, `benchmarks` incluida, y `agent_card_hash` el hash de la card de ese ámbito (la pública si el ámbito no tiene card propia). El agente guarda las páginas que firma por todo lo que las distingue, solicitante incluido, durante la mitad de su vida (150 s): una página servida desde la caché siempre tiene al menos la mitad de su vida por delante, y nunca se sirve a otro solicitante. Una entrada que no cabe sola en una página es `TOO_LARGE`.
 
 ### `ServiceQuery`
 
@@ -75,7 +75,13 @@ Una consulta de servicio (`agentnet.service-query/1`, esquema [`service-query.sc
 
 ### `GetBenchmarkReport`
 
-`UNSUPPORTED_OPERATION` en esta versión del daemon; la tarea 8 del hito 2 la implementa. Una petición sin operación es `BAD_REQUEST`.
+Un informe de benchmark (`agentnet.benchmark-report/1`, esquema [`benchmark-report.schema.json`](../extensions/inventory-v1/benchmark-report.schema.json)) que el agente ya tiene, en `benchmark_report`, tal como lo firmó quien midió: los bytes que guardó al importarlo, que verifican con la clave de `provenance.measured_by` (ver [Informes de benchmark](../extensions/inventory-v1.md#informes-de-benchmark)).
+
+- **Visible en el ámbito.** El del grant presentado (§4). El ámbito ve un informe si la visibilidad que el agente le dio lo muestra en él y si el ámbito muestra lo que mide (el servicio, el modelo o el hardware), o si mide una pareja de nodos.
+- **Igual que si no existiera.** Un informe que el ámbito no ve, uno que no existe y un `benchmark_id` que no es un id de informe tienen la misma respuesta: `NOT_FOUND` con el mensaje «not found», que nunca repite el id.
+- **Nunca mide.** El agente solo lee informes que ya existen: no arranca un LLM, una descarga ni un test de red, y nunca descarga la `evidence` de un informe (§9.7). Si no hay medidas, la vista dice `no_measurement`; nunca cero.
+
+Una petición sin operación es `BAD_REQUEST`.
 
 ## 6. Respuestas y errores
 
@@ -87,10 +93,10 @@ Toda respuesta, también las de error, lleva `version = 0`, `limits` y los regis
 | `BAD_REQUEST` | frame que no es una petición, cortado, seguido de más bytes, que no llega entero a tiempo («request timed out»), sin operación, con secciones desconocidas o demasiadas, o con una consulta de servicio inválida |
 | `TOO_LARGE` | frame de petición de más de 20 KiB, consulta de servicio de más de 8 KiB, respuesta mayor que `max_response_bytes`, o entrada que no cabe en una página |
 | `RATE_LIMITED` | cuota superada; con `retry_after_ms` |
-| `NOT_FOUND` | reservado (informes de benchmark, tarea 8) |
+| `NOT_FOUND` | `GetBenchmarkReport` de un informe que no existe o que el ámbito no ve, sin distinguirlos |
 | `INVALID_CURSOR` | cursor que no sirve, sea cual sea el motivo |
 | `UNAUTHENTICATED` | grant no aceptado; el mensaje es el motivo |
-| `UNSUPPORTED_OPERATION` | `GetBenchmarkReport` en esta versión |
+| `UNSUPPORTED_OPERATION` | reservado: toda operación de esta versión se atiende |
 | `INTERNAL` | el almacén no se puede leer o escribir, o no se puede firmar |
 
 Los mensajes de error son textos fijos de 256 bytes como mucho. Nunca repiten lo que envió el solicitante ni dicen si existe algo que el solicitante no puede ver: un error no distingue «no existe» de «no lo puedes ver».

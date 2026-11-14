@@ -17,6 +17,7 @@ use rusqlite::{Connection, ToSql, TransactionBehavior};
 
 use crate::identity::AgentId;
 
+mod benchmarks;
 mod cards;
 mod contacts;
 mod dedup;

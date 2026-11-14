@@ -1083,7 +1083,7 @@ fn check_timestamp(at: &str, text: &str) -> Result<(), InventoryError> {
 
 /// `<namespace>:<name>`: 1 to 64 `[a-z0-9._-]`, not `agentnet`, then 1 to
 /// 128 `[A-Za-z0-9._/-]`.
-fn is_namespaced_id(id: &str) -> bool {
+pub(crate) fn is_namespaced_id(id: &str) -> bool {
     let Some((namespace, name)) = id.split_once(':') else {
         return false;
     };

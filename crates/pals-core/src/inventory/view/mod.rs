@@ -19,11 +19,19 @@
 //!   hidden component exists. An MCP connection publishes only
 //!   the tools it offers, and, when an adapter checks it, only those the
 //!   adapter observed, named `<connection id>/<tool>` (§9.3).
+//! - **Benchmarks** ([`render_benchmarks`]): a reference to each benchmark
+//!   report the scope sees, about what it shows ([`benchmark_subjects`]) or
+//!   about a pair of nodes, with its kind of measurement as signed; and, for
+//!   each service, model or hardware the scope shows without a report,
+//!   `{"subject": …, "status": "no_measurement"}`, never a zero (§9.7). A
+//!   page has them only when asked for: the inventory's sections are
+//!   [`INVENTORY_SECTIONS`].
 //! - **Revision**: a scope's view has a sequence, the `seq` of its pages,
 //!   that moves only when what the scope shows changes
 //!   ([`crate::store::Store::view_revision`] over [`content_hash`] of every
-//!   section). Hidden entries count in nothing a page carries: a public page
-//!   has no totals, counts, hashes or references of what it leaves out.
+//!   section, benchmarks included). Hidden entries count in nothing a page
+//!   carries: a public page has no totals, counts, hashes or references of
+//!   what it leaves out.
 //! - **Pages** ([`page`]): a page ends at the first limit reached: its signed
 //!   JSON at [`MAX_PAGE_BYTES`], [`MAX_PAGE_ENTRIES`] entries (or fewer, if
 //!   asked), or [`MAX_QUERY_TOTAL_BYTES`] summed over the pages of one chain
@@ -55,10 +63,12 @@ mod render;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use self::render::{NO_MEASUREMENT_PROVENANCE, NoMeasurementBody, ReportBody};
 use super::{
     CARD_SKILL_ID, ComponentLink, MAX_STRING_BYTES, McpTool, Observation, Scope, Section,
     is_namespaced_id, is_service_id, is_tool_name,
 };
+use crate::benchmark::{is_benchmark_id, is_profile, is_profile_version};
 use crate::card_jws::CardHash;
 use crate::grant::parse_timestamp;
 use crate::identity::AgentId;
@@ -66,7 +76,7 @@ use crate::signed::{Signed, SignedDoc, SignedError, check_validity};
 
 pub use cache::ViewCache;
 pub use page::{CursorKey, PageRequest, PageSlice, page, sign_page};
-pub use render::{content_hash, render};
+pub use render::{benchmark_subjects, content_hash, render, render_benchmarks};
 
 /// The value of [`ViewPage::schema`].
 pub const VIEW_SCHEMA: &str = "agentnet.inventory-view/1";
@@ -84,8 +94,10 @@ pub const MAX_QUERY_TOTAL_BYTES: usize = 1024 * 1024;
 pub const MAX_CURSOR_BYTES: usize = 16 * 1024;
 /// The most pages a [`ViewCache`] keeps.
 pub const MAX_CACHED_PAGES: usize = 256;
-/// The sections [`render`] shows, in the order it shows them. A scope's
-/// revision is the [`content_hash`] of its view of all of them.
+/// The sections [`render`] shows, in the order it shows them, which a
+/// request that names none gets. A scope's revision is the
+/// [`content_hash`] of its view of all of them and of its benchmarks
+/// ([`render_benchmarks`]), which come last.
 pub const INVENTORY_SECTIONS: [Section; 9] = [
     Section::Services,
     Section::Skills,
@@ -282,12 +294,13 @@ impl SignedDoc for ViewPage {
 ///   [`MAX_STRING_BYTES`] bytes, `expires_at` a grant timestamp;
 /// - **ids**: a service id (`[a-z0-9][a-z0-9-]{0,63}`, never `ask`) in
 ///   `services`, an entry id (`<namespace>:<name>`) in the inventory's other
-///   sections, any non-empty id in `benchmarks`;
+///   sections;
 /// - **body**: an object, never with `visibility`, `adapter` or
 ///   `offered_tools`; a service's without `id` or `description`, with
 ///   `provenance` `operator` and neither `version` nor `expires_at`, and
 ///   only links to entry ids; an MCP connection's tools named
-///   `<its id>/<tool>`.
+///   `<its id>/<tool>`;
+/// - **benchmarks**: as [`shows_as_a_benchmark`] says.
 fn shows_as_a_view_does(entry: &ViewEntry, scope: &Scope) -> bool {
     let dimensions = &entry.dimensions;
     let shown = dimensions.installed
@@ -322,10 +335,45 @@ fn shows_as_a_view_does(entry: &ViewEntry, scope: &Scope) -> bool {
                 && links_only_entries(body)
         }
         Section::Mcp => is_namespaced_id(&entry.id) && tools_of_its_own(&entry.id, body),
-        Section::Benchmarks => !entry.id.is_empty(),
+        Section::Benchmarks => shows_as_a_benchmark(entry),
         _ => is_namespaced_id(&entry.id),
     };
     shown && text && never && by_section
+}
+
+/// Whether `entry` of the `benchmarks` section is one a view makes
+/// ([`render_benchmarks`]): never authorized nor observed, without
+/// `version`, and either a reference to a report (a benchmark id, its
+/// measurer as provenance, the report's `expires_at`, and a body of what it
+/// measured, its kind, a known or namespaced profile, its version and when)
+/// or a subject without
+/// reports (named by [`crate::benchmark::Subject::key`], without
+/// `expires_at`, with a body of the subject and `"status":
+/// "no_measurement"` only).
+fn shows_as_a_benchmark(entry: &ViewEntry) -> bool {
+    let plain = !entry.dimensions.authorized
+        && entry.dimensions.operational.is_none()
+        && entry.version.is_none();
+    let reference = || {
+        ReportBody::deserialize(&entry.body).is_ok_and(|body| {
+            is_benchmark_id(&entry.id)
+                && entry.provenance.parse::<AgentId>().is_ok()
+                && entry.expires_at.is_some()
+                && body.subject.is_valid()
+                && is_profile(&body.profile)
+                && is_profile_version(&body.profile_version)
+                && parse_timestamp(&body.measured_at).is_some()
+        })
+    };
+    let unmeasured = || {
+        NoMeasurementBody::deserialize(&entry.body).is_ok_and(|body| {
+            body.subject.is_valid()
+                && entry.id == body.subject.key()
+                && entry.provenance == NO_MEASUREMENT_PROVENANCE
+                && entry.expires_at.is_none()
+        })
+    };
+    plain && (reference() || unmeasured())
 }
 
 /// A string a view carries: 1 to [`MAX_STRING_BYTES`] bytes.

@@ -29,13 +29,13 @@ message Request {
 }
 
 message GetInventory {
-  repeated string sections = 1;    // vacío: todas las del inventario
+  repeated string sections = 1;    // vacío: todas las del inventario; benchmarks, solo si se nombra
   string cursor = 2;               // el next_cursor de la página anterior; vacío: la primera
   uint32 page_entries = 3;         // 0: las que quepan, como mucho 100
 }
 
 message GetBenchmarkReport {
-  string benchmark_id = 1;
+  string benchmark_id = 1;         // [A-Za-z0-9._-]{1,128}; NOT_FOUND si no existe o el ámbito no lo ve
 }
 
 message ServiceQuery {
