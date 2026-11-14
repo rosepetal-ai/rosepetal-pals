@@ -1,13 +1,17 @@
 //! The `pals` command line.
 //!
 //! Only `pals daemon` takes the data directory's lock; every other command
-//! opens the store directly, which a running daemon shares.
+//! opens the store directly, which a running daemon shares. `pals ask` and
+//! `pals task resume|cancel` reach peers through the running daemon's
+//! gateway.
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail, ensure};
@@ -19,6 +23,7 @@ use iroh_tickets::endpoint::EndpointTicket;
 use pals::config::{self, CONFIG_FILE, Config, INIT_TEMPLATE, is_header_safe};
 use pals::net::agent_id_of;
 use pals::node::{Node, STORE_FILE};
+use pals::outbox::{AskError, AskOutcome, AskRequest, Outbox};
 use pals_core::grant::{
     GRANT_SCHEMA, Grant, GrantError, MAX_TOKEN_BYTES, Operation, SignedGrant, format_timestamp,
     parse_timestamp,
@@ -62,6 +67,43 @@ enum Command {
     /// Grants this agent issued to peers, and grants peers issued to it
     #[command(subcommand)]
     Grant(GrantCommand),
+    /// Ask a peer a question, through the running daemon, and wait for the
+    /// answer. Exits 0 when the task completes; 2 when it fails, is
+    /// rejected or canceled, or the request is refused; 3 when the peer
+    /// cannot be reached or the wait ends first, and the question is kept
+    /// for `pals task resume`
+    Ask {
+        /// The peer, by contact name or agent id
+        peer: String,
+        /// The question
+        question: String,
+        /// A file to send with the question; repeat for more
+        #[arg(long, value_name = "FILE")]
+        attach: Vec<PathBuf>,
+        /// How long to wait for the answer: a number and s, m, h or d
+        #[arg(long, default_value = "600s")]
+        wait: String,
+    },
+    /// The questions this agent asked its peers
+    #[command(subcommand)]
+    Task(TaskCommand),
+}
+
+#[derive(Subcommand)]
+enum TaskCommand {
+    /// List the questions asked, oldest first: message id, state, peer,
+    /// task id and attempts
+    Ls,
+    /// Take up a question again: send it if it never reached the peer, wait
+    /// for its task if it did; never runs it twice. Exits as `pals ask` does
+    Resume {
+        message_id: String,
+        /// How long to wait for the answer: a number and s, m, h or d
+        #[arg(long, default_value = "600s")]
+        wait: String,
+    },
+    /// Cancel the peer's task for a question
+    Cancel { message_id: String },
 }
 
 #[derive(Subcommand)]
@@ -114,12 +156,30 @@ enum GrantCommand {
     },
 }
 
-fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+/// The exit code of an ask whose task failed, was rejected or canceled, or
+/// whose request was refused.
+const EXIT_NOT_COMPLETED: u8 = 2;
+/// The exit code of an ask that got no outcome: the peer could not be
+/// reached, or the wait ended first.
+const EXIT_NO_OUTCOME: u8 = 3;
+
+fn main() -> ExitCode {
+    // Before any HTTP client is built.
+    pals::install_crypto_provider();
+    match run(Cli::parse()) {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let home = cli.home.unwrap_or_else(config::default_home);
     let home =
         std::path::absolute(&home).with_context(|| format!("cannot resolve {}", home.display()))?;
-    match cli.command {
+    let done = match cli.command {
         Command::Init => init(&home),
         Command::Id { ticket: false } => id(&home),
         Command::Id { ticket: true } => id_ticket(&home),
@@ -136,7 +196,21 @@ fn main() -> anyhow::Result<()> {
         Command::Grant(GrantCommand::Import { token }) => grant_import(&home, &token),
         Command::Grant(GrantCommand::Revoke { grant_id }) => grant_revoke(&home, &grant_id),
         Command::Grant(GrantCommand::Ls { issued, held }) => grant_ls(&home, !held, !issued),
-    }
+        Command::Ask {
+            peer,
+            question,
+            attach,
+            wait,
+        } => return ask(&home, peer, question, attach, &wait),
+        Command::Task(TaskCommand::Ls) => task_ls(&home),
+        Command::Task(TaskCommand::Resume { message_id, wait }) => {
+            return task_resume(&home, &message_id, &wait);
+        }
+        Command::Task(TaskCommand::Cancel { message_id }) => {
+            return task_cancel(&home, &message_id);
+        }
+    };
+    done.map(|()| ExitCode::SUCCESS)
 }
 
 fn init(home: &Path) -> anyhow::Result<()> {
@@ -249,6 +323,14 @@ fn daemon(home: &Path) -> anyhow::Result<()> {
             node.id,
             node.gateway_url()
         );
+        // Listed, never sent again on their own.
+        for row in node.outbox().pending()? {
+            eprintln!(
+                "pals daemon: question {} to {} is still pending: `pals task resume {}` takes \
+                 it up again",
+                row.message_id, row.peer, row.message_id
+            );
+        }
         let signal = stop.await;
         eprintln!("pals daemon: {signal}, shutting down");
         node.shutdown().await
@@ -279,6 +361,175 @@ fn stop_signal() -> anyhow::Result<impl Future<Output = &'static str>> {
             }
             "Ctrl-C"
         })
+    }
+}
+
+fn ask(
+    home: &Path,
+    peer: String,
+    question: String,
+    attachments: Vec<PathBuf>,
+    wait: &str,
+) -> anyhow::Result<ExitCode> {
+    let wait = parse_wait(wait)?;
+    let attachments = attachments
+        .iter()
+        .map(|path| {
+            std::path::absolute(path).with_context(|| format!("cannot resolve {}", path.display()))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let request = AskRequest {
+        peer: peer.clone(),
+        question,
+        attachments,
+        wait,
+    };
+    with_outbox(home, |outbox| async move {
+        let asked = outbox.ask(request).await;
+        report(&peer, wait, asked)
+    })
+}
+
+fn task_ls(home: &Path) -> anyhow::Result<()> {
+    let (cfg, key) = load_agent(home)?;
+    let store = open_store(&cfg, &key)?;
+    let names: HashMap<AgentId, String> = store
+        .contacts()?
+        .into_iter()
+        .map(|contact| (contact.agent_id, contact.name))
+        .collect();
+    for row in store.outbox_all()? {
+        let peer = names
+            .get(&row.peer)
+            .cloned()
+            .unwrap_or_else(|| row.peer.to_string());
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            row.message_id,
+            row.state,
+            peer,
+            row.task_id.as_deref().unwrap_or("-"),
+            row.attempts
+        );
+    }
+    Ok(())
+}
+
+fn task_resume(home: &Path, message_id: &str, wait: &str) -> anyhow::Result<ExitCode> {
+    let wait = parse_wait(wait)?;
+    let message_id = message_id.to_owned();
+    with_outbox(home, |outbox| async move {
+        let resumed = outbox.resume(&message_id, wait).await;
+        report("the peer", wait, resumed)
+    })
+}
+
+fn task_cancel(home: &Path, message_id: &str) -> anyhow::Result<ExitCode> {
+    let message_id = message_id.to_owned();
+    with_outbox(home, |outbox| async move {
+        match outbox.cancel(&message_id).await {
+            Ok(outcome) => {
+                println!(
+                    "task {}: {}",
+                    outcome.task_id.as_deref().unwrap_or("-"),
+                    outcome.state
+                );
+                Ok(ExitCode::SUCCESS)
+            }
+            Err(err) => refused_or_unreachable(err),
+        }
+    })
+}
+
+/// Runs `call` with the outbox of the agent in `home`, which asks through
+/// the gateway of its running daemon.
+fn with_outbox<F, Fut>(home: &Path, call: F) -> anyhow::Result<ExitCode>
+where
+    F: FnOnce(Outbox) -> Fut,
+    Fut: Future<Output = anyhow::Result<ExitCode>>,
+{
+    let (cfg, key) = load_agent(home)?;
+    let listen = cfg.gateway.listen;
+    let store = Arc::new(open_store(&cfg, &key)?);
+    runtime(false)?.block_on(async move {
+        let health = gateway_health(listen).await.with_context(|| {
+            format!("no pals daemon answers at http://{listen}: start it with `pals daemon`")
+        })?;
+        let running = health["agent_id"].as_str().unwrap_or_default();
+        ensure!(
+            running == key.id().to_string(),
+            "the pals daemon at http://{listen} runs agent {running}, not this agent {}",
+            key.id()
+        );
+        call(Outbox::new(store, format!("http://{listen}"))).await
+    })
+}
+
+/// Prints how an ask of `peer` ended, and returns its exit code: the answer
+/// and the files on stdout, and anything else on stderr.
+fn report(
+    peer: &str,
+    wait: Duration,
+    asked: Result<AskOutcome, AskError>,
+) -> anyhow::Result<ExitCode> {
+    let outcome = match asked {
+        Ok(outcome) => outcome,
+        Err(AskError::Unreachable { message_id }) => {
+            eprintln!(
+                "pals: {peer} could not be reached; the question is kept: \
+                 `pals task resume {message_id}` tries again"
+            );
+            return Ok(ExitCode::from(EXIT_NO_OUTCOME));
+        }
+        Err(err) => return refused_or_unreachable(err),
+    };
+    let task = outcome.task_id.as_deref().unwrap_or("-");
+    match outcome.state.as_str() {
+        "TASK_STATE_COMPLETED" => {
+            if let Some(answer) = &outcome.answer {
+                println!("{answer}");
+            }
+            for file in &outcome.artifacts {
+                println!("file {}: {}", file.name, file.url);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        "TASK_STATE_SUBMITTED" | "TASK_STATE_WORKING" => {
+            eprintln!(
+                "pals: task {task} is still {} after {}s: `pals task resume {}` waits for it \
+                 again",
+                outcome.state,
+                wait.as_secs(),
+                outcome.message_id
+            );
+            Ok(ExitCode::from(EXIT_NO_OUTCOME))
+        }
+        state => {
+            eprintln!(
+                "pals: task {task} ended {state}: {}",
+                outcome.answer.as_deref().unwrap_or("no reason given")
+            );
+            Ok(ExitCode::from(EXIT_NOT_COMPLETED))
+        }
+    }
+}
+
+/// The exit code, and the message on stderr, of an ask or a cancel that
+/// failed.
+fn refused_or_unreachable(err: AskError) -> anyhow::Result<ExitCode> {
+    match err {
+        AskError::Rejected(reason) => {
+            eprintln!("pals: refused: {reason}");
+            Ok(ExitCode::from(EXIT_NOT_COMPLETED))
+        }
+        AskError::Unreachable { message_id } => {
+            eprintln!(
+                "pals: the peer could not be reached: `pals task resume {message_id}` tries \
+                 again"
+            );
+            Ok(ExitCode::from(EXIT_NO_OUTCOME))
+        }
+        AskError::Local(reason) => Err(anyhow!(reason)),
     }
 }
 
@@ -534,7 +785,20 @@ fn parse_list(list: &str) -> Vec<String> {
 
 /// The seconds of a `--ttl` such as `90s`, `30m`, `24h` or `7d`.
 fn parse_ttl(text: &str) -> anyhow::Result<i64> {
-    let invalid = || anyhow!("invalid --ttl {text:?}: use a number and s, m, h or d, such as 24h");
+    parse_seconds("--ttl", text, "24h")
+}
+
+/// The duration of a `--wait` such as `90s`, `30m` or `1h`.
+fn parse_wait(text: &str) -> anyhow::Result<Duration> {
+    let seconds = parse_seconds("--wait", text, "600s")?;
+    Ok(Duration::from_secs(u64::try_from(seconds)?))
+}
+
+/// The seconds of `flag`'s `text`: a positive number and s, m, h or d.
+/// `example` is shown when `text` is not one.
+fn parse_seconds(flag: &str, text: &str, example: &str) -> anyhow::Result<i64> {
+    let invalid =
+        || anyhow!("invalid {flag} {text:?}: use a number and s, m, h or d, such as {example}");
     let unit = text.chars().last().ok_or_else(invalid)?;
     let number = &text[..text.len() - unit.len_utf8()];
     let seconds_per_unit = match unit {
@@ -547,13 +811,13 @@ fn parse_ttl(text: &str) -> anyhow::Result<i64> {
     if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
         return Err(invalid());
     }
-    let ttl = number
+    let seconds = number
         .parse::<i64>()
         .ok()
         .and_then(|n| n.checked_mul(seconds_per_unit))
-        .ok_or_else(|| anyhow!("--ttl {text} is too long"))?;
-    ensure!(ttl > 0, "--ttl {text} must be positive");
-    Ok(ttl)
+        .ok_or_else(|| anyhow!("{flag} {text} is too long"))?;
+    ensure!(seconds > 0, "{flag} {text} must be positive");
+    Ok(seconds)
 }
 
 /// `g-` and 32 random lowercase hex digits.
@@ -651,6 +915,16 @@ mod tests {
         }
         assert!(format!("{:#}", parse_ttl("0h").unwrap_err()).contains("positive"));
         assert!(parse_ttl("99999999999999999999d").is_err());
+    }
+
+    #[test]
+    fn wait_takes_a_positive_number_and_a_unit() {
+        assert_eq!(parse_wait("600s").unwrap(), Duration::from_secs(600));
+        assert_eq!(parse_wait("2m").unwrap(), Duration::from_secs(120));
+        for bad in ["", "600", "0s", "-1s", "1.5m"] {
+            let err = format!("{:#}", parse_wait(bad).unwrap_err());
+            assert!(err.contains("--wait"), "{bad:?}: {err}");
+        }
     }
 
     #[test]

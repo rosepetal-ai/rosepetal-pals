@@ -2692,6 +2692,7 @@ dependencies = [
  "libc",
  "pals-core",
  "percent-encoding",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",

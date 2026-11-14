@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 a2a.workspace = true
+a2a-client.workspace = true
 a2a-server.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
@@ -28,6 +29,8 @@ iroh-blobs.workspace = true
 iroh-tickets.workspace = true
 pals-core.workspace = true
 percent-encoding.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -50,10 +53,7 @@ tracing.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
-# The stock A2A client, to talk to peers through the gateway as any client would.
-a2a-client.workspace = true
 assert_cmd.workspace = true
-rustls.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

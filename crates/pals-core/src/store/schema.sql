@@ -98,6 +98,11 @@ CREATE TABLE events (
 CREATE INDEX events_by_kind ON events (kind);
 
 -- Messages this agent sends to peers, persisted before the first attempt.
+-- `request_json` is the A2A `SendMessageRequest`, sent unchanged on every
+-- attempt; `task_id` the task the peer runs it as, once known; `state` is
+-- `pending` until the outcome is known, then the A2A name of the state the
+-- task ended in, or `refused` when the request was refused with no task;
+-- `attempts` counts the exchanges with the peer.
 CREATE TABLE outbox (
     message_id   TEXT PRIMARY KEY NOT NULL,
     peer         TEXT NOT NULL,

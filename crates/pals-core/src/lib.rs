@@ -3,8 +3,9 @@
 //! [`identity`] holds the agent's persistent Ed25519 key, [`jcs`] canonical
 //! JSON and the domain-separated signatures over it, [`grant`] the signed
 //! direct grants, [`store`] the local SQLite database (contacts, grants,
-//! revocations, the A2A tasks the agent serves and the messages it has
-//! seen), and [`events`] the signed, hash-chained event log kept in it.
+//! revocations, the A2A tasks the agent serves, the messages it has seen
+//! and the questions it asks), and [`events`] the signed, hash-chained event
+//! log kept in it.
 
 pub mod events;
 pub mod grant;

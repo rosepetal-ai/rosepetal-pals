@@ -105,6 +105,7 @@ use crate::blobs::{BLOB_META_KEY, BLOB_SHARE_TTL_S, BlobError, BlobRef, BlobServ
 use crate::config::LimitsCfg;
 use crate::net::{PeerHttp, TunnelError, peer_addr};
 use crate::node::ticket_of;
+use crate::outbox::Outbox;
 
 /// The A2A protocol version the gateway asks a peer's card for.
 const A2A_VERSION: &str = "1.0";
@@ -162,6 +163,8 @@ struct Inner {
     limits: LimitsCfg,
     /// Where the gateway listens.
     local_addr: SocketAddr,
+    /// The questions this agent asks its peers, through this gateway.
+    outbox: Outbox,
 }
 
 /// What the gateway of an agent works with besides its listener.
@@ -188,6 +191,7 @@ impl GatewayState {
             blobs,
             limits,
         } = parts;
+        let outbox = Outbox::new(Arc::clone(&store), base_url(&local_addr));
         Self {
             inner: Arc::new(Inner {
                 id,
@@ -198,13 +202,19 @@ impl GatewayState {
                 blobs,
                 limits,
                 local_addr,
+                outbox,
             }),
         }
     }
 
     /// `http://<address the gateway listens on>`.
     pub fn base_url(&self) -> String {
-        format!("http://{}", self.inner.local_addr)
+        base_url(&self.inner.local_addr)
+    }
+
+    /// The questions this agent asks its peers, through this gateway.
+    pub fn outbox(&self) -> &Outbox {
+        &self.inner.outbox
     }
 
     /// The agent `peer` names, a contact name or an agent id, and where to
@@ -241,6 +251,11 @@ impl GatewayState {
                 .expect("a base64url token is a valid header value")
         }))
     }
+}
+
+/// `http://<local_addr>`.
+fn base_url(local_addr: &SocketAddr) -> String {
+    format!("http://{local_addr}")
 }
 
 /// Whether `grant` can serve a request of the bindings the gateway forwards:

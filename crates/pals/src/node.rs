@@ -28,6 +28,7 @@ use crate::blobs::{BLOBS_DIR, BlobService};
 use crate::config::{Config, DataDirLock, WorkerCfg};
 use crate::gateway::{self, GatewayParts, GatewayState};
 use crate::net::{ALPN_A2A_HTTP, PeerHttp, TunnelLimits, TunnelServer};
+use crate::outbox::Outbox;
 use crate::worker::TASKS_DIR;
 use crate::worker::echo::EchoExecutor;
 #[cfg(unix)]
@@ -63,6 +64,8 @@ pub struct Node {
     pub peer_http: PeerHttp,
     /// The agent's files, in `<data_dir>/`[`BLOBS_DIR`].
     pub blobs: BlobService,
+    /// The questions this agent asks its peers, through its gateway.
+    outbox: Outbox,
     router: Router,
     gateway: GatewayServer,
     /// Purges old dedup rows every [`DEDUP_PURGE_INTERVAL`] while the node
@@ -83,10 +86,12 @@ impl Node {
     /// store; fails the tasks a previous run left in progress and removes
     /// their working directories ([`TASKS_DIR`]); frees the dedup keys it
     /// left with no execution behind them, and purges the dedup rows older
-    /// than [`DEDUP_RETENTION_S`]; binds the gateway's
-    /// listener on `gateway.listen`, which must be a loopback address (port
-    /// 0 picks a free one, see [`Node::gateway_url`]); binds the Iroh
-    /// endpoint with the agent's key and opens the blob store in
+    /// than [`DEDUP_RETENTION_S`]; logs how many questions of its own
+    /// [outbox](Outbox) are still pending, and leaves them for
+    /// [`Outbox::resume`]: it never sends them again on its own; binds the
+    /// gateway's listener on `gateway.listen`, which must be a loopback
+    /// address (port 0 picks a free one, see [`Node::gateway_url`]); binds
+    /// the Iroh endpoint with the agent's key and opens the blob store in
     /// `<data_dir>/`[`BLOBS_DIR`]; and only then serves [`ALPN_A2A_HTTP`]
     /// and [`iroh_blobs::ALPN`] on the endpoint and starts the gateway. With
     /// `net.relay` the endpoint uses Iroh's N0 preset and its public relays;
@@ -136,6 +141,17 @@ impl Node {
     /// `http://127.0.0.1:<port>` with the default `gateway.listen`.
     pub fn gateway_url(&self) -> String {
         self.gateway.url.clone()
+    }
+
+    /// The questions this agent asks its peers, through its gateway.
+    pub fn outbox(&self) -> &Outbox {
+        &self.outbox
+    }
+
+    /// Drops the connections to peers this agent holds, as a network cut
+    /// would; the next request to a peer dials it again.
+    pub async fn close_peer_connections(&self) {
+        self.peer_http.close_all().await;
     }
 
     /// Stops the gateway from accepting requests, stops purging, closes the
@@ -209,6 +225,16 @@ impl Opened {
                 tracing::info!(unbound, "freed the dedup keys a restart left unbound");
             }
             purge_dedup(&store).context("cannot purge the old dedup rows")?;
+            let pending = store
+                .outbox_pending()
+                .context("cannot read the outbox")?
+                .len();
+            if pending > 0 {
+                tracing::info!(
+                    pending,
+                    "questions to peers still pending, left for `pals task resume`"
+                );
+            }
             anyhow::Ok((lock, key, store))
         })
         .await??;
@@ -268,27 +294,27 @@ impl Opened {
             .accept(iroh_blobs::ALPN, blobs.protocol())
             .spawn();
         let peer_http = PeerHttp::new(endpoint.clone());
-        let gateway = GatewayServer::start(
-            listener,
-            GatewayState::new(
-                GatewayParts {
-                    id,
-                    name: cfg.agent.name.clone(),
-                    store: Arc::clone(&store),
-                    peer_http: peer_http.clone(),
-                    endpoint,
-                    blobs: blobs.clone(),
-                    limits: cfg.limits.clone(),
-                },
-                gateway_addr,
-            ),
+        let state = GatewayState::new(
+            GatewayParts {
+                id,
+                name: cfg.agent.name.clone(),
+                store: Arc::clone(&store),
+                peer_http: peer_http.clone(),
+                endpoint,
+                blobs: blobs.clone(),
+                limits: cfg.limits.clone(),
+            },
+            gateway_addr,
         );
+        let outbox = state.outbox().clone();
+        let gateway = GatewayServer::start(listener, state);
         let dedup_purge = AbortOnDrop(tokio::spawn(purge_dedup_hourly(Arc::clone(&store))));
         Node {
             id,
             store,
             peer_http,
             blobs,
+            outbox,
             router,
             gateway,
             dedup_purge,

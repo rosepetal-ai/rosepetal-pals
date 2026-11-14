@@ -47,9 +47,13 @@ libc = "0.2"
 # Decodes path parameters as axum does: unpinned, to be axum's.
 percent-encoding = "2"
 rusqlite = { version = "=0.42.0", features = ["bundled"] }
+# The HTTP client the A2A client is built on, to give it a client that never
+# goes through a proxy: unpinned, to be `a2a-client-lf`'s.
+reqwest = { version = "0.13", default-features = false, features = ["stream"] }
 # The crypto provider reqwest needs: iroh builds reqwest with
-# `rustls-no-provider` and rustls with `ring`. Unpinned, to be iroh's.
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# `rustls-no-provider` and rustls with `ring`. Pinned to the version iroh
+# resolves.
+rustls = { version = "=0.23.46", default-features = false, features = ["ring"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "1"
 serde_json_canonicalizer = "=0.4.1"
