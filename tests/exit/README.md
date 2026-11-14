@@ -59,6 +59,7 @@ Diferencias con el runbook:
 - El binario se compila en el anfitrión y se copia a A, en lugar de usar `cargo install` en cada máquina. A recibe una copia del árbol de trabajo del repositorio, que necesita el caso 8.
 - **Caso 3.** Si una transferencia acaba antes del corte, el arnés limita el emisor y repite, como indica el runbook. En `subida` usa el `tbf` del runbook sobre la interfaz de A. En `bajada` el emisor es B, el anfitrión, cuya red no se toca, así que A limita lo que recibe con un policía de entrada de `tc`.
 - **Camino.** Para informar del camino de cada caso, el arnés añade al final de las cadenas de A cuatro reglas de `iptables` que solo cuentan bytes: UDP salvo DNS, y TCP 443, en cada sentido, por `eth0`. Las líneas `camino …` comparan esos bytes. Las líneas `relay:` de `caso3.sh` dan, además, la medida del runbook.
+- **Caso 5.** El runbook busca a mano la orden que sobrevive al `kill -9` con `grep '[p]als-prueba'`, que puede encontrar también otros procesos cuya línea contenga ese texto. El arnés busca exactamente `sh $PALS_EXIT_DIR/b-salida/pals-prueba.sh` y termina su grupo de procesos.
 - **Caso 7.** Además del fichero del caso 2, C pide también el que B generó en el caso 2.
 
 ## Lo que no cubre

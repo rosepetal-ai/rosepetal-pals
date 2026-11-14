@@ -106,6 +106,7 @@ arranca_b() {
         ${RUST_LOG:+RUST_LOG="$RUST_LOG"} \
         setsid "$PALS" daemon >> "$B_SAL/daemon.log" 2>&1 < /dev/null &
     echo $! > "$B_SAL/daemon.pid"
+    disown   # case 5 kills it: no job notice
     local _
     for _ in $(seq 1 120); do
         pb id --ticket > /dev/null 2>&1 && break
@@ -120,6 +121,15 @@ para_b() {
     kill "$pid" 2>/dev/null || return 0
     while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
 }
+
+# The test worker's commands on B: the PIDs of the shells that run B's
+# pals-prueba.sh, matched by the start of their command line, so that no
+# other process that merely mentions the script counts (the runbook's
+# `grep '[p]als-prueba'` would).
+b_workers() { pgrep -f "^sh $B_SAL/pals-prueba\.sh" || true; }
+# group_of PID: its process group; ps_groups PGID…: their processes, with a header.
+group_of() { ps -o pgid= -p "$1" | tr -d ' '; }
+ps_groups() { ps -eo pid,pgid,etime,args | awk -v gs=" $* " 'NR == 1 || index(gs, " " $2 " ")'; }
 
 # Bytes through A's eth0, from the accounting rules `preparar` appends to A's
 # chains: UDP except DNS (the direct path, and the relays' address discovery),
@@ -533,8 +543,8 @@ EOS
 
 caso5() {
     say "Caso 5. Caída del proveedor: kill -9 del daemon de B a mitad de tarea"
-    local t0 msg
-    t0=$(date +%s)
+    local t0 msg before
+    before=$(counters); t0=$(date +%s)
     en_a > "$LOGS/caso5-ask.out" 2>&1 <<'EOS' &
 echo "$(date -u +%T) pals ask b 'espera 300'"
 pals ask b "espera 300"; echo "código $?"
@@ -544,17 +554,15 @@ EOS
     sleep 15
     en_a <<< 'pals task ls | tail -n 1'
     msg=$(en_a <<< 'pals task ls | tail -n 1' | cut -f1)
+    local pgid
+    pgid=$(group_of "$(b_workers | head -n 1)")
+    note "En B: la orden de la tarea, grupo de procesos $pgid"
+    ps_groups "$pgid"
     note "En B: kill -9 del daemon"
-    ps -eo pid,pgid,etime,args | grep '[p]als-prueba'
     kill -9 "$(cat "$B_SAL/daemon.pid")"
     sleep 1
     note "En B, tras el kill -9 (limitación conocida: la orden sigue viva)"
-    local survivors pgid
-    survivors=$(ps -eo pid,pgid,etime,args | grep '[p]als-prueba')
-    echo "$survivors"
-    pgid=$(echo "$survivors" | awk 'NR == 1 {print $2}')
-    note "grupo de procesos $pgid, entero:"
-    ps -eo pid,pgid,etime,args | awk -v g="$pgid" 'NR == 1 || $2 == g'
+    ps_groups "$pgid"
     note "En A: espera a que pals ask termine"
     wait "$ask"
     cat "$LOGS/caso5-ask.out"
@@ -584,7 +592,8 @@ EOS
     note "En B: se termina la orden que sobrevivió al kill -9 (grupo $pgid)"
     [ -z "$pgid" ] || kill -- "-$pgid"
     sleep 1
-    ps -eo pid,pgid,args | awk -v g="$pgid" '$2 == g' | grep . || note "ningún proceso del grupo $pgid vivo"
+    [ "$(ps_groups "$pgid" | wc -l)" -gt 1 ] && ps_groups "$pgid" || note "ningún proceso del grupo $pgid vivo"
+    path "caso 5" "$before"
     result "caso 5" "$ok" "pals ask: $(sed -n 's/^código //p' "$LOGS/caso5-ask.out"); resume: código $code; $(echo "$ev" | sed -n 's/^  eventos task.accepted de esas tareas: /task.accepted: /p'); ask nuevo: código $hcode; $(elapsed "$t0")"
 }
 
@@ -595,7 +604,8 @@ caso6() {
     gid=$(pb grant ls --issued | awk '/project demo .* on skill:ask .* to a$/ {print $1}' | tail -n 1)
     note "grant demo/skill:ask de a: $gid"
     pb grant revoke "$gid"
-    local out code=0 curl_out
+    local out code=0 curl_out before
+    before=$(counters)
     out=$(en_a <<< 'pals ask b "hola tras la revocación"' 2>&1) || code=$?
     note "En A: pals ask -> $out (código $code)"
     curl_out=$(en_a <<'EOS'
@@ -610,6 +620,7 @@ EOS
         && echo "$curl_out" | grep -q '^HTTP/1.1 401 Unauthorized' \
         && echo "$curl_out" | tr -d '\r' | grep -qix 'www-authenticate: Bearer realm="agentnet", error="invalid_token", error_description="revoked"' \
         && echo "$curl_out" | tail -n 1 | grep -qx '{"error":"revoked"}'; then ok=ok; fi
+    path "caso 6" "$before"
     result "caso 6" "$ok" "pals ask: código $code"
 
     note "Grant nuevo de B para A, para los casos 7 y 8"
@@ -620,7 +631,8 @@ EOS
 
 caso7() {
     say "Caso 7. Blob sin grant: una tercera identidad, C, en A"
-    local out
+    local out before
+    before=$(counters)
     out=$(en_a <<EOS 2>&1
 TICKET_B='$(pb id --ticket)'
 mkdir -p ~/.pals-c
@@ -659,25 +671,30 @@ EOS
     if [ "$forbidden" = 3 ] && [ "$(echo "$out" | grep -c '^{"error":"the holder denied the blob"}')" = 3 ] \
         && echo "$out" | grep -qx "pals: refused: HTTP 401: no grant held for $b_id" \
         && echo "$out" | grep -qx 'código 2'; then ok=ok; fi
+    path "caso 7 (C y B; lo que C habla con A no sale por eth0)" "$before"
     result "caso 7" "$ok" "403 en $forbidden de 3 peticiones de blobs; pals ask desde C: $(echo "$out" | sed -n 's/^código //p')"
 }
 
 caso8() {
     say "Caso 8. Cliente estándar: el SDK oficial de Python en A, contra el gateway de A, con B como par"
-    local out code=0
-    out=$(en_a <<'EOS' 2>&1
+    local out code=0 before
+    en_a <<'EOS' 2>&1
 cd "$REPO"
 python3 -m venv ~/pals-salida/venv
 ~/pals-salida/venv/bin/pip install -q -r tests/interop/requirements.txt
 ~/pals-salida/venv/bin/pip list 2>/dev/null | grep '^a2a-sdk '
+EOS
+    before=$(counters)
+    out=$(en_a <<'EOS' 2>&1
 ~/pals-salida/venv/bin/python ~/pals-salida/caso8.py http://127.0.0.1:7420 "$(pals contact ls | awk '$1 == "b" {print $2}')"
 EOS
 )  || code=$?
     echo "$out"
     note "código $code"
+    path "caso 8" "$before"
     local alive=1 _
     for _ in $(seq 1 20); do
-        alive=$(ps -eo args | grep -c '[p]als-prueba')
+        alive=$(b_workers | wc -l)
         [ "$alive" = 0 ] && break
         sleep 0.5
     done
@@ -692,12 +709,21 @@ limpieza() {
     local rules=0 alive ok=fail
     en_a <<'EOS' || rules=$?
 para
-reglas_como_antes
+r=0
+if [ -f ~/pals-salida/iptables.antes ]; then reglas_como_antes || r=$?
+else echo "sin copia de las reglas de antes: el caso 3 no se ejecutó"; fi
 rm -rf ~/.pals-c
+exit "$r"
 EOS
     para_b
-    alive=$(ps -eo pid,pgid,args | grep '[p]als-prueba')
-    if [ -z "$alive" ]; then note "En B: ninguna orden viva"; else echo "$alive"; fi
+    alive=$(b_workers)
+    if [ -z "$alive" ]; then
+        note "En B: ninguna orden viva"
+    else
+        local p gs=()
+        for p in $alive; do gs+=("$(group_of "$p")"); done
+        ps_groups "${gs[@]}"
+    fi
     if [ "$rules" = 0 ] && [ -z "$alive" ]; then ok=ok; fi
     result "limpieza" "$ok"
 }
@@ -719,7 +745,10 @@ desmontar() {
     fi
     para_b
     # Any test-worker command still alive, from B's directory only.
-    pkill -f "$B_SAL/pals-prueba.sh" && note "órdenes de pals-prueba.sh terminadas"
+    local p
+    for p in $(b_workers); do
+        kill -- "-$(group_of "$p")" && note "grupo de procesos de la orden $p terminado"
+    done
     [ ! -f "$B_SAL/daemon.log" ] || cp "$B_SAL/daemon.log" "$LOGS/b-daemon.log"
     rm -rf "$B_HOME" "$B_SAL"
     [ -n "${PALS_EXIT_PROYECTO:-}" ] || rm -rf "$PROYECTO"
