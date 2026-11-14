@@ -1,12 +1,16 @@
 //! Shared helpers for the integration tests: Iroh endpoints on loopback with
-//! no relay, an echo agent served through the tunnel, and a client that goes
-//! through the production `PeerHttp`.
+//! no relay, an echo agent served through the tunnel, a client that goes
+//! through the production `PeerHttp`, and complete PALS nodes ([`TestNode`])
+//! with the grants that let them talk to each other.
 
 // Each test binary uses a different subset of these helpers.
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
+use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use a2a::{
     AgentCapabilities, AgentCard, AgentInterface, AgentSkill, TRANSPORT_PROTOCOL_HTTP_JSON,
@@ -24,8 +28,12 @@ use http_body_util::BodyExt;
 use iroh::endpoint::{PortmapperConfig, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, RelayMode};
+use pals::config::{AgentCfg, Config, GatewayCfg, KEY_FILE, LimitsCfg, NetCfg, WorkerCfg};
 use pals::net::{ALPN_A2A_HTTP, PEER_HEADER, PeerHttp, TunnelLimits, TunnelServer};
+use pals::node::Node;
 use pals::worker::echo::EchoExecutor;
+use pals_core::grant::{GRANT_SCHEMA, Grant, Operation, SignedGrant, format_timestamp};
+use pals_core::identity::{AgentId, AgentKey};
 use serde_json::{Value, json};
 
 /// The echo agent as a standard A2A v1.0 server: a static card, the JSON-RPC
@@ -217,4 +225,219 @@ async fn loopback_endpoint() -> Endpoint {
         .bind()
         .await
         .expect("bind the Iroh endpoint")
+}
+
+/// A complete PALS node on loopback with no relay, and the data directory it
+/// runs on, removed when this value is dropped.
+pub struct TestNode {
+    pub node: Node,
+    pub dir: tempfile::TempDir,
+}
+
+/// The configuration a [`TestNode`] runs with on `data_dir`: the defaults,
+/// `worker`, and no relay, so the node binds to 127.0.0.1 only.
+pub fn test_config(data_dir: &Path, worker: WorkerCfg) -> Config {
+    Config {
+        data_dir: data_dir.to_path_buf(),
+        agent: AgentCfg::default(),
+        gateway: GatewayCfg::default(),
+        worker,
+        projects: BTreeMap::new(),
+        limits: LimitsCfg::default(),
+        net: NetCfg { relay: false },
+        trusted_issuers: Vec::new(),
+    }
+}
+
+/// A node with `worker` on a fresh data directory.
+pub async fn spawn_node(worker: WorkerCfg) -> TestNode {
+    spawn_node_with(worker, |_| {}).await
+}
+
+/// [`spawn_node`] with its configuration changed by `edit` first.
+pub async fn spawn_node_with(worker: WorkerCfg, edit: impl FnOnce(&mut Config)) -> TestNode {
+    let dir = tempfile::tempdir().expect("create a data directory");
+    spawn_node_in(dir, worker, edit).await
+}
+
+/// A node on `dir`, which may already hold a key and a store.
+pub async fn spawn_node_in(
+    dir: tempfile::TempDir,
+    worker: WorkerCfg,
+    edit: impl FnOnce(&mut Config),
+) -> TestNode {
+    let mut cfg = test_config(dir.path(), worker);
+    edit(&mut cfg);
+    let node = Node::spawn(cfg).await.expect("spawn the node");
+    TestNode { node, dir }
+}
+
+/// The key of the agent whose data directory is `dir`, created if missing.
+pub fn key_in(dir: &Path) -> AgentKey {
+    AgentKey::load_or_create(&dir.join(KEY_FILE)).expect("load the agent key")
+}
+
+/// Unix seconds now.
+pub fn now_unix() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// A grant of `issuer_key` that lets `subject` perform `ops` on `skill:ask`
+/// of project `demo` against `audience`, valid from `issued_at` to
+/// `expires_at`. Not stored anywhere.
+pub fn issue_grant(
+    issuer_key: &AgentKey,
+    subject: AgentId,
+    audience: AgentId,
+    ops: &[Operation],
+    issued_at: i64,
+    expires_at: i64,
+) -> SignedGrant {
+    static NEXT_GRANT: AtomicU64 = AtomicU64::new(1);
+    let grant = Grant {
+        schema: GRANT_SCHEMA.to_owned(),
+        grant_id: format!("g-{}", NEXT_GRANT.fetch_add(1, Ordering::Relaxed)),
+        issuer: issuer_key.id(),
+        subject,
+        audience,
+        project: "demo".to_owned(),
+        resources: vec!["skill:ask".to_owned()],
+        operations: ops.to_vec(),
+        issued_at: format_timestamp(issued_at).expect("a timestamp"),
+        expires_at: format_timestamp(expires_at).expect("a timestamp"),
+    };
+    SignedGrant::issue(issuer_key, grant).expect("issue the grant")
+}
+
+/// A grant of `issuer` that lets `subject` perform `ops` on `skill:ask` of
+/// project `demo` against the issuer, from now for `ttl_s` seconds (expired
+/// already when negative), recorded as issued in the issuer's store.
+pub fn grant(issuer: &TestNode, subject: &TestNode, ops: &[Operation], ttl_s: i64) -> SignedGrant {
+    let now = now_unix();
+    let g = issue_grant(
+        &key_in(issuer.dir.path()),
+        subject.id(),
+        issuer.id(),
+        ops,
+        now,
+        now + ttl_s,
+    );
+    issuer
+        .node
+        .store
+        .grant_issued_put(&g)
+        .expect("store the issued grant");
+    g
+}
+
+/// A JSON-RPC 2.0 request with id 1.
+pub fn rpc_request(method: &str, params: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+}
+
+/// `params` of a `SendMessage` or `SendStreamingMessage` with one text part
+/// and a fresh `messageId`, continuing `task_id` when given.
+pub fn message_params(text: &str, task_id: Option<&str>) -> Value {
+    static NEXT_MESSAGE: AtomicU64 = AtomicU64::new(1);
+    let mut message = json!({
+        "messageId": format!("m-{}", NEXT_MESSAGE.fetch_add(1, Ordering::Relaxed)),
+        "role": "ROLE_USER",
+        "parts": [{"text": text}],
+    });
+    if let Some(task_id) = task_id {
+        message["taskId"] = json!(task_id);
+    }
+    json!({ "message": message })
+}
+
+impl TestNode {
+    pub fn id(&self) -> AgentId {
+        self.node.id
+    }
+
+    /// Sends `request` from this node to `to` through this node's
+    /// `PeerHttp`, and returns the response with its body still streaming.
+    pub async fn send(&self, to: &TestNode, request: Request<Body>) -> Response<Body> {
+        self.node
+            .peer_http
+            .send(to.node.addr(), request)
+            .await
+            .expect("tunnel request")
+    }
+
+    /// `method path` to `to` with `headers` and an optional JSON body, read
+    /// to the end.
+    pub async fn request(
+        &self,
+        to: &TestNode,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&Value>,
+    ) -> TestResponse {
+        let mut request = Request::builder().method(method).uri(path);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let body = match body {
+            Some(body) => {
+                request = request.header(header::CONTENT_TYPE, "application/json");
+                Body::from(serde_json::to_vec(body).expect("serializable body"))
+            }
+            None => Body::empty(),
+        };
+        let request = request.body(body).expect("valid request");
+        TestResponse::read(self.send(to, request).await).await
+    }
+
+    /// `GET path` to `to`, presenting `grant` when given.
+    pub async fn get(
+        &self,
+        to: &TestNode,
+        path: &str,
+        grant: Option<&SignedGrant>,
+    ) -> TestResponse {
+        let bearer = grant.map(bearer);
+        let headers: Vec<(&str, &str)> = bearer
+            .iter()
+            .map(|value| ("authorization", value.as_str()))
+            .collect();
+        self.request(to, "GET", path, &headers, None).await
+    }
+
+    /// A JSON-RPC call to `to` at `/jsonrpc` with `A2A-Version: 1.0`,
+    /// presenting `grant` when given.
+    pub async fn rpc(
+        &self,
+        to: &TestNode,
+        grant: Option<&SignedGrant>,
+        method: &str,
+        params: Value,
+    ) -> TestResponse {
+        let bearer = grant.map(bearer);
+        let mut headers = vec![("a2a-version", "1.0")];
+        if let Some(value) = &bearer {
+            headers.push(("authorization", value.as_str()));
+        }
+        let body = rpc_request(method, params);
+        self.request(to, "POST", "/jsonrpc", &headers, Some(&body))
+            .await
+    }
+
+    /// Sends `text` to `to` as a new task with `SendMessage` and returns the
+    /// task it answered with.
+    pub async fn ask(&self, to: &TestNode, grant: &SignedGrant, text: &str) -> Value {
+        let res = self
+            .rpc(to, Some(grant), "SendMessage", message_params(text, None))
+            .await;
+        assert_eq!(res.status, 200, "{}", res.json);
+        let task = res.json["result"]["task"].clone();
+        assert!(task["id"].is_string(), "{}", res.json);
+        task
+    }
+}
+
+/// The `Authorization` value that presents `grant`.
+pub fn bearer(grant: &SignedGrant) -> String {
+    format!("Bearer {}", grant.to_token())
 }

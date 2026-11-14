@@ -131,6 +131,19 @@ impl Store {
     /// terminal state keeps it: `INVALID_REQUEST` when `task` is in another
     /// state, while the same terminal state can be written again.
     pub fn task_update(&self, task: &Task, now_unix: i64) -> anyhow::Result<u64> {
+        self.task_update_with_previous(task, now_unix)
+            .map(|(version, _)| version)
+    }
+
+    /// [`Store::task_update`], also returning the state the task was in
+    /// before this write, read in the same transaction: of all the writes of
+    /// a task, exactly one finds it outside a terminal state and leaves it in
+    /// one.
+    pub fn task_update_with_previous(
+        &self,
+        task: &Task,
+        now_unix: i64,
+    ) -> anyhow::Result<(u64, TaskState)> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let stored: Option<(String, i64)> = tx
@@ -152,7 +165,7 @@ impl Store {
         }
         rewrite(&tx, task, version + 1, now_unix)?;
         tx.commit()?;
-        to_version(version + 1)
+        Ok((to_version(version + 1)?, state))
     }
 
     /// The task with that id, whole.
@@ -527,5 +540,29 @@ mod tests {
             .unwrap_err();
         assert!(err.downcast_ref::<A2AError>().is_none(), "{err}");
         assert!(err.to_string().contains("already exists"), "{err}");
+    }
+
+    #[test]
+    fn an_update_reports_the_state_it_replaced() {
+        let store = Store::open_in_memory(AgentKey::generate().id()).unwrap();
+        store
+            .task_create(&task("t-1", TaskState::Submitted), NOW)
+            .unwrap();
+        let update = |state| store.task_update_with_previous(&task("t-1", state), NOW);
+        assert_eq!(
+            update(TaskState::Working).unwrap(),
+            (2, TaskState::Submitted)
+        );
+        assert_eq!(
+            update(TaskState::Completed).unwrap(),
+            (3, TaskState::Working)
+        );
+        assert_eq!(
+            update(TaskState::Completed).unwrap(),
+            (4, TaskState::Completed)
+        );
+        // A refused write reports nothing and changes nothing.
+        update(TaskState::Working).unwrap_err();
+        assert_eq!(columns(&store, "t-1").1, 4);
     }
 }

@@ -1,7 +1,7 @@
 //! The SQLite task store: the SDK's `TaskStore` contract, checked with the
 //! same assertions against the SDK's own `InMemoryTaskStore`; durability
-//! across a reopen; recovery of the tasks a restart interrupted; and
-//! listing scoped to the peer that owns each task.
+//! across a reopen; recovery of the tasks a restart interrupted; listing
+//! scoped to the peer that owns each task; and the task events it logs.
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -602,4 +602,100 @@ async fn list_for_owner_never_returns_other_owners_tasks() {
         .unwrap_err();
     let err = err.downcast_ref::<A2AError>().expect("an A2A error");
     assert_eq!(err.code, error_code::INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn task_events_are_logged_once_per_task() {
+    let store = store();
+    let key = Arc::new(AgentKey::generate());
+    let tasks = SqliteTaskStore::new(Arc::clone(&store)).with_events(Arc::clone(&key));
+    let count = |kind: &str| store.events_count(kind).unwrap();
+
+    // Created, worked on, completed, and the completion written again.
+    tasks
+        .create(task("e-1", "ctx", TaskState::Submitted))
+        .await
+        .unwrap();
+    assert_eq!((count("task.accepted"), count("task.terminal")), (1, 0));
+    tasks
+        .update(task("e-1", "ctx", TaskState::Working))
+        .await
+        .unwrap();
+    tasks
+        .update(task("e-1", "ctx", TaskState::Working))
+        .await
+        .unwrap();
+    assert_eq!((count("task.accepted"), count("task.terminal")), (1, 0));
+    tasks
+        .update(task("e-1", "ctx", TaskState::Completed))
+        .await
+        .unwrap();
+    tasks
+        .update(task("e-1", "ctx", TaskState::Completed))
+        .await
+        .unwrap();
+    assert_eq!((count("task.accepted"), count("task.terminal")), (1, 1));
+    // A refused transition out of a terminal state logs nothing.
+    tasks
+        .update(task("e-1", "ctx", TaskState::Working))
+        .await
+        .unwrap_err();
+    assert_eq!((count("task.accepted"), count("task.terminal")), (1, 1));
+
+    // Canceled: the cancel is the terminal transition; the executor's
+    // CANCELED that follows is not another one.
+    tasks
+        .create(task("e-2", "ctx", TaskState::Submitted))
+        .await
+        .unwrap();
+    tasks
+        .update(task("e-2", "ctx", TaskState::Working))
+        .await
+        .unwrap();
+    let canceled = tasks.begin_cancel("e-2").await.unwrap();
+    tasks.update(canceled).await.unwrap();
+    tasks.begin_cancel("e-2").await.unwrap_err();
+    assert_eq!((count("task.accepted"), count("task.terminal")), (2, 2));
+
+    // Created already terminal: both at once.
+    tasks
+        .create(task("e-3", "ctx", TaskState::Failed))
+        .await
+        .unwrap();
+    assert_eq!((count("task.accepted"), count("task.terminal")), (3, 3));
+    // A duplicate create is refused and logs nothing.
+    tasks
+        .create(task("e-3", "ctx", TaskState::Submitted))
+        .await
+        .unwrap_err();
+    assert_eq!((count("task.accepted"), count("task.terminal")), (3, 3));
+
+    // Every event is the key's, chained, with ids and states only.
+    assert_eq!(store.events_verify(&key.id()).unwrap(), 6);
+    let events = store.events_since(&key.id(), 0).unwrap();
+    let logged: Vec<(&str, &serde_json::Value)> = events
+        .iter()
+        .map(|e| (e.kind.as_str(), &e.payload))
+        .collect();
+    let payload =
+        |id: &str, state: &str| json!({"task_id": id, "context_id": "ctx", "state": state});
+    assert_eq!(
+        logged,
+        [
+            ("task.accepted", &payload("e-1", "TASK_STATE_SUBMITTED")),
+            ("task.terminal", &payload("e-1", "TASK_STATE_COMPLETED")),
+            ("task.accepted", &payload("e-2", "TASK_STATE_SUBMITTED")),
+            ("task.terminal", &payload("e-2", "TASK_STATE_CANCELED")),
+            ("task.accepted", &payload("e-3", "TASK_STATE_FAILED")),
+            ("task.terminal", &payload("e-3", "TASK_STATE_FAILED")),
+        ]
+    );
+
+    // Without an event key the store logs nothing.
+    let quiet = SqliteTaskStore::new(Arc::clone(&store));
+    quiet
+        .create(task("e-4", "ctx", TaskState::Completed))
+        .await
+        .unwrap();
+    assert_eq!((count("task.accepted"), count("task.terminal")), (3, 3));
 }
