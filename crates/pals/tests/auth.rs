@@ -11,7 +11,7 @@ use common::{
     TestNode, grant, issue_grant, key_in, message_params, now_unix, spawn_node, spawn_node_in,
     spawn_node_with, test_config,
 };
-use pals::a2a::{BINDING_URI, SECURITY_SCHEME, canonical_card};
+use pals::a2a::{SECURITY_SCHEME, canonical_card};
 use pals::config::{AlreadyRunning, WorkerCfg};
 use pals::node::Node;
 use pals_core::grant::Operation::{self, TaskCancel, TaskRead, TaskSend};
@@ -51,17 +51,25 @@ async fn card_is_public_and_declares_only_what_is_served() {
     assert_eq!(card["name"], "pals");
     assert_eq!(card["description"], "A PALS agent");
     assert_eq!(card["version"], env!("CARGO_PKG_VERSION"));
-    let interfaces = card["supportedInterfaces"].as_array().unwrap();
-    assert_eq!(interfaces.len(), 1, "{card}");
+    // Both bindings it serves to peers, JSON-RPC first, each over Iroh.
     assert_eq!(
-        card["supportedInterfaces"][0]["url"],
-        format!("iroh://{}/jsonrpc", b.id())
+        card["supportedInterfaces"],
+        json!([
+            {
+                "url": format!("iroh://{}/jsonrpc", b.id()),
+                "protocolBinding":
+                    "https://github.com/rosepetal-ai/rosepetal-pals/bindings/http-over-iroh/v1/jsonrpc",
+                "protocolVersion": "1.0",
+            },
+            {
+                "url": format!("iroh://{}/rest", b.id()),
+                "protocolBinding":
+                    "https://github.com/rosepetal-ai/rosepetal-pals/bindings/http-over-iroh/v1/http-json",
+                "protocolVersion": "1.0",
+            },
+        ]),
+        "{card}"
     );
-    assert_eq!(
-        card["supportedInterfaces"][0]["protocolBinding"],
-        BINDING_URI
-    );
-    assert_eq!(card["supportedInterfaces"][0]["protocolVersion"], "1.0");
     assert_eq!(card["capabilities"]["streaming"], true);
     assert_eq!(card["capabilities"]["pushNotifications"], false);
     assert_eq!(card["capabilities"]["extendedAgentCard"], false);

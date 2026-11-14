@@ -14,7 +14,10 @@ mod rest_shim;
 mod task_store;
 
 pub(crate) use binding::BindingExecutor;
-pub use card::{BINDING_URI, IDEMPOTENCY_EXTENSION, SECURITY_SCHEME, canonical_card, gateway_view};
+pub use card::{
+    BINDING_URI_HTTP_JSON, BINDING_URI_JSONRPC, IDEMPOTENCY_EXTENSION, SECURITY_SCHEME,
+    canonical_card, gateway_view,
+};
 pub use guard::GuardedHandler;
 pub(crate) use rest_shim::rest_shim;
 pub use task_store::SqliteTaskStore;

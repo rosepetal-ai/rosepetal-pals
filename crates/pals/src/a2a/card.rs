@@ -13,11 +13,18 @@ use pals_core::identity::AgentId;
 
 use crate::config::Config;
 
-/// The custom protocol binding peers reach the agent with (A2A §5.8): the
-/// standard JSON-RPC binding, unchanged, with HTTP/1.1 carried by an Iroh
-/// stream.
-pub const BINDING_URI: &str =
-    "https://github.com/rosepetal-ai/rosepetal-pals/bindings/http-over-iroh/v1";
+/// The custom protocol binding (A2A §5.8) with which peers reach the
+/// agent's JSON-RPC interface, at `iroh://<agent id>/jsonrpc`: the standard
+/// JSON-RPC binding, unchanged, with HTTP/1.1 carried by an Iroh stream
+/// (`docs/bindings/http-over-iroh-v1.md`).
+pub const BINDING_URI_JSONRPC: &str =
+    "https://github.com/rosepetal-ai/rosepetal-pals/bindings/http-over-iroh/v1/jsonrpc";
+
+/// The custom protocol binding with which peers reach the agent's HTTP+JSON
+/// interface, at `iroh://<agent id>/rest`: the standard HTTP+JSON binding,
+/// unchanged, carried the same way.
+pub const BINDING_URI_HTTP_JSON: &str =
+    "https://github.com/rosepetal-ai/rosepetal-pals/bindings/http-over-iroh/v1/http-json";
 
 /// The A2A extension that makes `SendMessage` and `SendStreamingMessage`
 /// idempotent by `messageId` (`docs/extensions/idempotency-v1.md`). A
@@ -34,11 +41,13 @@ pub const SECURITY_SCHEME: &str = "agentnetGrant";
 /// The card the agent serves at `/.well-known/agent-card.json`, unsigned.
 ///
 /// It declares only what the daemon serves: the JSON-RPC binding over Iroh
-/// at `iroh://<agent id>/jsonrpc`, streaming, no push notifications, no
-/// extended card, the optional [`IDEMPOTENCY_EXTENSION`], text and files
-/// of any media type as input (`*/*`: a
-/// question comes with any files, sent as blobs, and a part's media type
-/// never refuses it), the `ask` skill, and grants as bearer tokens.
+/// at `iroh://<agent id>/jsonrpc` ([`BINDING_URI_JSONRPC`]) and, second, the
+/// HTTP+JSON binding over Iroh at `iroh://<agent id>/rest`
+/// ([`BINDING_URI_HTTP_JSON`]), streaming, no push notifications, no
+/// extended card, the optional [`IDEMPOTENCY_EXTENSION`], text and files of
+/// any media type as input (`*/*`: a question comes with any files, sent as
+/// blobs, and a part's media type never refuses it), the `ask` skill, and
+/// grants as bearer tokens.
 pub fn canonical_card(cfg: &Config, id: &AgentId) -> AgentCard {
     let idempotency = AgentExtension {
         uri: IDEMPOTENCY_EXTENSION.to_owned(),
@@ -75,11 +84,12 @@ pub fn canonical_card(cfg: &Config, id: &AgentId) -> AgentCard {
         name: cfg.agent.name.clone(),
         description: cfg.agent.description.clone(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        // `new` sets the protocol version this SDK implements, 1.0.
-        supported_interfaces: vec![AgentInterface::new(
-            format!("iroh://{id}/jsonrpc"),
-            BINDING_URI,
-        )],
+        // In order of preference. `new` sets the protocol version this SDK
+        // implements, 1.0.
+        supported_interfaces: vec![
+            AgentInterface::new(format!("iroh://{id}/jsonrpc"), BINDING_URI_JSONRPC),
+            AgentInterface::new(format!("iroh://{id}/rest"), BINDING_URI_HTTP_JSON),
+        ],
         capabilities,
         default_input_modes: vec!["text/plain".to_owned(), "*/*".to_owned()],
         default_output_modes: vec![

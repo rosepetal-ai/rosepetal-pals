@@ -1,6 +1,6 @@
-# Binding `http-over-iroh/v1`
+# Bindings `http-over-iroh/v1`
 
-Especificación del *custom protocol binding* de A2A con el que dos agentes PALS se hablan entre pares. Cubre los puntos que exige la especificación A2A v1.0.1 en su §12 (*Custom Binding Guidelines*) y la identificación de §5.8.
+Especificación de los dos *custom protocol bindings* de A2A con los que dos agentes PALS se hablan entre pares: `http-over-iroh/v1/jsonrpc` y `http-over-iroh/v1/http-json`. Son el mismo transporte con uno u otro binding estándar dentro, y este documento los define juntos. Cubre los puntos que exige la especificación A2A v1.0.1 en su §12 (*Custom Binding Guidelines*) y la identificación de §5.8.
 
 En una frase: **los bindings estándar JSON-RPC (§9) y HTTP+JSON (§11) de A2A, sin cambios, con cada intercambio HTTP/1.1 transportado por un stream bidireccional de una conexión QUIC de [Iroh](https://www.iroh.computer/)**. Todo lo que no dice este documento se hereda tal cual de esos dos bindings.
 
@@ -8,18 +8,20 @@ Los valores que aparecen aquí son los del código: `crates/pals/src/net/` (tran
 
 ## 1. Identificación
 
-| Elemento | Valor |
-|-|-|
-| URI del binding (`AgentInterface.protocolBinding`) | `https://github.com/rosepetal-ai/rosepetal-pals/bindings/http-over-iroh/v1` (constante `BINDING_URI`) |
-| URL de la interfaz (`AgentInterface.url`) | `iroh://<agent_id>/jsonrpc` |
-| Versión del protocolo (`AgentInterface.protocolVersion`) | `1.0` |
-| ALPN de Iroh | `agentnet-a2a-http/1` (constante `ALPN_A2A_HTTP`) |
+| Binding interior | URI (`AgentInterface.protocolBinding`) | URL de la interfaz (`AgentInterface.url`) |
+|-|-|-|
+| JSON-RPC (A2A §9) | `https://github.com/rosepetal-ai/rosepetal-pals/bindings/http-over-iroh/v1/jsonrpc` (constante `BINDING_URI_JSONRPC`) | `iroh://<agent_id>/jsonrpc` |
+| HTTP+JSON (A2A §11) | `https://github.com/rosepetal-ai/rosepetal-pals/bindings/http-over-iroh/v1/http-json` (constante `BINDING_URI_HTTP_JSON`) | `iroh://<agent_id>/rest` |
+
+En los dos, `protocolVersion` es `1.0` y el ALPN de Iroh es `agentnet-a2a-http/1` (constante `ALPN_A2A_HTTP`).
 
 `<agent_id>` es la clave pública Ed25519 del agente en 64 caracteres hexadecimales en minúscula. Es a la vez el `EndpointId` de Iroh del agente: la URL nombra el endpoint al que hay que conectarse, no una dirección de red. Las direcciones (IP directas o relay) se obtienen aparte, del *ticket* del agente (`pals id --ticket`) o del descubrimiento de Iroh.
 
-La card canónica que el agente sirve a sus pares declara una sola interfaz: la de JSON-RPC, con este binding. El mismo servidor atiende también el binding HTTP+JSON bajo el prefijo `/rest` del mismo origen (`iroh://<agent_id>/rest/...`, con las rutas de §11: `/rest/message:send`, `/rest/tasks/{id}`, …); el cliente de PALS lo usa entre pares. El gateway local, que es donde llegan los clientes estándar, declara las dos interfaces con sus URL `http://` y los nombres estándar `JSONRPC` y `HTTP+JSON`.
+**Selección del binding interior.** La URI y la ruta de la URL lo eligen a la vez: las peticiones a `iroh://<agent_id>/jsonrpc` son las de JSON-RPC (un `POST` a esa ruta con el objeto JSON-RPC), y las de `iroh://<agent_id>/rest` son las de HTTP+JSON con sus rutas de §11 debajo de ese prefijo (`/rest/message:send`, `/rest/tasks/{id}`, …). Las dos comparten conexión, ALPN, límites, cabeceras y autenticación; solo cambia lo que va dentro de cada intercambio HTTP.
 
-**Versionado.** Un cambio incompatible de este binding usará una URI nueva (`.../http-over-iroh/v2`) y un ALPN nuevo; `v1` no cambia de significado (A2A §5.8, requisito BIND-CUSTOM-002 del TCK).
+La card canónica que el agente sirve a sus pares declara las dos interfaces, por orden de preferencia: JSON-RPC primero, HTTP+JSON después. El cliente de PALS usa la de HTTP+JSON. El gateway local, que es donde llegan los clientes estándar, declara las mismas dos interfaces con sus URL `http://` y los nombres estándar `JSONRPC` y `HTTP+JSON`.
+
+**Versionado.** Un cambio incompatible de estos bindings usará URI nuevas (`.../http-over-iroh/v2/...`) y un ALPN nuevo; las URI de `v1` no cambian de significado (A2A §5.8, requisito BIND-CUSTOM-002 del TCK).
 
 ## 2. Transporte
 
