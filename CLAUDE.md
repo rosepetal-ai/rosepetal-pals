@@ -1,12 +1,12 @@
 # CLAUDE.md
 
-Guidance for coding agents working in `rosepetal-pals`. User documentation is in Spanish (`README.md`, `docs/`); this file, the code, identifiers, comments and commit messages are in English.
+Guidance for coding agents working in `rosepetal-pals`. User documentation under `docs/` is in Spanish; `README.md`, this file, the code, identifiers, comments and commit messages are in English.
 
 ## What this repo is
 
 PALS, "Peer Agent Linking System": a Rust daemon, `pals`, that lets AI agents work with each other peer to peer. Each daemon is a full A2A v1.0 server built on the official Rust SDK (JSON-RPC and HTTP+JSON bindings, SSE); between peers that HTTP/1.1 travels unchanged inside Iroh QUIC streams, authenticated by signed grants presented as `Bearer` tokens. A loopback gateway lets stock A2A clients reach any peer, files move as iroh-blobs authorized by the holder, a worker answers tasks (`echo`, `exec` such as `claude -p`, `tck`), `pals ask` retries without duplicating work, and a local MCP server exposes six tools.
 
-Milestone 1 (hito 1) is implemented. A2A conformance is backed by the official TCK and Python SDK within the scoped claim of `docs/conformance/hito-1/README.md`: stock clients reach peers through the gateway with the JSON-RPC and HTTP+JSON bindings; between peers, the custom binding `http-over-iroh/v1` carries those same bindings; file bytes travel over iroh-blobs, outside A2A. The two-machine exit test on physical machines is pending the owner (`docs/runbooks/hito-1-dos-maquinas.md`). `docs/conformance/hito-1/exit-test.md` records all eight cases passed with a Docker container as the second machine (harness `tests/exit/`: real network cuts in the container, Iroh's public relays, `claude -p` for case 1), and an earlier single-host rehearsal.
+Milestone 1 (hito 1) is implemented. A2A conformance is backed by the official TCK and Python SDK within the scoped claim of `docs/conformance/hito-1/README.md`: stock clients reach peers through the gateway with the JSON-RPC and HTTP+JSON bindings; between peers, the custom binding `http-over-iroh/v1` carries those same bindings; file bytes travel over iroh-blobs, outside A2A. The two-machine exit test on physical machines is pending the owner (`docs/runbooks/hito-1-dos-maquinas.md`). `docs/conformance/hito-1/exit-test.md` records all eight cases passed with a Docker container as the second machine (harness `tests/exit/`: real network cuts in the container, Iroh's public relays, `claude -p` for case 1), and an earlier single-host rehearsal. Milestone 2 (hito 2) is in progress on `feat/hito-2` following `docs/plans/2026-11-14-hito-2-consulta-de-servicios.md`: only task 1 of 13, `pals_core::card_jws` (JWS signing and verification of Agent Cards), has landed, in review and not yet wired into the node.
 
 ## Commands
 
@@ -86,4 +86,4 @@ Module headers (`//!`) document each component's contract in detail; read them b
 | Idempotency extension | `docs/extensions/idempotency-v1.md` |
 | Conformance evidence and the exact claim | `docs/conformance/hito-1/README.md`, `sdk-issues.md` |
 | Exit test | `docs/runbooks/hito-1-dos-maquinas.md`, `docs/conformance/hito-1/exit-test.md`, `tests/exit/` |
-| Known hito 1 limitations | `README.md`, section "Limitaciones conocidas del hito 1" |
+| Known hito 1 limitations | `README.md`, section "Known limitations of milestone 1" |
