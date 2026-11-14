@@ -670,7 +670,7 @@ async fn second_daemon_on_same_data_dir_refuses_to_start() {
     );
 
     // Once the first one shuts down, the directory is free again.
-    let TestNode { node, dir } = b;
+    let TestNode { node, dir, .. } = b;
     let id = node.id;
     node.shutdown().await.unwrap();
     let again = spawn_node_in(dir, WorkerCfg::Echo, |_| {}).await;

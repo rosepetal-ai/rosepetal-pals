@@ -14,6 +14,8 @@ use anyhow::{Context, bail};
 use pals_core::identity::AgentId;
 use serde::Deserialize;
 
+use crate::path_policy::lexically_normal;
+
 /// The configuration file, in the PALS home directory.
 pub const CONFIG_FILE: &str = "config.toml";
 /// The agent's secret key, in the data directory.
@@ -60,6 +62,13 @@ adapter = "echo"
 # true: Iroh's public relays (the N0 preset); false: direct addresses only.
 relay = true
 
+[mcp]
+# The only directory pals_fetch writes the files of peers' answers to,
+# created on first use with mode 0700; it may not be inside the data
+# directory. Defaults to ~/Downloads/pals; a relative path is resolved
+# against the directory that holds this file.
+# download_dir = "/path/to/downloads"
+
 [limits]
 max_body_bytes = 1048576      # 1 MiB
 max_blob_bytes = 2147483648   # 2 GiB
@@ -91,6 +100,8 @@ pub struct Config {
     pub limits: LimitsCfg,
     #[serde(default)]
     pub net: NetCfg,
+    #[serde(default)]
+    pub mcp: McpCfg,
     /// Issuers whose grants this agent accepts, besides itself.
     #[serde(default)]
     pub trusted_issuers: Vec<AgentId>,
@@ -244,6 +255,18 @@ impl Default for NetCfg {
     }
 }
 
+/// The local MCP server.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpCfg {
+    /// The only directory `pals_fetch` writes to, created on first use with
+    /// mode `0700`; never inside the data directory. After [`Config::load`]
+    /// it is absolute: [`default_download_dir`] when the file does not set
+    /// it, and resolved against the configuration file's directory when it
+    /// is relative.
+    pub download_dir: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsCfg {
@@ -280,6 +303,21 @@ impl Config {
         } else {
             dir.join(&cfg.data_dir)
         };
+        cfg.mcp.download_dir = if cfg.mcp.download_dir.as_os_str().is_empty() {
+            default_download_dir().with_context(|| format!("invalid {}", path.display()))?
+        } else {
+            dir.join(&cfg.mcp.download_dir)
+        };
+        let downloads = lexically_normal(&cfg.mcp.download_dir);
+        if downloads.starts_with(lexically_normal(&cfg.data_dir)) {
+            bail!(
+                "invalid {}: mcp.download_dir {} is inside the data directory {}, which holds \
+                 the agent's key and grants: pals_fetch must never write there",
+                path.display(),
+                cfg.mcp.download_dir.display(),
+                cfg.data_dir.display()
+            );
+        }
         if !cfg.gateway.listen.ip().is_loopback() {
             bail!(
                 "invalid {}: gateway.listen must be a loopback address, not {}",
@@ -318,6 +356,15 @@ impl Config {
 /// spaces.
 pub fn is_header_safe(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// Where `pals_fetch` writes when `mcp.download_dir` is not set:
+/// `~/Downloads/pals`.
+pub fn default_download_dir() -> anyhow::Result<PathBuf> {
+    let home = std::env::home_dir()
+        .filter(|home| home.is_absolute())
+        .context("there is no home directory for the default mcp.download_dir: set it")?;
+    Ok(home.join("Downloads").join("pals"))
 }
 
 /// `$PALS_HOME` when it is set and not empty, else `~/.pals` (`.pals` in the
@@ -426,6 +473,43 @@ mod tests {
         assert!(cfg.projects.is_empty());
         assert!(cfg.trusted_issuers.is_empty());
         assert!(!cfg.agent.name.is_empty());
+    }
+
+    #[test]
+    fn download_dir_defaults_to_downloads_and_stays_out_of_the_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load(&write_config(dir.path(), "")).unwrap();
+        let home = std::env::home_dir().unwrap();
+        assert_eq!(cfg.mcp.download_dir, home.join("Downloads").join("pals"));
+
+        // Relative to the configuration file's directory, as data_dir.
+        let text = "data_dir = \"state\"\n[mcp]\ndownload_dir = \"incoming\"\n";
+        let cfg = Config::load(&write_config(dir.path(), text)).unwrap();
+        assert_eq!(cfg.mcp.download_dir, dir.path().join("incoming"));
+
+        // Never inside the data directory, however it is spelled.
+        for download_dir in [
+            "state",
+            "state/downloads",
+            "./state/x/../downloads",
+            "elsewhere/../state",
+        ] {
+            let text = format!("data_dir = \"state\"\n[mcp]\ndownload_dir = \"{download_dir}\"\n");
+            let err = Config::load(&write_config(dir.path(), &text)).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("inside the data directory"),
+                "{download_dir}: {err:#}"
+            );
+        }
+        // The data directory defaults to the configuration's.
+        let text = "[mcp]\ndownload_dir = \"downloads\"\n";
+        let err = Config::load(&write_config(dir.path(), text)).unwrap_err();
+        assert!(format!("{err:#}").contains("download_dir"), "{err:#}");
+        let text = format!(
+            "[mcp]\ndownload_dir = \"{}\"\n",
+            dir.path().join("..").join("downloads").display()
+        );
+        assert!(Config::load(&write_config(dir.path(), &text)).is_ok());
     }
 
     #[test]

@@ -206,7 +206,7 @@ async fn provider_restart_mid_task_surfaces_failed_not_a_hang() {
     wait_until("the run", || exec.runs() == 1).await;
     wait_for_task(&a).await;
     // The provider restarts on the same data directory, at a new address.
-    let TestNode { node, dir } = b;
+    let TestNode { node, dir, .. } = b;
     node.shutdown().await.expect("shut the provider down");
     let b = spawn_node_in_with_executor(dir, exec.clone()).await;
     a.add_contact("bob", &b);
@@ -231,7 +231,7 @@ async fn requester_restart_does_not_resend_pending_asks() {
     };
 
     // The requester restarts, and the provider is up now.
-    let TestNode { node, dir } = a;
+    let TestNode { node, dir, .. } = a;
     node.shutdown().await.expect("shut the requester down");
     let a = spawn_node_in(dir, WorkerCfg::Echo, |_| {}).await;
     let b = spawn_node_in_with_executor(b_dir, exec.clone()).await;

@@ -316,6 +316,7 @@ impl Opened {
                 blobs: blobs.clone(),
                 limits: cfg.limits.clone(),
                 data_dir: cfg.data_dir.clone(),
+                download_dir: cfg.mcp.download_dir.clone(),
             },
             gateway_addr,
         );

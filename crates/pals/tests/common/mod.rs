@@ -37,7 +37,7 @@ use hyper_util::rt::TokioIo;
 use iroh::endpoint::{PortmapperConfig, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, RelayMode};
-use pals::config::{AgentCfg, Config, GatewayCfg, KEY_FILE, LimitsCfg, NetCfg, WorkerCfg};
+use pals::config::{AgentCfg, Config, GatewayCfg, KEY_FILE, LimitsCfg, McpCfg, NetCfg, WorkerCfg};
 use pals::net::{ALPN_A2A_HTTP, PEER_HEADER, PeerHttp, TunnelLimits, TunnelServer};
 use pals::node::Node;
 use pals::worker::echo::EchoExecutor;
@@ -245,16 +245,21 @@ pub async fn loopback_endpoint() -> Endpoint {
         .expect("bind the Iroh endpoint")
 }
 
-/// A complete PALS node on loopback with no relay, and the data directory it
-/// runs on, removed when this value is dropped.
+/// A complete PALS node on loopback with no relay, the data directory it
+/// runs on and the directory its download directory is created in, both
+/// removed when this value is dropped.
 pub struct TestNode {
     pub node: Node,
     pub dir: tempfile::TempDir,
+    /// Holds the node's download directory, [`TestNode::download_dir`],
+    /// which `pals_fetch` creates on first use.
+    pub downloads: tempfile::TempDir,
 }
 
 /// The configuration a [`TestNode`] runs with on `data_dir`: the defaults,
-/// `worker`, no relay, so the node binds to 127.0.0.1 only, and the gateway
-/// on a free port of 127.0.0.1.
+/// `worker`, no relay, so the node binds to 127.0.0.1 only, the gateway on
+/// a free port of 127.0.0.1, and `pals_fetch` writing to
+/// `<temp dir>/pals-test-downloads` (a [`TestNode`] has its own).
 pub fn test_config(data_dir: &Path, worker: WorkerCfg) -> Config {
     Config {
         data_dir: data_dir.to_path_buf(),
@@ -266,8 +271,17 @@ pub fn test_config(data_dir: &Path, worker: WorkerCfg) -> Config {
         projects: BTreeMap::new(),
         limits: LimitsCfg::default(),
         net: NetCfg { relay: false },
+        mcp: McpCfg {
+            download_dir: std::env::temp_dir().join("pals-test-downloads"),
+        },
         trusted_issuers: Vec::new(),
     }
+}
+
+/// The download directory of a node whose downloads are kept in
+/// `downloads`: a directory in it that does not exist yet.
+fn download_dir_in(downloads: &tempfile::TempDir) -> std::path::PathBuf {
+    downloads.path().join("pals")
 }
 
 /// A node with `worker` on a fresh data directory.
@@ -287,10 +301,16 @@ pub async fn spawn_node_in(
     worker: WorkerCfg,
     edit: impl FnOnce(&mut Config),
 ) -> TestNode {
+    let downloads = tempfile::tempdir().expect("create a downloads directory");
     let mut cfg = test_config(dir.path(), worker);
+    cfg.mcp.download_dir = download_dir_in(&downloads);
     edit(&mut cfg);
     let node = Node::spawn(cfg).await.expect("spawn the node");
-    TestNode { node, dir }
+    TestNode {
+        node,
+        dir,
+        downloads,
+    }
 }
 
 /// A node whose work `executor` does, on a fresh data directory.
@@ -305,11 +325,17 @@ pub async fn spawn_node_in_with_executor(
     dir: tempfile::TempDir,
     executor: impl AgentExecutor,
 ) -> TestNode {
-    let cfg = test_config(dir.path(), WorkerCfg::Echo);
+    let downloads = tempfile::tempdir().expect("create a downloads directory");
+    let mut cfg = test_config(dir.path(), WorkerCfg::Echo);
+    cfg.mcp.download_dir = download_dir_in(&downloads);
     let node = Node::spawn_with_executor(cfg, executor)
         .await
         .expect("spawn the node");
-    TestNode { node, dir }
+    TestNode {
+        node,
+        dir,
+        downloads,
+    }
 }
 
 /// The text of the error a [`CountingExecutor::failing`] run ends with.
@@ -464,6 +490,12 @@ pub fn message_params(text: &str, task_id: Option<&str>) -> Value {
 impl TestNode {
     pub fn id(&self) -> AgentId {
         self.node.id
+    }
+
+    /// The only directory this node's `pals_fetch` writes to, which it
+    /// creates on first use.
+    pub fn download_dir(&self) -> std::path::PathBuf {
+        download_dir_in(&self.downloads)
     }
 
     /// The URL of this node's loopback gateway, `http://127.0.0.1:<port>`.

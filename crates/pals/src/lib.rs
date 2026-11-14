@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod net;
 pub mod node;
 pub mod outbox;
+mod path_policy;
 pub mod worker;
 
 /// Installs `ring` as the process's rustls crypto provider, unless one is

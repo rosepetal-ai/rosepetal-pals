@@ -515,7 +515,9 @@ async fn no_held_grant_is_a_local_401_and_the_peer_is_not_contacted() {
 
     // With the peer gone, still a local 401 and not a 502: it is never
     // dialed.
-    let TestNode { node, dir: _dir } = b;
+    let TestNode {
+        node, dir: _dir, ..
+    } = b;
     let b_id = node.id;
     node.shutdown().await.unwrap();
     let started = Instant::now();
@@ -612,7 +614,9 @@ async fn unknown_peer_is_404_and_unreachable_peer_is_502() {
     );
 
     // A contact whose daemon has stopped: nothing answers at its address.
-    let TestNode { node, dir: _dir } = b;
+    let TestNode {
+        node, dir: _dir, ..
+    } = b;
     node.shutdown().await.unwrap();
     let started = Instant::now();
     let (rpc, card) = tokio::join!(

@@ -4,13 +4,14 @@
 
 mod common;
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{
     CountingExecutor, TestNode, TestResponse, gateway_request, gateway_send_raw, grant, spawn_node,
-    spawn_node_with_executor,
+    spawn_node_with, spawn_node_with_executor,
 };
 use pals::config::WorkerCfg;
 use pals::mcp::DEFAULT_WAIT_S;
@@ -256,49 +257,34 @@ async fn relative_attachment_path_is_rejected() {
     client.cancel().await.expect("close the session");
 }
 
+/// Uploads `contents` to `node`'s gateway as a blob, and returns its URL.
+async fn upload(node: &TestNode, contents: &[u8]) -> String {
+    let uploaded = TestResponse::read(
+        gateway_send_raw(
+            &node.gateway_url(),
+            "POST",
+            "/blobs",
+            &[],
+            Some(("application/octet-stream", contents.to_vec())),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(uploaded.status, 201, "{}", uploaded.json);
+    uploaded.json["url"].as_str().unwrap().to_owned()
+}
+
 #[tokio::test]
 async fn pals_fetch_refuses_to_overwrite_and_rejects_non_gateway_urls() {
     let a = spawn_node(WorkerCfg::Echo).await;
     let gw = a.gateway_url();
     let client = mcp_client(&a).await;
     // A blob of this agent's, at its gateway URL.
-    let uploaded = TestResponse::read(
-        gateway_send_raw(
-            &gw,
-            "POST",
-            "/blobs",
-            &[],
-            Some(("application/octet-stream", b"contents".to_vec())),
-        )
-        .await,
-    )
-    .await;
-    assert_eq!(uploaded.status, 201, "{}", uploaded.json);
-    let url = uploaded.json["url"].as_str().unwrap().to_owned();
-    let hash = uploaded.json["hash"].as_str().unwrap();
+    let url = upload(&a, b"contents").await;
+    let hash = url.rsplit('/').next().unwrap().to_owned();
     let holder = a.id();
-    let dir = tempfile::tempdir().unwrap();
-
-    // An existing file is never overwritten.
-    let existing = dir.path().join("existing.txt");
-    std::fs::write(&existing, "keep").unwrap();
-    let refused = call(&client, "pals_fetch", json!({"url": url, "dest": existing})).await;
-    let text = error_text(&refused);
-    assert!(text.contains("exists"), "{text}");
-    assert_eq!(std::fs::read_to_string(&existing).unwrap(), "keep");
-
-    // The destination is an absolute path.
-    let refused = call(
-        &client,
-        "pals_fetch",
-        json!({"url": url, "dest": "out.bin"}),
-    )
-    .await;
-    let text = error_text(&refused);
-    assert!(text.contains("absolute"), "{text}");
 
     // Only this gateway's blob URLs.
-    let dest = dir.path().join("out.bin");
     let port = gw.rsplit(':').next().unwrap();
     for bad in [
         format!("http://example.com/blobs/{holder}/{hash}"),
@@ -308,18 +294,155 @@ async fn pals_fetch_refuses_to_overwrite_and_rejects_non_gateway_urls() {
         format!("{gw}/blobs/{holder}"),
         format!("{gw}/healthz"),
         format!("{gw}/peers/{holder}/rest/tasks"),
-        format!("file://{}", existing.display()),
+        "file:///etc/passwd".to_owned(),
     ] {
-        let refused = call(&client, "pals_fetch", json!({"url": bad, "dest": dest})).await;
+        let refused = call(
+            &client,
+            "pals_fetch",
+            json!({"url": bad, "dest": "out.bin"}),
+        )
+        .await;
         let text = error_text(&refused);
         assert!(text.contains("blob URL of this gateway"), "{bad}: {text}");
-        assert!(!dest.exists(), "{bad}");
     }
 
-    let out = ok_json(&call(&client, "pals_fetch", json!({"url": url, "dest": dest})).await);
-    let written = resolved(dir.path()).join("out.bin");
+    // A file name lands in the download directory, created on first use.
+    let out = ok_json(
+        &call(
+            &client,
+            "pals_fetch",
+            json!({"url": url, "dest": "out.bin"}),
+        )
+        .await,
+    );
+    let written = resolved(&a.download_dir()).join("out.bin");
     assert_eq!(out, json!({"path": written, "bytes": 8}));
-    assert_eq!(std::fs::read(&dest).unwrap(), b"contents");
+    assert_eq!(std::fs::read(&written).unwrap(), b"contents");
+
+    // An existing file is never overwritten, named either way.
+    for dest in [json!("out.bin"), json!(written)] {
+        let refused = call(&client, "pals_fetch", json!({"url": url, "dest": dest})).await;
+        let text = error_text(&refused);
+        assert!(text.contains("exists"), "{dest}: {text}");
+    }
+    assert_eq!(std::fs::read(&written).unwrap(), b"contents");
+    client.cancel().await.expect("close the session");
+}
+
+#[tokio::test]
+async fn pals_fetch_writes_only_inside_the_download_dir() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let client = mcp_client(&a).await;
+    let url = upload(&a, b"contents").await;
+    let downloads = a.download_dir();
+    assert!(!downloads.exists());
+    let data_dir = a.dir.path();
+    let elsewhere = tempfile::tempdir().unwrap();
+
+    // The server tells the model where its files go.
+    let instructions = client
+        .peer_info()
+        .and_then(|info| info.instructions.clone())
+        .unwrap_or_default();
+    assert!(
+        instructions.contains(&downloads.display().to_string()),
+        "{instructions}"
+    );
+
+    // A file name, a relative path whose directories are created, and an
+    // absolute path inside it.
+    for (dest, expected) in [
+        (json!("report.txt"), "report.txt"),
+        (json!("nested/dir/report.txt"), "nested/dir/report.txt"),
+        (json!(downloads.join("absolute.txt")), "absolute.txt"),
+    ] {
+        let out = ok_json(&call(&client, "pals_fetch", json!({"url": url, "dest": dest})).await);
+        let written = resolved(&downloads).join(expected);
+        assert_eq!(out["path"], json!(written), "{dest}");
+        assert_eq!(std::fs::read(&written).unwrap(), b"contents", "{dest}");
+    }
+    // Readable by its owner only, as the directories it created.
+    for dir in [
+        downloads.clone(),
+        downloads.join("nested"),
+        downloads.join("nested/dir"),
+    ] {
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{}", dir.display());
+    }
+
+    // Links inside it that lead out, to anywhere or to the data directory.
+    std::os::unix::fs::symlink(elsewhere.path(), downloads.join("out")).unwrap();
+    std::os::unix::fs::symlink(data_dir, downloads.join("data")).unwrap();
+    let outside = [
+        json!(data_dir.join("planted.bin")),
+        json!(data_dir.join("blobs").join("planted.bin")),
+        json!(elsewhere.path().join("planted.bin")),
+        json!(downloads.join("..").join("planted.bin")),
+        json!("../planted.bin"),
+        json!("nested/../../planted.bin"),
+        json!("out/planted.bin"),
+        json!(downloads.join("out").join("planted.bin")),
+        json!("data/planted.bin"),
+        json!(downloads.join("data").join("planted.bin")),
+    ];
+    for dest in outside {
+        let refused = call(&client, "pals_fetch", json!({"url": url, "dest": dest})).await;
+        let text = error_text(&refused);
+        assert!(
+            text.contains("download directory") || text.contains("climbs out"),
+            "{dest}: {text}"
+        );
+    }
+    // Nothing hidden, at any depth below it.
+    for dest in [
+        json!(".bashrc"),
+        json!("nested/.git/hooks/post-checkout"),
+        json!(downloads.join(".hidden")),
+        json!("./report2.txt"),
+    ] {
+        let refused = call(&client, "pals_fetch", json!({"url": url, "dest": dest})).await;
+        let text = error_text(&refused);
+        assert!(text.contains("dot"), "{dest}: {text}");
+    }
+    for planted in [
+        data_dir.join("planted.bin"),
+        data_dir.join("blobs").join("planted.bin"),
+        elsewhere.path().join("planted.bin"),
+        a.downloads.path().join("planted.bin"),
+        downloads.join(".bashrc"),
+        downloads.join("nested/.git"),
+        downloads.join(".hidden"),
+        downloads.join("report2.txt"),
+    ] {
+        assert!(!planted.exists(), "{}", planted.display());
+    }
+    client.cancel().await.expect("close the session");
+}
+
+#[tokio::test]
+async fn pals_fetch_refuses_a_download_dir_that_resolves_into_the_data_dir() {
+    let links = tempfile::tempdir().unwrap();
+    let link = links.path().join("downloads");
+    let a = spawn_node_with(WorkerCfg::Echo, |cfg| {
+        // Spelled outside, it is inside once the link is followed.
+        let inbox = cfg.data_dir.join("inbox");
+        std::fs::create_dir(&inbox).unwrap();
+        std::os::unix::fs::symlink(&inbox, &link).unwrap();
+        cfg.mcp.download_dir = link.clone();
+    })
+    .await;
+    let client = mcp_client(&a).await;
+    let url = upload(&a, b"contents").await;
+    let refused = call(
+        &client,
+        "pals_fetch",
+        json!({"url": url, "dest": "planted.bin"}),
+    )
+    .await;
+    let text = error_text(&refused);
+    assert!(text.contains("data directory"), "{text}");
+    assert!(!a.dir.path().join("inbox/planted.bin").exists());
     client.cancel().await.expect("close the session");
 }
 
@@ -469,47 +592,42 @@ async fn attachments_inside_the_data_dir_or_not_regular_files_are_refused() {
 }
 
 #[tokio::test]
-async fn pals_fetch_refuses_a_dest_inside_the_data_dir() {
-    let a = spawn_node(WorkerCfg::Echo).await;
-    let gw = a.gateway_url();
+async fn attachments_from_pseudo_filesystems_are_refused() {
+    let (a, _b) = pair().await;
     let client = mcp_client(&a).await;
-    let uploaded = TestResponse::read(
-        gateway_send_raw(
-            &gw,
-            "POST",
-            "/blobs",
-            &[],
-            Some(("application/octet-stream", b"contents".to_vec())),
-        )
-        .await,
-    )
-    .await;
-    let url = uploaded.json["url"].as_str().unwrap().to_owned();
-    let data_dir = a.dir.path();
-    let elsewhere = tempfile::tempdir().unwrap();
-    let dir_link = elsewhere.path().join("innocent");
-    std::os::unix::fs::symlink(data_dir, &dir_link).unwrap();
+    let uploads = tagged_blobs(&a).await;
+    // A file under /dev that is a regular one, where the system allows it.
+    let shm = tempfile::NamedTempFile::new_in("/dev/shm").ok();
 
-    for dest in [
-        data_dir.join("planted.bin"),
-        data_dir.join("blobs").join("planted.bin"),
-        dir_link.join("planted.bin"),
-        elsewhere
-            .path()
-            .join("..")
-            .join(data_dir.file_name().unwrap())
-            .join("planted.bin"),
-    ] {
-        let refused = call(&client, "pals_fetch", json!({"url": url, "dest": dest})).await;
+    // The environment of the daemon, its kernel's view of itself, and any
+    // file under /proc, /sys or /dev: none is a file to send, though /proc
+    // and /sys call theirs regular.
+    let mut refused_paths = vec![
+        PathBuf::from("/proc/self/environ"),
+        PathBuf::from("/proc/self/status"),
+        PathBuf::from("/sys/kernel/uevent_seqnum"),
+    ];
+    refused_paths.extend(shm.as_ref().map(|file| file.path().to_owned()));
+    // Through a link from an ordinary directory too.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let link = elsewhere.path().join("environ.txt");
+    std::os::unix::fs::symlink("/proc/self/environ", &link).unwrap();
+    refused_paths.push(link);
+
+    for path in refused_paths {
+        let refused = call(
+            &client,
+            "pals_ask",
+            json!({"peer": "bob", "question": "hola", "attachments": [path]}),
+        )
+        .await;
         let text = error_text(&refused);
-        assert!(
-            text.contains("data directory"),
-            "{}: {text}",
-            dest.display()
-        );
+        assert!(text.contains("system file"), "{}: {text}", path.display());
     }
-    assert!(!data_dir.join("planted.bin").exists());
-    assert!(!data_dir.join("blobs").join("planted.bin").exists());
+
+    // Nothing was uploaded, nothing asked.
+    assert_eq!(tagged_blobs(&a).await, uploads);
+    assert!(a.node.store.outbox_all().unwrap().is_empty());
     client.cancel().await.expect("close the session");
 }
 

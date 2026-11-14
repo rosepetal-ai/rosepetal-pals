@@ -273,7 +273,7 @@ async fn retry_after_a_restart_mid_execution_gets_the_failed_task() {
     let (http, addr) = (a.node.peer_http.clone(), b.node.addr());
     let first = tokio::spawn(async move { http.send(addr, request).await });
     wait_until(|| exec.runs() == 1).await;
-    let TestNode { node, dir } = b;
+    let TestNode { node, dir, .. } = b;
     node.shutdown().await.unwrap();
     let b = spawn_node_in_with_executor(dir, exec.clone()).await;
 
@@ -309,7 +309,7 @@ async fn unbound_row_left_by_a_crash_is_cleared_at_start() {
 
     // What a crash after the key was created and before its execution
     // started leaves: a row with no outcome.
-    let TestNode { node, dir } = b;
+    let TestNode { node, dir, .. } = b;
     node.shutdown().await.unwrap();
     {
         let store = Store::open(&dir.path().join(STORE_FILE), key_in(dir.path()).id()).unwrap();
@@ -408,7 +408,7 @@ async fn dedup_survives_daemon_restart() {
     )
     .clone();
 
-    let TestNode { node, dir } = b;
+    let TestNode { node, dir, .. } = b;
     node.shutdown().await.unwrap();
     let b = spawn_node_in_with_executor(dir, exec.clone()).await;
 

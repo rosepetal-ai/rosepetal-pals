@@ -174,6 +174,8 @@ struct Inner {
     local_addr: SocketAddr,
     /// The questions this agent asks its peers, through this gateway.
     outbox: Outbox,
+    /// The only directory `pals_fetch` writes to.
+    download_dir: PathBuf,
     /// Cancelled when the gateway stops: ends the MCP sessions.
     stopping: CancellationToken,
 }
@@ -190,6 +192,8 @@ pub struct GatewayParts {
     pub limits: LimitsCfg,
     /// The agent's data directory, whose files are never sent.
     pub data_dir: PathBuf,
+    /// The only directory `pals_fetch` writes to.
+    pub download_dir: PathBuf,
 }
 
 impl GatewayState {
@@ -204,6 +208,7 @@ impl GatewayState {
             blobs,
             limits,
             data_dir,
+            download_dir,
         } = parts;
         let outbox =
             Outbox::new(Arc::clone(&store), base_url(&local_addr)).with_data_dir(&data_dir);
@@ -218,6 +223,7 @@ impl GatewayState {
                 limits,
                 local_addr,
                 outbox,
+                download_dir,
                 stopping: CancellationToken::new(),
             }),
         }
@@ -231,6 +237,11 @@ impl GatewayState {
     /// The questions this agent asks its peers, through this gateway.
     pub fn outbox(&self) -> &Outbox {
         &self.inner.outbox
+    }
+
+    /// The only directory `pals_fetch` writes to.
+    pub(crate) fn download_dir(&self) -> &std::path::Path {
+        &self.inner.download_dir
     }
 
     /// Cancelled when the gateway stops.

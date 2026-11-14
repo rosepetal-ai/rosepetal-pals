@@ -34,12 +34,13 @@
 //! nor ever put in a URL; a task the peer answers for must be the one asked
 //! about.
 //!
-//! An attachment is read only when it is a regular file outside the agent's
-//! data directory ([`Outbox::with_data_dir`]), which holds its key and its
-//! grants: the path is resolved first, symbolic links and `..` included,
-//! and the file opened must be the one checked.
+//! An attachment is read only as the path policy's reading rule allows
+//! (`crate::path_policy`): resolved first, symbolic links and `..`
+//! included, it must be a regular file outside the agent's data directory
+//! ([`Outbox::with_data_dir`]), which holds its key and its grants, and
+//! outside `/proc`, `/sys`, `/dev` and any procfs or sysfs; the file opened
+//! must be the one checked.
 
-use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,6 +64,7 @@ use serde_json::Value;
 use tokio::time::Instant;
 
 use crate::a2a::{IDEMPOTENCY_EXTENSION, is_safe_task_id};
+use crate::path_policy::open_attachment;
 
 /// How many times an ask retries an attempt that failed on the way, after
 /// waiting 1 s, 2 s and 4 s.
@@ -191,8 +193,8 @@ impl Outbox {
     ///
     /// Fails with [`AskError::Local`], having sent nothing, when the peer is
     /// neither a contact nor an agent id, or an attachment cannot be read
-    /// or uploaded: one that is not a regular file, or is inside the data
-    /// directory, is refused.
+    /// or uploaded: one that is not a regular file, is inside the data
+    /// directory or is a system file is refused.
     pub async fn ask(&self, req: AskRequest) -> Result<AskOutcome, AskError> {
         self.ask_kept(req, |_| {}).await
     }
@@ -827,56 +829,6 @@ impl Answer {
     fn text(&self) -> Option<String> {
         (!self.texts.is_empty()).then(|| self.texts.join("\n"))
     }
-}
-
-/// Opens the attachment at `path` to read it, once resolved (symbolic links
-/// and `..` included): it must be outside `data_dir` and a regular file,
-/// checked before it is opened, so that a FIFO cannot block the call, and
-/// the file opened must be the one checked.
-fn open_attachment(path: &Path, data_dir: Option<&Path>) -> Result<std::fs::File, String> {
-    let resolved = std::fs::canonicalize(path).map_err(|err| err.to_string())?;
-    if let Some(data_dir) = data_dir
-        && resolved.starts_with(data_dir)
-    {
-        return Err(format!(
-            "it is inside this agent's data directory {}, which holds its key and its grants: \
-             nothing in it is ever sent",
-            data_dir.display()
-        ));
-    }
-    let checked = std::fs::metadata(&resolved).map_err(|err| err.to_string())?;
-    if !checked.is_file() {
-        return Err("not a regular file".to_owned());
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    // Should the path have become a FIFO or a link since, opening it does
-    // not wait for a writer nor follow the link.
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(
-        &mut options,
-        libc::O_NONBLOCK | libc::O_NOFOLLOW,
-    );
-    let file = options.open(&resolved).map_err(|err| err.to_string())?;
-    let opened = file.metadata().map_err(|err| err.to_string())?;
-    if !opened.is_file() || !same_file(&checked, &opened) {
-        return Err("it changed while it was being opened".to_owned());
-    }
-    Ok(file)
-}
-
-/// Whether `a` and `b` describe the same file.
-#[cfg(unix)]
-fn same_file(a: &Metadata, b: &Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    a.dev() == b.dev() && a.ino() == b.ino()
-}
-
-/// Whether `a` and `b` describe the same file: as far as this platform
-/// tells, files of the same size.
-#[cfg(not(unix))]
-fn same_file(a: &Metadata, b: &Metadata) -> bool {
-    a.len() == b.len()
 }
 
 /// Refuses a row whose task id is not [safe](is_safe_task_id), as a build
