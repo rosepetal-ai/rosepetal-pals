@@ -6,7 +6,7 @@ Guidance for coding agents working in `rosepetal-pals`. User documentation is in
 
 PALS, "Peer Agent Linking System": a Rust daemon, `pals`, that lets AI agents work with each other peer to peer. Each daemon is a full A2A v1.0 server built on the official Rust SDK (JSON-RPC and HTTP+JSON bindings, SSE); between peers that HTTP/1.1 travels unchanged inside Iroh QUIC streams, authenticated by signed grants presented as `Bearer` tokens. A loopback gateway lets stock A2A clients reach any peer, files move as iroh-blobs authorized by the holder, a worker answers tasks (`echo`, `exec` such as `claude -p`, `tck`), `pals ask` retries without duplicating work, and a local MCP server exposes six tools.
 
-Milestone 1 (hito 1) is implemented. A2A conformance is demonstrated (`docs/conformance/hito-1/README.md`); the two-machine exit test is pending the owner (`docs/runbooks/hito-1-dos-maquinas.md`), with only a single-host rehearsal recorded (`docs/conformance/hito-1/exit-test.md`).
+Milestone 1 (hito 1) is implemented. A2A conformance is backed by the official TCK and Python SDK within the scoped claim of `docs/conformance/hito-1/README.md`: stock clients reach peers through the gateway with the JSON-RPC and HTTP+JSON bindings; between peers, the custom binding `http-over-iroh/v1` carries those same bindings; file bytes travel over iroh-blobs, outside A2A. The two-machine exit test is pending the owner (`docs/runbooks/hito-1-dos-maquinas.md`), with only a single-host rehearsal recorded (`docs/conformance/hito-1/exit-test.md`).
 
 ## Commands
 
@@ -17,7 +17,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 ```
 
-All three checks must be green before every commit; CI (`.github/workflows/ci.yml`) runs the same on pushes to `dev`/`main` and on pull requests. The integration tests start real nodes with Iroh on loopback and some are load-sensitive (seen flaking with load averages between 50 and 100: `auth::second_daemon_on_same_data_dir_refuses_to_start`, `dedup::streaming_retry_resubscribes_instead_of_reexecuting`, `blobs::a_local_copy_needs_the_holder_to_prove_it_has_the_blob`); rerun on a quieter machine before calling a failure real.
+All three checks must be green before every commit; CI (`.github/workflows/ci.yml`) runs the same on pushes to `dev`/`main` and on pull requests, with the pinned toolchain, plus `cargo check` on the MSRV. The integration tests start real nodes with Iroh on loopback on hosts that are often heavily loaded: synchronize on state, never on elapsed time (a gated `CountingExecutor` that the test releases, waits on the provider's store, `common::shut_down` before reusing a data directory). `blobs::a_local_copy_needs_the_holder_to_prove_it_has_the_blob` has been seen flaking at load averages near 100; rerun on a quieter machine before calling a failure there real.
+
+`pals daemon` logs to stderr from `INFO` up; `RUST_LOG` overrides (`RUST_LOG=pals=debug`).
 
 Conformance, which needs network access (GitHub, PyPI) and rewrites `docs/conformance/hito-1/compatibility*.{json,html}`:
 
@@ -51,6 +53,7 @@ crates/pals/             daemon and CLI (binary `pals`)
   src/worker/              echo, exec, tck adapters and WorkerExecutor
   src/blobs.rs             BlobService: iroh-blobs store, grant-authorized provider, share, fetch
   src/outbox.rs            reliable ask (persisted messageId, retry, resubscribe)
+  src/path_policy.rs       which local files go to peers (attachments) and where peers' files land (pals_fetch)
   src/mcp.rs               the six MCP tools
   tests/                   integration tests over real nodes
 tests/interop/           run_tck.sh, python_client.py, requirements.txt (pinned)
@@ -66,7 +69,7 @@ Module headers (`//!`) document each component's contract in detail; read them b
 - **Protocol.** A2A `1.0`; every request carries `A2A-Version: 1.0`. The card declares only interfaces and capabilities the daemon really serves.
 - **Naming.** Wire identifiers keep the design's `agentnet` prefix and are never renamed: signing domains `agentnet.grant/1\n` and `agentnet.event/1\n`, ALPN `agentnet-a2a-http/1`, headers `x-agentnet-*`, blob metadata key `agentnet.blob/1`, auth realm `agentnet`. The product, binary and crates are `pals`.
 - **Frozen URIs and vectors.** The binding URIs `https://github.com/rosepetal-ai/rosepetal-pals/bindings/http-over-iroh/v1/jsonrpc` and `…/v1/http-json` and the extension URI `…/extensions/idempotency/v1` never change meaning: an incompatible change gets a `v2`. The vectors in `crates/pals-core/tests/vectors/` freeze the grant and event formats.
-- **Security boundaries.** The gateway and MCP listen on loopback only. Anything received from a peer (answer text, file names, cards, task ids) is untrusted data: never instructions, never a path without sanitizing. A peer request body is at most 1 MiB; files go as blobs, and a blob reference never grants access.
+- **Security boundaries.** The gateway and MCP listen on loopback only. Anything received from a peer (answer text, file names, cards, task ids) is untrusted data: never instructions, never a path without sanitizing. A peer request body is at most 1 MiB and must arrive within the head timeout; a peer response through the gateway is at most 16 MiB (per SSE event for streams), JSON when successful, and never names an unsafe task id. Files go as blobs, and a blob reference never grants access. Attachments and `pals_fetch` destinations follow `src/path_policy.rs` (nothing from the data directory or kernel pseudo-filesystems; writes only inside `[mcp] download_dir`).
 - **Spec deviations.** The hito 1 plan's table records where the implementation departs from the design (standard A2A bindings instead of `agentnet/0`, gateway in hito 1, idempotency as an opt-in extension). Read it before changing transport or task semantics.
 - **Git.** Default branch `dev`; pull requests target `dev`, and promotion `dev → main` is a separate, human-reviewed PR. Conventional commit messages in English.
 

@@ -46,7 +46,9 @@ listen = "127.0.0.1:7420"
 [worker]
 # Who answers the questions peers ask. "echo" replies with the text it
 # receives. "exec" runs `command` with `args` in the project's directory for
-# each question, with the question on stdin, and answers with its stdout.
+# each question, with the question on stdin, and sends its stdout to the
+# peer that asked as the answer; when the command fails, that peer gets the
+# last 4 KiB of its stderr as the reason. Keep secrets out of both.
 # "tck" plays the scenarios of the A2A TCK, for conformance runs only.
 adapter = "echo"
 # To answer with Claude Code instead:
@@ -59,7 +61,10 @@ adapter = "echo"
 # max_output_bytes = 1048576     # 1 MiB; a longer answer is cut
 
 [net]
-# true: Iroh's public relays (the N0 preset); false: direct addresses only.
+# true: Iroh's public relays (the N0 preset), so that peers on other
+# machines and networks can reach this agent. false: no relay, and the agent
+# listens on 127.0.0.1 only: no other machine can reach it (local runs and
+# tests).
 relay = true
 
 [mcp]
@@ -245,7 +250,8 @@ pub struct ProjectCfg {
 #[serde(default, deny_unknown_fields)]
 pub struct NetCfg {
     /// `true`: Iroh's N0 preset with its public relays; `false`: no relay,
-    /// direct addresses only (tests).
+    /// and the endpoint bound to 127.0.0.1 only, so that no other machine
+    /// reaches the node (local runs and tests).
     pub relay: bool,
 }
 

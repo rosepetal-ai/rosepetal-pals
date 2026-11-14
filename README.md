@@ -1,8 +1,8 @@
 # PALS — Peer Agent Linking System
 
-Red entre pares para que agentes de IA se encuentren, se autoricen y trabajen juntos sin depender de un directorio central. Cada agente ejecuta un daemon, `pals`, que lo conecta con otros agentes, controla qué pueden pedirle y le entrega el trabajo autorizado. Todo el intercambio final entre agentes (mensajes, tareas, estados, streaming, cancelación y ficheros) es [A2A](https://a2a-protocol.org/) v1.0 estándar.
+Red entre pares para que agentes de IA se encuentren, se autoricen y trabajen juntos sin depender de un directorio central. Cada agente ejecuta un daemon, `pals`, que lo conecta con otros agentes, controla qué pueden pedirle y le entrega el trabajo autorizado. Los mensajes, las tareas, sus estados, el streaming y la cancelación son [A2A](https://a2a-protocol.org/) v1.0: un cliente A2A estándar llega a cualquier par por el gateway local con los bindings JSON-RPC y HTTP+JSON, y entre pares esos mismos bindings viajan dentro del binding propio `http-over-iroh/v1`. Los bytes de los ficheros van aparte, por iroh-blobs, fuera de A2A; los mensajes A2A los nombran con una URL.
 
-> **Estado:** hito 1 implementado. La conformidad con A2A está demostrada con el kit de conformidad oficial (TCK) y con el SDK oficial de Python. La **prueba de salida en dos máquinas está pendiente**: de momento solo hay un [ensayo en una máquina](docs/conformance/hito-1/exit-test.md). Es un prototipo; lee las [limitaciones](#limitaciones-conocidas-del-hito-1) antes de usarlo.
+> **Estado:** hito 1 implementado. La conformidad con A2A, con el alcance exacto que fija el [informe](docs/conformance/hito-1/README.md#lo-que-queda-respaldado), está respaldada por el kit de conformidad oficial (TCK) y el SDK oficial de Python. La **prueba de salida en dos máquinas está pendiente**: de momento solo hay un [ensayo en una máquina](docs/conformance/hito-1/exit-test.md). Es un prototipo; lee las [limitaciones](#limitaciones-conocidas-del-hito-1) antes de usarlo.
 
 El documento de diseño llama al protocolo «Agentnet»; por eso los identificadores que viajan por la red conservan el prefijo `agentnet` (`agentnet.grant/1`, `agentnet-a2a-http/1`, `x-agentnet-peer`). El producto, el binario y los crates se llaman `pals`.
 
@@ -13,7 +13,7 @@ El documento de diseño llama al protocolo «Agentnet»; por eso los identificad
 - **Autorización.** *Grants* firmados (JSON canónico JCS y Ed25519) que dicen quién puede pedir qué, en qué proyecto y hasta cuándo. Se pueden revocar. Toleran 60 s de diferencia entre relojes.
 - **A2A v1.0.** Cada daemon es un servidor A2A completo, hecho con el SDK oficial de Rust, con los bindings JSON-RPC y HTTP+JSON y streaming por SSE. Entre pares, esas mismas peticiones HTTP viajan dentro de streams de Iroh.
 - **Gateway local.** Cualquier cliente A2A estándar llega a cualquier par en `http://127.0.0.1:7420/peers/<par>/…`; el gateway añade el grant y hace de túnel.
-- **Ficheros.** Viajan aparte, con iroh-blobs, verificados con BLAKE3. Quien tiene el fichero decide quién lo descarga: conocer el hash no da acceso.
+- **Ficheros.** Viajan aparte, con iroh-blobs y fuera de A2A, verificados con BLAKE3; en los mensajes A2A son partes con URL. Quien tiene el fichero decide quién lo descarga: conocer el hash no da acceso.
 - **Worker.** El trabajo que llega lo hace un adaptador: `echo`, `exec` (cualquier orden, como `claude -p`, en el directorio del proyecto) o `tck` (solo para las pruebas de conformidad).
 - **Preguntas fiables.** `pals ask` guarda cada pregunta antes de enviarla, reintenta y se vuelve a suscribir sin ejecutar el trabajo dos veces.
 - **MCP.** Un servidor MCP local con seis herramientas, para que una aplicación de IA como Claude Code trabaje con los pares.
@@ -59,7 +59,7 @@ pals grant import '<token>'
 pals ask b "¿Qué tal?"
 ```
 
-Con la configuración por defecto, B responde con el adaptador `echo`. Para que responda Claude Code sobre un proyecto, en el `~/.pals/config.toml` de B:
+Con la configuración por defecto, B responde con el adaptador `echo`. Para que responda Claude Code sobre un proyecto, sustituye la sección `[worker]` del `~/.pals/config.toml` de B por la de abajo (no la añadas al final: una segunda `[worker]` es un error de TOML) y añade el proyecto:
 
 ```toml
 [worker]
@@ -71,13 +71,13 @@ args = ["-p", "--output-format", "text"]
 path = "/ruta/al/proyecto"
 ```
 
-La orden corre en el directorio del proyecto del grant, recibe la pregunta por stdin y responde por stdout; los ficheros adjuntos están en `$PALS_IN_DIR`, y los que deje en `$PALS_OUT_DIR` vuelven como ficheros de la respuesta. `pals init` escribe el fichero con todas las opciones y su explicación.
+La orden corre en el directorio del proyecto del grant, recibe la pregunta por stdin y responde por stdout, que llega tal cual al par que preguntó; si falla, ese par recibe además los últimos 4 KiB de su stderr como motivo. Los ficheros adjuntos están en `$PALS_IN_DIR`, y los que deje en `$PALS_OUT_DIR` (32 como mucho) vuelven como ficheros de la respuesta. `pals init` escribe el fichero con todas las opciones y su explicación.
 
 Más órdenes:
 
 | Orden | Qué hace |
 |-|-|
-| `pals ask <par> "<pregunta>" [--attach FICHERO]… [--wait 600s]` | Pregunta y espera la respuesta. Sale con `0` si la tarea se completa, `2` si falla, se rechaza o se cancela, y `3` si el par no responde o la espera se agota; en ese caso la pregunta queda guardada |
+| `pals ask <par> "<pregunta>" [--attach FICHERO]… [--wait 600s]` | Pregunta y espera la respuesta. Escribe en stderr el `messageId` en cuanto guarda la pregunta, para retomarla si la orden se interrumpe. Sale con `0` si la tarea se completa, `2` si falla, se rechaza o se cancela, y `3` si el par no responde o la espera se agota; en ese caso la pregunta queda guardada |
 | `pals task ls` · `pals task resume <messageId>` · `pals task cancel <messageId>` | Las preguntas hechas; retomar una sin ejecutarla dos veces; cancelar su tarea |
 | `pals contact ls` | Los pares guardados |
 | `pals grant ls [--issued \| --held]` · `pals grant revoke <grant_id>` | Grants emitidos y recibidos; revocar uno emitido |
@@ -102,9 +102,11 @@ claude mcp add --transport http pals http://127.0.0.1:7420/mcp
 | `pals_ask` | Pregunta a un par, con ficheros si hace falta, y espera `wait_s` segundos: 50 por defecto, 3600 como mucho |
 | `pals_task` | Retoma una pregunta por su `message_id` sin ejecutarla dos veces |
 | `pals_cancel` | Cancela la tarea de una pregunta |
-| `pals_fetch` | Descarga un fichero de una respuesta a una ruta nueva |
+| `pals_fetch` | Descarga un fichero de una respuesta a un fichero nuevo del directorio de descargas |
 
-`pals_ask` espera 50 s por defecto, menos que el tiempo máximo de una llamada en los clientes MCP habituales; si la respuesta tarda más, devuelve el `message_id` y la IA sigue con `pals_task`. La CLI espera 600 s.
+`pals_ask` espera 50 s por defecto, menos que el tiempo máximo de una llamada en los clientes MCP habituales, y la espera cuenta la subida de los adjuntos; si la respuesta tarda más, devuelve el `message_id` y la IA sigue con `pals_task`. Una llamada que el cliente cancela antes de que la pregunta quede guardada no pregunta nada. La CLI espera 600 s.
+
+`pals_fetch` solo escribe dentro del directorio de descargas, `[mcp] download_dir` en `config.toml` (`~/Downloads/pals` por defecto, creado con permisos `0700` la primera vez y nunca dentro del directorio de datos): un nombre de fichero, una ruta relativa dentro de él o una ruta absoluta que, resuelta, quede dentro; ninguna parte puede empezar por punto, y nunca sobrescribe. Las instrucciones del servidor MCP le dicen a la IA qué directorio es.
 
 ## Clientes A2A estándar
 
@@ -118,6 +120,10 @@ Un cliente A2A cualquiera habla con el par `<par>` (nombre de contacto o id) a t
 | Ficheros | `GET http://127.0.0.1:7420/blobs/<poseedor>/<hash>` para descargar; `POST http://127.0.0.1:7420/blobs` para subir |
 
 El gateway añade el grant más reciente que tenga para ese par. Cada petición A2A lleva `A2A-Version: 1.0`, como cabecera o como parámetro de la petición.
+
+El gateway comprueba lo que responde el par antes de dárselo al cliente: un cuerpo de más de 16 MiB, o un evento SSE que crece más que eso antes de terminar, se rechaza; una respuesta correcta (`2xx`) tiene que ser JSON, y ningún `taskId` ni el `id` de una tarea pueden ser identificadores inseguros (como `../../../<otro par>/rest/tasks/x`, que un cliente normalizaría hasta otro par con el grant que el gateway tiene para él). Una respuesta rechazada llega como `502 {"error":"peer protocol error"}`; un stream rechazado se corta antes del evento culpable. Un par PALS nunca envía nada de eso.
+
+`ListTasks` devuelve las tareas de la actualizada más recientemente a la más antigua, pagina con un cursor opaco y omite los artefactos salvo con `includeArtifacts: true` (A2A §3.1.4); el SDK de Rust fijado no lo hace, y PALS lo corrige en su almacén.
 
 ## Compatibilidad con A2A
 
@@ -140,8 +146,9 @@ La idempotencia por `messageId` es una extensión A2A opcional, [`idempotency/v1
 
 ## Limitaciones conocidas del hito 1
 
-- **Sin autenticación local.** Cualquier usuario del sistema operativo de la máquina puede llegar al gateway y al MCP de loopback y actuar con los grants de este agente y con su acceso a ficheros: preguntar a sus pares en su nombre, descargar los blobs de su almacén y, a través del MCP, adjuntar ficheros que el usuario del daemon pueda leer (salvo los de su directorio de datos). El gateway solo rechaza las peticiones de navegadores y los `Host` que no son de loopback.
+- **Sin autenticación local.** Cualquier usuario del sistema operativo de la máquina puede llegar al gateway y al MCP de loopback y actuar con los grants de este agente y con su acceso a ficheros: preguntar a sus pares en su nombre, descargar los blobs de su almacén, adjuntar a través del MCP cualquier fichero regular que el usuario del daemon pueda leer (salvo los de su directorio de datos y los de `/proc`, `/sys`, `/dev` o de un sistema de ficheros procfs o sysfs) y escribir con `pals_fetch` ficheros nuevos dentro del directorio de descargas. El gateway solo rechaza las peticiones de navegadores y los `Host` que no son de loopback.
 - **Las órdenes del worker corren como el usuario del daemon** y pueden leer su directorio de datos, incluidas la clave del agente (`agent.key`) y la base de datos (`pals.db`). Una orden como `claude -p`, que actúa según lo que pregunta un par, podría leerlas.
+- **El par que pregunta recibe la salida de la orden.** Su stdout es la respuesta y, si la orden falla, los últimos 4 KiB de su stderr van en el motivo del fallo: lo que la orden escriba en cualquiera de los dos (rutas, trazas, secretos) llega al par.
 - **Los blobs no caducan.** Los ficheros subidos al gateway y los que un agente envía en sus respuestas se guardan en su almacén sin política de retención; el espacio en disco solo crece.
 - **`AUTH-TLS-001` pendiente.** El gateway local habla HTTP sin TLS en loopback; entre pares, el tráfico va cifrado con TLS 1.3 de QUIC. Falta la aceptación expresa del responsable.
 - **Esperas distintas en MCP y en la CLI.** `pals_ask` y `pals_task` esperan 50 s por defecto (`wait_s`, como mucho 3600); `pals ask` y `pals task resume`, 600 s (`--wait`).
@@ -152,7 +159,7 @@ La idempotencia por `messageId` es una extensión A2A opcional, [`idempotency/v1
 - **Dos máquinas necesitan `net.relay = true`.** Con `relay = false` el daemon se enlaza solo a `127.0.0.1`, y su puerto cambia en cada arranque: los tickets que guardaron sus pares dejan de valer.
 - **Un daemon terminado con `SIGKILL` puede dejar vivas las órdenes que corría**, con su grupo de procesos. Al rearrancar, sus tareas quedan `TASK_STATE_FAILED` (`interrupted: daemon restarted`), pero las órdenes hay que terminarlas a mano. Un proceso que una orden saque de su grupo (con `setsid`) escapa además del tiempo máximo y de la cancelación.
 - **Un grant por par.** Con varios grants de un mismo par, el gateway usa el más reciente: no se elige el proyecto pregunta a pregunta.
-- **Registro mínimo.** El daemon solo escribe el arranque, la parada y las preguntas pendientes; no informa del camino de red (directo o relay) ni de los reintentos.
+- **Registro mínimo.** El daemon escribe en stderr el arranque, la parada, las preguntas pendientes y sus diagnósticos desde el nivel `INFO` (`RUST_LOG` lo cambia, p. ej. `RUST_LOG=pals=debug`); no informa del camino de red (directo o relay).
 
 Fuera del hito 1: la card firmada (JWS), las notificaciones *push*, el binding gRPC, el acceso directo por HTTPS de clientes sin daemon PALS, el inventario de servicios y el descubrimiento de pares desconocidos.
 
