@@ -36,8 +36,11 @@
 //!   with the run. Readable by its holder, never writable.
 //! - **Signature**: a [`ViewPage`] is a [`SignedDoc`] under
 //!   [`VIEW_SIG_DOMAIN`], at most [`MAX_PAGE_BYTES`], living at most
-//!   [`VIEW_TTL_S`]. A private page names its requester (`audience`), a
-//!   public one nobody ([`verify_page`]).
+//!   [`VIEW_TTL_S`], made by [`sign_page`] from what [`page`] cut. A private
+//!   page names its requester (`audience`), a public one nobody
+//!   ([`verify_page`]). A page read from a peer must keep every rule of
+//!   `inventory-view.schema.json` ([`ViewPage`]'s `validate`): an entry shows
+//!   only what a view can show.
 //! - **Cache** ([`ViewCache`]): pages kept by everything that makes them
 //!   differ, the requester included, so a private page is never served to
 //!   another requester.
@@ -55,11 +58,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::{
-    ComponentLink, ComponentRole, DETAIL_MISSING_TOOLS, Entry, InventorySnapshot, McpConnection,
-    McpTool, Observation, Scope, Section, Service,
+    CARD_SKILL_ID, ComponentLink, ComponentRole, DETAIL_MISSING_TOOLS, Entry, InventorySnapshot,
+    MAX_STRING_BYTES, McpConnection, McpTool, Observation, Scope, Section, Service,
+    is_namespaced_id, is_service_id, is_tool_name,
 };
 use crate::card_jws::CardHash;
-use crate::grant::parse_timestamp;
+use crate::grant::{format_timestamp, parse_timestamp};
 use crate::identity::{AgentId, AgentKey};
 use crate::jcs::canonical;
 use crate::signed::{Signed, SignedDoc, SignedError, check_validity};
@@ -230,9 +234,10 @@ impl SignedDoc for ViewPage {
     /// A scope key; an `audience` exactly when the scope is not `public`;
     /// `seq` from 1 to 2^53 - 1; a lifetime of at most [`VIEW_TTL_S`];
     /// sections in order without repeats, and every entry of one of them,
-    /// with an object for body; at most [`MAX_PAGE_ENTRIES`] entries; a
-    /// cursor of at most [`MAX_CURSOR_BYTES`], present exactly when a page
-    /// limit ended the page.
+    /// shown as a view shows it ([`shows_as_a_view_does`]); at most
+    /// [`MAX_PAGE_ENTRIES`] entries; a cursor of at most
+    /// [`MAX_CURSOR_BYTES`], present exactly when a page limit ended the
+    /// page.
     fn validate(&self) -> Result<(), SignedError> {
         let scope = Scope::from_key(&self.scope).ok_or(SignedError::Malformed)?;
         let (Some(issued_at), Some(expires_at)) = (
@@ -251,10 +256,9 @@ impl SignedDoc for ViewPage {
             && expires_at - issued_at <= VIEW_TTL_S
             && self.sections.windows(2).all(|pair| pair[0] < pair[1])
             && self.entries.len() <= MAX_PAGE_ENTRIES
-            && self
-                .entries
-                .iter()
-                .all(|entry| self.sections.contains(&entry.section) && entry.body.is_object())
+            && self.entries.iter().all(|entry| {
+                self.sections.contains(&entry.section) && shows_as_a_view_does(entry, &scope)
+            })
             && self.next_cursor.is_some() == has_cursor
             && self
                 .next_cursor
@@ -266,6 +270,96 @@ impl SignedDoc for ViewPage {
             Err(SignedError::Malformed)
         }
     }
+}
+
+/// Whether `entry` of a page of `scope` keeps the rules of
+/// `inventory-view.schema.json`, which a peer's page is held to:
+///
+/// - **dimensions**: `installed` and `offered`, since it shows; `authorized`
+///   only in a task scope; an `operational` observation that a view may
+///   carry ([`Observation::check`]), without its tool list;
+/// - **text**: `description`, `provenance` and `version` of 1 to
+///   [`MAX_STRING_BYTES`] bytes, `expires_at` a grant timestamp;
+/// - **ids**: a service id (`[a-z0-9][a-z0-9-]{0,63}`, never `ask`) in
+///   `services`, an entry id (`<namespace>:<name>`) in the inventory's other
+///   sections, any non-empty id in `benchmarks`;
+/// - **body**: an object, never with `visibility`, `adapter` or
+///   `offered_tools`; a service's without `id` or `description`, with
+///   `provenance` `operator` and neither `version` nor `expires_at`, and
+///   only links to entry ids; an MCP connection's tools named
+///   `<its id>/<tool>`.
+fn shows_as_a_view_does(entry: &ViewEntry, scope: &Scope) -> bool {
+    let dimensions = &entry.dimensions;
+    let shown = dimensions.installed
+        && dimensions.offered
+        && (!dimensions.authorized || matches!(scope, Scope::Task(_)))
+        && dimensions
+            .operational
+            .as_ref()
+            .is_none_or(|observed| observed.tools.is_empty() && observed.check().is_ok());
+    let text = is_text(&entry.description)
+        && is_text(&entry.provenance)
+        && entry.version.as_deref().is_none_or(is_text)
+        && entry
+            .expires_at
+            .as_deref()
+            .is_none_or(|at| parse_timestamp(at).is_some());
+    let Value::Object(body) = &entry.body else {
+        return false;
+    };
+    let never = ["visibility", "adapter", "offered_tools"]
+        .iter()
+        .all(|key| !body.contains_key(*key));
+    let by_section = match entry.section {
+        Section::Services => {
+            is_service_id(&entry.id)
+                && entry.id != CARD_SKILL_ID
+                && entry.provenance == OPERATOR
+                && entry.version.is_none()
+                && entry.expires_at.is_none()
+                && !body.contains_key("id")
+                && !body.contains_key("description")
+                && links_only_entries(body)
+        }
+        Section::Mcp => is_namespaced_id(&entry.id) && tools_of_its_own(&entry.id, body),
+        Section::Benchmarks => !entry.id.is_empty(),
+        _ => is_namespaced_id(&entry.id),
+    };
+    shown && text && never && by_section
+}
+
+/// A string a view carries: 1 to [`MAX_STRING_BYTES`] bytes.
+fn is_text(text: &str) -> bool {
+    (1..=MAX_STRING_BYTES).contains(&text.len())
+}
+
+/// Whether a service's `components`, if any, are links to entry ids.
+fn links_only_entries(body: &Map<String, Value>) -> bool {
+    body.get("components").is_none_or(|components| {
+        Vec::<ComponentLink>::deserialize(components).is_ok_and(|links| {
+            links
+                .iter()
+                .all(|link| is_namespaced_id(&link.id) && link.group.as_deref().is_none_or(is_text))
+        })
+    })
+}
+
+/// Whether an MCP connection's `tools`, if any, are its own, named
+/// `<id>/<tool>`, with a text for description and an object for
+/// annotations.
+fn tools_of_its_own(id: &str, body: &Map<String, Value>) -> bool {
+    body.get("tools").is_none_or(|tools| {
+        Vec::<McpTool>::deserialize(tools).is_ok_and(|tools| {
+            tools.iter().all(|tool| {
+                tool.name
+                    .strip_prefix(id)
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .is_some_and(is_tool_name)
+                    && tool.description.as_deref().is_none_or(is_text)
+                    && tool.annotations.as_ref().is_none_or(Value::is_object)
+            })
+        })
+    })
 }
 
 /// What `scope` shows of `inv` in `sections`: in the order of
@@ -722,6 +816,50 @@ pub fn page(
     Ok((entries[offset..end].to_vec(), next_cursor, limit))
 }
 
+/// The page `slice` of the view `req` asks for, as `page` cut it, signed by
+/// `key` at `now_unix` for [`VIEW_TTL_S`], naming the card of `card_hash`:
+/// the page `page` sized, with `req`'s scope and audience, its revision as
+/// `seq` and its sections in order without repeats.
+///
+/// [`ViewError::TooLarge`] when the signed page would exceed
+/// [`MAX_PAGE_BYTES`], which a slice from [`page`] never does;
+/// [`ViewError::Malformed`] when it would not be a valid page: a time
+/// outside the years 0000 to 9999, or a scope whose project is not a
+/// project name.
+pub fn sign_page(
+    key: &AgentKey,
+    card_hash: &CardHash,
+    req: &PageRequest<'_>,
+    slice: PageSlice,
+    now_unix: i64,
+) -> Result<Signed<ViewPage>, ViewError> {
+    let (entries, next_cursor, truncated_by) = slice;
+    // Twenty characters each, as `page` sized them.
+    let issued_at = format_timestamp(now_unix).ok_or(ViewError::Malformed)?;
+    let expires_at = now_unix
+        .checked_add(VIEW_TTL_S)
+        .and_then(format_timestamp)
+        .ok_or(ViewError::Malformed)?;
+    let doc = ViewPage {
+        schema: VIEW_SCHEMA.to_owned(),
+        agent_id: key.id(),
+        scope: req.scope.key(),
+        audience: req.audience.copied(),
+        seq: req.revision,
+        issued_at,
+        expires_at,
+        agent_card_hash: card_hash.clone(),
+        sections: normalized(req.sections),
+        entries,
+        next_cursor,
+        truncated_by,
+    };
+    Signed::issue(key, doc).map_err(|err| match err {
+        SignedError::TooLarge => ViewError::TooLarge,
+        _ => ViewError::Malformed,
+    })
+}
+
 /// The entries a page of `asked` holds at most.
 fn page_entries(asked: Option<u32>) -> usize {
     match asked.and_then(|asked| usize::try_from(asked).ok()) {
@@ -741,7 +879,8 @@ fn normalized(sections: &[Section]) -> Vec<Section> {
 /// The bytes of a signed page of `req` without entries, at least: every
 /// field at its longest, a cursor with the largest numbers its chain of
 /// `entries` can reach and the longest limit. The entries add their JCS and
-/// a comma between each two.
+/// a comma between each two. [`sign_page`] builds the page with these
+/// fields, and no other.
 fn page_overhead(
     req: &PageRequest<'_>,
     binding: &Cursor,

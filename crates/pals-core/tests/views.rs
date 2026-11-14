@@ -10,7 +10,8 @@ use pals_core::identity::{AgentId, AgentKey};
 use pals_core::inventory::view::{
     CursorKey, Dimensions, INVENTORY_SECTIONS, MAX_CACHED_PAGES, MAX_PAGE_BYTES, MAX_PAGE_ENTRIES,
     MAX_QUERY_TOTAL_BYTES, PageLimit, PageRequest, PageSlice, VIEW_SCHEMA, VIEW_SIG_DOMAIN,
-    VIEW_TTL_S, ViewCache, ViewEntry, ViewError, ViewPage, content_hash, page, render, verify_page,
+    VIEW_TTL_S, ViewCache, ViewEntry, ViewError, ViewPage, content_hash, page, render, sign_page,
+    verify_page,
 };
 use pals_core::inventory::{
     ComponentLink, ComponentRole, Entry, Inventory, InventorySnapshot, Observation,
@@ -282,29 +283,16 @@ impl Provider {
         self.sign(&entries, &req, now)
     }
 
-    /// Pages `entries` for `req` and signs the page, issued at `now`.
+    /// Pages `entries` for `req` and signs the page, issued at `now`, as the
+    /// discovery protocol's answer does.
     fn sign(
         &self,
         entries: &[ViewEntry],
         req: &PageRequest<'_>,
         now: i64,
     ) -> Result<Vec<u8>, ViewError> {
-        let (entries, next_cursor, truncated_by) = page(entries, req, &self.cursors)?;
-        let doc = ViewPage {
-            schema: VIEW_SCHEMA.to_owned(),
-            agent_id: self.id(),
-            scope: req.scope.key(),
-            audience: req.audience.copied(),
-            seq: req.revision,
-            issued_at: ts(now),
-            expires_at: ts(now + VIEW_TTL_S),
-            agent_card_hash: self.card.clone(),
-            sections: req.sections.to_vec(),
-            entries,
-            next_cursor,
-            truncated_by,
-        };
-        Ok(Signed::issue(&self.key, doc)
+        let slice = page(entries, req, &self.cursors)?;
+        Ok(sign_page(&self.key, &self.card, req, slice, now)
             .expect("a page within its limits signs")
             .to_json())
     }
@@ -1163,6 +1151,130 @@ fn signed_page_verifies_and_names_its_audience() {
     );
 }
 
+/// The entry of `view`, a page's JSON, whose id is `id`.
+fn entry_of<'a>(view: &'a mut Value, id: &str) -> &'a mut Value {
+    view["entries"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|entry| entry["id"] == id)
+        .unwrap_or_else(|| panic!("entry {id}"))
+}
+
+/// A change to a page's JSON, named, and whether it is of the public page.
+type Forgery = (&'static str, bool, fn(&mut Value));
+
+#[test]
+fn a_page_shows_only_what_a_view_can_show() {
+    // A page a peer sends is held to inventory-view.schema.json: signed or
+    // not, an entry shows only what a view can show.
+    let provider = Provider::new();
+    let alice = AgentKey::generate().id();
+    let mut snapshot = fixture();
+    snapshot.observations.insert(
+        "example:demo-repo".to_owned(),
+        adapter_observation(&[("read_file", Some("Reads a file"))]),
+    );
+    let all = &INVENTORY_SECTIONS[..];
+    let task_page = provider
+        .serve(&snapshot, &task("demo"), Some(&alice), all, None, None, NOW)
+        .unwrap();
+    let public_page = provider
+        .serve(&snapshot, &Scope::Public, None, all, None, None, NOW)
+        .unwrap();
+    // As the agent makes them, both are good.
+    verify_page(&task_page, &provider.id(), Some(&alice), NOW).unwrap();
+    verify_page(&public_page, &provider.id(), None, NOW).unwrap();
+
+    let forgeries: [Forgery; 22] = [
+        ("not installed", false, |v| {
+            entry_of(v, "example:vision-pack")["dimensions"]["installed"] = json!(false);
+        }),
+        ("not offered", false, |v| {
+            entry_of(v, "example:vision-pack")["dimensions"]["offered"] = json!(false);
+        }),
+        ("authorized outside a task scope", true, |v| {
+            entry_of(v, "example:vision-pack")["dimensions"]["authorized"] = json!(true);
+        }),
+        ("an observation with a raw detail", false, |v| {
+            entry_of(v, "example:demo-repo")["dimensions"]["operational"]["detail"] =
+                json!("connection refused by 10.0.0.7");
+        }),
+        ("an observation with its tool list", false, |v| {
+            entry_of(v, "example:demo-repo")["dimensions"]["operational"]["tools"] =
+                json!([{"name": "delete_file"}]);
+        }),
+        ("an observation at no time", false, |v| {
+            entry_of(v, "example:demo-repo")["dimensions"]["operational"]["observed_at"] =
+                json!("yesterday");
+        }),
+        ("an entry id without a namespace", false, |v| {
+            entry_of(v, "example:vision-pack")["id"] = json!("vision-pack");
+        }),
+        ("an entry id in the reserved namespace", false, |v| {
+            entry_of(v, "example:vision-pack")["id"] = json!("agentnet:vision-pack");
+        }),
+        ("the card's own skill as a service", false, |v| {
+            entry_of(v, "ocr")["id"] = json!("ask");
+        }),
+        ("a service id that is no skill id", false, |v| {
+            entry_of(v, "ocr")["id"] = json!("OCR!");
+        }),
+        ("a service declared by another", false, |v| {
+            entry_of(v, "ocr")["provenance"] = json!("peer");
+        }),
+        ("a service with a version", false, |v| {
+            entry_of(v, "ocr")["version"] = json!("1.0");
+        }),
+        ("a service body with its id", false, |v| {
+            entry_of(v, "ocr")["body"]["id"] = json!("ocr");
+        }),
+        ("a link to no entry id", false, |v| {
+            entry_of(v, "review")["body"]["components"][0]["id"] = json!("demo-repo");
+        }),
+        ("a body with a visibility", false, |v| {
+            entry_of(v, "example:vision-pack")["body"]["visibility"] = json!("public");
+        }),
+        ("an MCP body with its adapter", false, |v| {
+            entry_of(v, "example:demo-repo")["body"]["adapter"] =
+                json!({"transport": "stdio", "command": "npx"});
+        }),
+        ("an MCP body with its offered tools", false, |v| {
+            entry_of(v, "example:demo-repo")["body"]["offered_tools"] = json!(["read_file"]);
+        }),
+        ("a tool without its connection's name", false, |v| {
+            entry_of(v, "example:demo-repo")["body"]["tools"][0]["name"] = json!("read_file");
+        }),
+        ("a tool of another connection", false, |v| {
+            entry_of(v, "example:demo-repo")["body"]["tools"][0]["name"] =
+                json!("example:other-repo/read_file");
+        }),
+        ("an empty description", false, |v| {
+            entry_of(v, "example:vision-pack")["description"] = json!("");
+        }),
+        ("an expiry at no time", false, |v| {
+            entry_of(v, "example:vision-pack")["expires_at"] = json!("soon");
+        }),
+        ("a body that is no object", false, |v| {
+            entry_of(v, "example:vision-pack")["body"] = json!([]);
+        }),
+    ];
+    for (name, public, forge) in forgeries {
+        let mut view = value_of(if public { &public_page } else { &task_page })["view"].clone();
+        forge(&mut view);
+        let forged = sign_raw(&provider.key, &view);
+        let audience = (!public).then_some(&alice);
+        assert_eq!(
+            verify_page(&forged, &provider.id(), audience, NOW),
+            Err(ViewError::Malformed),
+            "{name}"
+        );
+        // Nor does the agent sign such a page.
+        let doc: ViewPage = serde_json::from_value(view).unwrap();
+        assert!(Signed::issue(&provider.key, doc).is_err(), "{name}");
+    }
+}
+
 /// `doc` signed by `key` under the view domain, whatever it says.
 fn sign_raw(key: &AgentKey, doc: &Value) -> Vec<u8> {
     let mut envelope = Map::new();
@@ -1314,7 +1426,7 @@ fn optional_fields_round_trip_present_and_absent() {
         ..adapter_observation(&[])
     };
     let ok = adapter_observation(&[]);
-    let entries = vec![
+    let entries = [
         entry(None, None, None),
         entry(Some("1.0.0"), Some("2026-12-14T00:00:00Z"), Some(failed)),
         entry(None, Some("2026-12-14T00:00:00Z"), Some(ok)),
@@ -1329,7 +1441,15 @@ fn optional_fields_round_trip_present_and_absent() {
         expires_at: ts(NOW + VIEW_TTL_S),
         agent_card_hash: provider.card.clone(),
         sections: vec![Section::Plugins],
-        entries: entries.clone(),
+        // Authorized only in a task scope.
+        entries: entries
+            .iter()
+            .cloned()
+            .map(|mut entry| {
+                entry.dimensions.authorized = scope.starts_with("task:");
+                entry
+            })
+            .collect(),
         next_cursor: next_cursor.map(str::to_owned),
         truncated_by,
     };
