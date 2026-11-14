@@ -12,12 +12,12 @@
       "AUTH-SERVER-001",
       "BIND-CUSTOM-002"
     ],
-    "timestamp": "2026-11-14T09:31:29.878789+00:00",
-    "sut_url": "http://127.0.0.1:39219/peers/540de99b35cc96e13f813af209d8e86fab9c0a83575cdf76afe45c848fd2f0bb",
+    "timestamp": "2026-11-14T09:56:52.487015+00:00",
+    "sut_url": "http://127.0.0.1:44657/peers/955f5695895c92e463416dd1182192876efa41c21957ce525bea2157b310aca5",
     "spec_version": "",
-    "overall_compatibility": "2.5%",
+    "overall_compatibility": "6.5%",
     "must_compatibility": "0.0%",
-    "should_compatibility": "37.5%",
+    "should_compatibility": "72.7%",
     "may_compatibility": "0.0%"
   },
   "per_requirement": {
@@ -34,14 +34,11 @@
     },
     "CARD-CACHE-001": {
       "level": "SHOULD",
-      "status": "FAIL",
+      "status": "PASS",
       "transports": {
-        "agent_card": "FAIL"
+        "agent_card": "PASS"
       },
-      "errors": [
-        "Agent Card response should include a Cache-Control header",
-        "Cache-Control should include max-age directive, got: ''"
-      ],
+      "errors": [],
       "test_ids": [
         "tests/compatibility/agent_card/test_agent_card_caching.py::TestAgentCardCacheControl::test_cache_control_has_max_age",
         "tests/compatibility/agent_card/test_agent_card_caching.py::TestAgentCardCacheControl::test_cache_control_present"
@@ -49,13 +46,11 @@
     },
     "CARD-CACHE-002": {
       "level": "SHOULD",
-      "status": "FAIL",
+      "status": "PASS",
       "transports": {
-        "agent_card": "FAIL"
+        "agent_card": "PASS"
       },
-      "errors": [
-        "Agent Card response should include an ETag header"
-      ],
+      "errors": [],
       "test_ids": [
         "tests/compatibility/agent_card/test_agent_card_caching.py::TestAgentCardETag::test_etag_present"
       ]
@@ -78,45 +73,59 @@
       "status": "PASS",
       "transports": {
         "grpc": "SKIPPED",
-        "jsonrpc": "PASS"
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
       "errors": [],
       "test_ids": [
         "tests/compatibility/core_operations/test_task_history.py::TestHistoryLengthZeroGetTask::test_get_task_history_length_zero[grpc]",
+        "tests/compatibility/core_operations/test_task_history.py::TestHistoryLengthZeroGetTask::test_get_task_history_length_zero[http_json]",
         "tests/compatibility/core_operations/test_task_history.py::TestHistoryLengthZeroGetTask::test_get_task_history_length_zero[jsonrpc]"
       ]
     },
     "CORE-HIST-003": {
       "level": "SHOULD",
-      "status": "SKIPPED",
+      "status": "PASS",
       "transports": {
-        "grpc": "SKIPPED"
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
       "errors": [],
       "test_ids": [
-        "tests/compatibility/core_operations/test_task_history.py::TestHistoryLengthZeroSendMessage::test_send_message_history_length_zero[grpc]"
+        "tests/compatibility/core_operations/test_task_history.py::TestHistoryLengthZeroSendMessage::test_send_message_history_length_zero[grpc]",
+        "tests/compatibility/core_operations/test_task_history.py::TestHistoryLengthZeroSendMessage::test_send_message_history_length_zero[http_json]",
+        "tests/compatibility/core_operations/test_task_history.py::TestHistoryLengthZeroSendMessage::test_send_message_history_length_zero[jsonrpc]"
       ]
     },
     "CORE-HIST-005": {
       "level": "SHOULD",
-      "status": "SKIPPED",
+      "status": "PASS",
       "transports": {
-        "grpc": "SKIPPED"
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
       "errors": [],
       "test_ids": [
-        "tests/compatibility/core_operations/test_task_history.py::TestHistoryOrdering::test_history_messages_in_chronological_order[grpc]"
+        "tests/compatibility/core_operations/test_task_history.py::TestHistoryOrdering::test_history_messages_in_chronological_order[grpc]",
+        "tests/compatibility/core_operations/test_task_history.py::TestHistoryOrdering::test_history_messages_in_chronological_order[http_json]",
+        "tests/compatibility/core_operations/test_task_history.py::TestHistoryOrdering::test_history_messages_in_chronological_order[jsonrpc]"
       ]
     },
     "CORE-HIST-006": {
       "level": "SHOULD",
-      "status": "SKIPPED",
+      "status": "PASS",
       "transports": {
-        "grpc": "SKIPPED"
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
       "errors": [],
       "test_ids": [
-        "tests/compatibility/core_operations/test_task_history.py::TestHistoryContent::test_history_content_matches_sent_messages[grpc]"
+        "tests/compatibility/core_operations/test_task_history.py::TestHistoryContent::test_history_content_matches_sent_messages[grpc]",
+        "tests/compatibility/core_operations/test_task_history.py::TestHistoryContent::test_history_content_matches_sent_messages[http_json]",
+        "tests/compatibility/core_operations/test_task_history.py::TestHistoryContent::test_history_content_matches_sent_messages[jsonrpc]"
       ]
     },
     "HTTP_JSON-SVC-001": {
@@ -1009,19 +1018,19 @@
   "per_transport": {
     "agent_card": {
       "total": 4,
-      "passed": 0,
-      "failed": 3,
+      "passed": 3,
+      "failed": 0,
       "skipped": 1
     },
     "jsonrpc": {
-      "total": 3,
-      "passed": 3,
+      "total": 6,
+      "passed": 6,
       "failed": 0,
       "skipped": 0
     },
     "http_json": {
-      "total": 3,
-      "passed": 2,
+      "total": 7,
+      "passed": 6,
       "failed": 1,
       "skipped": 0
     },
@@ -1038,12 +1047,12 @@
     "version": "0.1.0",
     "supportedInterfaces": [
       {
-        "url": "http://127.0.0.1:39219/peers/540de99b35cc96e13f813af209d8e86fab9c0a83575cdf76afe45c848fd2f0bb/jsonrpc",
+        "url": "http://127.0.0.1:44657/peers/955f5695895c92e463416dd1182192876efa41c21957ce525bea2157b310aca5/jsonrpc",
         "protocolBinding": "JSONRPC",
         "protocolVersion": "1.0"
       },
       {
-        "url": "http://127.0.0.1:39219/peers/540de99b35cc96e13f813af209d8e86fab9c0a83575cdf76afe45c848fd2f0bb/rest",
+        "url": "http://127.0.0.1:44657/peers/955f5695895c92e463416dd1182192876efa41c21957ce525bea2157b310aca5/rest",
         "protocolBinding": "HTTP+JSON",
         "protocolVersion": "1.0"
       }
@@ -1051,6 +1060,13 @@
     "capabilities": {
       "streaming": true,
       "pushNotifications": false,
+      "extensions": [
+        {
+          "uri": "https://github.com/rosepetal-ai/rosepetal-pals/extensions/idempotency/v1",
+          "description": "Opt-in idempotency by messageId: a retry with the same messageId and content attaches to the first request's task or answer instead of running again.",
+          "required": false
+        }
+      ],
       "extendedAgentCard": false
     },
     "defaultInputModes": [

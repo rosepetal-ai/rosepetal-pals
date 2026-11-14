@@ -12,11 +12,11 @@
       "AUTH-SERVER-001",
       "BIND-CUSTOM-002"
     ],
-    "timestamp": "2026-11-14T09:31:28.734284+00:00",
-    "sut_url": "http://127.0.0.1:39219/peers/540de99b35cc96e13f813af209d8e86fab9c0a83575cdf76afe45c848fd2f0bb",
+    "timestamp": "2026-11-14T09:56:49.711989+00:00",
+    "sut_url": "http://127.0.0.1:44657/peers/955f5695895c92e463416dd1182192876efa41c21957ce525bea2157b310aca5",
     "spec_version": "",
-    "overall_compatibility": "56.5%",
-    "must_compatibility": "67.1%",
+    "overall_compatibility": "70.2%",
+    "must_compatibility": "81.8%",
     "should_compatibility": "8.3%",
     "may_compatibility": "0.0%"
   },
@@ -241,15 +241,12 @@
     },
     "CORE-ERR-002": {
       "level": "MUST",
-      "status": "FAIL",
+      "status": "PASS",
       "transports": {
-        "jsonrpc": "FAIL",
-        "http_json": "FAIL"
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
-      "errors": [
-        "Malformed request must return an error",
-        "Expected error status, got 200"
-      ],
+      "errors": [],
       "test_ids": [
         "tests/compatibility/core_operations/test_error_handling.py::TestCoreInputValidation::test_malformed_request_rejected_jsonrpc",
         "tests/compatibility/core_operations/test_error_handling.py::TestCoreInputValidation::test_malformed_request_rejected_rest"
@@ -335,14 +332,12 @@
     },
     "VER-SERVER-002": {
       "level": "MUST",
-      "status": "FAIL",
+      "status": "PASS",
       "transports": {
         "jsonrpc": "PASS",
-        "http_json": "FAIL"
+        "http_json": "PASS"
       },
-      "errors": [
-        "Status code mismatch: expected VersionNotSupportedError (400), got 200 (could be: )"
-      ],
+      "errors": [],
       "test_ids": [
         "tests/compatibility/core_operations/test_error_handling.py::TestVersionErrors::test_unsupported_version_returns_error_jsonrpc",
         "tests/compatibility/core_operations/test_error_handling.py::TestVersionErrors::test_unsupported_version_returns_error_rest"
@@ -414,13 +409,11 @@
     },
     "HTTP_JSON-ERR-001": {
       "level": "MUST",
-      "status": "FAIL",
+      "status": "PASS",
       "transports": {
-        "http_json": "FAIL"
+        "http_json": "PASS"
       },
-      "errors": [
-        "Error Content-Type must be application/json, got: 'application/problem+json'"
-      ],
+      "errors": [],
       "test_ids": [
         "tests/compatibility/core_operations/test_error_handling.py::TestRestErrorStructure::test_error_uses_aip193_format",
         "tests/compatibility/http_json/test_problem_details.py::TestAIP193ErrorFormat::test_code_field_matches_http_status",
@@ -455,35 +448,47 @@
     },
     "STREAM-ORDER-002": {
       "level": "MUST",
-      "status": "SKIPPED",
+      "status": "PASS",
       "transports": {
-        "grpc": "SKIPPED"
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
       "errors": [],
       "test_ids": [
-        "tests/compatibility/core_operations/test_multi_stream.py::TestMultiStreamOrdering::test_events_broadcast_to_all_streams[grpc]"
+        "tests/compatibility/core_operations/test_multi_stream.py::TestMultiStreamOrdering::test_events_broadcast_to_all_streams[grpc]",
+        "tests/compatibility/core_operations/test_multi_stream.py::TestMultiStreamOrdering::test_events_broadcast_to_all_streams[http_json]",
+        "tests/compatibility/core_operations/test_multi_stream.py::TestMultiStreamOrdering::test_events_broadcast_to_all_streams[jsonrpc]"
       ]
     },
     "STREAM-ORDER-003": {
       "level": "MUST",
-      "status": "SKIPPED",
+      "status": "PASS",
       "transports": {
-        "grpc": "SKIPPED"
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
       "errors": [],
       "test_ids": [
-        "tests/compatibility/core_operations/test_multi_stream.py::TestMultiStreamOrdering::test_streams_receive_same_events_in_order[grpc]"
+        "tests/compatibility/core_operations/test_multi_stream.py::TestMultiStreamOrdering::test_streams_receive_same_events_in_order[grpc]",
+        "tests/compatibility/core_operations/test_multi_stream.py::TestMultiStreamOrdering::test_streams_receive_same_events_in_order[http_json]",
+        "tests/compatibility/core_operations/test_multi_stream.py::TestMultiStreamOrdering::test_streams_receive_same_events_in_order[jsonrpc]"
       ]
     },
     "STREAM-ORDER-004": {
       "level": "MUST",
-      "status": "SKIPPED",
+      "status": "PASS",
       "transports": {
-        "grpc": "SKIPPED"
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
       "errors": [],
       "test_ids": [
-        "tests/compatibility/core_operations/test_multi_stream.py::TestMultiStreamOrdering::test_closing_one_stream_does_not_affect_others[grpc]"
+        "tests/compatibility/core_operations/test_multi_stream.py::TestMultiStreamOrdering::test_closing_one_stream_does_not_affect_others[grpc]",
+        "tests/compatibility/core_operations/test_multi_stream.py::TestMultiStreamOrdering::test_closing_one_stream_does_not_affect_others[http_json]",
+        "tests/compatibility/core_operations/test_multi_stream.py::TestMultiStreamOrdering::test_closing_one_stream_does_not_affect_others[jsonrpc]"
       ]
     },
     "PUSH-CREATE-001": {
@@ -818,16 +823,13 @@
     },
     "CORE-EXECUTION-MODE-001": {
       "level": "MUST",
-      "status": "FAIL",
+      "status": "PASS",
       "transports": {
         "grpc": "SKIPPED",
-        "jsonrpc": "FAIL",
-        "http_json": "FAIL"
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
-      "errors": [
-        "Operation failed: messageId reused with different content",
-        "Operation failed: [400] messageId reused with different content"
-      ],
+      "errors": [],
       "test_ids": [
         "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-EXECUTION-MODE-001-grpc]",
         "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-EXECUTION-MODE-001-http_json]",
@@ -836,16 +838,13 @@
     },
     "CORE-EXECUTION-MODE-002": {
       "level": "MUST",
-      "status": "FAIL",
+      "status": "PASS",
       "transports": {
         "grpc": "SKIPPED",
-        "jsonrpc": "FAIL",
-        "http_json": "FAIL"
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
-      "errors": [
-        "Operation failed: messageId reused with different content",
-        "Operation failed: [400] messageId reused with different content"
-      ],
+      "errors": [],
       "test_ids": [
         "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-EXECUTION-MODE-002-grpc]",
         "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-EXECUTION-MODE-002-http_json]",
@@ -854,16 +853,13 @@
     },
     "CORE-MULTI-001a": {
       "level": "MUST",
-      "status": "FAIL",
+      "status": "PASS",
       "transports": {
         "grpc": "SKIPPED",
-        "jsonrpc": "FAIL",
-        "http_json": "FAIL"
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
-      "errors": [
-        "Operation failed: messageId reused with different content",
-        "Operation failed: [400] messageId reused with different content"
-      ],
+      "errors": [],
       "test_ids": [
         "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-MULTI-001a-grpc]",
         "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-MULTI-001a-http_json]",
@@ -872,16 +868,13 @@
     },
     "CORE-MULTI-002a": {
       "level": "MUST",
-      "status": "FAIL",
+      "status": "PASS",
       "transports": {
         "grpc": "SKIPPED",
-        "jsonrpc": "FAIL",
-        "http_json": "FAIL"
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
-      "errors": [
-        "Operation failed: messageId reused with different content",
-        "Operation failed: [400] messageId reused with different content"
-      ],
+      "errors": [],
       "test_ids": [
         "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-MULTI-002a-grpc]",
         "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-MULTI-002a-http_json]",
@@ -890,16 +883,13 @@
     },
     "CORE-MULTI-003": {
       "level": "MUST",
-      "status": "FAIL",
+      "status": "PASS",
       "transports": {
         "grpc": "SKIPPED",
-        "jsonrpc": "FAIL",
-        "http_json": "FAIL"
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
-      "errors": [
-        "Operation failed: messageId reused with different content",
-        "Operation failed: [400] messageId reused with different content"
-      ],
+      "errors": [],
       "test_ids": [
         "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-MULTI-003-grpc]",
         "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-MULTI-003-http_json]",
@@ -958,100 +948,134 @@
       "status": "PASS",
       "transports": {
         "grpc": "SKIPPED",
-        "jsonrpc": "PASS"
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
       "errors": [],
       "test_ids": [
         "tests/compatibility/core_operations/test_task_history.py::TestHistoryLengthLimit::test_get_task_history_does_not_exceed_limit[grpc]",
+        "tests/compatibility/core_operations/test_task_history.py::TestHistoryLengthLimit::test_get_task_history_does_not_exceed_limit[http_json]",
         "tests/compatibility/core_operations/test_task_history.py::TestHistoryLengthLimit::test_get_task_history_does_not_exceed_limit[jsonrpc]"
       ]
     },
     "CORE-GET-001": {
       "level": "MUST",
-      "status": "SKIPPED",
+      "status": "PASS",
       "transports": {
-        "grpc": "SKIPPED"
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
       "errors": [],
       "test_ids": [
-        "tests/compatibility/core_operations/test_task_lifecycle.py::TestGetTask::test_get_task_returns_current_state[grpc]"
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestGetTask::test_get_task_returns_current_state[grpc]",
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestGetTask::test_get_task_returns_current_state[http_json]",
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestGetTask::test_get_task_returns_current_state[jsonrpc]"
       ]
     },
     "CORE-CANCEL-001": {
       "level": "MUST",
-      "status": "SKIPPED",
+      "status": "PASS",
       "transports": {
-        "grpc": "SKIPPED"
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
       "errors": [],
       "test_ids": [
-        "tests/compatibility/core_operations/test_task_lifecycle.py::TestCancelTask::test_cancel_task_returns_updated_state[grpc]"
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestCancelTask::test_cancel_task_returns_updated_state[grpc]",
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestCancelTask::test_cancel_task_returns_updated_state[http_json]",
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestCancelTask::test_cancel_task_returns_updated_state[jsonrpc]"
       ]
     },
     "CORE-CANCEL-002": {
       "level": "MUST",
-      "status": "SKIPPED",
+      "status": "PASS",
       "transports": {
-        "grpc": "SKIPPED"
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
       "errors": [],
       "test_ids": [
-        "tests/compatibility/core_operations/test_task_lifecycle.py::TestCancelTask::test_cancel_terminal_task_returns_error[grpc]"
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestCancelTask::test_cancel_terminal_task_returns_error[grpc]",
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestCancelTask::test_cancel_terminal_task_returns_error[http_json]",
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestCancelTask::test_cancel_terminal_task_returns_error[jsonrpc]"
       ]
     },
     "CORE-SEND-002": {
       "level": "MUST",
-      "status": "SKIPPED",
+      "status": "PASS",
       "transports": {
-        "grpc": "SKIPPED"
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
       "errors": [],
       "test_ids": [
-        "tests/compatibility/core_operations/test_task_lifecycle.py::TestMultiTurn::test_send_message_to_terminal_task[grpc]"
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestMultiTurn::test_send_message_to_terminal_task[grpc]",
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestMultiTurn::test_send_message_to_terminal_task[http_json]",
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestMultiTurn::test_send_message_to_terminal_task[jsonrpc]"
       ]
     },
     "CORE-MULTI-005": {
       "level": "MUST",
-      "status": "SKIPPED",
+      "status": "PASS",
       "transports": {
-        "grpc": "SKIPPED"
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
       "errors": [],
       "test_ids": [
-        "tests/compatibility/core_operations/test_task_lifecycle.py::TestMultiTurn::test_infer_context_from_task[grpc]"
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestMultiTurn::test_infer_context_from_task[grpc]",
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestMultiTurn::test_infer_context_from_task[http_json]",
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestMultiTurn::test_infer_context_from_task[jsonrpc]"
       ]
     },
     "CORE-MULTI-006": {
       "level": "MUST",
-      "status": "SKIPPED",
+      "status": "PASS",
       "transports": {
-        "grpc": "SKIPPED"
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
       "errors": [],
       "test_ids": [
-        "tests/compatibility/core_operations/test_task_lifecycle.py::TestMultiTurn::test_reject_mismatching_context[grpc]"
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestMultiTurn::test_reject_mismatching_context[grpc]",
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestMultiTurn::test_reject_mismatching_context[http_json]",
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestMultiTurn::test_reject_mismatching_context[jsonrpc]"
       ]
     },
     "STREAM-SUB-002": {
       "level": "MUST",
-      "status": "SKIPPED",
+      "status": "PASS",
       "transports": {
-        "grpc": "SKIPPED"
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
       "errors": [],
       "test_ids": [
-        "tests/compatibility/core_operations/test_task_lifecycle.py::TestSubscribeLifecycle::test_subscribe_terminates_at_terminal_state[grpc]"
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestSubscribeLifecycle::test_subscribe_terminates_at_terminal_state[grpc]",
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestSubscribeLifecycle::test_subscribe_terminates_at_terminal_state[http_json]",
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestSubscribeLifecycle::test_subscribe_terminates_at_terminal_state[jsonrpc]"
       ]
     },
     "STREAM-SUB-003": {
       "level": "MUST",
-      "status": "SKIPPED",
+      "status": "PASS",
       "transports": {
-        "grpc": "SKIPPED"
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
       },
       "errors": [],
       "test_ids": [
-        "tests/compatibility/core_operations/test_task_lifecycle.py::TestSubscribeLifecycle::test_subscribe_rejects_terminal_task[grpc]"
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestSubscribeLifecycle::test_subscribe_rejects_terminal_task[grpc]",
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestSubscribeLifecycle::test_subscribe_rejects_terminal_task[http_json]",
+        "tests/compatibility/core_operations/test_task_lifecycle.py::TestSubscribeLifecycle::test_subscribe_rejects_terminal_task[jsonrpc]"
       ]
     },
     "JSONRPC-FMT-001": {
@@ -1241,24 +1265,24 @@
     },
     "STREAM-SUB-001": {
       "level": "MUST",
-      "status": "SKIPPED",
+      "status": "PASS",
       "transports": {
-        "grpc": "SKIPPED"
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS"
       },
       "errors": [],
       "test_ids": [
-        "tests/compatibility/grpc/test_streaming.py::TestGrpcStreaming::test_subscribe_first_event_is_task"
+        "tests/compatibility/grpc/test_streaming.py::TestGrpcStreaming::test_subscribe_first_event_is_task",
+        "tests/compatibility/jsonrpc/test_sse_streaming.py::TestSseSubscribeToTask::test_subscribe_first_event_is_task"
       ]
     },
     "HTTP_JSON-STATUS-001": {
       "level": "MUST",
-      "status": "FAIL",
+      "status": "PASS",
       "transports": {
-        "http_json": "FAIL"
+        "http_json": "PASS"
       },
-      "errors": [
-        "Server MUST return VersionNotSupportedError (400) for unsupported A2A-Version, but processed the request normally"
-      ],
+      "errors": [],
       "test_ids": [
         "tests/compatibility/http_json/test_http_status.py::TestHttpJsonStatusCodes::test_cancel_missing_task_returns_404",
         "tests/compatibility/http_json/test_http_status.py::TestHttpJsonStatusCodes::test_content_type_not_supported_returns_400",
@@ -1564,15 +1588,15 @@
       "skipped": 65
     },
     "jsonrpc": {
-      "total": 78,
-      "passed": 57,
-      "failed": 6,
+      "total": 90,
+      "passed": 75,
+      "failed": 0,
       "skipped": 15
     },
     "http_json": {
-      "total": 73,
-      "passed": 49,
-      "failed": 9,
+      "total": 85,
+      "passed": 70,
+      "failed": 0,
       "skipped": 15
     }
   },
@@ -1582,12 +1606,12 @@
     "version": "0.1.0",
     "supportedInterfaces": [
       {
-        "url": "http://127.0.0.1:39219/peers/540de99b35cc96e13f813af209d8e86fab9c0a83575cdf76afe45c848fd2f0bb/jsonrpc",
+        "url": "http://127.0.0.1:44657/peers/955f5695895c92e463416dd1182192876efa41c21957ce525bea2157b310aca5/jsonrpc",
         "protocolBinding": "JSONRPC",
         "protocolVersion": "1.0"
       },
       {
-        "url": "http://127.0.0.1:39219/peers/540de99b35cc96e13f813af209d8e86fab9c0a83575cdf76afe45c848fd2f0bb/rest",
+        "url": "http://127.0.0.1:44657/peers/955f5695895c92e463416dd1182192876efa41c21957ce525bea2157b310aca5/rest",
         "protocolBinding": "HTTP+JSON",
         "protocolVersion": "1.0"
       }
@@ -1595,6 +1619,13 @@
     "capabilities": {
       "streaming": true,
       "pushNotifications": false,
+      "extensions": [
+        {
+          "uri": "https://github.com/rosepetal-ai/rosepetal-pals/extensions/idempotency/v1",
+          "description": "Opt-in idempotency by messageId: a retry with the same messageId and content attaches to the first request's task or answer instead of running again.",
+          "required": false
+        }
+      ],
       "extendedAgentCard": false
     },
     "defaultInputModes": [

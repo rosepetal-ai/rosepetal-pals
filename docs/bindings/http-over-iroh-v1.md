@@ -54,7 +54,8 @@ Convención propia dentro de los campos estándar: un fichero que el agente `<ho
 
 ## 4. Parámetros de servicio
 
-- **Mecanismo:** cabeceras HTTP de la petición, como en los bindings estándar basados en HTTP (A2A §3.2.6): `A2A-Version` (siempre `1.0`), `A2A-Extensions` y `Authorization`, entre otras. Nombres insensibles a mayúsculas.
+- **Mecanismo:** cabeceras HTTP de la petición, como en los bindings estándar basados en HTTP (A2A §3.2.6): `A2A-Version` (siempre `1.0`; sin ella cuenta como `0.3` y se rechaza en los dos bindings), `A2A-Extensions` y `Authorization`, entre otras. Nombres insensibles a mayúsculas.
+- **Extensiones:** `A2A-Extensions` activa las extensiones que la card declara. PALS declara una, opcional: [`idempotency/v1`](../extensions/idempotency-v1.md), que hace idempotentes `SendMessage` y `SendStreamingMessage` por `messageId`. El cliente de PALS la activa siempre.
 - **Valores:** los de una cabecera HTTP/1.1 (RFC 9110): texto visible ASCII. El servidor rechaza un cuerpo mayor de 1 MiB, no un tamaño de cabeceras concreto distinto del de su biblioteca HTTP (hyper).
 - **Nombres reservados por el binding:** todo `x-agentnet-*`. El cliente no debe enviarlos; el servidor los descarta y fija:
   - `x-agentnet-peer`: el id del agente remoto que autenticó el handshake de QUIC, en hexadecimal. Lo pone el túnel del servidor y sustituye cualquier valor recibido.
@@ -63,7 +64,7 @@ Convención propia dentro de los campos estándar: un fichero que el agente `<ho
 
 ## 5. Mapeo de errores
 
-Los errores de A2A se representan exactamente como en los bindings estándar: en JSON-RPC, un objeto `error` con los códigos de A2A §9 (`-32001` `TaskNotFoundError`, `-32002` `TaskNotCancelableError`, …) y `google.rpc.ErrorInfo` en `data`; en HTTP+JSON, el código de estado de A2A §5.4 con un `google.rpc.Status` en el cuerpo (A2A §11.6).
+Los errores de A2A se representan exactamente como en los bindings estándar: en JSON-RPC, un objeto `error` con los códigos de A2A §9 (`-32001` `TaskNotFoundError`, `-32002` `TaskNotCancelableError`, …) y `google.rpc.ErrorInfo` en `data`; en HTTP+JSON, el código de estado de A2A §5.4 con un `google.rpc.Status` en el cuerpo (A2A §11.6), servido como `application/json`.
 
 Antes de llegar al servidor A2A, el binding puede responder:
 
@@ -84,7 +85,7 @@ Si el intercambio no llega a producir una respuesta (el par no responde, la cone
 - **Mecanismo:** Server-Sent Events, como en los bindings estándar: `SendStreamingMessage` y `SubscribeToTask` responden `200` con `Content-Type: text/event-stream`, y cada evento es una línea `data:` con la respuesta JSON-RPC (JSON-RPC) o el `StreamResponse` (HTTP+JSON). El cuerpo viaja según se produce, sin acumularse.
 - **Orden:** el de generación. El flujo empieza con el `Task` (o con el único `Message`, si el agente responde con un mensaje) y sigue con las actualizaciones de estado y de artefactos en el orden en que el agente las produce; todas viajan por el mismo stream, que QUIC entrega en orden.
 - **Fin:** el último evento es el de un estado terminal o interrumpido de la tarea; después el servidor termina la respuesta y cierra su stream (FIN). Un stream que termina sin ese evento se ha cortado.
-- **Reconexión:** no se reanuda un stream cortado. Cortar el stream no cancela la tarea. El cliente se vuelve a suscribir con `SubscribeToTask` (tarea aún en curso) o consulta `GetTask` (tarea ya terminada), en un stream nuevo y por una conexión nueva si hace falta. Repetir `SendMessage`/`SendStreamingMessage` con el mismo `messageId` y el mismo contenido no ejecuta el trabajo otra vez: el agente lo une a la tarea del primer intento (A2A §3.3.1).
+- **Reconexión:** no se reanuda un stream cortado. Cortar el stream no cancela la tarea. El cliente se vuelve a suscribir con `SubscribeToTask` (tarea no terminada, también si espera entrada) o consulta `GetTask` (tarea ya terminada), en un stream nuevo y por una conexión nueva si hace falta. Con la extensión [`idempotency/v1`](../extensions/idempotency-v1.md) activada, repetir `SendMessage`/`SendStreamingMessage` con el mismo `messageId` y el mismo contenido no ejecuta el trabajo otra vez: el agente lo une a la tarea del primer intento (A2A §3.3.1).
 
 ## 7. Autenticación y autorización
 
@@ -111,4 +112,4 @@ El reto de autenticación es el `401` con `WWW-Authenticate` de §5. Además, ca
 - Las cabeceras reservadas `x-agentnet-*` y la autenticación obligatoria con grant.
 - Los límites de §2.
 
-Las diferencias del servidor A2A respecto a la especificación que no son del binding (las del SDK oficial de Rust fijado y las que mide el TCK) están en [`docs/conformance/hito-1/README.md`](../conformance/hito-1/README.md).
+Lo que el servidor A2A hace para cumplir la especificación donde el SDK oficial de Rust fijado no la cumple, y lo que mide el TCK, está en [`docs/conformance/hito-1/README.md`](../conformance/hito-1/README.md).
