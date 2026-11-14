@@ -274,6 +274,10 @@ fn sign_then_verify_roundtrip() {
     assert_eq!(verified.form, CanonicalForm::Raw);
     assert_eq!(verified.json, json);
     assert_eq!(verified.hash, card_hash(&json));
+    assert_eq!(
+        verified.payload,
+        canonical_payload(&json, CanonicalForm::Raw).unwrap()
+    );
     assert_eq!(serde_json::to_value(&verified.card).unwrap(), json);
 
     // The same, from the bytes a peer serves.
@@ -508,6 +512,35 @@ fn foreign_card_signed_over_the_python_form_verifies() {
     let verified = verify_card(&signed, &id).unwrap();
     assert_eq!(verified.form, CanonicalForm::ProtoJsonClean);
     assert_eq!(verified.json, signed);
+    assert_eq!(verified.payload, payloads[2]);
+    // The card is the one in the signed bytes: no empty requirement.
+    assert_eq!(verified.card.security_requirements, None);
+    assert_eq!(
+        verified.card.capabilities.extensions.as_ref().unwrap()[0].required,
+        None
+    );
+
+    // Signed bytes without fields a2a-lf requires (an empty `capabilities`
+    // and empty `tags`, both dropped) still read as a card.
+    let mut empty = foreign_card();
+    empty["capabilities"] = json!({});
+    empty["skills"][0]["tags"] = json!([]);
+    let entry = jws_entry(
+        &key,
+        &eddsa_header(&id.to_string()),
+        &empty,
+        CanonicalForm::ProtoJsonClean,
+    );
+    let signed = with_signatures(&empty, vec![entry]);
+    let clean: Value =
+        serde_json::from_slice(&canonical_payload(&signed, CanonicalForm::ProtoJsonClean).unwrap())
+            .unwrap();
+    assert_eq!(clean.get("capabilities"), None);
+    assert_eq!(clean["skills"][0].get("tags"), None);
+    let verified = verify_card(&signed, &id).unwrap();
+    assert_eq!(verified.form, CanonicalForm::ProtoJsonClean);
+    assert_eq!(verified.card.capabilities, Default::default());
+    assert!(verified.card.skills[0].tags.is_empty());
 }
 
 #[test]
@@ -617,6 +650,78 @@ fn empty_skill_tags_are_not_normalized() {
 }
 
 #[test]
+fn snake_case_alias_cannot_hide_a_signed_field() {
+    let (json, id) = signed_json(0x01);
+    let signed = verify_card(&json, &id).unwrap().card;
+    // The protobuf types also read snake_case names; a2a-lf does not.
+    for (camel, snake) in [
+        ("securityRequirements", "security_requirements"),
+        ("defaultInputModes", "default_input_modes"),
+    ] {
+        let mut renamed = json.clone();
+        let object = renamed.as_object_mut().unwrap();
+        let value = object.remove(camel).unwrap();
+        object.insert(snake.to_owned(), value);
+        let verified = verify_card(&renamed, &id).unwrap();
+        assert_eq!(verified.form, CanonicalForm::ProtoJson, "{snake}");
+        // The card is what the signature covers, not a2a-lf's reading of
+        // the renamed key; `json` stays as received.
+        assert_eq!(verified.card, signed, "{snake}");
+        assert_eq!(verified.json, renamed, "{snake}");
+        assert_eq!(
+            verified.payload,
+            canonical_payload(&json, CanonicalForm::Raw).unwrap(),
+            "{snake}"
+        );
+        assert_ne!(verified.hash, card_hash(&json), "{snake}");
+    }
+}
+
+#[test]
+fn requirement_outside_the_signed_form_is_not_in_the_card() {
+    let key = fixed_key(0x07);
+    let id = key.id();
+    let card = foreign_card();
+    let entry = jws_entry(
+        &key,
+        &eddsa_header(&id.to_string()),
+        &card,
+        CanonicalForm::ProtoJsonClean,
+    );
+    let signed = with_signatures(&card, vec![entry]);
+
+    // A requirement in the shape only a2a-lf reads: to the protobuf types it
+    // is an empty requirement, which the Python form drops.
+    let mut injected = signed.clone();
+    injected["securityRequirements"] = json!([{"x": ["y"]}]);
+    let verified = verify_card(&injected, &id).unwrap();
+    assert_eq!(verified.form, CanonicalForm::ProtoJsonClean);
+    assert_eq!(verified.card.security_requirements, None);
+    assert_eq!(verified.card, verify_card(&signed, &id).unwrap().card);
+    assert_eq!(
+        verified.payload,
+        canonical_payload(&signed, CanonicalForm::ProtoJsonClean).unwrap()
+    );
+}
+
+#[test]
+fn keys_unknown_to_the_signed_form_never_reach_the_card() {
+    let (json, id) = signed_json(0x01);
+    let signed = verify_card(&json, &id).unwrap().card;
+    let mut extended = json.clone();
+    extended["x-unsigned"] = json!("not covered by the signature");
+    extended["skills"][0]["securityRequirements"] = json!([{"agentnetGrant": ["skill:admin"]}]);
+    let verified = verify_card(&extended, &id).unwrap();
+    assert_eq!(verified.form, CanonicalForm::ProtoJsonClean);
+    assert_eq!(verified.card, signed);
+    assert_eq!(verified.json, extended);
+    assert_eq!(
+        verified.payload,
+        canonical_payload(&json, CanonicalForm::Raw).unwrap()
+    );
+}
+
+#[test]
 fn card_verifies_with_an_explicit_ed25519_key() {
     let signing = SigningKey::from_bytes(&[0x05; 32]);
     let key = AgentKey::from_bytes(&[0x05; 32]);
@@ -628,6 +733,23 @@ fn card_verifies_with_an_explicit_ed25519_key() {
     assert_eq!(verified.kid, "k1");
     assert_eq!(verified.form, CanonicalForm::Raw);
     assert_eq!(verified.hash, card_hash(&signed));
+    assert_eq!(
+        verified.payload,
+        canonical_payload(&signed, CanonicalForm::Raw).unwrap()
+    );
+
+    // The card is bound to the signed bytes here too.
+    let entry = jws_entry(
+        &key,
+        &eddsa_header("k1"),
+        &card,
+        CanonicalForm::ProtoJsonClean,
+    );
+    let mut injected = with_signatures(&card, vec![entry]);
+    injected["securityRequirements"] = json!([{"x": ["y"]}]);
+    let verified = verify_card_with_key(&injected, "k1", &signing.verifying_key()).unwrap();
+    assert_eq!(verified.form, CanonicalForm::ProtoJsonClean);
+    assert_eq!(verified.card.security_requirements, None);
 
     let other = SigningKey::from_bytes(&[0x06; 32]).verifying_key();
     assert_eq!(

@@ -24,7 +24,12 @@
 //! `alg` `EdDSA`, no `crit`, the expected `kid`, and the Ed25519 signature
 //! (strict rules) verifies for one of the forms. The card is validated
 //! first ([`validate_card`]): size, depth, string length, element counts and
-//! an A2A 1.0 interface, before anything else reads it.
+//! an A2A 1.0 interface, before anything else reads it. The card a
+//! verification returns is read from the bytes the valid signature covers,
+//! never from the JSON received: over a protobuf form, that JSON may carry
+//! what the signature does not cover (unknown keys, snake_case names that
+//! only the protobuf types read, shapes that only `a2a-lf` reads), and none
+//! of it reaches the card.
 //!
 //! **Hash.** [`card_hash`] identifies the exact signed version of a card
 //! (spec §9, `agent_card_hash`): BLAKE3 over the JCS of the card as received,
@@ -157,27 +162,47 @@ impl<'de> Deserialize<'de> for CardHash {
 }
 
 /// A card whose signature by an agent has been verified.
+///
+/// `card` and `payload` are what the valid signature covers. `json` is the
+/// card as received: with `form` [`CanonicalForm::Raw`], as every card PALS
+/// signs verifies, all of it but `signatures` is signed; with another form
+/// it may carry content the signature does not cover, so nothing should
+/// read the card from it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerifiedCard {
+    /// The card in `payload`, with the signatures received.
     pub card: AgentCard,
     /// The card as received, signatures included.
     pub json: Value,
     pub signer: AgentId,
     /// The form the valid signature covers.
     pub form: CanonicalForm,
+    /// The bytes the valid signature covers, the JWS payload before
+    /// base64url: `canonical_payload(&json, form)`.
+    pub payload: Vec<u8>,
+    /// [`card_hash`] of `json`, the card as received. A card that gained
+    /// unsigned content on its way hashes differently from its signer's
+    /// copy.
     pub hash: CardHash,
 }
 
 /// A card whose signature by a given Ed25519 key has been verified: the card
-/// of a plain A2A contact, whose key is not an agent id.
+/// of a plain A2A contact, whose key is not an agent id. Its fields mean
+/// what [`VerifiedCard`]'s do: `card` and `payload` are what the signature
+/// covers, `json` and `hash` the card as received.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeyVerifiedCard {
+    /// The card in `payload`, with the signatures received.
     pub card: AgentCard,
     /// The card as received, signatures included.
     pub json: Value,
     pub kid: String,
     /// The form the valid signature covers.
     pub form: CanonicalForm,
+    /// The bytes the valid signature covers, the JWS payload before
+    /// base64url.
+    pub payload: Vec<u8>,
+    /// [`card_hash`] of `json`, the card as received.
     pub hash: CardHash,
 }
 
@@ -487,6 +512,14 @@ pub fn validate_card(json: &Value) -> Result<AgentCard, CardError> {
         serde_json::from_value(json.clone()).map_err(|_| Invalid("not an A2A AgentCard"))?;
     serde_json::from_value::<a2a_pb::protojson::AgentCard>(json.clone())
         .map_err(|_| Invalid("not a protobuf AgentCard"))?;
+    check_content(&card)?;
+    Ok(card)
+}
+
+/// The element counts and the A2A 1.0 interface that [`validate_card`]
+/// requires of `card`.
+fn check_content(card: &AgentCard) -> Result<(), CardError> {
+    use CardError::Invalid;
 
     if card.supported_interfaces.len() > MAX_CARD_INTERFACES {
         return Err(Invalid("more than 8 interfaces"));
@@ -507,7 +540,7 @@ pub fn validate_card(json: &Value) -> Result<AgentCard, CardError> {
     {
         return Err(Invalid("no A2A 1.0 interface"));
     }
-    Ok(card)
+    Ok(())
 }
 
 /// `value`, at nesting `depth`, has no deeper container than
@@ -571,15 +604,18 @@ fn check_params_numbers(params: &Value) -> Result<(), CardError> {
 /// [`CardError::UnsupportedAlg`] (one with another `alg`, or with `crit`),
 /// and [`CardError::Invalid`] (a protected header that is not base64url of a
 /// JSON object).
+///
+/// The card returned is read from the bytes the valid signature covers
+/// ([`VerifiedCard`]), and it must still have an A2A 1.0 interface.
 pub fn verify_card(json: &Value, expected: &AgentId) -> Result<VerifiedCard, CardError> {
-    let card = validate_card(json)?;
     let kid = expected.to_string();
-    let form = verify_signatures(json, &card, &kid, |msg, sig| expected.verify(msg, sig))?;
+    let signed = verify_signed(json, &kid, |msg, sig| expected.verify(msg, sig))?;
     Ok(VerifiedCard {
-        card,
+        card: signed.card,
         json: json.clone(),
         signer: *expected,
-        form,
+        form: signed.form,
+        payload: signed.payload,
         hash: card_hash(json),
     })
 }
@@ -591,44 +627,100 @@ pub fn verify_card_with_key(
     kid: &str,
     key: &VerifyingKey,
 ) -> Result<KeyVerifiedCard, CardError> {
-    let card = validate_card(json)?;
-    let form = verify_signatures(json, &card, kid, |msg, sig| {
+    let signed = verify_signed(json, kid, |msg, sig| {
         key.verify_strict(msg, &Signature::from_bytes(sig)).is_ok()
     })?;
     Ok(KeyVerifiedCard {
-        card,
+        card: signed.card,
         json: json.clone(),
         kid: kid.to_owned(),
-        form,
+        form: signed.form,
+        payload: signed.payload,
         hash: card_hash(json),
     })
 }
 
-/// The form in which one of `card`'s signatures, with `kid`, verifies.
-fn verify_signatures(
+/// What a valid signature of a card covers.
+struct Signed {
+    card: AgentCard,
+    form: CanonicalForm,
+    payload: Vec<u8>,
+}
+
+/// `json` validated, one of its signatures with `kid` verified, and the card
+/// read from the bytes that signature covers, with the signatures received.
+fn verify_signed(
     json: &Value,
-    card: &AgentCard,
     kid: &str,
     verify: impl Fn(&[u8], &[u8; 64]) -> bool,
-) -> Result<CanonicalForm, CardError> {
-    let signatures = card.signatures.as_deref().unwrap_or_default();
+) -> Result<Signed, CardError> {
+    let received = validate_card(json)?;
+    let signatures = received.signatures.unwrap_or_default();
+    let (form, payload) = verify_signatures(json, &signatures, kid, verify)?;
+    let mut card = card_in_payload(&payload, form)?;
+    card.signatures = Some(signatures);
+    check_content(&card)?;
+    Ok(Signed {
+        card,
+        form,
+        payload,
+    })
+}
+
+/// The card in `payload`, the bytes a signature over `form` covers: how
+/// `a2a-lf` reads them for [`CanonicalForm::Raw`], and how the protobuf
+/// types do for the other forms, which may leave out fields `a2a-lf`
+/// requires (an empty `capabilities`, empty `tags`) and never hold a key the
+/// protobuf types do not read.
+fn card_in_payload(payload: &[u8], form: CanonicalForm) -> Result<AgentCard, CardError> {
+    let invalid = CardError::Invalid("signed content is not an AgentCard");
+    match form {
+        CanonicalForm::Raw => serde_json::from_slice(payload).map_err(|_| invalid),
+        CanonicalForm::ProtoJson | CanonicalForm::ProtoJsonClean => {
+            let value: Value = serde_json::from_slice(payload).map_err(|_| invalid)?;
+            a2a_pb::protojson_conv::from_value::<AgentCard>(value).map_err(|_| invalid)
+        }
+    }
+}
+
+/// A canonical form of the card being verified: its bytes, and those bytes
+/// in base64url.
+struct Payload {
+    form: CanonicalForm,
+    bytes: Vec<u8>,
+    base64: String,
+}
+
+/// The form in which one of `signatures`, with `kid`, verifies, and the
+/// bytes it covers.
+fn verify_signatures(
+    json: &Value,
+    signatures: &[AgentCardSignature],
+    kid: &str,
+    verify: impl Fn(&[u8], &[u8; 64]) -> bool,
+) -> Result<(CanonicalForm, Vec<u8>), CardError> {
     if signatures.is_empty() {
         return Err(CardError::Unsigned);
     }
     // Each distinct payload once, in the order of `FORMS`: a normalized
     // card has a single one.
-    let mut payloads: Vec<(CanonicalForm, String)> = Vec::with_capacity(FORMS.len());
+    let mut payloads: Vec<Payload> = Vec::with_capacity(FORMS.len());
     for form in FORMS {
-        let payload = URL_SAFE_NO_PAD.encode(canonical_payload(json, form)?);
-        if payloads.iter().all(|(_, seen)| *seen != payload) {
-            payloads.push((form, payload));
+        let bytes = canonical_payload(json, form)?;
+        if payloads.iter().all(|seen| seen.bytes != bytes) {
+            let base64 = URL_SAFE_NO_PAD.encode(&bytes);
+            payloads.push(Payload {
+                form,
+                bytes,
+                base64,
+            });
         }
     }
 
     let mut worst = CardError::Invalid("malformed signature header");
     for signature in signatures.iter().take(MAX_CARD_SIGNATURES) {
         match check_signature(signature, kid, &payloads, &verify) {
-            Ok(form) => return Ok(form),
+            Ok(payload) => return Ok((payload.form, payload.bytes.clone())),
             Err(err) if rank(err) > rank(worst) => worst = err,
             Err(_) => {}
         }
@@ -645,12 +737,12 @@ fn rank(err: CardError) -> u8 {
     }
 }
 
-fn check_signature(
+fn check_signature<'p>(
     signature: &AgentCardSignature,
     kid: &str,
-    payloads: &[(CanonicalForm, String)],
+    payloads: &'p [Payload],
     verify: &impl Fn(&[u8], &[u8; 64]) -> bool,
-) -> Result<CanonicalForm, CardError> {
+) -> Result<&'p Payload, CardError> {
     let malformed = CardError::Invalid("malformed signature header");
     let header = URL_SAFE_NO_PAD
         .decode(&signature.protected)
@@ -671,12 +763,10 @@ fn check_signature(
         .ok()
         .and_then(|sig| sig.try_into().ok())
         .ok_or(CardError::BadSignature)?;
-    for (form, payload) in payloads {
-        if verify(&signing_input(&signature.protected, payload), &sig) {
-            return Ok(*form);
-        }
-    }
-    Err(CardError::BadSignature)
+    payloads
+        .iter()
+        .find(|payload| verify(&signing_input(&signature.protected, &payload.base64), &sig))
+        .ok_or(CardError::BadSignature)
 }
 
 /// `bytes`, at most [`MAX_CARD_BYTES`], parsed as JSON and verified as
