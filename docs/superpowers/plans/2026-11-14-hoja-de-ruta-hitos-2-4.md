@@ -1,8 +1,8 @@
 # PALS: hoja de ruta de los hitos 2 a 4
 
-**Fecha:** 2026-11-14 · **Spec:** [`docs/plans/initial.md`](../../plans/initial.md) (revisión 3) · **Plan en curso:** [`2026-11-14-hito-1-flujo-basico-a2a.md`](2026-11-14-hito-1-flujo-basico-a2a.md)
+**Fecha:** 2026-11-14 · **Spec:** [`docs/plans/initial.md`](../../plans/initial.md) (revisión 3) · **Planes:** [hito 1](2026-11-14-hito-1-flujo-basico-a2a.md) (implementado) y [hito 2](2026-11-14-hito-2-consulta-de-servicios.md) (en curso)
 
-Este documento no es un plan ejecutable. El spec cubre cuatro subsistemas que se construyen en orden y dice que «no se asignan tiempos de desarrollo o promesas de rendimiento sin construir y medir cada hito» (§14). Por eso solo el hito 1 tiene plan paso a paso. Cada hito posterior recibe su propio plan en `docs/superpowers/plans/` cuando el anterior cumple su criterio de salida, porque sus interfaces dependen de código que todavía no existe y, en el hito 3, de una comparación cuyo resultado no se conoce.
+Este documento no es un plan ejecutable. El spec cubre cuatro subsistemas que se construyen en orden y dice que «no se asignan tiempos de desarrollo o promesas de rendimiento sin construir y medir cada hito» (§14). Por eso cada hito recibe su propio plan paso a paso en `docs/superpowers/plans/` cuando el anterior está construido, porque sus interfaces dependen de código que todavía no existe y, en el hito 3, de una comparación cuyo resultado no se conoce. Los hitos 1 y 2 ya tienen el suyo. El del hito 2 se escribió a petición del responsable con el hito 1 implementado y su prueba de salida todavía en curso.
 
 Aquí queda fijado lo que ya se puede decidir: qué implica para cada hito el requisito del 2026-11-14 («completamente compatible con A2A en su intercambio final»), qué hereda del hito 1, el esquema de tareas, el criterio de salida del spec y las decisiones que hay que tomar antes de escribir cada plan.
 
@@ -11,6 +11,12 @@ Aquí queda fijado lo que ya se puede decidir: qué implica para cada hito el re
 El intercambio final no cambia: sea cual sea el modo de encontrar o evaluar a un proveedor, la tarea se envía con los bindings estándar de A2A v1.0 del hito 1 y se repite el TCK antes de cerrar cada hito. Lo que estos hitos añaden ocurre antes de ese intercambio (descubrir, consultar, sincronizar catálogos) y puede usar protocolos propios, como prevé el spec en §3 y §10.
 
 ## Hito 2: consulta de servicios e inventario
+
+**Plan paso a paso:** [`2026-11-14-hito-2-consulta-de-servicios.md`](2026-11-14-hito-2-consulta-de-servicios.md). El responsable pidió empezar este hito el 2026-11-14, con la prueba de salida del hito 1 todavía en marcha. El plan sigue el esquema de abajo con dos cambios:
+- los esquemas del inventario van antes que la card extendida, que enumera sus servicios;
+- los contactos A2A corrientes (H2-D3) son una tarea propia.
+
+En total son 13 tareas.
 
 **Entregable (spec §14):** Agent Cards, inventarios filtrados, informes existentes, `ServiceQuery` y `ServiceOffer`.
 
@@ -41,13 +47,13 @@ El intercambio final no cambia: sea cual sea el modo de encontrar o evaluar a un
 
 **Límites que el spec fija y que el plan copiará tal cual:** 8 candidatos contactados por búsqueda, 3 consultas simultáneas, 3 segundos de espera por candidato, 15 segundos de presupuesto total, consulta de servicio hasta 8 KiB, oferta hasta 16 KiB, descriptor público hasta 32 KiB, reenvío por el receptor deshabilitado (§7.3); inventario con 64 KiB por página, hasta 100 entradas por página y 1 MiB acumulado por consulta (§10).
 
-**Decisiones que necesita el responsable antes de escribir el plan:**
+**Decisiones tomadas por el responsable (2026-11-14):**
 
-| Decisión | Opciones | Recomendación |
+| Id | Decisión | Opciones que había |
 |-|-|-|
-| Cómo se obtiene la card de un par | (a) Operación propia `GetAgentCard` en `agentnet-discovery/0`, como dice el spec §10. (b) Solo las rutas estándar de A2A, ya servidas por el túnel del hito 1 | (b): evita dos caminos para lo mismo. Es un cambio respecto al spec §10 |
-| Algoritmo de la firma JWS de la card | (a) `EdDSA` con la clave del agente. (b) Una clave `ES256` aparte, vinculada a la del agente | (a) si las herramientas independientes verifican `EdDSA`; se comprueba en la tarea 1 |
-| Contactos que son agentes A2A corrientes, por URL `https://`, sin daemon PALS | Incluirlo en este hito o dejarlo sin fecha | Incluirlo: completa la compatibilidad en el sentido saliente con poco código |
+| H2-D1 | La card de un par se obtiene solo por las rutas A2A estándar ya tunelizadas en el hito 1 (`/.well-known/agent-card.json` y `GetExtendedAgentCard`). `agentnet-discovery/0` no tiene `GetAgentCard`. Es una desviación del spec §10, anotada en la tabla del plan | (a) Operación propia `GetAgentCard`, como dice el spec §10. (b) Solo las rutas estándar |
+| H2-D2 | Firma JWS de la card con `EdDSA` y la clave Ed25519 del agente, si la verifican las herramientas independientes. La tarea 1 del plan lo comprueba con el SDK de Python 1.3.0 y con los demás verificadores existentes. Solo si no, una clave `ES256` aparte, vinculada a la del agente por una declaración firmada (rama de reserva de esa tarea). Al escribir el plan se verificó ya una firma `EdDSA` con los SDK oficiales de Python 1.3.0, Go v2.7.0 y JS 1.3.0; `a2a-inspector` no verifica firmas | (a) `EdDSA` con la clave del agente. (b) `ES256` aparte |
+| H2-D3 | Los contactos que son agentes A2A corrientes, por URL `https://` y sin daemon PALS, entran en este hito en sentido saliente: este agente, su gateway y su outbox los llaman. Exponer PALS por HTTPS sigue fuera (ver «Candidatos sin hito asignado») | Incluirlo en este hito o dejarlo sin fecha |
 
 ## Hito 3: descubrimiento con Kademlia
 
