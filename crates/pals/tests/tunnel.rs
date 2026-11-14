@@ -3,10 +3,13 @@
 
 mod common;
 
+use std::time::{Duration, Instant};
+
 use axum::body::{Body, Bytes};
 use axum::http::{Request, header};
 use http_body_util::BodyExt;
-use pals::net::{PEER_HEADER, TunnelLimits};
+use iroh::endpoint::Connection;
+use pals::net::{ALPN_A2A_HTTP, PEER_HEADER, TunnelLimits};
 use serde_json::{Value, json};
 
 fn send_message(method: &str, message_id: &str, text: &str) -> Value {
@@ -154,6 +157,55 @@ async fn body_over_limit_is_rejected_with_413() {
         .await;
     assert_eq!(res.status, 200);
     assert!(res.json["error"]["code"].is_i64(), "{}", res.json);
+}
+
+/// Sends `request`, raw bytes, on a new stream of `connection`, and returns
+/// the raw response, read until the server ends it. The stream's sending
+/// side stays open, as `PeerHttp` keeps it: the server takes an early end
+/// of it for the end of the exchange.
+async fn raw_exchange(connection: &Connection, request: &[u8]) -> String {
+    let (mut send, mut recv) = connection.open_bi().await.expect("open a stream");
+    send.write_all(request).await.expect("send the request");
+    let response = recv
+        .read_to_end(1024 * 1024)
+        .await
+        .expect("read the response");
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+#[tokio::test]
+async fn a_body_that_stalls_gets_408_and_frees_its_stream() {
+    // One exchange at a time on a connection, as tight as it gets.
+    let limits = TunnelLimits {
+        max_streams_per_conn: 1,
+        head_timeout: Duration::from_secs(2),
+        ..TunnelLimits::default()
+    };
+    let (server, client) = common::spawn_pair_with(common::echo_app("echo"), limits).await;
+    let connection = client
+        .endpoint
+        .connect(server.addr.clone(), ALPN_A2A_HTTP)
+        .await
+        .expect("connect to the server");
+
+    // The head, then less of the body than it announces, and silence.
+    let stalled = b"POST /jsonrpc HTTP/1.1\r\nhost: peer\r\ncontent-type: application/json\r\n\
+                    a2a-version: 1.0\r\ncontent-length: 100\r\n\r\n{\"jsonrpc\"";
+    let started = Instant::now();
+    let response =
+        tokio::time::timeout(Duration::from_secs(60), raw_exchange(&connection, stalled))
+            .await
+            .expect("the server gave up on the body");
+    assert!(response.starts_with("HTTP/1.1 408"), "{response}");
+    assert!(started.elapsed() >= Duration::from_secs(2), "{response}");
+
+    // The only slot is free again: the next exchange is served.
+    let card = b"GET /.well-known/agent-card.json HTTP/1.1\r\nhost: peer\r\n\r\n";
+    let response = tokio::time::timeout(Duration::from_secs(60), raw_exchange(&connection, card))
+        .await
+        .expect("the next exchange was served");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains("\"name\":\"echo\""), "{response}");
 }
 
 #[tokio::test]

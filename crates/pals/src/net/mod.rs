@@ -7,7 +7,9 @@
 //! - The server drops any `x-agentnet-peer` header the request carries and sets
 //!   it to the connection's authenticated remote id, in lowercase hex.
 //! - The response ends with the stream's FIN.
-//! - A request body larger than [`TunnelLimits::max_body_bytes`] gets `413`.
+//! - A request body larger than [`TunnelLimits::max_body_bytes`] gets `413`;
+//!   one that does not arrive whole within [`TunnelLimits::head_timeout`]
+//!   of its head, `408`.
 //!
 //! An agent's id is its endpoint's id ([`agent_id_of`], [`endpoint_id_of`]);
 //! [`peer_addr`] is where to dial one.

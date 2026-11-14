@@ -214,6 +214,29 @@ async fn nonzero_exit_fails_with_stderr_tail() {
 }
 
 #[tokio::test]
+async fn more_than_32_output_files_fail_the_task_and_none_is_shared() {
+    // A command that leaves as many files to answer with as the question
+    // says.
+    let script = r#"n=$(cat); i=0; while [ $i -lt "$n" ]; do i=$((i+1)); echo $i > "$PALS_OUT_DIR/f$i"; done; echo done"#;
+    let s = setup(sh(script)).await;
+    let shared = |s: &Setup| s.b.node.store.events_count("blob.shared").unwrap();
+
+    let task = s.ask("33").await;
+    assert_eq!(state(&task), "TASK_STATE_FAILED", "{task}");
+    assert_eq!(status_text(&task), "too many output files");
+    assert!(task.get("artifacts").is_none(), "{task}");
+    assert_eq!(shared(&s), 0);
+    assert!(s.b.node.blobs.tags().await.unwrap().is_empty());
+
+    // 32 travel.
+    let task = s.ask("32").await;
+    assert_eq!(state(&task), "TASK_STATE_COMPLETED", "{task}");
+    let parts = task["artifacts"][0]["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 1 + 32, "{task}");
+    assert_eq!(shared(&s), 32);
+}
+
+#[tokio::test]
 async fn hung_command_times_out_and_is_killed() {
     let s = setup(ExecCfg {
         timeout_s: 1,

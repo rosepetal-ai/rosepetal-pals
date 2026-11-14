@@ -32,7 +32,9 @@
 //! What a peer sends is used only once checked. A task id that is not
 //! [safe](is_safe_task_id) ends the attempt as refused, and is neither kept
 //! nor ever put in a URL; a task the peer answers for must be the one asked
-//! about.
+//! about. The gateway checks task ids first ([`crate::gateway`]): an answer
+//! that names an unsafe one never gets through it, so the attempt breaks
+//! as on a cut connection, and is retried.
 //!
 //! An attachment is read only as the path policy's reading rule allows
 //! (`crate::path_policy`): resolved first, symbolic links and `..`

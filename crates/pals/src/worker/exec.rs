@@ -15,7 +15,9 @@ use tokio::process::Child;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use super::{Adapter, AdapterError, AdapterOutput, TaskInput};
+use super::{
+    Adapter, AdapterError, AdapterOutput, MAX_OUTPUT_FILES, TOO_MANY_OUTPUT_FILES, TaskInput,
+};
 use crate::config::{ExecCfg, ProjectCfg};
 
 /// The variables a command takes from the daemon's environment. It gets no
@@ -40,7 +42,7 @@ const REAP_WAIT: Duration = Duration::from_secs(10);
 /// | Input | The text on stdin; `PALS_TASK_ID`, `PALS_PEER`, `PALS_PROJECT`, `PALS_IN_DIR`, `PALS_OUT_DIR` |
 /// | Environment | Nothing else but [`PASSED_ENV`] |
 /// | Output | stdout as UTF-8, invalid bytes replaced; beyond `max_output_bytes`, cut and followed by [`TRUNCATED`] |
-/// | Files | The regular files the command left directly in `PALS_OUT_DIR`, by name; not symbolic links, nor what is in subdirectories |
+/// | Files | The regular files the command left directly in `PALS_OUT_DIR`, by name; not symbolic links, nor what is in subdirectories; more than [`MAX_OUTPUT_FILES`] fail the task, `too many output files` |
 /// | Exit code other than 0 | `Failed` with the last [`STDERR_TAIL_BYTES`] of stderr |
 /// | Time | Beyond `timeout_s`, the process group is killed: `Failed("timeout after <n>s")` |
 /// | Cancellation | The process group is killed |
@@ -173,6 +175,9 @@ impl Adapter for ExecAdapter {
                     warn!(dir = %out_dir.display(), error = %err, "cannot list the output files");
                     AdapterError::Failed("cannot read the output directory".to_owned())
                 })?;
+                if files.len() > MAX_OUTPUT_FILES {
+                    return Err(AdapterError::Failed(TOO_MANY_OUTPUT_FILES.to_owned()));
+                }
                 Ok(AdapterOutput {
                     text: answer_text(&head, cut, max_output_bytes),
                     files,
@@ -283,8 +288,9 @@ async fn exited_unreaped(pid: libc::pid_t) -> io::Result<()> {
     .map_err(io::Error::other)?
 }
 
-/// The regular files directly in `dir`, sorted by name. Symbolic links are
-/// left out: a file to send is one the command wrote there.
+/// The regular files directly in `dir`, sorted by name; once there are
+/// more than [`MAX_OUTPUT_FILES`], the listing stops there. Symbolic links
+/// are left out: a file to send is one the command wrote there.
 async fn output_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let mut entries = tokio::fs::read_dir(dir).await?;
@@ -292,6 +298,9 @@ async fn output_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
         // `file_type` does not follow symbolic links.
         if entry.file_type().await?.is_file() {
             files.push(entry.path());
+            if files.len() > MAX_OUTPUT_FILES {
+                break;
+            }
         }
     }
     files.sort();

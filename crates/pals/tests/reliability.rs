@@ -5,7 +5,6 @@
 
 mod common;
 
-use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -17,14 +16,9 @@ use axum::extract::Request;
 use axum::response::Response;
 use common::{
     CountingExecutor, TestNode, grant, issue_grant, key_in, now_unix, spawn_node, spawn_node_in,
-    spawn_node_in_with_executor, spawn_node_with_executor,
+    spawn_node_in_with_executor, spawn_node_with_executor, stub_peer,
 };
-use iroh::endpoint::{PortmapperConfig, presets};
-use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
-use iroh_tickets::endpoint::EndpointTicket;
 use pals::config::WorkerCfg;
-use pals::net::{ALPN_A2A_HTTP, TunnelLimits, TunnelServer};
 use pals::outbox::{ASK_MAX_ATTEMPTS, AskError, AskOutcome, AskRequest};
 use pals_core::grant::Operation::{self, TaskCancel, TaskRead, TaskSend};
 use pals_core::identity::AgentKey;
@@ -385,41 +379,6 @@ async fn ask_cli_exit_codes() {
 /// The requests a stub peer got: `<method> <path>`.
 type Seen = Arc<Mutex<Vec<String>>>;
 
-/// A stub peer with `key`'s identity, serving `app` through the tunnel as a
-/// node would, saved in `a` as contact `name` with its address, and a grant
-/// of it that `a` holds. It keeps running until the returned router drops.
-async fn stub_peer(a: &TestNode, name: &str, key: &AgentKey, app: axum::Router) -> Router {
-    let endpoint = Endpoint::builder(presets::Minimal)
-        .secret_key(SecretKey::from_bytes(&key.to_bytes()))
-        .relay_mode(RelayMode::Disabled)
-        .portmapper_config(PortmapperConfig::Disabled)
-        .clear_ip_transports()
-        .bind_addr((Ipv4Addr::LOCALHOST, 0))
-        .expect("loopback bind address")
-        .bind()
-        .await
-        .expect("bind the stub's endpoint");
-    let socket = *endpoint.bound_sockets().first().expect("a bound socket");
-    let ticket = EndpointTicket::new(EndpointAddr::new(endpoint.id()).with_ip_addr(socket));
-    let now = now_unix();
-    a.hold(&issue_grant(key, a.id(), key.id(), &OPS, now, now + 3600));
-    a.node
-        .store
-        .contact_put(&Contact {
-            name: name.to_owned(),
-            agent_id: key.id(),
-            ticket: Some(ticket.to_string()),
-            added_at: now,
-        })
-        .expect("save the stub");
-    Router::builder(endpoint)
-        .accept(
-            ALPN_A2A_HTTP,
-            TunnelServer::new(app, TunnelLimits::default()),
-        )
-        .spawn()
-}
-
 /// An app that records every request in `seen` and answers what `answer`
 /// gives for its path, or `404`.
 fn recording_app(
@@ -476,17 +435,25 @@ async fn peer_task_id_that_is_not_safe_is_refused() {
     let mut req = request("hola");
     req.peer = "evil".to_owned();
     let result = a.node.outbox().ask(req).await;
-    let Err(AskError::Rejected(reason)) = result else {
-        panic!("not refused: {result:?}");
+    // The gateway cuts every stream that names it, so the ask never learns
+    // a task: each attempt breaks, as on a cut connection, until the
+    // retries run out.
+    let Err(AskError::Unreachable { message_id }) = result else {
+        panic!("not cut: {result:?}");
     };
-    assert!(reason.contains("invalid task id"), "{reason}");
 
-    // Nothing left `/peers/<evil>/rest`, and nothing was kept of the id.
+    // Nothing but the question left `/peers/<evil>/rest`, and nothing was
+    // kept of the id.
     tokio::time::sleep(Duration::from_secs(2)).await;
-    assert_eq!(*evil_seen.lock().unwrap(), ["POST /rest/message:stream"]);
+    let attempts = ASK_MAX_ATTEMPTS as usize + 1;
+    assert_eq!(
+        *evil_seen.lock().unwrap(),
+        vec!["POST /rest/message:stream"; attempts]
+    );
     assert!(victim_seen.lock().unwrap().is_empty());
     let rows = a.node.store.outbox_all().unwrap();
     assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].message_id, message_id);
     assert_eq!(rows[0].task_id, None);
-    assert_eq!(rows[0].state, "refused");
+    assert_eq!(rows[0].state, "pending");
 }

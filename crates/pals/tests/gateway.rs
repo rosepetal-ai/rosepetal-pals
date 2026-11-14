@@ -787,9 +787,24 @@ async fn rogue_peer(a: &TestNode, name: &str, app: axum::Router) -> TestServer {
 }
 
 /// What a hostile peer answers: a script page with its own cookie and
-/// policy, and redirects that send the client to `/peers/carol/...`.
+/// policy, as a success and as an error, and redirects that send the client
+/// to `/peers/carol/...`.
 fn rogue_app() -> axum::Router {
     use axum::routing::{get, post};
+    let page = |status: u16| {
+        move || async move {
+            (
+                http::StatusCode::from_u16(status).unwrap(),
+                [
+                    ("content-type", "text/html"),
+                    ("set-cookie", "session=stolen; Path=/"),
+                    ("set-cookie2", "legacy=stolen"),
+                    ("content-security-policy", "default-src *"),
+                ],
+                "<script>fetch('/peers/carol/rest/tasks')</script>",
+            )
+        }
+    };
     let redirect = |status: u16| {
         move || async move {
             (
@@ -802,20 +817,8 @@ fn rogue_app() -> axum::Router {
         }
     };
     axum::Router::new()
-        .route(
-            "/rest/page",
-            get(|| async {
-                (
-                    [
-                        ("content-type", "text/html"),
-                        ("set-cookie", "session=stolen; Path=/"),
-                        ("set-cookie2", "legacy=stolen"),
-                        ("content-security-policy", "default-src *"),
-                    ],
-                    "<script>fetch('/peers/carol/rest/tasks')</script>",
-                )
-            }),
-        )
+        .route("/rest/page", get(page(200)))
+        .route("/rest/error-page", get(page(404)))
         .route("/jsonrpc", post(redirect(307)))
         .route("/rest/message:send", post(redirect(308)))
         .route("/rest/see-other", get(redirect(303)))
@@ -886,12 +889,18 @@ async fn browser_requests_are_403_and_every_response_is_sandboxed() {
     assert_eq!(res.status, 200, "{}", res.json);
     assert_sandboxed(&res, "peer answer");
 
-    // A page a peer serves cannot run at the gateway's origin.
+    // A page a peer serves cannot run at the gateway's origin: as a
+    // success, which A2A answers with JSON only, it never reaches the
+    // client; as an error, it comes sandboxed.
     let _rogue = rogue_peer(&a, "mallory", rogue_app()).await;
     let res = gateway_request(&gw, "GET", "/peers/mallory/rest/page", &[], None).await;
-    assert_eq!(res.status, 200, "{}", String::from_utf8_lossy(&res.body));
-    assert_eq!(res.header("content-type"), "text/html");
+    assert_eq!(res.status, 502, "{}", String::from_utf8_lossy(&res.body));
+    assert_eq!(res.json, json!({"error": "peer protocol error"}));
     assert_sandboxed(&res, "a peer's page");
+    let res = gateway_request(&gw, "GET", "/peers/mallory/rest/error-page", &[], None).await;
+    assert_eq!(res.status, 404, "{}", String::from_utf8_lossy(&res.body));
+    assert_eq!(res.header("content-type"), "text/html");
+    assert_sandboxed(&res, "a peer's error page");
 }
 
 #[tokio::test]
@@ -976,14 +985,249 @@ async fn peer_redirects_and_cookies_never_reach_the_client() {
     assert_eq!(carol.node.store.events_count("task.accepted").unwrap(), 0);
 
     // A peer's cookies are dropped from what it answers.
-    let res = gateway_request(&gw, "GET", "/peers/mallory/rest/page", &[], None).await;
-    assert_eq!(res.status, 200);
+    let res = gateway_request(&gw, "GET", "/peers/mallory/rest/error-page", &[], None).await;
+    assert_eq!(res.status, 404);
     assert!(res.headers.get("set-cookie").is_none(), "{:?}", res.headers);
     assert!(
         res.headers.get("set-cookie2").is_none(),
         "{:?}",
         res.headers
     );
+}
+
+/// A task named `id`, as a peer answers with it.
+fn task_named(id: &str) -> Value {
+    json!({"id": id, "contextId": "c-1", "status": {"state": "TASK_STATE_WORKING"}})
+}
+
+/// `200` with `body` as `content_type`.
+fn answer(
+    content_type: &'static str,
+    body: impl Into<axum::body::Body>,
+) -> axum::response::Response {
+    axum::response::Response::builder()
+        .header("content-type", content_type)
+        .body(body.into())
+        .unwrap()
+}
+
+/// One SSE event whose data is `value`.
+fn sse_event(value: &Value) -> String {
+    format!("data: {value}\n\n")
+}
+
+/// The body of `response`, read until it ends or breaks: the bytes that
+/// came, and whether it ended cleanly.
+async fn read_until_end(response: axum::response::Response) -> (Vec<u8>, bool) {
+    let mut body = response.into_body();
+    let mut received = Vec::new();
+    loop {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    received.extend_from_slice(&data);
+                }
+            }
+            Some(Err(_)) => return (received, false),
+            None => return (received, true),
+        }
+    }
+}
+
+#[tokio::test]
+async fn peer_task_ids_that_are_not_safe_never_reach_the_client() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    // The peer whose grant the gateway would present to a client that
+    // followed `<gw>/peers/<evil>/rest/tasks/../../../<victim>/rest/tasks/x`,
+    // as WHATWG URL parsing and httpx resolve it.
+    let victim = AgentKey::generate().id();
+    let climbing = format!("../../../{victim}/rest/tasks/x");
+    let evil_app = {
+        use axum::routing::{get, post};
+        let (c1, c2, c3, c4, c5) = (
+            climbing.clone(),
+            climbing.clone(),
+            climbing.clone(),
+            climbing.clone(),
+            climbing.clone(),
+        );
+        axum::Router::new()
+            // A task, as GetTask answers.
+            .route(
+                "/rest/tasks/climbing",
+                get(move || {
+                    let task = task_named(&c1);
+                    async move { answer("application/json", task.to_string()) }
+                }),
+            )
+            // The same, labelled as something else.
+            .route(
+                "/rest/tasks/as-text",
+                get(move || {
+                    let task = task_named(&c2);
+                    async move { answer("text/plain", task.to_string()) }
+                }),
+            )
+            // A message that names the task, in a JSON-RPC result.
+            .route(
+                "/jsonrpc",
+                post(move || {
+                    let message = json!({"messageId": "m", "role": "ROLE_AGENT",
+                        "taskId": c3.clone(), "parts": [{"text": "x"}]});
+                    let reply = json!({"jsonrpc": "2.0", "id": 1, "result": {"message": message}});
+                    async move { answer("application/json", reply.to_string()) }
+                }),
+            )
+            // JSON that only lenient parsers read, with NaN.
+            .route(
+                "/rest/tasks/lenient",
+                get(move || {
+                    let task = task_named(&c4).to_string();
+                    let body = format!("{}, \"n\": NaN}}", &task[..task.len() - 1]);
+                    async move { answer("application/json", body) }
+                }),
+            )
+            // A safe task, then an update that names the climbing id, then
+            // more.
+            .route(
+                "/rest/message:stream",
+                post(move || {
+                    let stream = format!(
+                        "{}{}{}",
+                        sse_event(&json!({"task": task_named("t-1")})),
+                        sse_event(
+                            &json!({"statusUpdate": {"taskId": c5.clone(), "contextId": "c-1",
+                            "status": {"state": "TASK_STATE_COMPLETED"}}})
+                        ),
+                        sse_event(&json!({"task": task_named("t-2")})),
+                    );
+                    async move { answer("text/event-stream", stream) }
+                }),
+            )
+            // Encoded bytes the gateway cannot read.
+            .route(
+                "/rest/tasks/encoded",
+                get(|| async {
+                    axum::response::Response::builder()
+                        .header("content-type", "application/json")
+                        .header("content-encoding", "gzip")
+                        .body(axum::body::Body::from(vec![0x1f, 0x8b, 8, 0]))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/rest/tasks/safe",
+                get(|| async { answer("application/json", task_named("t-1").to_string()) }),
+            )
+    };
+    let _evil = common::stub_peer(&a, "evil", &AgentKey::generate(), evil_app).await;
+    let gw = a.gateway_url();
+    let version = [("a2a-version", "1.0")];
+
+    // A safe answer passes, as it was.
+    let res = gateway_request(&gw, "GET", "/peers/evil/rest/tasks/safe", &version, None).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json, task_named("t-1"));
+
+    // Unary answers: a protocol error, and nothing of the id.
+    let call = rpc_request("SendMessage", message_params("hola", None));
+    for (method, path, body) in [
+        ("GET", "/peers/evil/rest/tasks/climbing", None),
+        ("GET", "/peers/evil/rest/tasks/as-text", None),
+        ("POST", "/peers/evil/jsonrpc", Some(&call)),
+        ("GET", "/peers/evil/rest/tasks/lenient", None),
+        ("GET", "/peers/evil/rest/tasks/encoded", None),
+    ] {
+        let res = gateway_request(&gw, method, path, &version, body).await;
+        assert_eq!(
+            res.status,
+            502,
+            "{path}: {}",
+            String::from_utf8_lossy(&res.body)
+        );
+        assert_eq!(res.json, json!({"error": "peer protocol error"}), "{path}");
+        assert!(
+            !String::from_utf8_lossy(&res.body).contains("../"),
+            "{path}"
+        );
+    }
+
+    // A stream: the safe event comes, then it breaks before the unsafe one.
+    let response = gateway_send(
+        &gw,
+        "POST",
+        "/peers/evil/rest/message:stream",
+        &version,
+        Some(&message_params("hola", None)),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let (received, ended_cleanly) = read_until_end(response).await;
+    let received = String::from_utf8_lossy(&received).into_owned();
+    assert!(!ended_cleanly, "{received}");
+    assert_eq!(received, sse_event(&json!({"task": task_named("t-1")})));
+}
+
+#[tokio::test]
+async fn peer_responses_are_bounded() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let endless = |chunk: &'static [u8]| {
+        let chunk = axum::body::Bytes::from_static(chunk);
+        axum::body::Body::from_stream(futures::stream::repeat_with(move || {
+            Ok::<_, std::io::Error>(chunk.clone())
+        }))
+    };
+    let flood: &'static [u8] = "x".repeat(64 * 1024).leak().as_bytes();
+    let lines: &'static [u8] = "data: x\n".repeat(8 * 1024).leak().as_bytes();
+    let evil_app = {
+        use axum::routing::{get, post};
+        axum::Router::new()
+            .route(
+                "/rest/tasks/flood",
+                get(move || async move { answer("text/plain", endless(flood)) }),
+            )
+            .route(
+                "/rest/message:stream",
+                post(move || async move { answer("text/event-stream", endless(lines)) }),
+            )
+    };
+    let _evil = common::stub_peer(&a, "evil", &AgentKey::generate(), evil_app).await;
+    let gw = a.gateway_url();
+    let version = [("a2a-version", "1.0")];
+    let bound = Duration::from_secs(120);
+
+    // An endless body, whatever its type: refused once past the bound.
+    let res = tokio::time::timeout(
+        bound,
+        gateway_request(&gw, "GET", "/peers/evil/rest/tasks/flood", &version, None),
+    )
+    .await
+    .expect("the gateway gave up on an endless body");
+    assert_eq!(res.status, 502, "{}", String::from_utf8_lossy(&res.body));
+    assert_eq!(res.json, json!({"error": "peer protocol error"}));
+
+    // An event that never ends: the stream breaks, and none of it came.
+    let streamed = async {
+        let response = gateway_send(
+            &gw,
+            "POST",
+            "/peers/evil/rest/message:stream",
+            &version,
+            Some(&message_params("hola", None)),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        read_until_end(response).await
+    };
+    let (received, ended_cleanly) = tokio::time::timeout(bound, streamed)
+        .await
+        .expect("the gateway gave up on an endless event");
+    assert!(!ended_cleanly);
+    assert!(received.is_empty(), "{} bytes came", received.len());
+
+    // The gateway still serves.
+    let res = gateway_request(&gw, "GET", "/healthz", &[], None).await;
+    assert_eq!(res.status, 200);
 }
 
 #[tokio::test]

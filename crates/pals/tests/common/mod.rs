@@ -36,7 +36,8 @@ use hyper::client::conn::http1 as client_http1;
 use hyper_util::rt::TokioIo;
 use iroh::endpoint::{PortmapperConfig, presets};
 use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointAddr, RelayMode};
+use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
+use iroh_tickets::endpoint::EndpointTicket;
 use pals::config::{AgentCfg, Config, GatewayCfg, KEY_FILE, LimitsCfg, McpCfg, NetCfg, WorkerCfg};
 use pals::net::{ALPN_A2A_HTTP, PEER_HEADER, PeerHttp, TunnelLimits, TunnelServer};
 use pals::node::Node;
@@ -203,6 +204,11 @@ impl TestClient {
 /// Two Iroh endpoints on 127.0.0.1 with no relay; the first serves `app`
 /// through `TunnelServer` with the default limits.
 pub async fn spawn_pair(app: axum::Router) -> (TestServer, TestClient) {
+    spawn_pair_with(app, TunnelLimits::default()).await
+}
+
+/// [`spawn_pair`], the server with `limits`.
+pub async fn spawn_pair_with(app: axum::Router, limits: TunnelLimits) -> (TestServer, TestClient) {
     let server_endpoint = loopback_endpoint().await;
     let socket = *server_endpoint
         .bound_sockets()
@@ -210,10 +216,7 @@ pub async fn spawn_pair(app: axum::Router) -> (TestServer, TestClient) {
         .expect("the endpoint is bound to a socket");
     let addr = EndpointAddr::new(server_endpoint.id()).with_ip_addr(socket);
     let router = Router::builder(server_endpoint)
-        .accept(
-            ALPN_A2A_HTTP,
-            TunnelServer::new(app, TunnelLimits::default()),
-        )
+        .accept(ALPN_A2A_HTTP, TunnelServer::new(app, limits))
         .spawn();
 
     let client_endpoint = loopback_endpoint().await;
@@ -407,6 +410,47 @@ impl AgentExecutor for CountingExecutor {
     fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         EchoExecutor.cancel(ctx)
     }
+}
+
+/// A stub peer with `key`'s identity, serving `app` through the tunnel as a
+/// node would, saved in `a` as contact `name` with its address, and a grant
+/// of it to send, read and cancel tasks that `a` holds. It keeps running
+/// until the returned router drops.
+pub async fn stub_peer(a: &TestNode, name: &str, key: &AgentKey, app: axum::Router) -> Router {
+    let endpoint = Endpoint::builder(presets::Minimal)
+        .secret_key(SecretKey::from_bytes(&key.to_bytes()))
+        .relay_mode(RelayMode::Disabled)
+        .portmapper_config(PortmapperConfig::Disabled)
+        .clear_ip_transports()
+        .bind_addr((Ipv4Addr::LOCALHOST, 0))
+        .expect("loopback bind address")
+        .bind()
+        .await
+        .expect("bind the stub's endpoint");
+    let socket = *endpoint.bound_sockets().first().expect("a bound socket");
+    let ticket = EndpointTicket::new(EndpointAddr::new(endpoint.id()).with_ip_addr(socket));
+    let now = now_unix();
+    let ops = [
+        Operation::TaskSend,
+        Operation::TaskRead,
+        Operation::TaskCancel,
+    ];
+    a.hold(&issue_grant(key, a.id(), key.id(), &ops, now, now + 3600));
+    a.node
+        .store
+        .contact_put(&Contact {
+            name: name.to_owned(),
+            agent_id: key.id(),
+            ticket: Some(ticket.to_string()),
+            added_at: now,
+        })
+        .expect("save the stub");
+    Router::builder(endpoint)
+        .accept(
+            ALPN_A2A_HTTP,
+            TunnelServer::new(app, TunnelLimits::default()),
+        )
+        .spawn()
 }
 
 /// The key of the agent whose data directory is `dir`, created if missing.

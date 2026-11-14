@@ -45,6 +45,14 @@ pub const ANSWER_ARTIFACT: &str = "answer";
 /// The most files a question may come with.
 pub const MAX_INPUT_BLOBS: usize = 32;
 
+/// The most files an answer may come with: each is a blob in the store and
+/// a grant the provider checks on every fetch.
+pub const MAX_OUTPUT_FILES: usize = 32;
+
+/// Why a task whose adapter answered with more than [`MAX_OUTPUT_FILES`]
+/// files fails.
+pub const TOO_MANY_OUTPUT_FILES: &str = "too many output files";
+
 /// How long [`WorkerExecutor`]'s `cancel` waits for the run it stops to be
 /// over before it reports the task `CANCELED` anyway.
 const CANCEL_WAIT: Duration = Duration::from_secs(10);
@@ -157,7 +165,9 @@ impl From<&ExecCfg> for Capacity {
 /// After the adapter, each file it answered with is added to the agent's
 /// store and [shared](BlobService::share) with the peer for
 /// [`BLOB_SHARE_TTL_S`], and becomes a file part
-/// ([`BlobRef::to_part`], `application/octet-stream`).
+/// ([`BlobRef::to_part`], `application/octet-stream`). An answer with more
+/// than [`MAX_OUTPUT_FILES`] files fails the task, `too many output files`,
+/// with none of them added or shared.
 ///
 /// `cancel` stops the task's run, through the [`CancellationToken`] the
 /// adapter got, and waits up to 10 s for the run to be over,
@@ -596,6 +606,9 @@ impl Files {
     /// `output`, with each of its files added to the store, shared with
     /// `peer` and turned into a file part.
     async fn publish(&self, output: AdapterOutput, peer: &AgentId) -> Result<Answer, AdapterError> {
+        if output.files.len() > MAX_OUTPUT_FILES {
+            return Err(AdapterError::Failed(TOO_MANY_OUTPUT_FILES.to_owned()));
+        }
         let mut parts = Vec::with_capacity(output.files.len());
         for path in &output.files {
             let published = async {

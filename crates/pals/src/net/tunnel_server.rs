@@ -27,12 +27,14 @@ pub struct TunnelLimits {
     pub max_body_bytes: usize,
     /// Exchanges served at the same time on one connection.
     pub max_streams_per_conn: usize,
-    /// Time a stream has to deliver the complete request head.
+    /// Time a stream has to deliver the complete request head, and then
+    /// again the complete body; a body later than that gets `408`.
     pub head_timeout: Duration,
 }
 
 impl Default for TunnelLimits {
-    /// 1 MiB bodies, 16 streams per connection, 10 s for the request head.
+    /// 1 MiB bodies, 16 streams per connection, 10 s for the request head
+    /// and 10 s for its body.
     fn default() -> Self {
         Self {
             max_body_bytes: 1024 * 1024,
@@ -105,9 +107,7 @@ async fn serve_exchange(
     recv: RecvStream,
 ) {
     let io = TokioIo::new(tokio::io::join(recv, send));
-    let service = service_fn(move |request| {
-        handle(app.clone(), limits.max_body_bytes, peer.clone(), request)
-    });
+    let service = service_fn(move |request| handle(app.clone(), limits, peer.clone(), request));
     let exchange = http1::Builder::new()
         .keep_alive(false)
         .timer(TokioTimer::new())
@@ -120,10 +120,11 @@ async fn serve_exchange(
 
 async fn handle(
     app: axum::Router,
-    max_body_bytes: usize,
+    limits: TunnelLimits,
     peer: HeaderValue,
     request: Request<Incoming>,
 ) -> Result<Response<Body>, std::convert::Infallible> {
+    let max_body_bytes = limits.max_body_bytes;
     let (mut parts, body) = request.into_parts();
     let declared_length = parts
         .headers
@@ -133,16 +134,25 @@ async fn handle(
     if declared_length.is_some_and(|length| length > max_body_bytes as u64) {
         return Ok(payload_too_large(max_body_bytes));
     }
-    // A2A requests are small JSON documents, so the body is read here, bounded,
-    // instead of being streamed into the app.
-    let body = match Limited::new(body, max_body_bytes).collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(error) if error.is::<LengthLimitError>() => {
+    // A2A requests are small JSON documents, so the body is read here, bounded
+    // in size and in time, instead of being streamed into the app: a peer that
+    // stalls it would otherwise hold its stream's slot for good.
+    let collected = tokio::time::timeout(
+        limits.head_timeout,
+        Limited::new(body, max_body_bytes).collect(),
+    );
+    let body = match collected.await {
+        Ok(Ok(collected)) => collected.to_bytes(),
+        Ok(Err(error)) if error.is::<LengthLimitError>() => {
             return Ok(payload_too_large(max_body_bytes));
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             tracing::debug!(%error, "unreadable request body");
             return Ok((StatusCode::BAD_REQUEST, "unreadable request body").into_response());
+        }
+        Err(_) => {
+            tracing::debug!("a request body did not arrive in time");
+            return Ok((StatusCode::REQUEST_TIMEOUT, "request body timed out").into_response());
         }
     };
     // `insert` replaces every value the peer sent: the app only ever sees the
