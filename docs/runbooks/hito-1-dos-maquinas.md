@@ -55,7 +55,7 @@ arranca() {
     nohup pals daemon >> ~/pals-salida/daemon.log 2>&1 &
     echo $! > ~/pals-salida/daemon.pid
     sleep 5
-    tail -n 1 ~/pals-salida/daemon.log
+    grep 'pals daemon:' ~/pals-salida/daemon.log | tail -n 1
 }
 para() {
     local pid; pid=$(cat ~/pals-salida/daemon.pid)
@@ -65,6 +65,8 @@ para() {
 ```
 
 `arranca` debe imprimir `pals daemon: agent <id> serving, gateway at http://127.0.0.1:7420`. `para` envía `SIGTERM` y espera a que el daemon termine, lo que puede llevar unos segundos: hasta entonces conserva el bloqueo de su directorio de datos, y un `arranca` inmediato fallaría con `a pals daemon is already running on this data directory`. El daemon usa `~/.pals` (o `$PALS_HOME`) para su configuración, su clave y su almacén.
+
+El registro, `~/pals-salida/daemon.log`, recoge además los diagnósticos del daemon desde el nivel `INFO`, como la descarga fallida de un fichero de entrada o un error al comprobar el grant de una petición de blobs. Si un caso falla sin explicación, para el daemon, ejecuta `export RUST_LOG=pals=debug` en esa terminal y vuelve a `arranca`: el registro detallará cada intento (`RUST_LOG` sigue la sintaxis de `tracing-subscriber`, p. ej. `RUST_LOG=pals=debug,iroh=info`).
 
 ## 2. Configuración
 

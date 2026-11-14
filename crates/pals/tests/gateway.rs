@@ -1373,8 +1373,19 @@ impl CliAgent {
 
     /// Starts `pals daemon` and waits until its gateway answers.
     async fn start_daemon(&self) -> Daemon {
+        self.start_daemon_logging(None).await
+    }
+
+    /// [`CliAgent::start_daemon`], with `RUST_LOG` set to `rust_log`, or
+    /// unset.
+    async fn start_daemon_logging(&self, rust_log: Option<&str>) -> Daemon {
         let log = self.home.path().join("daemon.log");
-        let child = std::process::Command::new(env!("CARGO_BIN_EXE_pals"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pals"));
+        match rust_log {
+            Some(filter) => command.env("RUST_LOG", filter),
+            None => command.env_remove("RUST_LOG"),
+        };
+        let child = command
             .arg("daemon")
             .env("PALS_HOME", self.home.path())
             .stdin(Stdio::null())
@@ -1439,6 +1450,47 @@ impl Drop for Daemon {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[tokio::test]
+async fn the_daemon_logs_to_stderr_from_info_unless_rust_log_says_otherwise() {
+    let agent = CliAgent::init("logged");
+    let id = agent.id();
+    // What a previous run leaves: a task in progress, which the next start
+    // fails, and logs at INFO.
+    let leave_a_task = |task_id: &str| {
+        let task: a2a::Task = serde_json::from_value(json!({
+            "id": task_id,
+            "contextId": "ctx",
+            "status": {"state": "TASK_STATE_WORKING"},
+        }))
+        .unwrap();
+        Store::open(&agent.home.path().join("pals.db"), id)
+            .unwrap()
+            .task_create(&task, now_unix())
+            .unwrap();
+    };
+    let interrupted = "failed the tasks a restart interrupted";
+
+    leave_a_task("t-1");
+    let daemon = agent.start_daemon_logging(None).await;
+    let log = daemon.log.clone();
+    daemon.stop().await;
+    let text = std::fs::read_to_string(&log).unwrap();
+    let line = text
+        .lines()
+        .find(|line| line.contains(interrupted))
+        .unwrap_or_else(|| panic!("no INFO line: {text}"));
+    assert!(line.contains("INFO"), "{line}");
+
+    // RUST_LOG decides instead.
+    leave_a_task("t-2");
+    let daemon = agent.start_daemon_logging(Some("warn")).await;
+    let log = daemon.log.clone();
+    daemon.stop().await;
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(!text.contains(interrupted), "{text}");
+    assert!(text.contains("serving"), "{text}");
 }
 
 /// A loopback port that was free a moment ago.

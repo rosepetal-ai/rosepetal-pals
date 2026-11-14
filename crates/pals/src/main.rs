@@ -313,6 +313,7 @@ async fn gateway_health(listen: SocketAddr) -> anyhow::Result<Value> {
 }
 
 fn daemon(home: &Path) -> anyhow::Result<()> {
+    install_log();
     let cfg = load_config(home)?;
     runtime(true)?.block_on(async move {
         // Before anything binds, so that a signal never kills a half-started
@@ -336,6 +337,26 @@ fn daemon(home: &Path) -> anyhow::Result<()> {
         eprintln!("pals daemon: {signal}, shutting down");
         node.shutdown().await
     })
+}
+
+/// Logs the daemon's diagnostics, such as a blob that cannot be fetched or
+/// a grant check that fails, to stderr, one compact line each: from `INFO`
+/// up, unless `RUST_LOG` filters otherwise (`RUST_LOG=pals=debug`).
+fn install_log() {
+    use std::io::IsTerminal;
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::filter::LevelFilter;
+
+    let filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
+    // Only one subscriber per process; nothing else installs one.
+    let _ = tracing_subscriber::fmt()
+        .compact()
+        .with_env_filter(filter)
+        .with_writer(io::stderr)
+        .with_ansi(io::stderr().is_terminal())
+        .try_init();
 }
 
 /// A future that resolves, with the signal's name, on SIGINT or SIGTERM.
