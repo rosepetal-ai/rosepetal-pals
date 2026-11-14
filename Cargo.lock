@@ -2398,7 +2398,9 @@ dependencies = [
  "a2a-server-lf",
  "anyhow",
  "assert_cmd",
+ "async-trait",
  "axum",
+ "chrono",
  "clap",
  "futures",
  "http",
@@ -2421,9 +2423,11 @@ dependencies = [
 name = "pals-core"
 version = "0.1.0"
 dependencies = [
+ "a2a-lf",
  "anyhow",
  "base64 0.23.1",
  "blake3",
+ "chrono",
  "ed25519-dalek",
  "getrandom 0.4.3",
  "iroh",

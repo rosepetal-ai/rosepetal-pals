@@ -17,8 +17,10 @@ use crate::identity::AgentId;
 
 mod contacts;
 mod grants;
+mod tasks;
 
 pub use contacts::Contact;
+pub use tasks::INTERRUPTED_MESSAGE;
 
 /// The schema this build writes and reads.
 const SCHEMA_VERSION: i64 = 1;

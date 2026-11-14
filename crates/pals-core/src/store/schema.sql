@@ -44,16 +44,23 @@ CREATE TABLE revocations (
     revoked_at INTEGER NOT NULL
 ) STRICT;
 
--- A2A tasks this agent serves, as their A2A JSON.
+-- A2A tasks this agent serves. A task is kept as its A2A JSON, `task_json`;
+-- the other columns index it and are written with it: `state` is the A2A
+-- name of its state (`TASK_STATE_WORKING`), `version` its `TaskStore` version
+-- (1 when created, one more on every write) and `updated_at` the instant of
+-- the last write.
 CREATE TABLE tasks (
     task_id    TEXT PRIMARY KEY NOT NULL,
     context_id TEXT NOT NULL,
     state      TEXT NOT NULL,
-    task_json  TEXT NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    version    INTEGER NOT NULL,
+    task_json  TEXT NOT NULL
 ) STRICT;
+CREATE INDEX tasks_by_state ON tasks (state);
 
--- The peer that created each task.
+-- The peer that owns each task, the one that created it. Set once, and
+-- possibly before the task is stored.
 CREATE TABLE task_owners (
     task_id TEXT PRIMARY KEY NOT NULL,
     owner   TEXT NOT NULL
