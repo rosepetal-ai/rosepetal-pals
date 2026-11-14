@@ -1,0 +1,10 @@
+[package]
+name = "pals-core"
+description = "PALS core without networking: identity, grants, storage and the signed event log"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
