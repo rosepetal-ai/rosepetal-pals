@@ -1,10 +1,12 @@
-//! Executors that do the work behind the A2A server: [`echo`], and
+//! Executors that do the work behind the A2A server: [`echo`], [`tck`],
+//! which plays the scenarios of the A2A TCK for conformance runs, and
 //! [`WorkerExecutor`], which answers each task by running an [`Adapter`],
 //! such as the command of [`exec`].
 
 pub mod echo;
 #[cfg(unix)]
 pub mod exec;
+pub mod tck;
 
 use std::collections::{HashMap, HashSet};
 use std::io;

@@ -45,6 +45,7 @@ listen = "127.0.0.1:7420"
 # Who answers the questions peers ask. "echo" replies with the text it
 # receives. "exec" runs `command` with `args` in the project's directory for
 # each question, with the question on stdin, and answers with its stdout.
+# "tck" plays the scenarios of the A2A TCK, for conformance runs only.
 adapter = "echo"
 # To answer with Claude Code instead:
 # adapter = "exec"
@@ -137,6 +138,11 @@ pub enum WorkerCfg {
     Echo,
     /// Runs a command for each task, see [`ExecCfg`].
     Exec(ExecCfg),
+    /// Plays the scenarios of the A2A TCK, by the prefix of each message's
+    /// `messageId`, see [`TckExecutor`](crate::worker::tck::TckExecutor).
+    /// Only for conformance runs.
+    #[serde(deserialize_with = "no_settings")]
+    Tck,
 }
 
 /// The `exec` adapter: each task runs `command` with `args` in its project's
@@ -556,6 +562,10 @@ max_output_bytes = 10
                 "unknown field `typo`",
             ),
             (
+                "[worker]\nadapter = \"tck\"\ncommand = \"claude\"\n",
+                "unknown field `command`",
+            ),
+            (
                 "[worker]\nadapter = \"exec\"\ncommand = \"claude\"\ntimeout = 5\n",
                 "unknown field `timeout`",
             ),
@@ -565,6 +575,14 @@ max_output_bytes = 10
             let err = Config::load(&write_config(dir.path(), text)).unwrap_err();
             assert!(format!("{err:#}").contains(word), "{text}: {err:#}");
         }
+    }
+
+    #[test]
+    fn tck_worker_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "[worker]\nadapter = \"tck\"\n";
+        let cfg = Config::load(&write_config(dir.path(), text)).unwrap();
+        assert_eq!(cfg.worker, WorkerCfg::Tck);
     }
 
     #[test]

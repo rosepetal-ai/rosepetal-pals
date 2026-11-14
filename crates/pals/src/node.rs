@@ -34,6 +34,7 @@ use crate::worker::TASKS_DIR;
 use crate::worker::echo::EchoExecutor;
 #[cfg(unix)]
 use crate::worker::exec::ExecAdapter;
+use crate::worker::tck::TckExecutor;
 #[cfg(unix)]
 use crate::worker::{Capacity, WorkerExecutor};
 
@@ -78,7 +79,8 @@ pub struct Node {
 
 impl Node {
     /// Starts the agent of `cfg.data_dir`, which must exist, with the
-    /// executor `cfg.worker` selects: [`EchoExecutor`], or a
+    /// executor `cfg.worker` selects: [`EchoExecutor`], [`TckExecutor`] with
+    /// the streaming timeout of its environment variable, or a
     /// `WorkerExecutor` running the `exec` adapter.
     ///
     /// In order: takes the data directory's lock, failing with
@@ -106,6 +108,7 @@ impl Node {
         let opened = Opened::open(&cfg).await?;
         match &cfg.worker {
             WorkerCfg::Echo => Ok(opened.start(&cfg, EchoExecutor)),
+            WorkerCfg::Tck => Ok(opened.start(&cfg, TckExecutor::from_env())),
             #[cfg(unix)]
             WorkerCfg::Exec(exec) => {
                 let adapter = Arc::new(ExecAdapter::new(exec.clone(), &cfg.projects));
