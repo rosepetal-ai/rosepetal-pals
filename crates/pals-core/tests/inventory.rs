@@ -666,6 +666,33 @@ fn capability_tags_follow_the_vocabulary() {
 }
 
 #[test]
+fn own_tags_cannot_take_the_reserved_agentnet_prefix() {
+    // A card skill's tags are its capability tags and its own together: an
+    // own tag in the reserved namespace would pass for a capability.
+    for tag in [
+        "agentnet:capability:v1:vision.ocr",
+        "agentnet:anything",
+        "agentnet:",
+        "AgentNet:capability:v1:vision.ocr",
+        " agentnet:capability:v1:vision.ocr",
+    ] {
+        let toml = service("ocr", &format!("tags = [\"metal\", {}]", json!(tag)));
+        let err = refusal(&toml);
+        assert!(err.contains("services[0] (ocr).tags[1]"), "{tag:?}: {err}");
+        assert!(err.contains("agentnet:"), "{tag:?}: {err}");
+    }
+    // The capability itself, and tags that only mention the word, are fine.
+    for fields in [
+        "capabilities = [\"vision.ocr\"]\ntags = [\"metal\"]",
+        "tags = [\"agentnet\", \"not-agentnet:ocr\", \"example:agentnet\"]",
+    ] {
+        let inventory = Inventory::from_toml(&service("ocr", fields))
+            .unwrap_or_else(|err| panic!("{fields}: {err}"));
+        assert_eq!(inventory.services.len(), 1);
+    }
+}
+
+#[test]
 fn inventory_file_over_1_mib_is_refused() {
     // Comments only: the size alone decides.
     let fill = |bytes: usize| {

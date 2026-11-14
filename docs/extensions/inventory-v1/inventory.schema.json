@@ -166,7 +166,16 @@
           "type": "array",
           "items": { "$ref": "#/$defs/capability" }
         },
-        "tags": { "$ref": "#/$defs/texts" },
+        "tags": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              { "$ref": "#/$defs/text" },
+              { "not": { "pattern": "^\\s*[Aa][Gg][Ee][Nn][Tt][Nn][Ee][Tt]:" } }
+            ]
+          },
+          "description": "Etiquetas propias. Ninguna empieza por agentnet:, en cualquier combinación de mayúsculas: viajan en la card junto a las de capacidad y se harían pasar por una."
+        },
         "examples": { "$ref": "#/$defs/texts" },
         "input_modes": {
           "$ref": "#/$defs/texts",

@@ -34,7 +34,9 @@
 //! - a capability without `:` belongs to the common vocabulary and travels
 //!   as the skill tag [`CAPABILITY_PREFIX`]`<capability>`; one with `:`
 //!   belongs to its provider's namespace and travels as it is
-//!   ([`capability_tag`]).
+//!   ([`capability_tag`]);
+//! - a service's own tags travel next to its capability tags, so none may
+//!   start with `agentnet:`, in any case: it would pass for a capability.
 //!
 //! A service needs a name, a description and at least one capability or
 //! tag, and none of what becomes card fields may be empty: an empty field
@@ -939,6 +941,14 @@ fn check_service(at: &str, service: &Service) -> Result<(), InventoryError> {
         capability_tag(capability)
             .map_err(|err| invalid(format!("{at}.capabilities[{i}]: {}", message(&err))))?;
     }
+    for (i, tag) in service.tags.iter().enumerate() {
+        if is_reserved_tag(tag) {
+            return Err(invalid(format!(
+                "{at}.tags[{i}]: the tag {tag:?} starts with {RESERVED_NAMESPACE}:, which only \
+                 capability tags use: list the capability under `capabilities`"
+            )));
+        }
+    }
     check_visibility(&format!("{at}.visibility"), &service.visibility)?;
     for (i, link) in service.components.iter().enumerate() {
         if link.group.as_deref() == Some("") {
@@ -1084,6 +1094,18 @@ fn is_namespaced_id(id: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-'))
+}
+
+/// Whether a service's own `tag` starts with `agentnet:`, in any case and
+/// after any leading blanks: the card skill lists capability tags and own
+/// tags together, and such a tag would pass for a capability
+/// ([`CAPABILITY_PREFIX`]).
+fn is_reserved_tag(tag: &str) -> bool {
+    let tag = tag.trim_start().as_bytes();
+    let prefix = RESERVED_NAMESPACE.len();
+    tag.len() > prefix
+        && tag[prefix] == b':'
+        && tag[..prefix].eq_ignore_ascii_case(RESERVED_NAMESPACE.as_bytes())
 }
 
 /// A common-vocabulary capability: 1 to 128 `[a-z0-9._-]`.
