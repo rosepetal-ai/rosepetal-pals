@@ -8,7 +8,7 @@
 
 **Tech Stack:** Lo del hito 1 sin cambios de versión: Rust 2024 (MSRV 1.91), iroh 1.4.1, iroh-blobs 0.105.0, `a2a-lf` 0.4.2 / `a2a-server-lf` 0.5.3 / `a2a-client-lf` 0.2.9, rmcp 3.10.0, ed25519-dalek 3.0.0, base64 0.23.1, serde_json_canonicalizer 0.4.1, blake3 1.8.7, rusqlite 0.42.0, reqwest 0.13 (rustls, el de iroh). Dependencias nuevas, todas con `=`: `a2a-pb =0.3.2` (sus tipos `protojson`, para las formas canónicas de la card; ya estaba en el lock, la traen los SDK) y `prost =0.14.6` (framing del descubrimiento; ya estaba en el lock, con `derive`). Features nuevas de `rmcp` en dependencias normales: `client` y `transport-streamable-http-client-reqwest`, ya en el lock por las de desarrollo. El transporte stdio del adaptador MCP usa `rmcp::transport::async_rw::AsyncRwTransport`, que ya habilita la feature de servidor del hito 1, sobre un proceso hijo que lanza PALS: `TokioChildProcess` no deja fijar el límite de línea, así que `transport-child-process` (y con ella `process-wrap` y `nix`) no hace falta. Solo en la rama de reserva de la tarea 1: `p256 =0.14.0` (features `ecdsa`, `std`), que añade 14 crates y sube `ctutils` de 0.4.2 a 0.4.8. Interoperabilidad: `a2a-sdk==1.3.0` con su extra de firma (`PyJWT==2.15.1`), `jsonschema==4.26.0`, `github.com/a2aproject/a2a-go/v2 v2.7.0`, `@a2a-js/sdk` 1.3.0 (con `jose` 6.2.17), y el TCK en el mismo commit `104a7b4ae0d8`.
 
-**Spec:** [`docs/plans/initial.md`](../../plans/initial.md) (revisión 3), su hito 2 (§14), con §2–§3, §7, §8, §9, §10 y §13. La [hoja de ruta](2026-11-14-hoja-de-ruta-hitos-2-4.md) fija el esquema de tareas y las decisiones H2-D1 a H2-D3. Este plan sigue al del [hito 1](2026-11-14-hito-1-flujo-basico-a2a.md) y hereda su tabla de desviaciones.
+**Spec:** [`docs/plans/initial.md`](initial.md) (revisión 3), su hito 2 (§14), con §2–§3, §7, §8, §9, §10 y §13. La [hoja de ruta](2026-11-14-hoja-de-ruta-hitos-2-4.md) fija el esquema de tareas y las decisiones H2-D1 a H2-D3. Este plan sigue al del [hito 1](2026-11-14-hito-1-flujo-basico-a2a.md) y hereda su tabla de desviaciones.
 
 ## Decisiones tomadas por el responsable
 
@@ -1516,7 +1516,7 @@ env_passthrough = []                        # solo nombres
 
 **Files:**
 - Create: `docs/runbooks/hito-2-consulta-de-servicios.md`, `docs/conformance/hito-2/{README.md,exit-test.md}`, `docs/conformance/hito-2/compatibility*.{json,html}` (generados)
-- Modify: `tests/interop/run_tck.sh` (destino de los informes por variable `PALS_CONFORMANCE_DIR`, `docs/conformance/hito-1` por defecto), `README.md`, `CLAUDE.md`, `docs/superpowers/plans/2026-11-14-hoja-de-ruta-hitos-2-4.md`
+- Modify: `tests/interop/run_tck.sh` (destino de los informes por variable `PALS_CONFORMANCE_DIR`, `docs/conformance/hito-1` por defecto), `README.md`, `CLAUDE.md`, `docs/plans/2026-11-14-hoja-de-ruta-hitos-2-4.md`
 
 **Criterio de salida del spec §14 y sus tests:**
 

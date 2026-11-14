@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2024 (MSRV 1.91), tokio, iroh 1.4.1, iroh-blobs 0.105.0, `a2a-lf` 0.4.2 / `a2a-server-lf` 0.5.3 / `a2a-client-lf` 0.2.9 (SDK oficial `a2aproject/a2a-rs`), axum 0.8 + hyper 1, rmcp 3.10.0 (MCP), rusqlite 0.42 (SQLite embebido), ed25519-dalek 3, serde_json_canonicalizer 0.4 (JCS), blake3, clap. Conformidad: `a2aproject/a2a-tck` (commit `104a7b4ae0d8`) y el SDK oficial de Python.
 
-**Spec:** [`docs/plans/initial.md`](../../plans/initial.md) (revisión 3). Este plan cubre su hito 1 (§14) más el requisito añadido por el responsable del proyecto el 2026-11-14: **«tiene que ser completamente compatible con A2A en su intercambio final»**. Los hitos 2 a 4 están en [`2026-11-14-hoja-de-ruta-hitos-2-4.md`](2026-11-14-hoja-de-ruta-hitos-2-4.md).
+**Spec:** [`docs/plans/initial.md`](initial.md) (revisión 3). Este plan cubre su hito 1 (§14) más el requisito añadido por el responsable del proyecto el 2026-11-14: **«tiene que ser completamente compatible con A2A en su intercambio final»**. Los hitos 2 a 4 están en [`2026-11-14-hoja-de-ruta-hitos-2-4.md`](2026-11-14-hoja-de-ruta-hitos-2-4.md).
 
 ## Cambios respecto al spec que impone el requisito A2A
 
