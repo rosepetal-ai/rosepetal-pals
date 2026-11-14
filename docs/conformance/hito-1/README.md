@@ -9,7 +9,7 @@ Evidencia de la compatibilidad con A2A v1.0 del intercambio final de PALS: el TC
 | Dato | Valor |
 |-|-|
 | Fecha | 2026-11-14 |
-| Commit de `pals` | `2f4d1cc` (el código; este informe y los del TCK llegan en el commit siguiente, sin tocar código) |
+| Commit de `pals` | `27ef71f` (el código, tras la última ronda de correcciones; este informe y los del TCK llegan en el commit siguiente, sin tocar código). Los resultados coinciden requisito a requisito con los de la ejecución anterior, en `2f4d1cc` |
 | TCK | `a2aproject/a2a-tck` en `104a7b4ae0d83f65c075e3793e322953a830eaba`, Python 3.15.2, dependencias de su `uv.lock` (`uv sync --frozen`, uv 0.13.8) |
 | Transportes | `jsonrpc`, `http_json` (el TCK no prueba gRPC: PALS no lo ofrece) |
 | `TCK_STREAMING_TIMEOUT` | `2.0` (el valor por defecto) |
@@ -90,6 +90,8 @@ Del propio PALS:
 - La respuesta a una petición que activa la extensión la nombra en su cabecera `A2A-Extensions`, como A2A recomienda para las extensiones activadas; el gateway la devuelve sin cambios.
 - La card canónica que el agente sirve a sus pares declara sus dos interfaces entre pares (A2A §5.2): `iroh://<id>/jsonrpc` con `…/bindings/http-over-iroh/v1/jsonrpc` y `iroh://<id>/rest` con `…/bindings/http-over-iroh/v1/http-json`. Antes solo declaraba la primera. La vista del gateway no cambia.
 - La vista de la card en el gateway lleva `Cache-Control: max-age=300` y un `ETag` fuerte, y responde `304` a un `If-None-Match` que lo nombra (A2A §8.6; `CARD-CACHE-001`, `CARD-CACHE-002`).
+- El gateway comprueba cada respuesta del par antes de dársela al cliente: como mucho 16 MiB por cuerpo o por evento SSE, JSON en las respuestas correctas y en los datos de cada evento, sin `Content-Encoding`, y ningún `taskId` ni `id` de tarea inseguro (un cliente que normaliza `../` en la URL de su siguiente petición llegaría a otro par con el grant del gateway). El TCK y el SDK de Python pasan por esas comprobaciones en cada petición; un par PALS no envía nada que las active.
+- `ListTasks` ordena de la tarea actualizada más recientemente a la más antigua, pagina con un cursor opaco y omite los artefactos salvo con `includeArtifacts: true` (A2A §3.1.4; ver la tabla siguiente).
 
 Rodeos de defectos del SDK oficial de Rust fijado, cada uno en una capa propia de PALS y con su prueba en `crates/pals/tests/conformance.rs`; los textos para comunicarlos aguas arriba están en [`sdk-issues.md`](sdk-issues.md):
 
