@@ -8,14 +8,16 @@
 //! |-|-|
 //! | `GET /healthz` | `200 {"agent_id", "name", "ticket"}` |
 //! | `GET /peers/{peer}/.well-known/agent-card.json` | the peer's card, as [`gateway_view`] |
-//! | `POST /peers/{peer}/jsonrpc` | the peer's `/jsonrpc` |
+//! | `POST /peers/{peer}/jsonrpc`, or `/jsonrpc/` | the peer's `/jsonrpc` |
 //! | any method, `/peers/{peer}/rest/{*rest}` | the peer's `/rest/{rest}` |
 //! | `POST /blobs` | stores the raw body as a blob: `201 {"url", "hash", "size"}` |
 //! | `GET /blobs/{holder}/{hash}` | the blob, fetched from its holder first if need be |
 //! | any method, `/mcp` | the local [MCP server](crate::mcp), Streamable HTTP |
 //!
 //! A request to a peer travels through [`PeerHttp`], never to the node's own
-//! app: method, path after `/peers/{peer}` and query exactly as received,
+//! app: method, path after `/peers/{peer}` and query exactly as received
+//! (but for the slash after `jsonrpc`, which a client that joins a path to
+//! the interface URL adds, as `httpx` does with a base URL),
 //! end-to-end headers and the body; the response comes back the same way,
 //! Server-Sent Events streamed as they come. The gateway drops the hop-by-hop
 //! headers, `Host` and any `x-agentnet-*` header the client sent, which only
@@ -412,6 +414,7 @@ pub fn router(state: GatewayState) -> Router {
         .route("/healthz", get(healthz))
         .route("/peers/{peer}/.well-known/agent-card.json", get(peer_card))
         .route("/peers/{peer}/jsonrpc", post(forward_jsonrpc))
+        .route("/peers/{peer}/jsonrpc/", post(forward_jsonrpc))
         .route("/peers/{peer}/rest/{*rest}", any(forward_rest))
         .route("/blobs", post(upload_blob))
         .route("/blobs/{holder}/{hash}", get(download_blob))
@@ -528,11 +531,24 @@ async fn peer_card(State(state): State<GatewayState>, Path(peer): Path<String>) 
     Json(gateway_view(&card, &state.base_url(), &target.id)).into_response()
 }
 
+/// `POST /peers/{peer}/jsonrpc`, or `/jsonrpc/`: both go to the peer's
+/// `/jsonrpc`, where its JSON-RPC binding is served.
 async fn forward_jsonrpc(
     State(state): State<GatewayState>,
     Path(peer): Path<String>,
-    request: Request,
+    mut request: Request,
 ) -> Response {
+    let uri = request.uri();
+    if let Some(path) = uri.path().strip_suffix('/') {
+        let target = match uri.query() {
+            Some(query) => format!("{path}?{query}"),
+            None => path.to_owned(),
+        };
+        match target.parse() {
+            Ok(target) => *request.uri_mut() = target,
+            Err(_) => return error(StatusCode::BAD_REQUEST, "invalid request target"),
+        }
+    }
     forward(state, peer, request).await
 }
 

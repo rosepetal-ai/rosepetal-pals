@@ -178,6 +178,61 @@ async fn stock_a2a_client_talks_to_a_peer_through_the_gateway() {
 }
 
 #[tokio::test]
+async fn jsonrpc_endpoint_takes_a_trailing_slash() {
+    // A client that joins a path to the interface URL, as `httpx` does with
+    // a base URL (the A2A TCK's JSON-RPC client posts `/` to it), sends
+    // `.../jsonrpc/`: the same endpoint.
+    let (a, b, _) = connected_pair().await;
+    let headers = [("a2a-version", "1.0")];
+    let send = rpc_request("SendMessage", message_params("hola", None));
+    let res = gateway_request(
+        &a.gateway_url(),
+        "POST",
+        &format!("/peers/{}/jsonrpc/", b.id()),
+        &headers,
+        Some(&send),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", String::from_utf8_lossy(&res.body));
+    let task = &res.json["result"]["task"];
+    assert_eq!(
+        task["status"]["state"], "TASK_STATE_COMPLETED",
+        "{}",
+        res.json
+    );
+    assert_eq!(task["artifacts"][0]["parts"][0]["text"], "echo: hola");
+
+    // Streaming too, by contact name.
+    let stream = rpc_request("SendStreamingMessage", message_params("otra", None));
+    let res = gateway_request(
+        &a.gateway_url(),
+        "POST",
+        "/peers/bob/jsonrpc/",
+        &headers,
+        Some(&stream),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", String::from_utf8_lossy(&res.body));
+    let events = sse_data(&String::from_utf8_lossy(&res.body));
+    assert_eq!(
+        events.last().unwrap()["result"]["statusUpdate"]["status"]["state"],
+        "TASK_STATE_COMPLETED",
+        "{events:?}"
+    );
+
+    // Only the one slash: anything after it is no endpoint.
+    let res = gateway_request(
+        &a.gateway_url(),
+        "POST",
+        "/peers/bob/jsonrpc/x",
+        &headers,
+        Some(&send),
+    )
+    .await;
+    assert_eq!(res.status, 404);
+}
+
+#[tokio::test]
 async fn rest_binding_works_through_the_gateway() {
     let (a, b, _) = connected_pair().await;
     let gw = a.gateway_url();
