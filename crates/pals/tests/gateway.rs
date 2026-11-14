@@ -1231,6 +1231,316 @@ async fn peer_responses_are_bounded() {
     assert_eq!(res.status, 200);
 }
 
+/// The line breaks some SSE readers honour besides CR and LF: httpx splits
+/// lines as `str.splitlines()` does.
+const OTHER_LINE_BREAKS: [&str; 8] = [
+    "\u{2028}", "\u{2029}", "\u{85}", "\u{b}", "\u{c}", "\u{1c}", "\u{1d}", "\u{1e}",
+];
+
+/// The kinds of line a `data:` line can hide behind.
+const HIDING_LINES: [&str; 4] = [": hi", "event: x", "id: 7", "foo: bar"];
+
+/// A peer that answers what each test case in its query asks for, every
+/// answer naming a task id that climbs to another peer.
+fn lying_app() -> axum::Router {
+    use axum::extract::Request;
+    use axum::routing::{any, get, post};
+    let climbing = "../../../0000/rest/tasks/x";
+    let query = |request: &Request| -> String {
+        request
+            .uri()
+            .query()
+            .unwrap_or_default()
+            .trim_start_matches("case=")
+            .to_owned()
+    };
+    let endless_keepalives = || {
+        let chunk = axum::body::Bytes::from(":\n\n".repeat(16 * 1024));
+        axum::body::Body::from_stream(futures::stream::repeat_with(move || {
+            Ok::<_, std::io::Error>(chunk.clone())
+        }))
+    };
+    let stream = move |request: Request| async move {
+        let case = query(&request);
+        let safe = sse_event(&json!({"task": task_named("t-1")}));
+        let body = if let Some(hidden) = case.strip_prefix("hide-") {
+            // `<kind>-<break>`: a data line behind another line break.
+            let (kind, brk) = hidden.split_once('-').unwrap();
+            let kind = HIDING_LINES[kind.parse::<usize>().unwrap()];
+            let brk = OTHER_LINE_BREAKS[brk.parse::<usize>().unwrap()];
+            let lie = json!({"task": task_named(climbing)});
+            format!("{kind}{brk}data: {lie}\n\n{safe}")
+        } else {
+            let event = match case.as_str() {
+                "snake-update" => json!({"statusUpdate": {"task_id": climbing,
+                    "context_id": "c-1", "status": {"state": "TASK_STATE_WORKING"}}}),
+                "bare-task" => json!({"task": {"id": climbing}}),
+                "unicode" => json!({"artifactUpdate": {"taskId": "t-1", "contextId": "c-1",
+                    "artifact": {"artifactId": "a-1", "parts": [{"text": "ñandú 😀 \u{2028}\u{85}"}]}}}),
+                other => panic!("no case {other}"),
+            };
+            format!("{safe}{}", sse_event(&event))
+        };
+        answer("text/event-stream", body)
+    };
+    axum::Router::new()
+        .route("/rest/message:stream", post(stream))
+        // Unary calls answered as event streams.
+        .route(
+            "/rest/message:send",
+            post(move |request: Request| async move {
+                match query(&request).as_str() {
+                    "endless" => answer("text/event-stream", endless_keepalives()),
+                    _ => answer(
+                        "text/event-stream",
+                        json!({"task": task_named(climbing)}).to_string(),
+                    ),
+                }
+            }),
+        )
+        .route(
+            "/rest/tasks/{id}",
+            get(move |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                match id.as_str() {
+                    "endless" => answer("text/event-stream", endless_keepalives()),
+                    "as-stream" => {
+                        answer("text/event-stream", task_named(climbing).to_string())
+                    }
+                    // A task with no contextId nor status, as a lenient
+                    // parser takes it.
+                    "bare" => answer("application/json", json!({"id": climbing}).to_string()),
+                    "snake" => answer(
+                        "application/json",
+                        json!({"id": climbing, "context_id": "c-1",
+                            "status": {"state": "TASK_STATE_WORKING"}})
+                        .to_string(),
+                    ),
+                    "referenced" => answer(
+                        "application/json",
+                        json!({"id": "t-1", "contextId": "c-1",
+                            "status": {"state": "TASK_STATE_WORKING"},
+                            "history": [{"messageId": "m-1", "role": "ROLE_USER",
+                                "parts": [{"text": "x"}], "reference_task_ids": ["t-0", climbing]}]})
+                        .to_string(),
+                    ),
+                    "free-form" => answer(
+                        "application/json",
+                        json!({"id": "t-1", "contextId": "c-1",
+                            "status": {"state": "TASK_STATE_WORKING"},
+                            "metadata": {"id": climbing, "taskId": climbing},
+                            "artifacts": [{"artifactId": "a-1",
+                                "parts": [{"data": {"id": climbing, "task_id": climbing}}]}]})
+                        .to_string(),
+                    ),
+                    "unicode" => answer(
+                        "application/json; charset=utf-8",
+                        json!({"id": "t-1", "contextId": "c-1",
+                            "status": {"state": "TASK_STATE_WORKING",
+                                "message": {"messageId": "m-1", "role": "ROLE_AGENT",
+                                    "parts": [{"text": "ñandú 😀 \u{2028}\u{85}"}]}}})
+                        .to_string(),
+                    ),
+                    other => panic!("no task {other}"),
+                }
+            }),
+        )
+        .route(
+            "/jsonrpc",
+            any(move |body: axum::body::Bytes| async move {
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                let lie = json!({"task": task_named(climbing)});
+                match request["method"].as_str().unwrap() {
+                    // A streaming call: an event hidden behind U+2028.
+                    "SendStreamingMessage" => answer(
+                        "text/event-stream",
+                        format!(
+                            ": hi\u{2028}data: {}\n\n{}",
+                            json!({"jsonrpc": "2.0", "id": 1, "result": lie}),
+                            sse_event(&json!({"jsonrpc": "2.0", "id": 1,
+                                "result": {"task": task_named("t-1")}}))
+                        ),
+                    ),
+                    // A unary one, answered as an event stream.
+                    _ => answer(
+                        "text/event-stream",
+                        json!({"jsonrpc": "2.0", "id": 1, "result": lie}).to_string(),
+                    ),
+                }
+            }),
+        )
+}
+
+/// `a` with the lying peer saved as contact `liar`.
+async fn liar() -> (TestNode, iroh::protocol::Router) {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let stub = common::stub_peer(&a, "liar", &AgentKey::generate(), lying_app()).await;
+    (a, stub)
+}
+
+/// Streams `path` of the liar through `a`'s gateway: the bytes that came,
+/// and whether the stream ended unbroken.
+async fn stream_from_liar(a: &TestNode, path: &str, body: &Value) -> (String, bool) {
+    let response = gateway_send(
+        &a.gateway_url(),
+        "POST",
+        &format!("/peers/liar{path}"),
+        &[("a2a-version", "1.0")],
+        Some(body),
+    )
+    .await;
+    assert_eq!(response.status(), 200, "{path}");
+    let (received, unbroken) = read_until_end(response).await;
+    (String::from_utf8(received).expect("UTF-8"), unbroken)
+}
+
+#[tokio::test]
+async fn data_lines_hidden_behind_other_line_breaks_never_reach_the_client() {
+    let (a, _liar) = liar().await;
+    let message = message_params("hola", None);
+    let safe = sse_event(&json!({"task": task_named("t-1")}));
+    for kind in 0..HIDING_LINES.len() {
+        for brk in 0..OTHER_LINE_BREAKS.len() {
+            let path = format!("/rest/message:stream?case=hide-{kind}-{brk}");
+            let (received, unbroken) = stream_from_liar(&a, &path, &message).await;
+            // Only what was checked comes through: a keepalive for the event
+            // without data, then the safe event.
+            assert_eq!(received, format!(":\n\n{safe}"), "{path}");
+            assert!(unbroken, "{path}");
+        }
+    }
+    // The same on the JSON-RPC binding, its streaming call told by its
+    // method.
+    let call = rpc_request("SendStreamingMessage", message.clone());
+    let (received, unbroken) = stream_from_liar(&a, "/jsonrpc", &call).await;
+    let safe =
+        sse_event(&json!({"jsonrpc": "2.0", "id": 1, "result": {"task": task_named("t-1")}}));
+    assert_eq!(received, format!(":\n\n{safe}"));
+    assert!(unbroken);
+}
+
+#[tokio::test]
+async fn unary_answers_labelled_as_event_streams_are_read_whole() {
+    let (a, _liar) = liar().await;
+    let gw = a.gateway_url();
+    let version = [("a2a-version", "1.0")];
+    let message = message_params("hola", None);
+    let bound = Duration::from_secs(120);
+    let refused = json!({"error": "peer protocol error"});
+    for (method, path, body) in [
+        (
+            "POST",
+            "/peers/liar/rest/message:send".to_owned(),
+            Some(message.clone()),
+        ),
+        ("GET", "/peers/liar/rest/tasks/as-stream".to_owned(), None),
+        (
+            "POST",
+            "/peers/liar/jsonrpc".to_owned(),
+            Some(rpc_request("SendMessage", message.clone())),
+        ),
+        (
+            "POST",
+            "/peers/liar/rest/message:send?case=endless".to_owned(),
+            Some(message.clone()),
+        ),
+        ("GET", "/peers/liar/rest/tasks/endless".to_owned(), None),
+    ] {
+        let res = tokio::time::timeout(
+            bound,
+            gateway_request(&gw, method, &path, &version, body.as_ref()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{path}: no answer within {bound:?}"));
+        assert_eq!(
+            res.status,
+            502,
+            "{path}: {}",
+            String::from_utf8_lossy(&res.body)
+        );
+        assert_eq!(res.json, refused, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn task_ids_are_checked_in_every_spelling_and_every_object() {
+    let (a, _liar) = liar().await;
+    let gw = a.gateway_url();
+    let version = [("a2a-version", "1.0")];
+    for task in ["bare", "snake", "referenced"] {
+        let path = format!("/peers/liar/rest/tasks/{task}");
+        let res = gateway_request(&gw, "GET", &path, &version, None).await;
+        assert_eq!(
+            res.status,
+            502,
+            "{task}: {}",
+            String::from_utf8_lossy(&res.body)
+        );
+        assert!(
+            !String::from_utf8_lossy(&res.body).contains("../"),
+            "{task}"
+        );
+    }
+    // Free-form data and metadata are no ids: they pass.
+    let res = gateway_request(
+        &gw,
+        "GET",
+        "/peers/liar/rest/tasks/free-form",
+        &version,
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", String::from_utf8_lossy(&res.body));
+
+    let message = message_params("hola", None);
+    let safe = sse_event(&json!({"task": task_named("t-1")}));
+    for case in ["snake-update", "bare-task"] {
+        let path = format!("/rest/message:stream?case={case}");
+        let (received, unbroken) = stream_from_liar(&a, &path, &message).await;
+        assert_eq!(received, safe, "{case}");
+        assert!(!unbroken, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn answers_are_reencoded_as_ascii_json_with_their_content_intact() {
+    let (a, _liar) = liar().await;
+    let gw = a.gateway_url();
+    let text = "ñandú 😀 \u{2028}\u{85}";
+    let res = gateway_request(
+        &gw,
+        "GET",
+        "/peers/liar/rest/tasks/unicode",
+        &[("a2a-version", "1.0")],
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", String::from_utf8_lossy(&res.body));
+    assert!(
+        res.body.is_ascii(),
+        "{}",
+        String::from_utf8_lossy(&res.body)
+    );
+    assert_eq!(res.header("content-type"), "application/json");
+    assert_eq!(res.json["status"]["message"]["parts"][0]["text"], text);
+
+    let message = message_params("hola", None);
+    let (received, unbroken) =
+        stream_from_liar(&a, "/rest/message:stream?case=unicode", &message).await;
+    assert!(unbroken);
+    assert!(received.is_ascii(), "{received}");
+    let last = received
+        .trim_end()
+        .rsplit("\n\n")
+        .next()
+        .and_then(|event| event.strip_prefix("data: "))
+        .expect("a last event");
+    let event: Value = serde_json::from_str(last).unwrap();
+    assert_eq!(
+        event["artifactUpdate"]["artifact"]["parts"][0]["text"],
+        text
+    );
+}
+
 #[tokio::test]
 async fn task_requests_present_a_task_grant_not_a_newer_blob_grant() {
     let a = spawn_node(WorkerCfg::Echo).await;
@@ -1371,7 +1681,7 @@ impl CliAgent {
         Store::open(&self.home.path().join("pals.db"), self.id()).unwrap()
     }
 
-    /// Starts `pals daemon` and waits until its gateway answers.
+    /// Starts `pals daemon` and waits until it says it serves.
     async fn start_daemon(&self) -> Daemon {
         self.start_daemon_logging(None).await
     }
@@ -1395,11 +1705,11 @@ impl CliAgent {
             .expect("start pals daemon");
         let mut daemon = Daemon { child, log };
         let deadline = Instant::now() + Duration::from_secs(30);
+        // Its own word that it serves, signals handled: something else may
+        // have taken the port that was free a moment ago.
+        let serving = format!("gateway at http://127.0.0.1:{}", self.port);
         loop {
-            if tokio::net::TcpStream::connect(("127.0.0.1", self.port))
-                .await
-                .is_ok()
-            {
+            if daemon.log_text().contains(&serving) {
                 return daemon;
             }
             if let Some(status) = daemon.child.try_wait().unwrap() {

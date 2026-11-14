@@ -41,27 +41,24 @@
 //! is [shared](BlobService::share) with the peer for [`BLOB_SHARE_TTL_S`]
 //! before the request leaves.
 //!
-//! A peer's response is checked before it reaches the client, which would
-//! otherwise read it whole and build its next URL from the task ids in it.
-//! A response with a `Content-Encoding` other than `identity` is refused.
-//! An event stream (`text/event-stream`, sent on with that type and no
-//! parameter) goes on event by event, an event ending at an empty line,
-//! lines ending with CRLF, LF or CR as SSE says; any other response, whatever
-//! its type, is read whole first. Either is bounded by [`MAX_REWRITE_BYTES`]:
-//! a body, or an event before its empty line, that grows past it is refused.
-//! The JSON in a body, or in the data of an event, must not name an unsafe
-//! task id ([`is_safe_task_id`]): neither in any `taskId` string nor as the
-//! `id` of a task (an object with `id`, `contextId` and `status`), since a
-//! client resolving `<gateway>/peers/<peer>/rest/tasks/<id>` with dot
-//! segments (`../../../<other>/rest/tasks/x`) would reach another peer with
-//! the grant the gateway holds for it. A successful (`2xx`) body must be
-//! empty or JSON (RFC 8259, UTF-8) and an event's data, when it has any,
-//! JSON: lenient parsers read more than that (`NaN`, UTF-16), and A2A
-//! answers with nothing else. Then the blob URLs in them become gateway ones
-//! ([`rewrite::to_gateway`]); nothing else changes. A body refused is
-//! `502 {"error":"peer protocol error"}`; a stream refused ends, broken,
-//! before the event at fault, which never reaches the client.
-//!
+//! A peer's response never reaches the client as the peer sent it
+//! ([`checks`]): whether the client expects one JSON document or an event
+//! stream comes from its own call, never from the peer's `Content-Type`; a
+//! response with a `Content-Encoding` other than `identity` is refused; a
+//! body is read whole, an event of a stream as it completes, either bounded
+//! by [`MAX_REWRITE_BYTES`] (a body, or an event before its empty line,
+//! that grows past it is refused); a successful body must be JSON, and an
+//! event's data, when it has any, too; no task id in them may be unsafe
+//! ([`is_safe_task_id`]), since a client resolving
+//! `<gateway>/peers/<peer>/rest/tasks/<id>` with dot segments
+//! (`../../../<other>/rest/tasks/x`) would reach another peer with the
+//! grant the gateway holds for it. What goes on is the gateway's own ASCII
+//! encoding of the JSON it checked, its blob URLs the gateway's
+//! ([`rewrite::to_gateway`]): a body typed `application/json`, an event as
+//! `data: <JSON>` or a bare keepalive. A body refused is `502
+//! {"error":"peer protocol error"}`; a stream refused ends, broken, before
+//! the event at fault, which never reaches the client.
+
 //! `POST /blobs` takes the body as it is, up to `limits.max_blob_bytes`
 //! (beyond, `413`), into the agent's store, and answers with the blob's
 //! gateway URL. `GET /blobs/{holder}/{hash}` serves the blob from the store
@@ -88,6 +85,7 @@
 //! peer sends at the gateway's origin: a sandboxed page has an opaque
 //! origin, and its requests carry `Origin: null`.
 
+mod checks;
 pub mod rewrite;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -123,8 +121,11 @@ use pals_core::store::{Contact, Store};
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
+use self::checks::{Call, EventFramer};
 use crate::a2a::auth::ASK_RESOURCE;
-use crate::a2a::{gateway_view, is_safe_task_id};
+use crate::a2a::gateway_view;
+#[cfg(doc)]
+use crate::a2a::is_safe_task_id;
 use crate::blobs::{BLOB_META_KEY, BLOB_SHARE_TTL_S, BlobError, BlobRef, BlobService, parse_hash};
 use crate::config::LimitsCfg;
 use crate::net::{PeerHttp, TunnelError, peer_addr};
@@ -152,10 +153,12 @@ const PEER_COOKIES: [&str; 2] = ["set-cookie", "set-cookie2"];
 /// The largest response body, or event of a stream, the gateway takes from
 /// a peer.
 const MAX_REWRITE_BYTES: usize = 16 * 1024 * 1024;
-/// The member that names a task, in A2A messages and events.
-const TASK_ID: &str = "taskId";
 /// The type of an event stream.
 const EVENT_STREAM: &str = "text/event-stream";
+/// The type of JSON.
+const JSON: &str = "application/json";
+/// The type of A2A's JSON, which a peer may answer with.
+const A2A_JSON: &str = "application/a2a+json";
 /// The type of every blob the gateway serves, whatever its content.
 const OCTET_STREAM: &str = "application/octet-stream";
 
@@ -625,7 +628,7 @@ async fn forward_jsonrpc(
             Err(_) => return error(StatusCode::BAD_REQUEST, "invalid request target"),
         }
     }
-    forward(state, peer, request).await
+    forward(state, peer, request, Binding::JsonRpc).await
 }
 
 async fn forward_rest(
@@ -633,11 +636,23 @@ async fn forward_rest(
     Path((peer, _rest)): Path<(String, String)>,
     request: Request,
 ) -> Response {
-    forward(state, peer, request).await
+    forward(state, peer, request, Binding::Rest).await
+}
+
+/// The A2A binding a forwarded request speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Binding {
+    JsonRpc,
+    Rest,
 }
 
 /// Forwards `request`, for `/peers/<peer>/<rest>`, to `/<rest>` of `peer`.
-async fn forward(state: GatewayState, peer: String, request: Request) -> Response {
+async fn forward(
+    state: GatewayState,
+    peer: String,
+    request: Request,
+    binding: Binding,
+) -> Response {
     let Some(target_uri) = peer_target(request.uri()) else {
         return error(StatusCode::BAD_REQUEST, "invalid request target");
     };
@@ -662,9 +677,17 @@ async fn forward(state: GatewayState, peer: String, request: Request) -> Respons
             Err(failure) => return failure.into_response(),
         }
     }
-    let body = match state.outgoing_body(&target.id, &mut headers, body).await {
-        Ok(body) => body,
+    let (body, request_json) = match state.outgoing_body(&target.id, &mut headers, body).await {
+        Ok(outgoing) => outgoing,
         Err(refused) => return refused.into_response(),
+    };
+    // What the client expects, from its own call.
+    let call = match binding {
+        Binding::JsonRpc => Call::jsonrpc(request_json.as_ref()),
+        Binding::Rest => {
+            let path = target_uri.path();
+            Call::rest(&parts.method, path.strip_prefix("/rest").unwrap_or(path))
+        }
     };
     let mut outgoing = http::Request::builder()
         .method(parts.method)
@@ -685,7 +708,7 @@ async fn forward(state: GatewayState, peer: String, request: Request) -> Respons
             let (mut parts, body) = response.into_parts();
             parts.headers = incoming_headers(&parts.headers);
             match state
-                .incoming_body(parts.status, &mut parts.headers, body)
+                .incoming_body(call, parts.status, &mut parts.headers, body)
                 .await
             {
                 Ok(body) => Response::from_parts(parts, body),
@@ -699,14 +722,15 @@ async fn forward(state: GatewayState, peer: String, request: Request) -> Respons
 impl GatewayState {
     /// The body of a client's request as it goes to `peer`: its blob URLs as
     /// `iroh-blob://` ones, the file parts that name a blob of this agent's
-    /// declaring its hash and size, and those blobs shared with `peer`.
-    /// `headers` get the new `Content-Length`.
+    /// declaring its hash and size, and those blobs shared with `peer`; and
+    /// the request as JSON, when it is. `headers` get the new
+    /// `Content-Length`.
     async fn outgoing_body(
         &self,
         peer: &AgentId,
         headers: &mut HeaderMap,
         body: Body,
-    ) -> Result<Body, Refusal> {
+    ) -> Result<(Body, Option<Value>), Refusal> {
         let limit = self.inner.limits.max_body_bytes;
         let bytes = match Limited::new(body, limit).collect().await {
             Ok(collected) => collected.to_bytes(),
@@ -725,16 +749,16 @@ impl GatewayState {
         };
         // Not JSON: nothing of it is a file part.
         let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) else {
-            return Ok(Body::from(bytes));
+            return Ok((Body::from(bytes), None));
         };
         let rewritten = rewrite::rewrite_to_wire(&mut value, &self.base_url());
         let declared = self.declare_own_blobs(&mut value, peer).await?;
         if !rewritten && !declared {
-            return Ok(Body::from(bytes));
+            return Ok((Body::from(bytes), Some(value)));
         }
         let bytes = serde_json::to_vec(&value).expect("a JSON value serializes");
         headers.insert(CONTENT_LENGTH, HeaderValue::from(bytes.len()));
-        Ok(Body::from(bytes))
+        Ok((Body::from(bytes), Some(value)))
     }
 
     /// Gives every file part of `value` that names a blob of this agent's
@@ -780,11 +804,12 @@ impl GatewayState {
         Ok(!declared.is_empty())
     }
 
-    /// The body of a peer's response, of `status`, as it goes to the client,
-    /// checked and with its blob URLs as gateway ones, as the module says.
-    /// `headers` lose a `Content-Length` that no longer holds.
+    /// The body of a peer's response, of `status`, to `call`, as it goes to
+    /// the client: checked and re-encoded, as [`checks`] says. `headers` get
+    /// the type and length of what goes.
     async fn incoming_body(
         &self,
+        call: Call,
         status: StatusCode,
         headers: &mut HeaderMap,
         body: Body,
@@ -802,11 +827,10 @@ impl GatewayState {
             .and_then(|value| value.split(';').next())
             .map(|value| value.trim().to_ascii_lowercase())
             .unwrap_or_default();
-        if media_type == EVENT_STREAM {
+        if call == Call::Streaming && status.is_success() && media_type == EVENT_STREAM {
             headers.remove(CONTENT_LENGTH);
-            // A client decodes the events as UTF-8, as they are checked.
             headers.insert(CONTENT_TYPE, HeaderValue::from_static(EVENT_STREAM));
-            return Ok(rewrite_event_stream(body, self.base_url()));
+            return Ok(checked_event_stream(body, self.base_url()));
         }
         let bytes = Limited::new(body, MAX_REWRITE_BYTES)
             .collect()
@@ -820,41 +844,22 @@ impl GatewayState {
                     "a successful response that is not JSON".to_owned(),
                 ));
             }
-            // An error a client does not take task ids from, or nothing.
+            // An error a client takes no task id from, or nothing.
             Err(_) => return Ok(Body::from(bytes)),
         };
-        if let Some(task_id) = unsafe_task_id(&value) {
-            return Err(TunnelError::Protocol(format!(
-                "an unsafe task id {task_id:?}"
-            )));
+        if let Some(id) = checks::unsafe_id(&value) {
+            return Err(TunnelError::Protocol(format!("an unsafe id {id}")));
         }
-        if !rewrite::rewrite_to_gateway(&mut value, &self.base_url()) {
-            return Ok(Body::from(bytes));
-        }
-        let bytes = serde_json::to_vec(&value).expect("a JSON value serializes");
+        rewrite::rewrite_to_gateway(&mut value, &self.base_url());
+        let bytes = checks::ascii_json(&value);
+        let json_type = if media_type == A2A_JSON {
+            A2A_JSON
+        } else {
+            JSON
+        };
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static(json_type));
         headers.insert(CONTENT_LENGTH, HeaderValue::from(bytes.len()));
         Ok(Body::from(bytes))
-    }
-}
-
-/// The first task id in `value` that is not [safe](is_safe_task_id): a
-/// `taskId` string anywhere, or the `id` string of a task, an object with
-/// `id`, `contextId` and `status`.
-fn unsafe_task_id(value: &Value) -> Option<&str> {
-    match value {
-        Value::Object(object) => {
-            let named = object.get(TASK_ID).and_then(Value::as_str);
-            let task = (object.contains_key("contextId") && object.contains_key("status"))
-                .then(|| object.get("id").and_then(Value::as_str))
-                .flatten();
-            named
-                .into_iter()
-                .chain(task)
-                .find(|id| !is_safe_task_id(id))
-                .or_else(|| object.values().find_map(unsafe_task_id))
-        }
-        Value::Array(items) => items.iter().find_map(unsafe_task_id),
-        _ => None,
     }
 }
 
@@ -872,20 +877,14 @@ fn declare(part: &mut Map<String, Value>, blob: &BlobRef) {
 }
 
 /// `body`, an event stream, sent on event by event as each is complete,
-/// [checked and rewritten](check_event): the stream ends, broken, at the
-/// first event refused, before it, or once the event being received grows
-/// past [`MAX_REWRITE_BYTES`] before its empty line. An event the peer's
-/// stream ends in the middle of is checked as one.
-fn rewrite_event_stream(body: Body, base_url: String) -> Body {
+/// [checked and rebuilt](checks::check_event): the stream ends, broken, at
+/// the first event refused, before it, or once the event being received
+/// grows past [`MAX_REWRITE_BYTES`] before its empty line. An event the
+/// peer's stream ends in the middle of is checked as one.
+fn checked_event_stream(body: Body, base_url: String) -> Body {
     struct Events {
         body: BodyDataStream,
-        /// The bytes of the event being received, from its first line.
-        pending: Vec<u8>,
-        /// Where in `pending` the line to scan next starts.
-        line: usize,
-        /// Whether the stream's first bytes, and so a byte order mark, may
-        /// still come.
-        at_start: bool,
+        framer: EventFramer,
         /// Whether the peer's stream has ended.
         input_ended: bool,
         /// Whether this stream has ended, broken or not.
@@ -893,22 +892,28 @@ fn rewrite_event_stream(body: Body, base_url: String) -> Body {
         base_url: String,
     }
     impl Events {
+        /// `event`, checked and rebuilt, or the end of this stream.
+        async fn send(self, event: &[u8]) -> Option<(io::Result<Bytes>, Self)> {
+            match checks::check_event(event, &self.base_url) {
+                Ok(checked) => Some((Ok(checked), self)),
+                Err(why) => self.fail(why).await,
+            }
+        }
+
         /// Ends this stream, broken, because of `why`, once what it sent
         /// before has had its chance to be flushed: the server sends what it
         /// holds when the body is not ready, and drops it on an error.
         async fn fail(mut self, why: String) -> Option<(io::Result<Bytes>, Self)> {
             tracing::debug!(%why, "a peer's event stream was cut");
             self.done = true;
-            self.pending = Vec::new();
+            self.framer = EventFramer::new();
             tokio::task::yield_now().await;
             Some((Err(io::Error::other(why)), self))
         }
     }
     let events = Events {
         body: body.into_data_stream(),
-        pending: Vec::new(),
-        line: 0,
-        at_start: true,
+        framer: EventFramer::new(),
         input_ended: false,
         done: false,
         base_url,
@@ -918,146 +923,30 @@ fn rewrite_event_stream(body: Body, base_url: String) -> Body {
             if events.done {
                 return None;
             }
-            if events.at_start {
-                let bom = "\u{feff}".as_bytes();
-                if events.pending.len() < bom.len()
-                    && bom.starts_with(&events.pending)
-                    && !events.input_ended
-                {
-                    // It may be the start of one.
-                } else {
-                    // SSE ignores one byte order mark before the first event.
-                    if events.pending.starts_with(bom) {
-                        events.pending.drain(..bom.len());
-                    }
-                    events.at_start = false;
-                }
-            }
-            if !events.at_start
-                && let Some(end) = event_end(&events.pending, &mut events.line, events.input_ended)
-            {
-                let event: Vec<u8> = events.pending.drain(..end).collect();
-                events.line = 0;
-                return match check_event(&event, &events.base_url) {
-                    Ok(checked) => Some((Ok(checked), events)),
-                    Err(why) => events.fail(why).await,
-                };
+            if let Some(event) = events.framer.next_event(events.input_ended) {
+                return events.send(&event).await;
             }
             if events.input_ended {
-                events.done = true;
-                if events.pending.is_empty() {
-                    return None;
-                }
-                let tail = std::mem::take(&mut events.pending);
-                return match check_event(&tail, &events.base_url) {
-                    Ok(checked) => Some((Ok(checked), events)),
-                    Err(why) => events.fail(why).await,
-                };
+                let tail = events.framer.rest()?;
+                let sent = events.send(&tail).await;
+                return sent.map(|(item, mut events)| {
+                    events.done = true;
+                    (item, events)
+                });
             }
-            if events.pending.len() > MAX_REWRITE_BYTES {
+            if events.framer.held() > MAX_REWRITE_BYTES {
                 return events
                     .fail(format!("an event larger than {MAX_REWRITE_BYTES} bytes"))
                     .await;
             }
             match events.body.next().await {
-                Some(Ok(chunk)) => events.pending.extend_from_slice(&chunk),
+                Some(Ok(chunk)) => events.framer.push(&chunk),
                 Some(Err(err)) => return events.fail(format!("the stream broke: {err}")).await,
                 None => events.input_ended = true,
             }
         }
     });
     Body::from_stream(stream)
-}
-
-/// Where the event that starts `pending` ends: just after the empty line
-/// that closes it. Scans the lines from `line`, and leaves `line` where to
-/// go on when the event is not complete yet (`None`). A line ends with
-/// CRLF, LF or CR; a CR at the end of what came so far may be the start of
-/// a CRLF, unless the stream has ended.
-fn event_end(pending: &[u8], line: &mut usize, input_ended: bool) -> Option<usize> {
-    loop {
-        let start = *line;
-        let at = start
-            + pending[start..]
-                .iter()
-                .position(|&b| b == b'\r' || b == b'\n')?;
-        let after = match (pending[at], pending.get(at + 1)) {
-            (b'\r', Some(b'\n')) => at + 2,
-            (b'\r', None) if !input_ended => return None,
-            _ => at + 1,
-        };
-        *line = after;
-        if at == start {
-            return Some(after);
-        }
-    }
-}
-
-/// The lines of `text`, each with its ending (CRLF, LF, CR, or none for the
-/// last).
-fn sse_lines(text: &str) -> Vec<(&str, &str)> {
-    let mut lines = Vec::new();
-    let mut rest = text;
-    while !rest.is_empty() {
-        let Some(at) = rest.find(['\r', '\n']) else {
-            lines.push((rest, ""));
-            break;
-        };
-        let ending = if rest[at..].starts_with("\r\n") { 2 } else { 1 };
-        lines.push((&rest[..at], &rest[at..at + ending]));
-        rest = &rest[at + ending..];
-    }
-    lines
-}
-
-/// The value of `line` when it is a `data` field, as SSE reads it: after
-/// `data:`, less one space; `""` for a bare `data`.
-fn sse_data(line: &str) -> Option<&str> {
-    match line.split_once(':') {
-        Some(("data", value)) => Some(value.strip_prefix(' ').unwrap_or(value)),
-        None if line == "data" => Some(""),
-        _ => None,
-    }
-}
-
-/// `event`, the bytes of one event and its empty line, as it goes to the
-/// client: refused unless it is UTF-8 and its data, its `data` lines joined
-/// with LF as SSE joins them, is JSON that names no unsafe task id (see
-/// [`unsafe_task_id`]) or there is no data; the same bytes when no blob URL
-/// changes, else with its data on one `data:` line where the first was.
-fn check_event(event: &[u8], base_url: &str) -> Result<Bytes, String> {
-    let text = std::str::from_utf8(event).map_err(|_| "an event that is not UTF-8".to_owned())?;
-    let lines = sse_lines(text);
-    let data: Vec<&str> = lines
-        .iter()
-        .filter_map(|(line, _)| sse_data(line))
-        .collect();
-    if data.is_empty() {
-        return Ok(Bytes::copy_from_slice(event));
-    }
-    let mut value = serde_json::from_str::<Value>(&data.join("\n"))
-        .map_err(|_| "an event whose data is not JSON".to_owned())?;
-    if let Some(task_id) = unsafe_task_id(&value) {
-        return Err(format!("an event with an unsafe task id {task_id:?}"));
-    }
-    if !rewrite::rewrite_to_gateway(&mut value, base_url) {
-        return Ok(Bytes::copy_from_slice(event));
-    }
-    let json = serde_json::to_string(&value).expect("a JSON value serializes");
-    let mut out = String::with_capacity(event.len());
-    let mut data_written = false;
-    for (line, ending) in lines {
-        if sse_data(line).is_none() {
-            out.push_str(line);
-            out.push_str(ending);
-        } else if !data_written {
-            out.push_str("data: ");
-            out.push_str(&json);
-            out.push_str(if ending.is_empty() { "\n" } else { ending });
-            data_written = true;
-        }
-    }
-    Ok(Bytes::from(out))
 }
 
 /// Stores the request's body as a blob, up to `limits.max_blob_bytes`, as it
@@ -1456,81 +1345,26 @@ mod tests {
     }
 
     #[test]
-    fn events_rewrite_only_json_data_that_names_a_blob() {
+    fn events_go_on_with_their_blob_urls_the_gateways() {
         let base = "http://127.0.0.1:7420";
         let (wire, local) = blob_urls(base);
         let event = |url: &str| json!({"result": {"artifact": {"parts": [{"url": url}]}}});
-        // Rewritten, the rest of the event as it was.
         let sent = format!("event: message\r\nid: 7\r\ndata:{}\r\n\r\n", event(&wire));
-        let checked = check_event(sent.as_bytes(), base).unwrap();
+        let checked = checks::check_event(sent.as_bytes(), base).unwrap();
         assert_eq!(
             String::from_utf8(checked.to_vec()).unwrap(),
-            format!("event: message\r\nid: 7\r\ndata: {}\r\n\r\n", event(&local))
+            format!("data: {}\n\n", event(&local))
         );
-        // Data over two lines is one document, and goes on in one line.
-        let sent = format!(
-            "data: {{\"result\":\ndata: {}}}\n: comment {wire}\n\n",
-            event(&wire)["result"]
-        );
-        let checked = check_event(sent.as_bytes(), base).unwrap();
+        // A text that mentions a blob URL is no file part: it stays.
+        let text = json!({"result": {"text": wire}});
+        let checked = checks::check_event(format!("data: {text}\n\n").as_bytes(), base).unwrap();
         assert_eq!(
             String::from_utf8(checked.to_vec()).unwrap(),
-            format!("data: {}\n: comment {wire}\n\n", event(&local))
+            format!("data: {text}\n\n")
         );
-        // Nothing to rewrite, or no data: the same bytes.
-        for same in [
-            format!("data: {}\n\n", json!({"result": {"text": wire}})),
-            ":\n\n".to_owned(),
-            format!(": a comment naming {wire}\nid: 3\n\n"),
-        ] {
-            let checked = check_event(same.as_bytes(), base).unwrap();
-            assert_eq!(checked.as_ref(), same.as_bytes());
-        }
     }
 
-    #[test]
-    fn events_that_name_an_unsafe_task_id_or_are_not_json_are_refused() {
-        let base = "http://127.0.0.1:7420";
-        let climbing = "../../../other/rest/tasks/x";
-        let task = |id: &str| json!({"id": id, "contextId": "c", "status": {}});
-        for refused in [
-            format!("data: {}\n\n", json!({"task": task(climbing)})),
-            format!("data: {}\n\n", json!({"result": {"task": task(climbing)}})),
-            format!(
-                "data: {}\n\n",
-                json!({"statusUpdate": {"taskId": climbing, "contextId": "c", "status": {}}})
-            ),
-            format!(
-                "data: {}\n\n",
-                json!({"result": {"message": {"messageId": "m", "taskId": climbing}}})
-            ),
-            // Split over two data lines.
-            format!(
-                "data: {{\"task\":\ndata: {}}}\n\n",
-                json!({"id": climbing, "contextId": "c", "status": {}})
-            ),
-            // Data a lenient parser reads, and data that is no JSON at all.
-            format!("data: {}\n\n", r#"{"task": {"id": "t", "n": NaN}}"#),
-            "data: not json\n\n".to_owned(),
-        ] {
-            assert!(check_event(refused.as_bytes(), base).is_err(), "{refused}");
-        }
-        assert!(check_event(b"data: \xff\n\n", base).is_err());
-        // An id that is safe, a task id that is not a string, and an `id`
-        // of something that is not a task pass.
-        for passed in [
-            format!("data: {}\n\n", json!({"task": task("t-1")})),
-            format!(
-                "data: {}\n\n",
-                json!({"jsonrpc": "2.0", "id": "../x", "result": {}})
-            ),
-            format!("data: {}\n\n", json!({"message": {"taskId": null}})),
-        ] {
-            assert!(check_event(passed.as_bytes(), base).is_ok(), "{passed}");
-        }
-    }
-
-    /// What `rewrite_event_stream` sends of `chunks`: the bytes, and whether
+    /// What `checked_event_stream` sends of `chunks`: the bytes, and whether
     /// it ended unbroken.
     async fn stream_through(chunks: Vec<Vec<u8>>) -> (Vec<u8>, bool) {
         let chunks: Vec<Result<Bytes, io::Error>> = chunks
@@ -1539,7 +1373,7 @@ mod tests {
             .collect();
         let body = Body::from_stream(futures::stream::iter(chunks));
         let mut stream =
-            rewrite_event_stream(body, "http://127.0.0.1:7420".to_owned()).into_data_stream();
+            checked_event_stream(body, "http://127.0.0.1:7420".to_owned()).into_data_stream();
         let mut received = Vec::new();
         while let Some(chunk) = stream.next().await {
             match chunk {
@@ -1563,13 +1397,14 @@ mod tests {
         let expected = format!("{}{}", event(&local), event("https://example.com/x"));
         assert_eq!(String::from_utf8(received).unwrap(), expected);
 
-        // A last event without its end comes through too, checked.
+        // A last event without its end comes through too, checked and
+        // completed.
         let tail = format!("data: {}", json!({"url": wire}));
         let (received, unbroken) = stream_through(vec![tail.into_bytes()]).await;
         assert!(unbroken);
         assert_eq!(
             String::from_utf8(received).unwrap(),
-            format!("data: {}\n", json!({"url": local}))
+            format!("data: {}\n\n", json!({"url": local}))
         );
         let (received, unbroken) =
             stream_through(vec![b"data: {\"taskId\": \"../x\"}".to_vec()]).await;
@@ -1579,15 +1414,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_stream_ends_before_the_first_event_refused() {
-        let safe = format!(
-            "data: {}\n\n",
-            json!({"task": {"id": "t-1", "contextId": "c", "status": {}}})
-        );
+        let task = |id: &str| json!({"task": {"id": id, "contextId": "c", "status": {}}});
+        let safe = format!("data: {}\n\n", task("t-1"));
         let unsafe_event = json!({"statusUpdate": {"taskId": "../x", "contextId": "c"}});
-        let after = format!(
-            "data: {}\n\n",
-            json!({"task": {"id": "t-2", "contextId": "c", "status": {}}})
-        );
+        let after = format!("data: {}\n\n", task("t-2"));
         // Lines ended with LF, CRLF, or CR alone, as SSE allows.
         for ending in ["\n", "\r\n", "\r"] {
             let lines = |text: &str| text.replace('\n', ending);
@@ -1601,11 +1431,7 @@ mod tests {
             let chunks = sent.as_bytes().chunks(5).map(<[u8]>::to_vec).collect();
             let (received, unbroken) = stream_through(chunks).await;
             assert!(!unbroken, "{ending:?}");
-            assert_eq!(
-                String::from_utf8(received).unwrap(),
-                lines(&safe),
-                "{ending:?}"
-            );
+            assert_eq!(String::from_utf8(received).unwrap(), safe, "{ending:?}");
         }
         // A byte order mark at the start does not hide the first event.
         let sent = format!("\u{feff}data: {unsafe_event}\n\n");

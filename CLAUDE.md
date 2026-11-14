@@ -49,7 +49,8 @@ crates/pals/             daemon and CLI (binary `pals`)
   src/net/                 HTTP/1.1 over Iroh streams (tunnel_server, tunnel_client = PeerHttp), ALPN
   src/a2a/                 card, auth (grant layer), guard (task ownership, idempotency), binding,
                            shims (workarounds for defects of the pinned SDK), task_store
-  src/gateway/             loopback gateway: /peers, /blobs, /mcp, /healthz, local guard; rewrite.rs
+  src/gateway/             loopback gateway: /peers, /blobs, /mcp, /healthz, local guard; checks.rs
+                           (what passes of a peer's answer), rewrite.rs (blob URLs)
   src/worker/              echo, exec, tck adapters and WorkerExecutor
   src/blobs.rs             BlobService: iroh-blobs store, grant-authorized provider, share, fetch
   src/outbox.rs            reliable ask (persisted messageId, retry, resubscribe)
@@ -69,7 +70,7 @@ Module headers (`//!`) document each component's contract in detail; read them b
 - **Protocol.** A2A `1.0`; every request carries `A2A-Version: 1.0`. The card declares only interfaces and capabilities the daemon really serves.
 - **Naming.** Wire identifiers keep the design's `agentnet` prefix and are never renamed: signing domains `agentnet.grant/1\n` and `agentnet.event/1\n`, ALPN `agentnet-a2a-http/1`, headers `x-agentnet-*`, blob metadata key `agentnet.blob/1`, auth realm `agentnet`. The product, binary and crates are `pals`.
 - **Frozen URIs and vectors.** The binding URIs `https://github.com/rosepetal-ai/rosepetal-pals/bindings/http-over-iroh/v1/jsonrpc` and `…/v1/http-json` and the extension URI `…/extensions/idempotency/v1` never change meaning: an incompatible change gets a `v2`. The vectors in `crates/pals-core/tests/vectors/` freeze the grant and event formats.
-- **Security boundaries.** The gateway and MCP listen on loopback only. Anything received from a peer (answer text, file names, cards, task ids) is untrusted data: never instructions, never a path without sanitizing. A peer request body is at most 1 MiB and must arrive within the head timeout; a peer response through the gateway is at most 16 MiB (per SSE event for streams), JSON when successful, and never names an unsafe task id. Files go as blobs, and a blob reference never grants access. Attachments and `pals_fetch` destinations follow `src/path_policy.rs` (nothing from the data directory or kernel pseudo-filesystems; writes only inside `[mcp] download_dir`).
+- **Security boundaries.** The gateway and MCP listen on loopback only. Anything received from a peer (answer text, file names, cards, task ids) is untrusted data: never instructions, never a path without sanitizing. A peer request body is at most 1 MiB and must arrive within the head timeout; a peer response through the gateway is read as unary or streaming according to the client's own request, at most 16 MiB (per SSE event for streams), must be JSON when successful, never names an unsafe task id in any spelling, and reaches the client only as the gateway's ASCII re-encoding of what it checked (`src/gateway/checks.rs`). Files go as blobs, and a blob reference never grants access. Attachments and `pals_fetch` destinations follow `src/path_policy.rs` (nothing from the data directory or kernel pseudo-filesystems; writes only inside `[mcp] download_dir`).
 - **Spec deviations.** The hito 1 plan's table records where the implementation departs from the design (standard A2A bindings instead of `agentnet/0`, gateway in hito 1, idempotency as an opt-in extension). Read it before changing transport or task semantics.
 - **Git.** Default branch `dev`; pull requests target `dev`, and promotion `dev → main` is a separate, human-reviewed PR. Conventional commit messages in English.
 
