@@ -14,9 +14,11 @@ Extensión opcional de A2A (§4.6) con la que un cliente pide que reenviar un me
 
 El cliente la activa en cada petición con el parámetro de servicio estándar `A2A-Extensions` (A2A §3.2.6), que en los bindings HTTP es la cabecera del mismo nombre: una lista de URI separadas por comas que incluya la de la extensión. El gateway local la reenvía sin cambios.
 
-La respuesta a una petición que la activa lleva a su vez la cabecera `A2A-Extensions` con la URI de la extensión, como A2A recomienda para las extensiones activadas: es la prueba, petición a petición, de que el agente aplicó la deduplicación. Sin esa cabecera en la respuesta, el cliente no debe suponer que un reintento es seguro. El gateway devuelve la cabecera sin cambios.
+La respuesta a una petición que la activa lleva a su vez la cabecera `A2A-Extensions` con la URI de la extensión, como A2A recomienda para las extensiones activadas. Esa cabecera solo dice que el cliente pidió la extensión en una petición que el servidor A2A de este agente atendió. No prueba, petición a petición, que se aplicara la deduplicación: el agente la devuelve en la respuesta de cualquier operación que la pida, también en `GetTask`, `ListTasks`, `CancelTask` y `SubscribeToTask`, donde la extensión no cambia nada, y en errores del servidor A2A. No la llevan las respuestas que la capa de autenticación o de versión da antes de llegar a él (`401`, `403`, la versión no soportada en HTTP+JSON). El gateway devuelve la cabecera sin cambios.
 
-El cliente de PALS (`pals ask`, `pals task resume` y las herramientas MCP) la activa siempre: sus reintentos dependen de ella.
+Que reenviar un mensaje sea seguro depende de otras dos cosas: que la card del agente declare la extensión, y que el cliente la active en **todos** los intentos con el mismo `messageId`, el primero incluido. Un primer intento sin la extensión no deja nada que un reintento con ella pueda encontrar, y lo ejecutaría otra vez.
+
+El cliente de PALS (`pals ask`, `pals task resume` y las herramientas MCP) la activa en todos sus intentos: sus reintentos dependen de ella.
 
 ## Semántica
 
