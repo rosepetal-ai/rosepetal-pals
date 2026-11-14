@@ -1244,7 +1244,7 @@ const HIDING_LINES: [&str; 4] = [": hi", "event: x", "id: 7", "foo: bar"];
 /// answer naming a task id that climbs to another peer.
 fn lying_app() -> axum::Router {
     use axum::extract::Request;
-    use axum::routing::{any, get, post};
+    use axum::routing::{any, post};
     let climbing = "../../../0000/rest/tasks/x";
     let query = |request: &Request| -> String {
         request
@@ -1275,6 +1275,9 @@ fn lying_app() -> axum::Router {
                 "snake-update" => json!({"statusUpdate": {"task_id": climbing,
                     "context_id": "c-1", "status": {"state": "TASK_STATE_WORKING"}}}),
                 "bare-task" => json!({"task": {"id": climbing}}),
+                // A JSON-RPC envelope's id means nothing on HTTP+JSON.
+                "enveloped" => json!({"jsonrpc": "2.0", "id": climbing,
+                    "result": {"task": task_named("t-1")}}),
                 "unicode" => json!({"artifactUpdate": {"taskId": "t-1", "contextId": "c-1",
                     "artifact": {"artifactId": "a-1", "parts": [{"text": "ñandú 😀 \u{2028}\u{85}"}]}}}),
                 other => panic!("no case {other}"),
@@ -1300,7 +1303,17 @@ fn lying_app() -> axum::Router {
         )
         .route(
             "/rest/tasks/{id}",
-            get(move |axum::extract::Path(id): axum::extract::Path<String>| async move {
+            // CancelTask, answered with a task that wears a JSON-RPC
+            // member.
+            post(move || async move {
+                answer(
+                    "application/json",
+                    json!({"jsonrpc": "2.0", "id": climbing, "contextId": "c-1",
+                        "status": {"state": "TASK_STATE_CANCELED"}})
+                    .to_string(),
+                )
+            })
+            .get(move |axum::extract::Path(id): axum::extract::Path<String>| async move {
                 match id.as_str() {
                     "endless" => answer("text/event-stream", endless_keepalives()),
                     "as-stream" => {
@@ -1309,6 +1322,12 @@ fn lying_app() -> axum::Router {
                     // A task with no contextId nor status, as a lenient
                     // parser takes it.
                     "bare" => answer("application/json", json!({"id": climbing}).to_string()),
+                    "enveloped" => answer(
+                        "application/json",
+                        json!({"jsonrpc": "2.0", "id": climbing, "contextId": "c-1",
+                            "status": {"state": "TASK_STATE_WORKING"}})
+                        .to_string(),
+                    ),
                     "snake" => answer(
                         "application/json",
                         json!({"id": climbing, "context_id": "c-1",
@@ -1466,9 +1485,15 @@ async fn task_ids_are_checked_in_every_spelling_and_every_object() {
     let (a, _liar) = liar().await;
     let gw = a.gateway_url();
     let version = [("a2a-version", "1.0")];
-    for task in ["bare", "snake", "referenced"] {
+    for (method, task) in [
+        ("GET", "bare"),
+        ("GET", "snake"),
+        ("GET", "referenced"),
+        ("GET", "enveloped"),
+        ("POST", "t-1:cancel"),
+    ] {
         let path = format!("/peers/liar/rest/tasks/{task}");
-        let res = gateway_request(&gw, "GET", &path, &version, None).await;
+        let res = gateway_request(&gw, method, &path, &version, None).await;
         assert_eq!(
             res.status,
             502,
@@ -1493,7 +1518,7 @@ async fn task_ids_are_checked_in_every_spelling_and_every_object() {
 
     let message = message_params("hola", None);
     let safe = sse_event(&json!({"task": task_named("t-1")}));
-    for case in ["snake-update", "bare-task"] {
+    for case in ["snake-update", "bare-task", "enveloped"] {
         let path = format!("/rest/message:stream?case={case}");
         let (received, unbroken) = stream_from_liar(&a, &path, &message).await;
         assert_eq!(received, safe, "{case}");

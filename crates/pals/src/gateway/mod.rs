@@ -121,7 +121,7 @@ use pals_core::store::{Contact, Store};
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
-use self::checks::{Call, EventFramer};
+use self::checks::{Binding, Call, EventFramer};
 use crate::a2a::auth::ASK_RESOURCE;
 use crate::a2a::gateway_view;
 #[cfg(doc)]
@@ -645,13 +645,6 @@ async fn forward_rest(
     forward(state, peer, request, Binding::Rest).await
 }
 
-/// The A2A binding a forwarded request speaks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Binding {
-    JsonRpc,
-    Rest,
-}
-
 /// Forwards `request`, for `/peers/<peer>/<rest>`, to `/<rest>` of `peer`.
 async fn forward(
     state: GatewayState,
@@ -714,7 +707,7 @@ async fn forward(
             let (mut parts, body) = response.into_parts();
             parts.headers = incoming_headers(&parts.headers);
             match state
-                .incoming_body(call, parts.status, &mut parts.headers, body)
+                .incoming_body(binding, call, parts.status, &mut parts.headers, body)
                 .await
             {
                 Ok(body) => Response::from_parts(parts, body),
@@ -810,11 +803,12 @@ impl GatewayState {
         Ok(!declared.is_empty())
     }
 
-    /// The body of a peer's response, of `status`, to `call`, as it goes to
-    /// the client: checked and re-encoded, as [`checks`] says. `headers` get
-    /// the type and length of what goes.
+    /// The body of a peer's response, of `status`, to `call` on `binding`,
+    /// as it goes to the client: checked and re-encoded, as [`checks`] says.
+    /// `headers` get the type and length of what goes.
     async fn incoming_body(
         &self,
+        binding: Binding,
         call: Call,
         status: StatusCode,
         headers: &mut HeaderMap,
@@ -836,7 +830,7 @@ impl GatewayState {
         if call == Call::Streaming && status.is_success() && media_type == EVENT_STREAM {
             headers.remove(CONTENT_LENGTH);
             headers.insert(CONTENT_TYPE, HeaderValue::from_static(EVENT_STREAM));
-            return Ok(checked_event_stream(body, self.base_url()));
+            return Ok(checked_event_stream(body, self.base_url(), binding));
         }
         let bytes = Limited::new(body, MAX_REWRITE_BYTES)
             .collect()
@@ -853,7 +847,7 @@ impl GatewayState {
             // An error a client takes no task id from, or nothing.
             Err(_) => return Ok(Body::from(bytes)),
         };
-        if let Some(id) = checks::unsafe_id(&value) {
+        if let Some(id) = checks::unsafe_id(&value, binding) {
             return Err(TunnelError::Protocol(format!("an unsafe id {id}")));
         }
         rewrite::rewrite_to_gateway(&mut value, &self.base_url());
@@ -882,12 +876,14 @@ fn declare(part: &mut Map<String, Value>, blob: &BlobRef) {
     }
 }
 
-/// `body`, an event stream, sent on event by event as each is complete,
-/// [checked and rebuilt](checks::check_event): the stream ends, broken, at
-/// the first event refused, before it, or once the event being received
-/// grows past [`MAX_REWRITE_BYTES`] before its empty line. An event the
-/// peer's stream ends in the middle of is checked as one.
-fn checked_event_stream(body: Body, base_url: String) -> Body {
+/// `body`, an event stream on `binding`, sent on event by event as each is
+/// complete, [checked and rebuilt](checks::check_event): the stream ends,
+/// broken, at the first event refused, before it, or once the event being
+/// received grows past [`MAX_REWRITE_BYTES`] before its empty line. An
+/// event the peer's stream ends in the middle of, before its empty line,
+/// is no event: SSE discards it, and so does the gateway, ending the stream
+/// as the peer did.
+fn checked_event_stream(body: Body, base_url: String, binding: Binding) -> Body {
     struct Events {
         body: BodyDataStream,
         framer: EventFramer,
@@ -896,11 +892,12 @@ fn checked_event_stream(body: Body, base_url: String) -> Body {
         /// Whether this stream has ended, broken or not.
         done: bool,
         base_url: String,
+        binding: Binding,
     }
     impl Events {
         /// `event`, checked and rebuilt, or the end of this stream.
         async fn send(self, event: &[u8]) -> Option<(io::Result<Bytes>, Self)> {
-            match checks::check_event(event, &self.base_url) {
+            match checks::check_event(event, &self.base_url, self.binding) {
                 Ok(checked) => Some((Ok(checked), self)),
                 Err(why) => self.fail(why).await,
             }
@@ -923,6 +920,7 @@ fn checked_event_stream(body: Body, base_url: String) -> Body {
         input_ended: false,
         done: false,
         base_url,
+        binding,
     };
     let stream = futures::stream::unfold(events, |mut events| async move {
         loop {
@@ -933,12 +931,11 @@ fn checked_event_stream(body: Body, base_url: String) -> Body {
                 return events.send(&event).await;
             }
             if events.input_ended {
-                let tail = events.framer.rest()?;
-                let sent = events.send(&tail).await;
-                return sent.map(|(item, mut events)| {
-                    events.done = true;
-                    (item, events)
-                });
+                // Whatever is left is cut off: dropped, unchecked, unsent.
+                if let Some(cut) = events.framer.rest() {
+                    tracing::debug!(bytes = cut.len(), "dropped an event cut off by the peer");
+                }
+                return None;
             }
             if events.framer.held() > MAX_REWRITE_BYTES {
                 return events
@@ -1356,14 +1353,19 @@ mod tests {
         let (wire, local) = blob_urls(base);
         let event = |url: &str| json!({"result": {"artifact": {"parts": [{"url": url}]}}});
         let sent = format!("event: message\r\nid: 7\r\ndata:{}\r\n\r\n", event(&wire));
-        let checked = checks::check_event(sent.as_bytes(), base).unwrap();
+        let checked = checks::check_event(sent.as_bytes(), base, Binding::JsonRpc).unwrap();
         assert_eq!(
             String::from_utf8(checked.to_vec()).unwrap(),
             format!("data: {}\n\n", event(&local))
         );
         // A text that mentions a blob URL is no file part: it stays.
         let text = json!({"result": {"text": wire}});
-        let checked = checks::check_event(format!("data: {text}\n\n").as_bytes(), base).unwrap();
+        let checked = checks::check_event(
+            format!("data: {text}\n\n").as_bytes(),
+            base,
+            Binding::JsonRpc,
+        )
+        .unwrap();
         assert_eq!(
             String::from_utf8(checked.to_vec()).unwrap(),
             format!("data: {text}\n\n")
@@ -1379,7 +1381,8 @@ mod tests {
             .collect();
         let body = Body::from_stream(futures::stream::iter(chunks));
         let mut stream =
-            checked_event_stream(body, "http://127.0.0.1:7420".to_owned()).into_data_stream();
+            checked_event_stream(body, "http://127.0.0.1:7420".to_owned(), Binding::Rest)
+                .into_data_stream();
         let mut received = Vec::new();
         while let Some(chunk) = stream.next().await {
             match chunk {
@@ -1403,19 +1406,25 @@ mod tests {
         let expected = format!("{}{}", event(&local), event("https://example.com/x"));
         assert_eq!(String::from_utf8(received).unwrap(), expected);
 
-        // A last event without its end comes through too, checked and
-        // completed.
-        let tail = format!("data: {}", json!({"url": wire}));
-        let (received, unbroken) = stream_through(vec![tail.into_bytes()]).await;
-        assert!(unbroken);
-        assert_eq!(
-            String::from_utf8(received).unwrap(),
-            format!("data: {}\n\n", json!({"url": local}))
-        );
-        let (received, unbroken) =
-            stream_through(vec![b"data: {\"taskId\": \"../x\"}".to_vec()]).await;
-        assert!(!unbroken);
-        assert!(received.is_empty());
+        // A last event cut off before its empty line is no event: SSE
+        // discards it, and so does the gateway, safe or not, ending the
+        // stream as the peer did.
+        for (sent, kept) in [
+            (format!("data: {}", json!({"url": wire})), String::new()),
+            ("data: {\"taskId\": \"../x\"}".to_owned(), String::new()),
+            (
+                format!(
+                    "{}data: {}\n",
+                    event("https://example.com/x"),
+                    json!({"n": 1})
+                ),
+                event("https://example.com/x"),
+            ),
+        ] {
+            let (received, unbroken) = stream_through(vec![sent.clone().into_bytes()]).await;
+            assert!(unbroken, "{sent}");
+            assert_eq!(String::from_utf8(received).unwrap(), kept, "{sent}");
+        }
     }
 
     #[tokio::test]

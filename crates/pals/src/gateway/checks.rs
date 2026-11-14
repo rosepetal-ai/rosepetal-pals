@@ -44,7 +44,8 @@
 //! and comments are dropped: A2A carries everything in the data (the pinned
 //! SDK server names no events; its `id:` counters serve no resumption, and
 //! neither the TCK nor the Python SDK reads them). Data that is not JSON,
-//! or names an unsafe id, ends the stream.
+//! or names an unsafe id, ends the stream. An event the stream ends in the
+//! middle of, before its empty line, is dropped, as SSE drops it.
 //!
 //! **Ids.** In the checked JSON, every string under `taskId` or `task_id`,
 //! every element of `referenceTaskIds` or `reference_task_ids`, and the
@@ -52,8 +53,12 @@
 //! JSON parsers, the Python SDK's among them, take both spellings of a
 //! field, and a client takes any object in a task's place for a task, with
 //! or without `contextId` and `status`. A non-string `id` is refused too.
-//! Only the JSON-RPC envelope's own `id`, at the top of a document, is the
-//! client's, and passes. The objects of A2A v1.0 with an `id` are the
+//! Only the `id` of a JSON-RPC response envelope is the client's, and
+//! passes: on the JSON-RPC binding only, at the top of a document (or of
+//! each item of a batch), and only an object with `"jsonrpc": "2.0"` and a
+//! `result` or an `error`. On HTTP+JSON there is no envelope, and an object
+//! that wears a `jsonrpc` member is taken for what a client would take it:
+//! a task, whose `id` it checks. The objects of A2A v1.0 with an `id` are the
 //! task, the push notification configuration (not served: the card
 //! declares no push notifications) and the agent skill (only in an extended
 //! card, not served either); their ids are checked like a task's. Skipped,
@@ -75,6 +80,13 @@ use serde_json::Value;
 
 use super::rewrite;
 use crate::a2a::is_safe_task_id;
+
+/// The A2A binding a call speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Binding {
+    JsonRpc,
+    Rest,
+}
 
 /// What a client expects of a call: one JSON document, or an event stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,23 +140,33 @@ impl Call {
 /// The members whose values are free-form, and hold no id a client uses.
 const FREE_FORM: [&str; 3] = ["metadata", "data", "details"];
 
-/// The first id in `answer`, a JSON document a peer sent, that is not
-/// safe, as JSON: under `taskId` or `task_id`, in `referenceTaskIds` or
-/// `reference_task_ids`, or the `id` of any object but the JSON-RPC
-/// envelope at the top (of the document, or of each item of a batch);
+/// The first id in `answer`, a JSON document a peer sent on `binding`,
+/// that is not safe, as JSON: under `taskId` or `task_id`, in
+/// `referenceTaskIds` or `reference_task_ids`, or the `id` of any object
+/// but a JSON-RPC response envelope ([`is_response_envelope`]) at the top
+/// (of the document, or of each item of a batch) on the JSON-RPC binding;
 /// [`FREE_FORM`] members are not looked into.
-pub(crate) fn unsafe_id(answer: &Value) -> Option<String> {
+pub(crate) fn unsafe_id(answer: &Value, binding: Binding) -> Option<String> {
+    let jsonrpc = binding == Binding::JsonRpc;
     match answer {
-        Value::Array(items) => items.iter().find_map(|item| unsafe_id_in(item, true)),
-        other => unsafe_id_in(other, true),
+        Value::Array(items) => items.iter().find_map(|item| unsafe_id_in(item, jsonrpc)),
+        other => unsafe_id_in(other, jsonrpc),
     }
 }
 
-/// [`unsafe_id`] of `value`, at the top of a document when `top`.
-fn unsafe_id_in(value: &Value, top: bool) -> Option<String> {
+/// Whether `object` is a JSON-RPC 2.0 response: `"jsonrpc": "2.0"` and a
+/// `result` or an `error`.
+fn is_response_envelope(object: &serde_json::Map<String, Value>) -> bool {
+    object.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+        && (object.contains_key("result") || object.contains_key("error"))
+}
+
+/// [`unsafe_id`] of `value`; its own `id` may be an envelope's when
+/// `envelope_allowed`.
+fn unsafe_id_in(value: &Value, envelope_allowed: bool) -> Option<String> {
     match value {
         Value::Object(object) => {
-            let envelope = top && object.contains_key("jsonrpc");
+            let envelope = envelope_allowed && is_response_envelope(object);
             for (key, member) in object {
                 let refused = match key.as_str() {
                     free if FREE_FORM.contains(&free) => continue,
@@ -326,12 +348,12 @@ impl EventFramer {
     fn count(&mut self, _bytes: usize) {}
 }
 
-/// `event`, one event of a peer's stream, as it goes to the client:
-/// `data: <JSON>\n\n` with its data checked ([`unsafe_id`]), its blob URLs
-/// the gateway's and re-encoded ([`ascii_json`]), or [`KEEPALIVE`] when it
-/// has no data. Refused when it is not UTF-8, its data is not JSON, or the
-/// data names an unsafe id.
-pub(crate) fn check_event(event: &[u8], base_url: &str) -> Result<Bytes, String> {
+/// `event`, one event of a peer's stream on `binding`, as it goes to the
+/// client: `data: <JSON>\n\n` with its data checked ([`unsafe_id`]), its
+/// blob URLs the gateway's and re-encoded ([`ascii_json`]), or
+/// [`KEEPALIVE`] when it has no data. Refused when it is not UTF-8, its
+/// data is not JSON, or the data names an unsafe id.
+pub(crate) fn check_event(event: &[u8], base_url: &str, binding: Binding) -> Result<Bytes, String> {
     let text = std::str::from_utf8(event).map_err(|_| "an event that is not UTF-8".to_owned())?;
     let data: Vec<&str> = sse_lines(text).into_iter().filter_map(sse_data).collect();
     if data.is_empty() {
@@ -339,7 +361,7 @@ pub(crate) fn check_event(event: &[u8], base_url: &str) -> Result<Bytes, String>
     }
     let mut value = serde_json::from_str::<Value>(&data.join("\n"))
         .map_err(|_| "an event whose data is not JSON".to_owned())?;
-    if let Some(id) = unsafe_id(&value) {
+    if let Some(id) = unsafe_id(&value, binding) {
         return Err(format!("an event with an unsafe id {id}"));
     }
     rewrite::rewrite_to_gateway(&mut value, base_url);
@@ -451,23 +473,38 @@ mod tests {
             json!({"jsonrpc": "2.0", "id": 1, "result": {"id": "../y"}}),
             json!([{"jsonrpc": "2.0", "id": 1, "result": {"task_id": bad}}]),
             // An envelope only at the top.
-            json!({"result": {"jsonrpc": "2.0", "id": bad}}),
+            json!({"result": {"jsonrpc": "2.0", "id": bad, "result": {}}}),
+            // Not a response envelope: a task wearing a `jsonrpc` member.
+            json!({"jsonrpc": "2.0", "id": bad, "contextId": "c", "status": {}}),
+            json!({"jsonrpc": "1.0", "id": bad, "result": {}}),
         ];
-        for answer in refused {
-            assert!(unsafe_id(&answer).is_some(), "{answer}");
+        for binding in [Binding::JsonRpc, Binding::Rest] {
+            for answer in &refused {
+                assert!(unsafe_id(answer, binding).is_some(), "{binding:?} {answer}");
+            }
         }
         let passed = [
             json!({"task": {"id": "t-1", "contextId": "c", "status": {}}}),
-            json!({"jsonrpc": "2.0", "id": bad, "result": {"task": {"id": "t-1"}}}),
-            json!({"jsonrpc": "2.0", "id": null, "error": {"code": 1, "data": {"id": bad}}}),
             json!({"task": {"id": "t-1", "metadata": {"id": bad, "taskId": bad}}}),
             json!({"parts": [{"data": {"id": bad, "task_id": bad}}]}),
             json!({"error": {"details": [{"id": bad}]}}),
             json!({"message": {"taskId": null, "referenceTaskIds": null}}),
             json!({"message": {"messageId": "../m", "contextId": "../c"}}),
         ];
-        for answer in passed {
-            assert_eq!(unsafe_id(&answer), None, "{answer}");
+        for binding in [Binding::JsonRpc, Binding::Rest] {
+            for answer in &passed {
+                assert_eq!(unsafe_id(answer, binding), None, "{binding:?} {answer}");
+            }
+        }
+        // The client's own id, in a response envelope, on JSON-RPC only.
+        let envelopes = [
+            json!({"jsonrpc": "2.0", "id": bad, "result": {"task": {"id": "t-1"}}}),
+            json!({"jsonrpc": "2.0", "id": null, "error": {"code": 1, "data": {"id": bad}}}),
+            json!([{"jsonrpc": "2.0", "id": 3, "result": {}}]),
+        ];
+        for envelope in &envelopes {
+            assert_eq!(unsafe_id(envelope, Binding::JsonRpc), None, "{envelope}");
+            assert!(unsafe_id(envelope, Binding::Rest).is_some(), "{envelope}");
         }
     }
 
@@ -553,7 +590,7 @@ mod tests {
     #[test]
     fn events_go_on_rebuilt_from_their_checked_data() {
         let base = "http://127.0.0.1:7420";
-        let check = |event: &str| check_event(event.as_bytes(), base);
+        let check = |event: &str| check_event(event.as_bytes(), base, Binding::Rest);
         // Fields, comments and ids go; data, joined, stays.
         let rebuilt =
             check("event: x\r\nid: 7\r\n: c\r\ndata: {\"a\":\r\ndata: 1}\r\n\r\n").unwrap();
@@ -578,6 +615,6 @@ mod tests {
         ] {
             assert!(check(refused).is_err(), "{refused:?}");
         }
-        assert!(check_event(b"data: \xff\n\n", base).is_err());
+        assert!(check_event(b"data: \xff\n\n", base, Binding::Rest).is_err());
     }
 }
