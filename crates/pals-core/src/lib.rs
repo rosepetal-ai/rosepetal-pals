@@ -6,11 +6,12 @@
 //! Cards, [`signed`] the signed JSON documents of milestone 2, [`records`]
 //! the signed contact and announce records, [`inventory`] what the agent
 //! offers and with what (`agentnet.inventory/1`), who may see each part of
-//! it and the scopes grants give, [`store`] the local SQLite database
+//! it, the scopes grants give and the signed, paginated views each scope
+//! gets (`agentnet.inventory-view/1`), [`store`] the local SQLite database
 //! (contacts, grants, revocations, the A2A tasks the agent serves, the
 //! messages it has seen, the questions it asks, its own and its peers'
-//! records, and its peers' verified cards), and [`events`] the signed,
-//! hash-chained event log kept in it.
+//! records, its peers' verified cards and the revisions of its own views),
+//! and [`events`] the signed, hash-chained event log kept in it.
 
 pub mod card_jws;
 pub mod events;

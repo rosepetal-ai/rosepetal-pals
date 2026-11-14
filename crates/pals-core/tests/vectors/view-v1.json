@@ -1,0 +1,712 @@
+{
+  "agent_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+  "audience_key_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+  "canonical_hex": "7b226167656e745f636172645f68617368223a22626c616b65333a38353661636330363663373330346164626165396334343432303463313061306332653364313133343931666361363263316130366461373466656464346665222c226167656e745f6964223a2238613838653364643734303966313935666435326462326433636261356437326361363730396266316439343132316266333734383830316234306636663563222c2261756469656e6365223a2238313339373730656138376431373566353661333534363663333463376563636362386438613931623465653337613235646636306635623866633962333934222c22656e7472696573223a5b7b22626f6479223a7b226361706162696c6974696573223a5b22766973696f6e2e6f6372222c226578616d706c653a6f63722d6d6574616c225d2c22636f6d706f6e656e7473223a5b7b226964223a226578616d706c653a6f63722d6d6f64656c222c22726f6c65223a227265717569726564227d2c7b226964223a226578616d706c653a776f726b73746174696f6e222c22726f6c65223a227265717569726564227d2c7b226964223a226578616d706c653a766973696f6e2d7061636b222c22726f6c65223a226f7074696f6e616c227d5d2c22657374696d617465645f6475726174696f6e5f6d73223a343030302c22657374696d617465645f73746172745f64656c61795f6d73223a3530302c226578616d706c6573223a5b2252656164207468652073657269616c206e756d62657220696e20746869732070686f746f225d2c2265787465726e616c5f636c6f75645f75736564223a66616c73652c22696e7075745f6d6f646573223a5b22696d6167652f706e67222c22696d6167652f6a706567225d2c226c616e677561676573223a5b22656e222c226573225d2c226c696d69746174696f6e73223a5b22496d6167657320757020746f203230204d6942225d2c226e616d65223a22496e647573747269616c204f4352222c226f75747075745f6d6f646573223a5b226170706c69636174696f6e2f6a736f6e225d2c2270726f63657373696e675f726567696f6e223a224555222c2274616773223a5b226f6372222c226d6574616c225d7d2c226465736372697074696f6e223a2252656164732073657269616c206e756d62657273207374616d706564206f6e206d6574616c207061727473222c2264696d656e73696f6e73223a7b22617574686f72697a6564223a747275652c22696e7374616c6c6564223a747275652c226f666665726564223a747275657d2c226964223a226f63722d6d6574616c2d7631222c2270726f76656e616e6365223a226f70657261746f72222c2273656374696f6e223a227365727669636573227d2c7b22626f6479223a7b226361706162696c6974696573223a5b22636f64652e727573742e726576696577225d2c22636f6d706f6e656e7473223a5b7b226964223a226578616d706c653a7265706f2d726561646572222c22726f6c65223a227265717569726564227d2c7b226964223a2270726f6a6563743a7265706f2d636f6e74726f6c6c6572222c22726f6c65223a227265717569726564227d2c7b226964223a226578616d706c653a727573742d726576696577222c22726f6c65223a226f7074696f6e616c227d5d2c226e616d65223a225265706f7369746f727920726576696577227d2c226465736372697074696f6e223a2252657669657773207468652064656d6f207265706f7369746f727920616e642072756e7320697473207465737473222c2264696d656e73696f6e73223a7b22617574686f72697a6564223a747275652c22696e7374616c6c6564223a747275652c226f666665726564223a747275657d2c226964223a227265706f2d726576696577222c2270726f76656e616e6365223a226f70657261746f72222c2273656374696f6e223a227365727669636573227d2c7b22626f6479223a7b226e616d65223a225275737420726576696577222c226f6666657265645f666f72223a5b22636f646520726576696577222c22756e73616665206175646974225d2c227061636b6167655f6964223a226578616d706c652f727573742d726576696577227d2c226465736372697074696f6e223a2250726f63656475726520666f7220726576696577696e67205275737420636f646520666f7220736f756e646e65737320616e64207374796c65222c2264696d656e73696f6e73223a7b22617574686f72697a6564223a747275652c22696e7374616c6c6564223a747275652c226f666665726564223a747275657d2c226964223a226578616d706c653a727573742d726576696577222c2270726f76656e616e6365223a226f70657261746f72222c2273656374696f6e223a22736b696c6c73222c2276657273696f6e223a22312e322e30227d2c7b22626f6479223a7b22636f6d706f6e656e7473223a5b226f6372222c226465736b6577225d2c2272756e74696d65223a22636c617564652d636f6465227d2c226465736372697074696f6e223a22566973696f6e20746f6f6c7320666f7220696e647573747269616c20696e7370656374696f6e222c2264696d656e73696f6e73223a7b22617574686f72697a6564223a747275652c22696e7374616c6c6564223a747275652c226f666665726564223a747275657d2c226964223a226578616d706c653a766973696f6e2d7061636b222c2270726f76656e616e6365223a226f70657261746f72222c2273656374696f6e223a22706c7567696e73222c2276657273696f6e223a22302e342e31227d2c7b22626f6479223a7b227265736f7572636573223a5b227265706f3a2f2f64656d6f225d2c22736572766572223a22406d6f64656c636f6e7465787470726f746f636f6c2f7365727665722d66696c6573797374656d222c227365727665725f76657273696f6e223a22323032352e382e3231222c22746f6f6c73223a5b7b22616e6e6f746174696f6e73223a7b22726561644f6e6c7948696e74223a747275652c227469746c65223a22526561642066696c65227d2c226465736372697074696f6e223a22526561647320612066696c65206f6620746865207265706f7369746f7279222c226e616d65223a226578616d706c653a7265706f2d7265616465722f726561645f66696c65227d5d7d2c226465736372697074696f6e223a225265616473207468652070726f6a656374207265706f7369746f7279222c2264696d656e73696f6e73223a7b22617574686f72697a6564223a747275652c22696e7374616c6c6564223a747275652c226f666665726564223a747275652c226f7065726174696f6e616c223a7b22657870697265735f6174223a22323032362d31312d31345430303a33303a30305a222c226f627365727665645f6174223a22323032362d31312d31345430303a30303a30305a222c22736f75726365223a7b226b696e64223a2261646170746572222c226d6574686f64223a226d637020746f6f6c732f6c697374227d2c22737461747573223a226f6b227d7d2c226964223a226578616d706c653a7265706f2d726561646572222c2270726f76656e616e6365223a226f70657261746f72222c2273656374696f6e223a226d6370227d2c7b22626f6479223a7b226b696e64223a22636c617564652d636f6465222c226d6f646573223a5b227072696e74225d2c227265737472696374696f6e73223a5b226e6f206e6574776f726b20616363657373206f757473696465207468652070726f6a656374225d7d2c226465736372697074696f6e223a22436c6175646520436f646520696e207072696e74206d6f6465222c2264696d656e73696f6e73223a7b22617574686f72697a6564223a747275652c22696e7374616c6c6564223a747275652c226f666665726564223a747275657d2c226964223a226578616d706c653a636c617564652d636f6465222c2270726f76656e616e6365223a226f70657261746f72222c2273656374696f6e223a2272756e74696d65222c2276657273696f6e223a22322e302e30227d2c7b22626f6479223a7b22657865637574696f6e223a7b226b696e64223a226c6f63616c227d2c22696e666572656e63655f72756e74696d65223a226f6e6e7872756e74696d6520312e3230222c226d6f64616c6974696573223a5b22696d616765222c2274657874225d2c226d6f64656c5f6964223a226578616d706c652d6f63722d6d6574616c222c22707265636973696f6e223a22696e7438222c2270726f7669646572223a224578616d706c65222c227175616e74697a6174696f6e223a22696e7438222c227265766973696f6e223a22323032362d31302d3031222c22726f6c65223a226f666665726564227d2c226465736372697074696f6e223a224f4352206d6f64656c20666f72207374616d706564206d6574616c222c2264696d656e73696f6e73223a7b22617574686f72697a6564223a747275652c22696e7374616c6c6564223a747275652c226f666665726564223a747275657d2c226964223a226578616d706c653a6f63722d6d6f64656c222c2270726f76656e616e6365223a226f70657261746f72222c2273656374696f6e223a226d6f64656c73227d2c7b22626f6479223a7b22617070726f78696d6174655f766f6c756d65223a2234306b206c696e6573222c22636f766572616765223a226d61696e206272616e6368222c22646f6d61696e73223a5b22696e647573747269616c20636f6e74726f6c225d2c2265766964656e6365223a7b2268617368223a22626c616b65333a35623562356235623562356235623562356235623562356235623562356235623562356235623562356235623562356235623562356235623562356235623562222c227265666572656e6365223a2268747470733a2f2f6578616d706c652e6f72672f7265706f2d636f6e74726f6c6c65722f636f6d6d69742f61316232633364227d2c22657874656e73696f6e73223a7b226578616d706c653a726574656e74696f6e223a7b2264617973223a33307d7d2c22666f726d617473223a5b22746578742f782d72757374225d2c226c616e677561676573223a5b22656e225d2c226c696d697473223a5b226e6f206578706f7274206f662077686f6c652066696c6573225d2c226c697665223a747275652c226f7065726174696f6e73223a5b22616e737765725f776974685f736f7572636573222c22736561726368222c2270726f636573735f696e5f706c616365225d2c22736368656d615f726566223a2268747470733a2f2f6578616d706c652e6f72672f7265706f2d636f6e74726f6c6c65722f524541444d452e6d64222c22757064617465645f6174223a22323032362d31312d31345430303a30303a30305a227d2c226465736372697074696f6e223a2254686520636f6e74726f6c6c6572207265706f7369746f7279222c2264696d656e73696f6e73223a7b22617574686f72697a6564223a747275652c22696e7374616c6c6564223a747275652c226f666665726564223a747275657d2c22657870697265735f6174223a22323032362d31322d31345430303a30303a30305a222c226964223a2270726f6a6563743a7265706f2d636f6e74726f6c6c6572222c2270726f76656e616e6365223a226f70657261746f72222c2273656374696f6e223a22696e666f726d6174696f6e222c2276657273696f6e223a2261316232633364227d2c7b22626f6479223a7b22616363656c657261746f7273223a5b7b22636f756e74223a312c226b696e64223a22677075222c226d656d6f72795f6d69625f65616368223a32343537362c226d6f64656c223a224e5649444941205254582034303930227d5d2c226261736973223a226465636c61726564222c22637075223a7b2261726368223a227838365f3634222c22636f726573223a31362c226d6f64656c223a22414d442052797a656e2039203739353058227d2c226f666665726564223a7b22616363656c657261746f7273223a5b22677075225d2c22636f6e63757272656e6379223a322c226370755f636f726573223a342c2272616d5f6d6962223a383139322c227672616d5f6d69625f65616368223a383139327d2c2272616d5f6d6962223a36353533362c2273746f72616765223a7b2263617061636974795f676962223a323030302c226b696e64223a226e766d65227d7d2c226465736372697074696f6e223a22496e7370656374696f6e20776f726b73746174696f6e222c2264696d656e73696f6e73223a7b22617574686f72697a6564223a747275652c22696e7374616c6c6564223a747275652c226f666665726564223a747275657d2c226964223a226578616d706c653a776f726b73746174696f6e222c2270726f76656e616e6365223a226f70657261746f72222c2273656374696f6e223a226861726477617265227d2c7b22626f6479223a7b226469726563745f636f6e6e65637469766974795f6f62736572766564223a747275652c22726567696f6e223a224555222c227472616e73706f727473223a5b2269726f682d71756963225d7d2c226465736372697074696f6e223a224f66666963652075706c696e6b222c2264696d656e73696f6e73223a7b22617574686f72697a6564223a747275652c22696e7374616c6c6564223a747275652c226f666665726564223a747275657d2c226964223a226578616d706c653a75706c696e6b222c2270726f76656e616e6365223a226f70657261746f72222c2273656374696f6e223a226e6574776f726b227d5d2c22657870697265735f6174223a22323032362d31312d31345430303a30353a30305a222c226973737565645f6174223a22323032362d31312d31345430303a30303a30305a222c22736368656d61223a226167656e746e65742e696e76656e746f72792d766965772f31222c2273636f7065223a227461736b3a64656d6f222c2273656374696f6e73223a5b227365727669636573222c22736b696c6c73222c22706c7567696e73222c226d6370222c2272756e74696d65222c226d6f64656c73222c22696e666f726d6174696f6e222c226861726477617265222c226e6574776f726b225d2c22736571223a317d",
+  "description": "agentnet.inventory-view/1 test vector: the page of the inventory of inventory-v1.json that a requester holding a task.send grant on skill:ask for the project demo sees (scope task:demo), every section in one page, with the observation in observations that the adapter of example:repo-reader made. The agent's Ed25519 secret key is 32 bytes of 0x01 (signing_key_hex); agent_id is its public key in hex, the view's agent_id. The requester's secret key is 32 bytes of 0x02 (audience_key_hex); the view's audience is its public key. agent_card_hash is the hash of card-jws-v1.json. canonical_hex is JCS (RFC 8785) of view; signature is Ed25519 over \"agentnet.inventory-view/1\\n\" followed by those bytes, base64url without padding; signed is the signed page as it travels, whose JCS is the exact bytes: {\"view\": view, \"signature\": signature}. The view leaves out every visibility, the private model example:assistant and the repository review's link to it, whose other alternative, alone in its group, shows as optional; and the MCP connection's adapter, its offered_tools and the declared tool delete_file, which it does not offer. The offered tool read_file shows as example:repo-reader/read_file, as the adapter observed it, and the observation without its tool list.",
+  "observations": {
+    "example:repo-reader": {
+      "expires_at": "2026-11-14T00:30:00Z",
+      "observed_at": "2026-11-14T00:00:00Z",
+      "source": {
+        "kind": "adapter",
+        "method": "mcp tools/list"
+      },
+      "status": "ok",
+      "tools": [
+        {
+          "annotations": {
+            "readOnlyHint": true,
+            "title": "Read file"
+          },
+          "description": "Reads a file of the repository",
+          "name": "read_file"
+        }
+      ]
+    }
+  },
+  "signature": "qex82G23QQ7FJC-kxLmO_Pu3ArfEPVkNp5oyBCT6g3rsW4fCs-KpuB8wc7kgPnt-pyCO4J287e88bW9V_otPCA",
+  "signed": {
+    "signature": "qex82G23QQ7FJC-kxLmO_Pu3ArfEPVkNp5oyBCT6g3rsW4fCs-KpuB8wc7kgPnt-pyCO4J287e88bW9V_otPCA",
+    "view": {
+      "agent_card_hash": "blake3:856acc066c7304adbae9c444204c10a0c2e3d113491fca62c1a06da74fedd4fe",
+      "agent_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "audience": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+      "entries": [
+        {
+          "body": {
+            "capabilities": [
+              "vision.ocr",
+              "example:ocr-metal"
+            ],
+            "components": [
+              {
+                "id": "example:ocr-model",
+                "role": "required"
+              },
+              {
+                "id": "example:workstation",
+                "role": "required"
+              },
+              {
+                "id": "example:vision-pack",
+                "role": "optional"
+              }
+            ],
+            "estimated_duration_ms": 4000,
+            "estimated_start_delay_ms": 500,
+            "examples": [
+              "Read the serial number in this photo"
+            ],
+            "external_cloud_used": false,
+            "input_modes": [
+              "image/png",
+              "image/jpeg"
+            ],
+            "languages": [
+              "en",
+              "es"
+            ],
+            "limitations": [
+              "Images up to 20 MiB"
+            ],
+            "name": "Industrial OCR",
+            "output_modes": [
+              "application/json"
+            ],
+            "processing_region": "EU",
+            "tags": [
+              "ocr",
+              "metal"
+            ]
+          },
+          "description": "Reads serial numbers stamped on metal parts",
+          "dimensions": {
+            "authorized": true,
+            "installed": true,
+            "offered": true
+          },
+          "id": "ocr-metal-v1",
+          "provenance": "operator",
+          "section": "services"
+        },
+        {
+          "body": {
+            "capabilities": [
+              "code.rust.review"
+            ],
+            "components": [
+              {
+                "id": "example:repo-reader",
+                "role": "required"
+              },
+              {
+                "id": "project:repo-controller",
+                "role": "required"
+              },
+              {
+                "id": "example:rust-review",
+                "role": "optional"
+              }
+            ],
+            "name": "Repository review"
+          },
+          "description": "Reviews the demo repository and runs its tests",
+          "dimensions": {
+            "authorized": true,
+            "installed": true,
+            "offered": true
+          },
+          "id": "repo-review",
+          "provenance": "operator",
+          "section": "services"
+        },
+        {
+          "body": {
+            "name": "Rust review",
+            "offered_for": [
+              "code review",
+              "unsafe audit"
+            ],
+            "package_id": "example/rust-review"
+          },
+          "description": "Procedure for reviewing Rust code for soundness and style",
+          "dimensions": {
+            "authorized": true,
+            "installed": true,
+            "offered": true
+          },
+          "id": "example:rust-review",
+          "provenance": "operator",
+          "section": "skills",
+          "version": "1.2.0"
+        },
+        {
+          "body": {
+            "components": [
+              "ocr",
+              "deskew"
+            ],
+            "runtime": "claude-code"
+          },
+          "description": "Vision tools for industrial inspection",
+          "dimensions": {
+            "authorized": true,
+            "installed": true,
+            "offered": true
+          },
+          "id": "example:vision-pack",
+          "provenance": "operator",
+          "section": "plugins",
+          "version": "0.4.1"
+        },
+        {
+          "body": {
+            "resources": [
+              "repo://demo"
+            ],
+            "server": "@modelcontextprotocol/server-filesystem",
+            "server_version": "2025.8.21",
+            "tools": [
+              {
+                "annotations": {
+                  "readOnlyHint": true,
+                  "title": "Read file"
+                },
+                "description": "Reads a file of the repository",
+                "name": "example:repo-reader/read_file"
+              }
+            ]
+          },
+          "description": "Reads the project repository",
+          "dimensions": {
+            "authorized": true,
+            "installed": true,
+            "offered": true,
+            "operational": {
+              "expires_at": "2026-11-14T00:30:00Z",
+              "observed_at": "2026-11-14T00:00:00Z",
+              "source": {
+                "kind": "adapter",
+                "method": "mcp tools/list"
+              },
+              "status": "ok"
+            }
+          },
+          "id": "example:repo-reader",
+          "provenance": "operator",
+          "section": "mcp"
+        },
+        {
+          "body": {
+            "kind": "claude-code",
+            "modes": [
+              "print"
+            ],
+            "restrictions": [
+              "no network access outside the project"
+            ]
+          },
+          "description": "Claude Code in print mode",
+          "dimensions": {
+            "authorized": true,
+            "installed": true,
+            "offered": true
+          },
+          "id": "example:claude-code",
+          "provenance": "operator",
+          "section": "runtime",
+          "version": "2.0.0"
+        },
+        {
+          "body": {
+            "execution": {
+              "kind": "local"
+            },
+            "inference_runtime": "onnxruntime 1.20",
+            "modalities": [
+              "image",
+              "text"
+            ],
+            "model_id": "example-ocr-metal",
+            "precision": "int8",
+            "provider": "Example",
+            "quantization": "int8",
+            "revision": "2026-10-01",
+            "role": "offered"
+          },
+          "description": "OCR model for stamped metal",
+          "dimensions": {
+            "authorized": true,
+            "installed": true,
+            "offered": true
+          },
+          "id": "example:ocr-model",
+          "provenance": "operator",
+          "section": "models"
+        },
+        {
+          "body": {
+            "approximate_volume": "40k lines",
+            "coverage": "main branch",
+            "domains": [
+              "industrial control"
+            ],
+            "evidence": {
+              "hash": "blake3:5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b",
+              "reference": "https://example.org/repo-controller/commit/a1b2c3d"
+            },
+            "extensions": {
+              "example:retention": {
+                "days": 30
+              }
+            },
+            "formats": [
+              "text/x-rust"
+            ],
+            "languages": [
+              "en"
+            ],
+            "limits": [
+              "no export of whole files"
+            ],
+            "live": true,
+            "operations": [
+              "answer_with_sources",
+              "search",
+              "process_in_place"
+            ],
+            "schema_ref": "https://example.org/repo-controller/README.md",
+            "updated_at": "2026-11-14T00:00:00Z"
+          },
+          "description": "The controller repository",
+          "dimensions": {
+            "authorized": true,
+            "installed": true,
+            "offered": true
+          },
+          "expires_at": "2026-12-14T00:00:00Z",
+          "id": "project:repo-controller",
+          "provenance": "operator",
+          "section": "information",
+          "version": "a1b2c3d"
+        },
+        {
+          "body": {
+            "accelerators": [
+              {
+                "count": 1,
+                "kind": "gpu",
+                "memory_mib_each": 24576,
+                "model": "NVIDIA RTX 4090"
+              }
+            ],
+            "basis": "declared",
+            "cpu": {
+              "arch": "x86_64",
+              "cores": 16,
+              "model": "AMD Ryzen 9 7950X"
+            },
+            "offered": {
+              "accelerators": [
+                "gpu"
+              ],
+              "concurrency": 2,
+              "cpu_cores": 4,
+              "ram_mib": 8192,
+              "vram_mib_each": 8192
+            },
+            "ram_mib": 65536,
+            "storage": {
+              "capacity_gib": 2000,
+              "kind": "nvme"
+            }
+          },
+          "description": "Inspection workstation",
+          "dimensions": {
+            "authorized": true,
+            "installed": true,
+            "offered": true
+          },
+          "id": "example:workstation",
+          "provenance": "operator",
+          "section": "hardware"
+        },
+        {
+          "body": {
+            "direct_connectivity_observed": true,
+            "region": "EU",
+            "transports": [
+              "iroh-quic"
+            ]
+          },
+          "description": "Office uplink",
+          "dimensions": {
+            "authorized": true,
+            "installed": true,
+            "offered": true
+          },
+          "id": "example:uplink",
+          "provenance": "operator",
+          "section": "network"
+        }
+      ],
+      "expires_at": "2026-11-14T00:05:00Z",
+      "issued_at": "2026-11-14T00:00:00Z",
+      "schema": "agentnet.inventory-view/1",
+      "scope": "task:demo",
+      "sections": [
+        "services",
+        "skills",
+        "plugins",
+        "mcp",
+        "runtime",
+        "models",
+        "information",
+        "hardware",
+        "network"
+      ],
+      "seq": 1
+    }
+  },
+  "signing_key_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+  "view": {
+    "agent_card_hash": "blake3:856acc066c7304adbae9c444204c10a0c2e3d113491fca62c1a06da74fedd4fe",
+    "agent_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "audience": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+    "entries": [
+      {
+        "body": {
+          "capabilities": [
+            "vision.ocr",
+            "example:ocr-metal"
+          ],
+          "components": [
+            {
+              "id": "example:ocr-model",
+              "role": "required"
+            },
+            {
+              "id": "example:workstation",
+              "role": "required"
+            },
+            {
+              "id": "example:vision-pack",
+              "role": "optional"
+            }
+          ],
+          "estimated_duration_ms": 4000,
+          "estimated_start_delay_ms": 500,
+          "examples": [
+            "Read the serial number in this photo"
+          ],
+          "external_cloud_used": false,
+          "input_modes": [
+            "image/png",
+            "image/jpeg"
+          ],
+          "languages": [
+            "en",
+            "es"
+          ],
+          "limitations": [
+            "Images up to 20 MiB"
+          ],
+          "name": "Industrial OCR",
+          "output_modes": [
+            "application/json"
+          ],
+          "processing_region": "EU",
+          "tags": [
+            "ocr",
+            "metal"
+          ]
+        },
+        "description": "Reads serial numbers stamped on metal parts",
+        "dimensions": {
+          "authorized": true,
+          "installed": true,
+          "offered": true
+        },
+        "id": "ocr-metal-v1",
+        "provenance": "operator",
+        "section": "services"
+      },
+      {
+        "body": {
+          "capabilities": [
+            "code.rust.review"
+          ],
+          "components": [
+            {
+              "id": "example:repo-reader",
+              "role": "required"
+            },
+            {
+              "id": "project:repo-controller",
+              "role": "required"
+            },
+            {
+              "id": "example:rust-review",
+              "role": "optional"
+            }
+          ],
+          "name": "Repository review"
+        },
+        "description": "Reviews the demo repository and runs its tests",
+        "dimensions": {
+          "authorized": true,
+          "installed": true,
+          "offered": true
+        },
+        "id": "repo-review",
+        "provenance": "operator",
+        "section": "services"
+      },
+      {
+        "body": {
+          "name": "Rust review",
+          "offered_for": [
+            "code review",
+            "unsafe audit"
+          ],
+          "package_id": "example/rust-review"
+        },
+        "description": "Procedure for reviewing Rust code for soundness and style",
+        "dimensions": {
+          "authorized": true,
+          "installed": true,
+          "offered": true
+        },
+        "id": "example:rust-review",
+        "provenance": "operator",
+        "section": "skills",
+        "version": "1.2.0"
+      },
+      {
+        "body": {
+          "components": [
+            "ocr",
+            "deskew"
+          ],
+          "runtime": "claude-code"
+        },
+        "description": "Vision tools for industrial inspection",
+        "dimensions": {
+          "authorized": true,
+          "installed": true,
+          "offered": true
+        },
+        "id": "example:vision-pack",
+        "provenance": "operator",
+        "section": "plugins",
+        "version": "0.4.1"
+      },
+      {
+        "body": {
+          "resources": [
+            "repo://demo"
+          ],
+          "server": "@modelcontextprotocol/server-filesystem",
+          "server_version": "2025.8.21",
+          "tools": [
+            {
+              "annotations": {
+                "readOnlyHint": true,
+                "title": "Read file"
+              },
+              "description": "Reads a file of the repository",
+              "name": "example:repo-reader/read_file"
+            }
+          ]
+        },
+        "description": "Reads the project repository",
+        "dimensions": {
+          "authorized": true,
+          "installed": true,
+          "offered": true,
+          "operational": {
+            "expires_at": "2026-11-14T00:30:00Z",
+            "observed_at": "2026-11-14T00:00:00Z",
+            "source": {
+              "kind": "adapter",
+              "method": "mcp tools/list"
+            },
+            "status": "ok"
+          }
+        },
+        "id": "example:repo-reader",
+        "provenance": "operator",
+        "section": "mcp"
+      },
+      {
+        "body": {
+          "kind": "claude-code",
+          "modes": [
+            "print"
+          ],
+          "restrictions": [
+            "no network access outside the project"
+          ]
+        },
+        "description": "Claude Code in print mode",
+        "dimensions": {
+          "authorized": true,
+          "installed": true,
+          "offered": true
+        },
+        "id": "example:claude-code",
+        "provenance": "operator",
+        "section": "runtime",
+        "version": "2.0.0"
+      },
+      {
+        "body": {
+          "execution": {
+            "kind": "local"
+          },
+          "inference_runtime": "onnxruntime 1.20",
+          "modalities": [
+            "image",
+            "text"
+          ],
+          "model_id": "example-ocr-metal",
+          "precision": "int8",
+          "provider": "Example",
+          "quantization": "int8",
+          "revision": "2026-10-01",
+          "role": "offered"
+        },
+        "description": "OCR model for stamped metal",
+        "dimensions": {
+          "authorized": true,
+          "installed": true,
+          "offered": true
+        },
+        "id": "example:ocr-model",
+        "provenance": "operator",
+        "section": "models"
+      },
+      {
+        "body": {
+          "approximate_volume": "40k lines",
+          "coverage": "main branch",
+          "domains": [
+            "industrial control"
+          ],
+          "evidence": {
+            "hash": "blake3:5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b",
+            "reference": "https://example.org/repo-controller/commit/a1b2c3d"
+          },
+          "extensions": {
+            "example:retention": {
+              "days": 30
+            }
+          },
+          "formats": [
+            "text/x-rust"
+          ],
+          "languages": [
+            "en"
+          ],
+          "limits": [
+            "no export of whole files"
+          ],
+          "live": true,
+          "operations": [
+            "answer_with_sources",
+            "search",
+            "process_in_place"
+          ],
+          "schema_ref": "https://example.org/repo-controller/README.md",
+          "updated_at": "2026-11-14T00:00:00Z"
+        },
+        "description": "The controller repository",
+        "dimensions": {
+          "authorized": true,
+          "installed": true,
+          "offered": true
+        },
+        "expires_at": "2026-12-14T00:00:00Z",
+        "id": "project:repo-controller",
+        "provenance": "operator",
+        "section": "information",
+        "version": "a1b2c3d"
+      },
+      {
+        "body": {
+          "accelerators": [
+            {
+              "count": 1,
+              "kind": "gpu",
+              "memory_mib_each": 24576,
+              "model": "NVIDIA RTX 4090"
+            }
+          ],
+          "basis": "declared",
+          "cpu": {
+            "arch": "x86_64",
+            "cores": 16,
+            "model": "AMD Ryzen 9 7950X"
+          },
+          "offered": {
+            "accelerators": [
+              "gpu"
+            ],
+            "concurrency": 2,
+            "cpu_cores": 4,
+            "ram_mib": 8192,
+            "vram_mib_each": 8192
+          },
+          "ram_mib": 65536,
+          "storage": {
+            "capacity_gib": 2000,
+            "kind": "nvme"
+          }
+        },
+        "description": "Inspection workstation",
+        "dimensions": {
+          "authorized": true,
+          "installed": true,
+          "offered": true
+        },
+        "id": "example:workstation",
+        "provenance": "operator",
+        "section": "hardware"
+      },
+      {
+        "body": {
+          "direct_connectivity_observed": true,
+          "region": "EU",
+          "transports": [
+            "iroh-quic"
+          ]
+        },
+        "description": "Office uplink",
+        "dimensions": {
+          "authorized": true,
+          "installed": true,
+          "offered": true
+        },
+        "id": "example:uplink",
+        "provenance": "operator",
+        "section": "network"
+      }
+    ],
+    "expires_at": "2026-11-14T00:05:00Z",
+    "issued_at": "2026-11-14T00:00:00Z",
+    "schema": "agentnet.inventory-view/1",
+    "scope": "task:demo",
+    "sections": [
+      "services",
+      "skills",
+      "plugins",
+      "mcp",
+      "runtime",
+      "models",
+      "information",
+      "hardware",
+      "network"
+    ],
+    "seq": 1
+  }
+}

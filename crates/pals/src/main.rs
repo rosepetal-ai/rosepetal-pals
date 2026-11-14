@@ -33,6 +33,8 @@ use pals_core::grant::{
     parse_timestamp,
 };
 use pals_core::identity::{AgentId, AgentKey};
+use pals_core::inventory::view::{INVENTORY_SECTIONS, render};
+use pals_core::inventory::{Scope, Section};
 use pals_core::store::{Contact, Store};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -96,6 +98,27 @@ enum Command {
     /// Agent Cards: this agent's, and its peers'
     #[command(subcommand)]
     Card(CardCommand),
+    /// This agent's inventory
+    #[command(subcommand)]
+    Inventory(InventoryCommand),
+}
+
+#[derive(Subcommand)]
+enum InventoryCommand {
+    /// Print what a peer of a scope sees of this agent's inventory, rendered
+    /// here from the inventory file: the entries of its view in one piece,
+    /// unsigned, as JSON
+    Show {
+        /// The scope: public (any peer), project:<project> (a grant for
+        /// task.read or task.cancel on skill:ask in that project) or
+        /// task:<project> (one for task.send)
+        #[arg(long, default_value = "public")]
+        scope: String,
+        /// The sections, comma separated: services, skills, plugins, mcp,
+        /// runtime, models, information, hardware, network [default: all]
+        #[arg(long, value_delimiter = ',')]
+        sections: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -237,6 +260,9 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Card(CardCommand::Show { peer, extended }) => {
             card_show(&home, peer.as_deref(), extended)
+        }
+        Command::Inventory(InventoryCommand::Show { scope, sections }) => {
+            inventory_show(&home, &scope, &sections)
         }
     };
     done.map(|()| ExitCode::SUCCESS)
@@ -415,6 +441,47 @@ fn card_show(home: &Path, peer: Option<&str>, extended: bool) -> anyhow::Result<
             print_card(&card, &peer_id, verified.hash.as_str())
         }
     })
+}
+
+/// Prints the entries `scope` sees of this agent's inventory in `sections`
+/// (all when empty), as the daemon renders them for a peer of that scope,
+/// with the observations it starts with: unsigned and in one piece, without
+/// the `seq`, pages and signature that only an answer to a peer carries.
+fn inventory_show(home: &Path, scope: &str, sections: &[String]) -> anyhow::Result<()> {
+    let scope = Scope::from_key(scope).ok_or_else(|| {
+        anyhow!("unknown scope {scope:?}: public, project:<project> or task:<project>")
+    })?;
+    let mut sections = if sections.is_empty() {
+        INVENTORY_SECTIONS.to_vec()
+    } else {
+        sections
+            .iter()
+            .map(|name| {
+                serde_json::from_value::<Section>(json!(name))
+                    .ok()
+                    .filter(|section| INVENTORY_SECTIONS.contains(section))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "unknown section {name:?}: services, skills, plugins, mcp, runtime, \
+                             models, information, hardware or network"
+                        )
+                    })
+            })
+            .collect::<anyhow::Result<_>>()?
+    };
+    sections.sort_unstable();
+    sections.dedup();
+
+    let (cfg, key) = load_agent(home)?;
+    let store = Arc::new(open_store(&cfg, &key)?);
+    let snapshot = InventoryState::load(&cfg, store)?.snapshot();
+    let view = json!({
+        "scope": scope.key(),
+        "sections": sections,
+        "entries": render(&snapshot, &scope, &sections),
+    });
+    println!("{}", serde_json::to_string_pretty(&view)?);
+    Ok(())
 }
 
 /// Prints `card`, then `verified: <signer> <hash>`.

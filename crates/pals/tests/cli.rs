@@ -127,3 +127,76 @@ fn id_without_init_fails_with_a_hint() {
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
     assert!(stderr.contains("pals init"), "{stderr}");
 }
+
+#[test]
+fn inventory_show_renders_what_a_scope_sees() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = home_arg(dir.path());
+    pals(&["init", "--home", home]).assert().success();
+    std::fs::write(
+        dir.path().join("inventory.toml"),
+        r#"
+[[plugins]]
+id = "example:vision-pack"
+description = "Vision tools"
+provenance = "operator"
+visibility = "public"
+
+[[plugins]]
+id = "example:secret-plugin"
+description = "Installed, never offered"
+provenance = "operator"
+
+[[mcp]]
+id = "example:repo"
+description = "Reads the demo repository"
+provenance = "operator"
+visibility = { project = ["demo"] }
+tools = [{ name = "read_file" }, { name = "delete_file" }]
+offered_tools = ["read_file"]
+"#,
+    )
+    .unwrap();
+
+    let show = |args: &[&str]| -> serde_json::Value {
+        let mut all = vec!["inventory", "show", "--home", home];
+        all.extend_from_slice(args);
+        serde_json::from_str(&stdout_of(&mut pals(&all))).expect("JSON on stdout")
+    };
+    let ids = |view: &serde_json::Value| -> Vec<String> {
+        view["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // Public by default, every section.
+    let public = show(&[]);
+    assert_eq!(public["scope"], "public");
+    assert_eq!(ids(&public), ["example:vision-pack"]);
+
+    let demo = show(&["--scope", "project:demo", "--sections", "mcp,plugins"]);
+    assert_eq!(demo["scope"], "project:demo");
+    assert_eq!(demo["sections"], serde_json::json!(["plugins", "mcp"]));
+    assert_eq!(ids(&demo), ["example:vision-pack", "example:repo"]);
+    assert_eq!(
+        demo["entries"][1]["body"]["tools"],
+        serde_json::json!([{"name": "example:repo/read_file"}])
+    );
+    let text = demo.to_string();
+    for never in ["secret", "delete_file", "offered_tools"] {
+        assert!(!text.contains(never), "{never} in {text}");
+    }
+
+    for bad in [
+        &["--scope", "everyone"][..],
+        &["--scope", "project:"],
+        &["--sections", "mcp,gadgets"],
+    ] {
+        let mut all = vec!["inventory", "show", "--home", home];
+        all.extend_from_slice(bad);
+        pals(&all).assert().failure();
+    }
+}

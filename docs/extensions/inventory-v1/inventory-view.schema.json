@@ -1,0 +1,311 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Página firmada de una vista del inventario, agentnet.inventory-view/1",
+  "description": "Lo que ve de un inventario agentnet.inventory/1 quien pregunta, según el ámbito que le da su grant, en páginas firmadas por el agente del inventario. Viaja como el JCS (RFC 8785) de este objeto. La firma es Ed25519 de la clave de view.agent_id sobre \"agentnet.inventory-view/1\\n\" seguido del JCS de view, en base64url sin relleno, y se comprueba sobre la vista recibida antes de leerla; una clave desconocida, o un campo ausente escrito como null, la invalida. La página firmada ocupa como mucho 65536 bytes. Caduca como mucho 300 s después de emitirse; quien la recibe admite 60 s de desfase de reloj, solo para rechazarla. Una vista nunca muestra lo privado, la visibilidad de una entrada ni el adapter de una conexión MCP, y una vista pública no lleva totales, recuentos, hashes ni referencias de lo que oculta. Una vista no es un grant: la ejecución vuelve a comprobar el permiso.",
+  "type": "object",
+  "properties": {
+    "view": { "$ref": "#/$defs/view" },
+    "signature": { "$ref": "#/$defs/signature" }
+  },
+  "required": ["view", "signature"],
+  "additionalProperties": false,
+  "$defs": {
+    "view": {
+      "type": "object",
+      "properties": {
+        "schema": { "const": "agentnet.inventory-view/1" },
+        "agent_id": {
+          "$ref": "#/$defs/agentId",
+          "description": "El agente del inventario, que es también quien firma la página."
+        },
+        "scope": {
+          "type": "string",
+          "pattern": "^(public|(project|task):[!-~]+)$",
+          "description": "El ámbito de quien pregunta: public, project:<proyecto> o task:<proyecto>. Sale del grant que presentó, verificado, y de nada más."
+        },
+        "audience": {
+          "$ref": "#/$defs/agentId",
+          "description": "Quien pregunta. Lo lleva toda página que no es pública, y solo vale para él; una página pública no lo lleva."
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "description": "La revisión de la vista del ámbito: solo sube cuando cambia lo que el ámbito muestra, y nunca vuelve atrás."
+        },
+        "issued_at": { "$ref": "#/$defs/timestamp" },
+        "expires_at": {
+          "$ref": "#/$defs/timestamp",
+          "description": "Posterior a issued_at, y como mucho 300 s después. Este esquema no puede expresarlo; PALS rechaza la página que lo incumple."
+        },
+        "agent_card_hash": {
+          "type": "string",
+          "pattern": "^blake3:[0-9a-f]{64}$",
+          "description": "BLAKE3 del JCS de la Agent Card que describe al agente en este ámbito, firmas incluidas."
+        },
+        "sections": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/section" },
+          "description": "Las secciones pedidas, en el orden de la enumeración y sin repetir."
+        },
+        "entries": {
+          "type": "array",
+          "maxItems": 100,
+          "items": { "$ref": "#/$defs/entry" },
+          "description": "Cada una de alguna de las secciones pedidas: las secciones en su orden y, en cada una, las entradas en el del inventario."
+        },
+        "next_cursor": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384,
+          "description": "Dónde empieza la página siguiente; se devuelve tal cual. Lleva un MAC con una clave del agente, solo vale para el mismo solicitante, ámbito, secciones y revisión, y muere al reiniciarse el agente."
+        },
+        "truncated_by": {
+          "enum": ["page_bytes", "page_entries", "query_total"],
+          "description": "El límite que cortó la página antes del final de la vista: 64 KiB por página, las entradas pedidas (como mucho 100), o 1 MiB acumulado en la cadena de cursores, tras el que no hay más páginas."
+        }
+      },
+      "required": [
+        "schema",
+        "agent_id",
+        "scope",
+        "seq",
+        "issued_at",
+        "expires_at",
+        "agent_card_hash",
+        "sections",
+        "entries"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "scope": { "const": "public" } } },
+          "then": { "not": { "required": ["audience"] } },
+          "else": { "required": ["audience"] }
+        },
+        {
+          "if": { "required": ["next_cursor"] },
+          "then": {
+            "required": ["truncated_by"],
+            "properties": { "truncated_by": { "enum": ["page_bytes", "page_entries"] } }
+          },
+          "else": { "properties": { "truncated_by": { "const": "query_total" } } }
+        }
+      ]
+    },
+    "section": {
+      "enum": [
+        "services",
+        "skills",
+        "plugins",
+        "mcp",
+        "runtime",
+        "models",
+        "information",
+        "hardware",
+        "network",
+        "benchmarks"
+      ]
+    },
+    "entry": {
+      "type": "object",
+      "properties": {
+        "section": { "$ref": "#/$defs/section" },
+        "id": { "type": "string", "minLength": 1 },
+        "description": { "$ref": "#/$defs/text" },
+        "provenance": {
+          "$ref": "#/$defs/text",
+          "description": "Quién lo declara: operator en una declaración del fichero, y en todo servicio."
+        },
+        "version": { "$ref": "#/$defs/text" },
+        "dimensions": { "$ref": "#/$defs/dimensions" },
+        "body": {
+          "type": "object",
+          "propertyNames": { "not": { "enum": ["visibility", "adapter", "offered_tools"] } },
+          "description": "Los campos del bloque de la entrada, con su evidence y sus extensions si las tiene; los de un servicio, sin su id ni su description. Nunca la visibilidad ni el adapter."
+        },
+        "expires_at": {
+          "$ref": "#/$defs/timestamp",
+          "description": "Cuándo deja de valer la declaración."
+        }
+      },
+      "required": ["section", "id", "description", "provenance", "dimensions", "body"],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "section": { "const": "services" } } },
+          "then": {
+            "properties": {
+              "id": { "$ref": "#/$defs/serviceId" },
+              "provenance": { "const": "operator" },
+              "body": {
+                "propertyNames": { "not": { "enum": ["id", "description"] } },
+                "properties": {
+                  "components": {
+                    "type": "array",
+                    "items": { "$ref": "#/$defs/componentLink" },
+                    "description": "Solo los vínculos a componentes que el ámbito muestra. Una alternativa que queda sola de su grupo se muestra como optional y sin grupo: se lee igual haya o no alternativas ocultas."
+                  }
+                }
+              }
+            },
+            "not": { "anyOf": [{ "required": ["version"] }, { "required": ["expires_at"] }] }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "section": {
+                "enum": [
+                  "skills",
+                  "plugins",
+                  "mcp",
+                  "runtime",
+                  "models",
+                  "information",
+                  "hardware",
+                  "network"
+                ]
+              }
+            }
+          },
+          "then": { "properties": { "id": { "$ref": "#/$defs/entryId" } } }
+        },
+        {
+          "if": { "properties": { "section": { "const": "mcp" } } },
+          "then": {
+            "properties": {
+              "body": {
+                "properties": {
+                  "tools": {
+                    "type": "array",
+                    "items": { "$ref": "#/$defs/publishedTool" },
+                    "description": "Solo las herramientas ofrecidas (offered_tools) y, si un adaptador comprueba la conexión, solo las que además observó."
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "dimensions": {
+      "type": "object",
+      "properties": {
+        "installed": { "const": true, "description": "Está en el inventario." },
+        "operational": {
+          "$ref": "#/$defs/observation",
+          "description": "Lo que observó un adaptador, con su fecha y su caducidad; ausente si no hay observación. Una declaración nunca lo da."
+        },
+        "offered": { "const": true, "description": "El ámbito lo muestra." },
+        "authorized": {
+          "type": "boolean",
+          "description": "El grant de quien pregunta permite tareas con ello: true solo en un ámbito de tarea. Se vuelve a comprobar al ejecutar."
+        }
+      },
+      "required": ["installed", "offered", "authorized"],
+      "additionalProperties": false,
+      "description": "Cuatro de las cinco dimensiones (§9.3); la disponibilidad del momento la da una oferta de servicio, nunca el inventario."
+    },
+    "observation": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": { "kind": { "const": "declared" } },
+              "required": ["kind"],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": { "const": "adapter" },
+                "method": { "$ref": "#/$defs/text" }
+              },
+              "required": ["kind", "method"],
+              "additionalProperties": false
+            }
+          ]
+        },
+        "status": { "enum": ["ok", "failed", "unknown"] },
+        "observed_at": { "$ref": "#/$defs/timestamp" },
+        "expires_at": { "$ref": "#/$defs/timestamp" },
+        "detail": {
+          "anyOf": [
+            { "enum": ["timeout", "unreachable", "protocol error", "too many tools"] },
+            {
+              "type": "string",
+              "pattern": "^missing tools: [A-Za-z0-9_.-]{1,128}(, [A-Za-z0-9_.-]{1,128})*$"
+            }
+          ],
+          "description": "Solo un código fijo; nunca el error en crudo, que puede nombrar una URL o una orden. missing tools nombra solo herramientas ofrecidas."
+        }
+      },
+      "required": ["source", "status", "observed_at", "expires_at"],
+      "additionalProperties": false,
+      "description": "La observación sin su lista de herramientas: el cuerpo nombra las que se publican."
+    },
+    "publishedTool": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^(?!agentnet:)[a-z0-9._-]{1,64}:[A-Za-z0-9._/-]{1,128}/[A-Za-z0-9_.-]{1,128}$",
+          "description": "<id de la conexión>/<herramienta>, para que no choquen las de conexiones distintas."
+        },
+        "description": {
+          "$ref": "#/$defs/text",
+          "description": "La observada si la hay; si no, la declarada."
+        },
+        "annotations": {
+          "type": "object",
+          "description": "Las observadas si las hay; si no, las declaradas. Son declaraciones, no una política de seguridad."
+        }
+      },
+      "required": ["name"],
+      "additionalProperties": false
+    },
+    "componentLink": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/entryId" },
+        "role": { "enum": ["required", "optional", "alternative"] },
+        "group": { "$ref": "#/$defs/text" }
+      },
+      "required": ["id", "role"],
+      "additionalProperties": false
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "entryId": {
+      "type": "string",
+      "pattern": "^(?!agentnet:)[a-z0-9._-]{1,64}:[A-Za-z0-9._/-]{1,128}$"
+    },
+    "serviceId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+      "not": { "const": "ask" }
+    },
+    "agentId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Clave pública Ed25519 del agente en hexadecimal en minúsculas."
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$",
+      "description": "RFC 3339 en UTC con segundos enteros: 2026-11-14T00:00:00Z."
+    },
+    "signature": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{85}[AQgw]$",
+      "description": "Firma Ed25519 de 64 bytes en base64url sin relleno."
+    }
+  }
+}

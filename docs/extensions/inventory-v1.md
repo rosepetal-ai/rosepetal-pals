@@ -12,6 +12,7 @@ Extensión opcional de A2A con la que un agente PALS describe, además de lo que
 | Cuándo se declara | Solo cuando el daemon sirve el ALPN de `discoveryAlpn`: la card declara únicamente lo que el agente sirve |
 | Transporte | El inventario no viaja por A2A: lo sirve, en vistas firmadas y filtradas por el permiso de quien pregunta, el protocolo de descubrimiento que nombra `discoveryAlpn` |
 | Esquema | [`inventory-v1/inventory.schema.json`](inventory-v1/inventory.schema.json) (JSON Schema 2020-12), con el vector `crates/pals-core/tests/vectors/inventory-v1.json` |
+| Vistas | `agentnet.inventory-view/1`, dominio de firma `agentnet.inventory-view/1\n`: [`inventory-v1/inventory-view.schema.json`](inventory-v1/inventory-view.schema.json), con el vector `crates/pals-core/tests/vectors/view-v1.json` |
 
 La URI y el perfil no cambian de significado: un cambio incompatible será `inventory/v2` y `agentnet.inventory/2`.
 
@@ -100,3 +101,26 @@ El ámbito de quien pregunta sale del grant que presenta, una vez verificado, y 
 | Cualquier otro (`blob.fetch`, otro recurso) | Público | `public` |
 
 Cada ámbito ve también lo que ven los anteriores: el de tarea ve lo público, lo de su proyecto y lo de sus tareas. Las vistas se firman por ámbito, con su secuencia y su caducidad, y una vista pública no lleva recuentos, hashes ni referencias que dejen inferir lo oculto (§9.8).
+
+## Vistas
+
+Quien pregunta nunca recibe el inventario, sino la vista de su ámbito: páginas firmadas por el agente, con el esquema `agentnet.inventory-view/1` ([`inventory-v1/inventory-view.schema.json`](inventory-v1/inventory-view.schema.json)). Cada página lleva su ámbito, su destinatario, su secuencia y su caducidad (§9.8).
+
+**Qué muestra.** Solo las entradas y los servicios visibles en el ámbito: lo privado (instalado pero no ofrecido) no aparece en ninguna vista. Cada entrada lleva su sección, su `id`, `description`, `provenance` y, si las tiene, `version` y `expires_at`, sus dimensiones y un `body`:
+
+- `body` son los campos propios del bloque, con `evidence` y `extensions` si la entrada los tiene. Nunca lleva la visibilidad, que nombraría los demás proyectos que la ven. En un servicio son sus campos, sin `id` ni `description`.
+- `dimensions` lleva `installed` y `offered` siempre a `true`, porque lo que aparece está instalado y ofrecido en ese ámbito; `authorized`, `true` solo en un ámbito de tarea, y que se vuelve a comprobar al ejecutar; y `operational`, la observación del adaptador sin su lista de herramientas, o nada si no hay observación. La disponibilidad del momento nunca está en la vista: la da la oferta.
+- Un servicio conserva solo los vínculos a componentes que el ámbito muestra. Una alternativa que se queda sola de su grupo aparece como `optional` y sin grupo, así que se lee igual haya o no alternativas ocultas: la vista no revela que exista un componente oculto.
+- Una conexión MCP publica solo las herramientas de `offered_tools`; si tiene adaptador, solo las que este además observó. Cada una se llama `<id de la conexión>/<herramienta>` y lleva la descripción y las anotaciones observadas o, si no las hay, las declaradas. Ni `adapter`, ni `offered_tools`, ni las herramientas declaradas que no se ofrecen salen nunca.
+
+**Destinatario y firma.** Una página de proyecto o de tarea lleva en `audience` a quien pregunta, y solo vale para él; una pública no lleva `audience`. La firma es Ed25519 del agente sobre `agentnet.inventory-view/1\n` seguido del JCS de la página, y la página firmada ocupa como mucho 64 KiB. Caduca 300 s después de emitirse, y quien la recibe admite 60 s de desfase de reloj, solo para rechazarla.
+
+**Revisión.** `seq` es la revisión de la vista del ámbito, sobre todas sus secciones. Solo sube cuando cambia lo que ese ámbito muestra, nunca vuelve atrás y sobrevive a los reinicios. Lo oculto no cuenta en nada que lleve una página: una vista pública no tiene totales, recuentos, hashes ni referencias de lo que deja fuera.
+
+**Páginas.** Una página termina en el primer límite que alcanza: 64 KiB, 100 entradas (o las que se pidan, si son menos) o 1 MiB acumulado en la cadena de cursores. `truncated_by` dice cuál fue. Con `page_bytes` o `page_entries`, `next_cursor` lleva a la página siguiente; con `query_total`, la cadena termina ahí y no hay cursor. Una entrada que no cabe sola en una página no se corta: la petición falla.
+
+**Cursores.** Quien recibe un cursor lo devuelve tal cual: puede leerlo, pero no alterarlo sin invalidarlo, porque lleva un MAC con una clave del agente. Solo vale para el mismo solicitante, ámbito, secciones y revisión. Si el contenido cambia, cambia la revisión y el cursor deja de valer. Cada arranque usa una clave nueva, así que los cursores mueren al reiniciar. Que un cursor no valga no dice por qué.
+
+**Caché.** El agente guarda como mucho 256 páginas, por ámbito, destinatario, secciones, cursor, tamaño de página y revisión: una página privada nunca se sirve a otro solicitante.
+
+`pals inventory show [--scope public|project:<p>|task:<p>] [--sections a,b]` imprime en JSON lo que vería un par de ese ámbito, renderizado en local desde el fichero: las entradas de su vista de una pieza, sin firma, sin `seq` y sin paginar.

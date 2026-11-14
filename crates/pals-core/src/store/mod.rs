@@ -25,6 +25,7 @@ mod migrate;
 mod outbox;
 mod records;
 mod tasks;
+mod views;
 
 pub use cards::MAX_CARD_CONTEXTS_PER_PEER;
 pub use contacts::Contact;

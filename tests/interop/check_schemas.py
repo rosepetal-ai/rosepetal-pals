@@ -30,6 +30,7 @@ DOCUMENTS: dict[str, tuple[str, str]] = {
     "contact-v1.json": ("contact-record.schema.json", "/signed"),
     "announce-v1.json": ("announce-record.schema.json", "/signed"),
     "inventory-v1.json": ("inventory.schema.json", "/inventory"),
+    "view-v1.json": ("inventory-view.schema.json", "/signed"),
 }
 
 

@@ -33,6 +33,24 @@ impl Scope {
         }
     }
 
+    /// The scope whose [`Scope::key`] is `key`, when its project is a project
+    /// name (printable ASCII without spaces, as in visibilities and the
+    /// configuration).
+    pub fn from_key(key: &str) -> Option<Scope> {
+        if key == "public" {
+            return Some(Scope::Public);
+        }
+        let (kind, project) = key.split_once(':')?;
+        if !super::is_project_name(project) {
+            return None;
+        }
+        match kind {
+            "project" => Some(Scope::Project(project.to_owned())),
+            "task" => Some(Scope::Task(project.to_owned())),
+            _ => None,
+        }
+    }
+
     /// The scope `grant` gives: [`Scope::Task`] of its project when it allows
     /// `task.send` on `skill:ask`, [`Scope::Project`] when it allows another
     /// task operation there, [`Scope::Public`] otherwise or without a grant.

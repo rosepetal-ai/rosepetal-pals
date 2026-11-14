@@ -17,7 +17,8 @@
 //! say it ([`InventoryError::DeclaredOperational`]); *offered* is its
 //! [`Visibility`] in a [`Scope`]; *authorized* is the requester's grant,
 //! checked again when a task runs; *available now* is a service offer's,
-//! never the inventory's.
+//! never the inventory's. A peer never reads the inventory itself, only the
+//! signed view of its scope ([`view`]).
 //!
 //! Limits: the file at most [`MAX_INVENTORY_BYTES`], strings and keys at
 //! most [`MAX_STRING_BYTES`], at most [`MAX_BLOCK_ENTRIES`] entries per
@@ -55,6 +56,7 @@ use serde_json::Value;
 use crate::grant::parse_timestamp;
 
 pub mod scope;
+pub mod view;
 
 pub use scope::Scope;
 
