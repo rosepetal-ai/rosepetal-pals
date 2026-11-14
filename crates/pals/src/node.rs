@@ -57,7 +57,8 @@ impl Node {
     /// In order: takes the data directory's lock, failing with
     /// [`AlreadyRunning`](crate::config::AlreadyRunning) when another daemon
     /// holds it; loads the agent's key, creating it if missing; opens the
-    /// store; fails the tasks a previous run left in progress; purges the
+    /// store; fails the tasks a previous run left in progress; frees the
+    /// dedup keys it left with no execution behind them, and purges the
     /// dedup rows older than [`DEDUP_RETENTION_S`]; and only then binds the
     /// Iroh endpoint with the agent's key and serves [`ALPN_A2A_HTTP`] on
     /// it. With `net.relay` the endpoint uses Iroh's N0 preset and its
@@ -88,6 +89,14 @@ impl Node {
                 .context("cannot fail the tasks a restart interrupted")?;
             if interrupted > 0 {
                 tracing::info!(interrupted, "failed the tasks a restart interrupted");
+            }
+            // An unbound key belongs to a request that never ran: free it,
+            // so that its retry runs instead of waiting for nothing.
+            let unbound = store
+                .dedup_clear_unbound()
+                .context("cannot free the dedup keys a restart left unbound")?;
+            if unbound > 0 {
+                tracing::info!(unbound, "freed the dedup keys a restart left unbound");
             }
             purge_dedup(&store).context("cannot purge the old dedup rows")?;
             anyhow::Ok((lock, key, store))

@@ -1,6 +1,8 @@
 //! [`GuardedHandler`]: every task belongs to the peer that created it, and
 //! every message a peer sends runs once.
 
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,8 +17,8 @@ use a2a_server::{RequestHandler, ServiceParams};
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Utc;
-use futures::StreamExt;
 use futures::stream::{self, BoxStream};
+use futures::{FutureExt, StreamExt};
 use pals_core::identity::{AgentId, AgentKey};
 use pals_core::jcs;
 use pals_core::store::{DEDUP_INFLIGHT_WAIT_S, DedupBegin, DedupRow, Store};
@@ -64,9 +66,11 @@ type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 ///   however long it runs, and after a restart that failed it. When the
 ///   agent answers with a message and no task, the guard binds the key to
 ///   that message as well, and the message is the outcome; with a task, the
-///   guard's binding of the first task returned or streamed is a no-op. The
-///   request runs detached from the requester, so that binding is made even
-///   if the requester goes away.
+///   guard's binding of the first task returned or streamed is a no-op.
+///   From the creation of its key to the start of its run, and on to that
+///   binding, the request runs detached from the requester: should the
+///   requester go away at any point, a key this request created gets its
+///   run, or is freed.
 /// - A repeated request with the same content gets that outcome without
 ///   running again. A unary one gets the task as it is now; a streaming one
 ///   follows the task's execution with `SubscribeToTask`, or gets one event
@@ -78,8 +82,10 @@ type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 /// - A request whose `messageId` came before with other content fails with
 ///   `InvalidParamsError`, `messageId reused with different content`.
 /// - A first request refused before any execution started frees its key,
-///   so that a retry runs. Once the execution started, the key stays bound
-///   to its task whatever happens to it.
+///   so that a retry runs; so does one whose inner handler panics. Once the
+///   execution started, the key stays bound to its task whatever happens to
+///   it. A key a restart left with no execution behind it is freed when the
+///   node starts again ([`Store::dedup_clear_unbound`]).
 ///
 /// Push notification configs and the extended card go to the inner handler
 /// unchecked, and it refuses them because the agent card declares neither.
@@ -114,61 +120,26 @@ impl<H: RequestHandler> GuardedHandler<H> {
         }
     }
 
-    /// Whether a request with `key` runs or repeats an earlier one, waiting
-    /// up to [`DEDUP_INFLIGHT_WAIT_S`] for the earlier one's outcome.
-    async fn attempt(&self, key: &Key) -> Result<Attempt, A2AError> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(DEDUP_INFLIGHT_WAIT_S);
-        loop {
-            let begin = {
-                let key = key.clone();
-                blocking(&self.store, move |store| {
-                    let now = Utc::now().timestamp();
-                    store.dedup_begin(&key.peer, &key.message_id, &key.hash, now)
-                })
-                .await?
-            };
-            let row = match begin {
-                DedupBegin::New => return Ok(Attempt::First),
-                DedupBegin::Existing(row) => row,
-            };
-            if row.request_hash != key.hash {
-                return Err(A2AError::invalid_params(REUSED_MESSAGE_ID));
-            }
-            if let Some(outcome) = Outcome::of(row)? {
-                return Ok(Attempt::Repeat(outcome));
-            }
-            // In flight. Should it fail without an outcome, its row is gone
-            // and the next look begins anew.
-            if tokio::time::Instant::now() >= deadline {
-                return Err(A2AError::internal(STILL_IN_FLIGHT));
-            }
-            tokio::time::sleep(INFLIGHT_POLL).await;
-        }
-    }
-
-    /// Runs the first `SendMessage` with `key`, and binds the key to its
-    /// response: the message when there is no task, a no-op otherwise.
-    async fn first_send(
+    /// Starts a `SendMessage` with `key`: runs it if it is the first with
+    /// its key, and then binds the key to its response (the message when
+    /// there is no task, a no-op otherwise).
+    ///
+    /// One detached unit does it all, from the creation of the key on: the
+    /// requester going away can never leave a key created with no run.
+    async fn start_send(
         &self,
         params: &ServiceParams,
         req: SendMessageRequest,
         key: Key,
-    ) -> Result<SendMessageResponse, A2AError> {
+    ) -> Result<Start<SendMessageResponse>, A2AError> {
         let inner = Arc::clone(&self.inner);
         let store = Arc::clone(&self.store);
         let params = params.clone();
-        // Detached: should the requester go away, the run still binds the
-        // key, and a retry finds its outcome.
-        let run = tokio::spawn(async move {
-            let response = match inner.send_message(&params, req).await {
-                Ok(response) => response,
-                Err(err) => {
-                    // Frees the key only if no execution started and bound
-                    // it.
-                    release(&store, &key).await;
-                    return Err(err);
-                }
-            };
+        let unit = tokio::spawn(async move {
+            if let Attempt::Repeat(outcome) = attempt(&store, &key).await? {
+                return Ok(Start::Repeat(outcome));
+            }
+            let response = first_call(&store, &key, inner.send_message(&params, req)).await?;
             let outcome = match &response {
                 SendMessageResponse::Task(task) => {
                     own(&store, &task.id, key.peer).await?;
@@ -182,43 +153,55 @@ impl<H: RequestHandler> GuardedHandler<H> {
                 }
             };
             bind(&store, &key, &outcome).await?;
-            Ok(response)
+            Ok(Start::Ran(response))
         });
-        run.await.map_err(|err| a2a_error(err.into()))?
+        unit.await.map_err(|err| a2a_error(err.into()))?
     }
 
-    /// Runs the first `SendStreamingMessage` with `key`: see [`forward`].
-    async fn first_stream(
+    /// Starts a `SendStreamingMessage` with `key`: runs it if it is the
+    /// first with its key, and then passes its events on (see [`forward`]).
+    ///
+    /// As in [`GuardedHandler::start_send`], one detached unit does it all.
+    async fn start_stream(
         &self,
         params: &ServiceParams,
         req: SendMessageRequest,
         key: Key,
-    ) -> Result<Events, A2AError> {
+    ) -> Result<Start<Events>, A2AError> {
         let inner = Arc::clone(&self.inner);
         let store = Arc::clone(&self.store);
         let params = params.clone();
         let (started_tx, started_rx) = oneshot::channel();
-        let (events_tx, events_rx) = mpsc::channel(EVENT_BUFFER);
         tokio::spawn(async move {
-            match inner.send_streaming_message(&params, req).await {
-                Ok(events) => {
-                    let _ = started_tx.send(Ok(()));
-                    forward(events, Settler::new(store, key), events_tx).await;
+            let started = match attempt(&store, &key).await {
+                Ok(Attempt::First) => {
+                    first_call(&store, &key, inner.send_streaming_message(&params, req)).await
                 }
+                Ok(Attempt::Repeat(outcome)) => {
+                    let _ = started_tx.send(Ok(Start::Repeat(outcome)));
+                    return;
+                }
+                Err(err) => Err(err),
+            };
+            let events = match started {
+                Ok(events) => events,
                 Err(err) => {
-                    release(&store, &key).await;
                     let _ = started_tx.send(Err(err));
+                    return;
                 }
-            }
+            };
+            let (events_tx, events_rx) = mpsc::channel(EVENT_BUFFER);
+            let received = stream::unfold(events_rx, |mut events| async move {
+                events.recv().await.map(|event| (event, events))
+            });
+            let received: Events = Box::pin(received);
+            let _ = started_tx.send(Ok(Start::Ran(received)));
+            forward(events, Settler::new(store, key), events_tx).await;
         });
         started_rx.await.map_err(|_| {
             error!("a streaming request ended before it started");
             A2AError::internal("Internal error")
-        })??;
-        Ok(Box::pin(stream::unfold(
-            events_rx,
-            |mut events| async move { events.recv().await.map(|event| (event, events)) },
-        )))
+        })?
     }
 
     /// What a repeated `SendMessage` gets: the message, or the task as it is
@@ -296,6 +279,59 @@ impl<H: RequestHandler> GuardedHandler<H> {
         };
         self.inner.get_task(params, req).await
     }
+}
+
+/// Whether a request with `key` runs or repeats an earlier one, waiting up
+/// to [`DEDUP_INFLIGHT_WAIT_S`] for the earlier one's outcome.
+async fn attempt(store: &Arc<Store>, key: &Key) -> Result<Attempt, A2AError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(DEDUP_INFLIGHT_WAIT_S);
+    loop {
+        let begin = {
+            let key = key.clone();
+            blocking(store, move |store| {
+                let now = Utc::now().timestamp();
+                store.dedup_begin(&key.peer, &key.message_id, &key.hash, now)
+            })
+            .await?
+        };
+        let row = match begin {
+            DedupBegin::New => return Ok(Attempt::First),
+            DedupBegin::Existing(row) => row,
+        };
+        if row.request_hash != key.hash {
+            return Err(A2AError::invalid_params(REUSED_MESSAGE_ID));
+        }
+        if let Some(outcome) = Outcome::of(row)? {
+            return Ok(Attempt::Repeat(outcome));
+        }
+        // In flight. Should it fail without an outcome, its row is gone and
+        // the next look begins anew.
+        if tokio::time::Instant::now() >= deadline {
+            return Err(A2AError::internal(STILL_IN_FLIGHT));
+        }
+        tokio::time::sleep(INFLIGHT_POLL).await;
+    }
+}
+
+/// Runs `call`, the inner handler's part of the first request with `key`.
+/// If it fails, or panics, the key is freed, unless an execution started
+/// and bound it.
+async fn first_call<T>(
+    store: &Arc<Store>,
+    key: &Key,
+    call: impl Future<Output = Result<T, A2AError>>,
+) -> Result<T, A2AError> {
+    let result = AssertUnwindSafe(call)
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| {
+            error!("the request handler panicked");
+            Err(A2AError::internal("Internal error"))
+        });
+    if result.is_err() {
+        release(store, key).await;
+    }
+    result
 }
 
 /// The authenticated peer of a request, set by the tunnel and required by the
@@ -387,6 +423,14 @@ impl Outcome {
             StreamResponse::Message(message) => Self::Message(message.clone()),
         }
     }
+}
+
+/// How a message request started.
+enum Start<T> {
+    /// It was the first with its key, and ran: what the inner handler gave.
+    Ran(T),
+    /// It repeats the first, which has this outcome.
+    Repeat(Outcome),
 }
 
 /// What a request with a key does.
@@ -536,9 +580,9 @@ impl<H: RequestHandler> RequestHandler for GuardedHandler<H> {
             self.ensure_owner(peer, task_id).await?;
         }
         let key = Key::of(peer, &req)?;
-        match self.attempt(&key).await? {
-            Attempt::First => self.first_send(params, req, key).await,
-            Attempt::Repeat(outcome) => self.repeat_send(params, &req, peer, outcome).await,
+        match self.start_send(params, req.clone(), key).await? {
+            Start::Ran(response) => Ok(response),
+            Start::Repeat(outcome) => self.repeat_send(params, &req, peer, outcome).await,
         }
     }
 
@@ -552,9 +596,9 @@ impl<H: RequestHandler> RequestHandler for GuardedHandler<H> {
             self.ensure_owner(peer, task_id).await?;
         }
         let key = Key::of(peer, &req)?;
-        match self.attempt(&key).await? {
-            Attempt::First => self.first_stream(params, req, key).await,
-            Attempt::Repeat(outcome) => self.repeat_stream(params, &req, peer, outcome).await,
+        match self.start_stream(params, req.clone(), key).await? {
+            Start::Ran(events) => Ok(events),
+            Start::Repeat(outcome) => self.repeat_stream(params, &req, peer, outcome).await,
         }
     }
 
@@ -640,11 +684,12 @@ impl<H: RequestHandler> RequestHandler for GuardedHandler<H> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Instant;
 
     use a2a::{Part, Role, TaskState, TaskStatus, error_code};
     use a2a_server::{AgentExecutor, DefaultRequestHandler, ExecutorContext};
+    use futures::FutureExt;
 
     use super::*;
     use crate::a2a::{BindingExecutor, SqliteTaskStore};
@@ -875,5 +920,190 @@ mod tests {
         assert_eq!(err.code, error_code::INTERNAL_ERROR, "{err}");
         assert_eq!(err.message, STILL_IN_FLIGHT);
         assert!(started.elapsed() >= Duration::from_secs(DEDUP_INFLIGHT_WAIT_S));
+    }
+
+    #[tokio::test]
+    async fn a_request_dropped_while_creating_its_key_still_runs() {
+        let executor = Scripted::new(Script::Answer);
+        let (handler, params) = guarded(executor.clone());
+
+        for streaming in [false, true] {
+            let req = request(if streaming { "streamed" } else { "unary" });
+            // Polled once, to its first wait, which is on the creation of
+            // its key, and dropped there: the requester went away.
+            let pending = if streaming {
+                handler
+                    .send_streaming_message(&params, req.clone())
+                    .now_or_never()
+                    .is_none()
+            } else {
+                handler
+                    .send_message(&params, req.clone())
+                    .now_or_never()
+                    .is_none()
+            };
+            assert!(pending, "the request did not wait for its key");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // The retry gets the answer of the run the key was created for,
+            // at once.
+            let started = Instant::now();
+            let retry = handler.send_message(&params, req).await.unwrap();
+            assert!(
+                matches!(retry, SendMessageResponse::Message(_)),
+                "{retry:?}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(DEDUP_INFLIGHT_WAIT_S));
+        }
+        assert_eq!(executor.runs(), 2);
+    }
+
+    /// The SDK's handler, except that the next message request panics.
+    struct Panicky {
+        inner: DefaultRequestHandler,
+        panic_next: AtomicBool,
+    }
+
+    impl Panicky {
+        fn panic_now(&self) {
+            if self.panic_next.swap(false, Ordering::SeqCst) {
+                panic!("the inner handler panicked");
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RequestHandler for Panicky {
+        async fn send_message(
+            &self,
+            params: &ServiceParams,
+            req: SendMessageRequest,
+        ) -> Result<SendMessageResponse, A2AError> {
+            self.panic_now();
+            self.inner.send_message(params, req).await
+        }
+
+        async fn send_streaming_message(
+            &self,
+            params: &ServiceParams,
+            req: SendMessageRequest,
+        ) -> Result<Events, A2AError> {
+            self.panic_now();
+            self.inner.send_streaming_message(params, req).await
+        }
+
+        async fn get_task(
+            &self,
+            params: &ServiceParams,
+            req: GetTaskRequest,
+        ) -> Result<Task, A2AError> {
+            self.inner.get_task(params, req).await
+        }
+
+        async fn list_tasks(
+            &self,
+            params: &ServiceParams,
+            req: ListTasksRequest,
+        ) -> Result<ListTasksResponse, A2AError> {
+            self.inner.list_tasks(params, req).await
+        }
+
+        async fn cancel_task(
+            &self,
+            params: &ServiceParams,
+            req: CancelTaskRequest,
+        ) -> Result<Task, A2AError> {
+            self.inner.cancel_task(params, req).await
+        }
+
+        async fn subscribe_to_task(
+            &self,
+            params: &ServiceParams,
+            req: SubscribeToTaskRequest,
+        ) -> Result<Events, A2AError> {
+            self.inner.subscribe_to_task(params, req).await
+        }
+
+        async fn create_push_config(
+            &self,
+            params: &ServiceParams,
+            req: TaskPushNotificationConfig,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            self.inner.create_push_config(params, req).await
+        }
+
+        async fn get_push_config(
+            &self,
+            params: &ServiceParams,
+            req: GetTaskPushNotificationConfigRequest,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            self.inner.get_push_config(params, req).await
+        }
+
+        async fn list_push_configs(
+            &self,
+            params: &ServiceParams,
+            req: ListTaskPushNotificationConfigsRequest,
+        ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
+            self.inner.list_push_configs(params, req).await
+        }
+
+        async fn delete_push_config(
+            &self,
+            params: &ServiceParams,
+            req: DeleteTaskPushNotificationConfigRequest,
+        ) -> Result<(), A2AError> {
+            self.inner.delete_push_config(params, req).await
+        }
+
+        async fn get_extended_agent_card(
+            &self,
+            params: &ServiceParams,
+            req: GetExtendedAgentCardRequest,
+        ) -> Result<AgentCard, A2AError> {
+            self.inner.get_extended_agent_card(params, req).await
+        }
+    }
+
+    #[tokio::test]
+    async fn an_inner_handler_panic_frees_the_key() {
+        let executor = Scripted::new(Script::Answer);
+        let store = Arc::new(Store::open_in_memory(AgentKey::generate().id()).unwrap());
+        let tasks = SqliteTaskStore::new(Arc::clone(&store));
+        let bound = BindingExecutor::new(executor.clone(), Arc::clone(&store));
+        let inner = Panicky {
+            inner: DefaultRequestHandler::new(bound, tasks),
+            panic_next: AtomicBool::new(false),
+        };
+        let handler = GuardedHandler::new(inner, store, Arc::new(AgentKey::generate()));
+        let peer = AgentKey::generate().id().to_string();
+        let params = ServiceParams::from([(PEER_HEADER.to_owned(), vec![peer])]);
+
+        for streaming in [false, true] {
+            let req = request(if streaming { "streamed" } else { "unary" });
+            handler.inner.panic_next.store(true, Ordering::SeqCst);
+            let err = if streaming {
+                match handler.send_streaming_message(&params, req.clone()).await {
+                    Ok(_) => panic!("a panicking request streamed"),
+                    Err(err) => err,
+                }
+            } else {
+                handler
+                    .send_message(&params, req.clone())
+                    .await
+                    .unwrap_err()
+            };
+            assert_eq!(err.code, error_code::INTERNAL_ERROR, "{err}");
+
+            // Nothing ran, so the retry runs, at once.
+            let started = Instant::now();
+            let retry = handler.send_message(&params, req).await.unwrap();
+            assert!(
+                matches!(retry, SendMessageResponse::Message(_)),
+                "{retry:?}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(DEDUP_INFLIGHT_WAIT_S));
+        }
+        assert_eq!(executor.runs(), 2);
     }
 }

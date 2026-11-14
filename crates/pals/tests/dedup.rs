@@ -18,6 +18,7 @@ use pals::node::STORE_FILE;
 use pals_core::grant::Operation::{TaskRead, TaskSend};
 use pals_core::grant::{Operation, SignedGrant};
 use pals_core::identity::AgentKey;
+use pals_core::jcs;
 use pals_core::store::{
     DEDUP_INFLIGHT_WAIT_S, DEDUP_RETENTION_S, DedupBegin, DedupRow, INTERRUPTED_MESSAGE, Store,
 };
@@ -46,6 +47,14 @@ async fn wait_until(mut done: impl FnMut() -> bool) {
         assert!(Instant::now() < deadline, "timed out waiting");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// The dedup hash of a `SendMessage` with `params`: the BLAKE3, in hex, of
+/// the JCS form of the params as A2A reads them.
+fn request_hash(params: &Value) -> String {
+    let req: a2a::SendMessageRequest = serde_json::from_value(params.clone()).unwrap();
+    let params = serde_json::to_value(&req).unwrap();
+    blake3::hash(&jcs::canonical(&params)).to_hex().to_string()
 }
 
 /// The text of a task's status message.
@@ -274,6 +283,40 @@ async fn retry_after_a_restart_mid_execution_gets_the_failed_task() {
 }
 
 #[tokio::test]
+async fn unbound_row_left_by_a_crash_is_cleared_at_start() {
+    let (b, a, g, exec) = setup(Duration::ZERO).await;
+    let params = message_params("hola", None);
+    let message_id = params["message"]["messageId"].as_str().unwrap();
+    let done = message_params("done before", None);
+    let done_task = task_of(&a.rpc(&b, Some(&g), "SendMessage", done.clone()).await).clone();
+
+    // What a crash after the key was created and before its execution
+    // started leaves: a row with no outcome.
+    let TestNode { node, dir } = b;
+    node.shutdown().await.unwrap();
+    {
+        let store = Store::open(&dir.path().join(STORE_FILE), key_in(dir.path()).id()).unwrap();
+        let begin = store
+            .dedup_begin(&a.id(), message_id, &request_hash(&params), now_unix())
+            .unwrap();
+        assert_eq!(begin, DedupBegin::New);
+    }
+    let b = spawn_node_in_with_executor(dir, exec.clone()).await;
+
+    // The retry runs, at once, instead of waiting for a run that never was.
+    let started = Instant::now();
+    let res = a.rpc(&b, Some(&g), "SendMessage", params).await;
+    let task = task_of(&res);
+    assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED", "{task}");
+    assert!(started.elapsed() < Duration::from_secs(DEDUP_INFLIGHT_WAIT_S));
+    assert_eq!(exec.runs(), 2);
+    // A bound row is kept.
+    let res = a.rpc(&b, Some(&g), "SendMessage", done).await;
+    assert_eq!(task_of(&res)["id"], done_task["id"]);
+    assert_eq!(exec.runs(), 2);
+}
+
+#[tokio::test]
 async fn executor_error_fails_the_task_and_a_retry_returns_it() {
     let (b, a, g, exec) = setup_with(CountingExecutor::failing()).await;
     let params = message_params("hola", None);
@@ -412,18 +455,22 @@ async fn purge_removes_only_old_rows() {
         DedupBegin::New
     );
 
-    // A node purges what is older than the retention when it starts.
+    // A node purges what is older than the retention when it starts. The
+    // rows are bound: a node starting also frees every unbound one.
     let dir = tempfile::tempdir().unwrap();
     let owner = key_in(dir.path()).id();
     let now = now_unix();
     {
         let store = Store::open(&dir.path().join(STORE_FILE), owner).unwrap();
-        store
-            .dedup_begin(&peer, "m-expired", "h", now - DEDUP_RETENTION_S - 60)
-            .unwrap();
-        store
-            .dedup_begin(&peer, "m-kept", "h", now - DEDUP_RETENTION_S + 3600)
-            .unwrap();
+        for (message_id, at) in [
+            ("m-expired", now - DEDUP_RETENTION_S - 60),
+            ("m-kept", now - DEDUP_RETENTION_S + 3600),
+        ] {
+            store.dedup_begin(&peer, message_id, "h", at).unwrap();
+            store
+                .dedup_bind(&peer, message_id, Some("t"), None)
+                .unwrap();
+        }
     }
     let node = spawn_node_in_with_executor(dir, CountingExecutor::new(Duration::ZERO)).await;
     let store = &node.node.store;
@@ -433,6 +480,10 @@ async fn purge_removes_only_old_rows() {
     );
     assert_eq!(
         store.dedup_begin(&peer, "m-kept", "h", now).unwrap(),
-        existing
+        DedupBegin::Existing(DedupRow {
+            request_hash: "h".to_owned(),
+            task_id: Some("t".to_owned()),
+            response_json: None,
+        })
     );
 }

@@ -130,6 +130,20 @@ impl Store {
         Ok(deleted == 1)
     }
 
+    /// Deletes every unbound row, and returns how many.
+    ///
+    /// For the daemon to call when it starts, before it serves any request:
+    /// a key is bound before its execution does any work, so an unbound row
+    /// then belongs to a request that never ran, cut off by a crash or a
+    /// restart. Left there, it would hold its key with no outcome to come.
+    pub fn dedup_clear_unbound(&self) -> anyhow::Result<u64> {
+        let deleted = self.conn().execute(
+            "DELETE FROM dedup WHERE task_id IS NULL AND response_json IS NULL",
+            [],
+        )?;
+        Ok(u64::try_from(deleted)?)
+    }
+
     /// Deletes the rows created before `older_than_unix`, bound or not, and
     /// returns how many.
     pub fn dedup_purge(&self, older_than_unix: i64) -> anyhow::Result<u64> {
@@ -250,6 +264,36 @@ mod tests {
         assert_eq!(
             store.dedup_begin(&peer, "m-1", "h1", 11).unwrap(),
             DedupBegin::New
+        );
+    }
+
+    #[test]
+    fn clearing_unbound_rows_keeps_every_bound_one() {
+        let store = Store::open_in_memory(AgentKey::generate().id()).unwrap();
+        let peer = AgentKey::generate().id();
+        for message_id in ["m-free", "m-free-2", "m-task", "m-answer", "m-both"] {
+            store.dedup_begin(&peer, message_id, "h1", 10).unwrap();
+        }
+        store.dedup_bind(&peer, "m-task", Some("t"), None).unwrap();
+        store
+            .dedup_bind(&peer, "m-answer", None, Some("{}"))
+            .unwrap();
+        store
+            .dedup_bind(&peer, "m-both", Some("t2"), Some("{}"))
+            .unwrap();
+
+        assert_eq!(store.dedup_clear_unbound().unwrap(), 2);
+        assert_eq!(store.dedup_clear_unbound().unwrap(), 0);
+        assert_eq!(store.dedup_row(&peer, "m-free"), None);
+        assert_eq!(store.dedup_row(&peer, "m-free-2"), None);
+        assert_eq!(store.dedup_row(&peer, "m-task"), Some(row(Some("t"), None)));
+        assert_eq!(
+            store.dedup_row(&peer, "m-answer"),
+            Some(row(None, Some("{}")))
+        );
+        assert_eq!(
+            store.dedup_row(&peer, "m-both"),
+            Some(row(Some("t2"), Some("{}")))
         );
     }
 
