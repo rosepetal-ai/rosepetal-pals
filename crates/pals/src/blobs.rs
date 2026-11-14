@@ -77,6 +77,9 @@ pub const BLOBS_DIR: &str = "blobs";
 /// The project of the grants [`BlobService::share`] issues.
 pub const BLOB_PROJECT: &str = "blobs";
 
+/// How long [`BlobService::shutdown`] waits for the blob store to close.
+const BLOB_STORE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How often the store removes the blobs no tag holds.
 pub const BLOB_GC_INTERVAL: Duration = Duration::from_secs(3600);
 
@@ -239,6 +242,9 @@ struct Inner {
     endpoint: Endpoint,
     store: Arc<Store>,
     key: Arc<AgentKey>,
+    /// The task that decides the provider's requests, until
+    /// [`BlobService::shutdown`] ends it.
+    authorizer: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl BlobService {
@@ -274,7 +280,7 @@ impl BlobService {
             .await
             .map_err(|err| anyhow!("cannot drop the input tags of a previous run: {err}"))?;
         let (events, requests) = EventSender::channel(EVENT_CAPACITY, PROVIDER_EVENTS);
-        tokio::spawn(authorize(requests, Arc::clone(&store)));
+        let authorizer = tokio::spawn(authorize(requests, Arc::clone(&store)));
         let protocol = BlobsProtocol::new(&fs, Some(events));
         Ok(Self {
             inner: Arc::new(Inner {
@@ -284,8 +290,32 @@ impl BlobService {
                 endpoint,
                 store,
                 key,
+                authorizer: std::sync::Mutex::new(Some(authorizer)),
             }),
         })
+    }
+
+    /// Stops serving and storing: ends the task that decides the
+    /// provider's requests, which holds the agent's store, and shuts the
+    /// blob store down, within [`BLOB_STORE_STOP_TIMEOUT`]. Nothing of this
+    /// service works afterwards.
+    pub async fn shutdown(&self) {
+        let authorizer = self
+            .inner
+            .authorizer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(authorizer) = authorizer {
+            authorizer.abort();
+            // Cancelled, as asked; nothing else to learn.
+            let _ = authorizer.await;
+        }
+        match tokio::time::timeout(BLOB_STORE_STOP_TIMEOUT, self.inner.fs.shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => debug!(error = %err, "the blob store did not shut down cleanly"),
+            Err(_) => warn!("the blob store did not shut down in time"),
+        }
     }
 
     /// The provider, to serve on [`iroh_blobs::ALPN`].

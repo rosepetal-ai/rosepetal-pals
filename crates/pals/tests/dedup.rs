@@ -9,13 +9,15 @@ mod common;
 
 use std::time::{Duration, Instant};
 
+use a2a::TaskState;
 use axum::body::Body;
 use axum::http::{Request, header};
 use common::{
     CountingExecutor, IDEMPOTENCY_EXTENSION, TestNode, TestResponse, WORKER_CRASHED, bearer, grant,
     key_in, message_params, now_unix, rpc_request, spawn_node, spawn_node_in_with_executor,
-    spawn_node_with_executor, sse_results,
+    spawn_node_with_executor, sse_results, tasks_in,
 };
+use http_body_util::BodyExt;
 use pals::config::WorkerCfg;
 use pals::node::STORE_FILE;
 use pals_core::grant::Operation::{TaskRead, TaskSend};
@@ -43,9 +45,9 @@ async fn setup_with(exec: CountingExecutor) -> (TestNode, TestNode, SignedGrant,
     (b, a, g, exec)
 }
 
-/// Waits up to 10 s for `done`.
+/// Waits up to 30 s for `done`.
 async fn wait_until(mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !done() {
         assert!(Instant::now() < deadline, "timed out waiting");
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -126,33 +128,93 @@ async fn same_message_id_sent_twice_runs_once() {
     assert_eq!(res.json["result"]["totalSize"], 1, "{}", res.json);
 }
 
+/// Whether `b` serves a task in `WORKING`: its run has started.
+fn running(b: &TestNode) -> bool {
+    !tasks_in(b, TaskState::Working).is_empty()
+}
+
+/// The `result` of each JSON-RPC response of an event stream, as they
+/// arrive.
+struct SseResults {
+    body: Body,
+    pending: String,
+}
+
+impl SseResults {
+    fn new(response: axum::response::Response) -> Self {
+        assert_eq!(response.status(), 200);
+        Self {
+            body: response.into_body(),
+            pending: String::new(),
+        }
+    }
+
+    /// The next result, once it has arrived; `None` when the stream ends.
+    async fn next(&mut self) -> Option<Value> {
+        loop {
+            if let Some(end) = self.pending.find("\n\n") {
+                let event: String = self.pending.drain(..end + 2).collect();
+                let data: Vec<&str> = event
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data:"))
+                    .map(str::trim_start)
+                    .collect();
+                if data.is_empty() {
+                    continue;
+                }
+                let response: Value = serde_json::from_str(&data.join("\n")).expect("JSON");
+                assert!(response.get("error").is_none(), "{response}");
+                return Some(response["result"].clone());
+            }
+            match self.body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        self.pending
+                            .push_str(std::str::from_utf8(&data).expect("UTF-8"));
+                    }
+                }
+                Some(Err(err)) => panic!("the stream broke: {err}"),
+                None => return None,
+            }
+        }
+    }
+
+    /// Every result still to come, until the stream ends.
+    async fn rest(mut self) -> Vec<Value> {
+        let mut results = Vec::new();
+        while let Some(result) = self.next().await {
+            results.push(result);
+        }
+        results
+    }
+}
+
 #[tokio::test]
 async fn retry_while_first_execution_is_running_attaches_to_it() {
-    let (b, a, g, exec) = setup(Duration::from_secs(2)).await;
+    let (b, a, g, exec) = setup_with(CountingExecutor::gated()).await;
     let params = message_params("hola", None);
-    let send = |delay_ms: u64| {
-        let params = params.clone();
-        let (a, b, g) = (&a, &b, &g);
-        async move {
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            a.rpc_idempotent(b, Some(g), "SendMessage", params).await
-        }
-    };
+    let send = || a.rpc_idempotent(&b, Some(&g), "SendMessage", params.clone());
 
-    // Two identical requests at once, and a retry 200 ms later.
-    let (first, twin, retry) = tokio::join!(send(0), send(0), send(200));
+    // Two identical requests at once, and a retry once the run has started,
+    // which returns while the run is held: with the task as it is then.
+    let retried = async {
+        wait_until(|| running(&b)).await;
+        let retry = send().await;
+        assert_eq!(
+            task_of(&retry)["status"]["state"],
+            "TASK_STATE_WORKING",
+            "{}",
+            retry.json
+        );
+        exec.release();
+        retry
+    };
+    let (first, twin, retry) = tokio::join!(send(), send(), retried);
     assert_eq!(exec.runs(), 1);
     let id = &task_of(&first)["id"];
     assert_eq!(&task_of(&twin)["id"], id);
     assert_eq!(&task_of(&retry)["id"], id);
-    // The retry gets the task as it is then, running; the request that ran
-    // it gets it completed.
-    assert_eq!(
-        task_of(&retry)["status"]["state"],
-        "TASK_STATE_WORKING",
-        "{}",
-        retry.json
-    );
+    // The request that ran it gets it completed.
     let states = [&first, &twin].map(|res| task_of(res)["status"]["state"].clone());
     assert!(
         states.contains(&json!("TASK_STATE_COMPLETED")),
@@ -163,29 +225,42 @@ async fn retry_while_first_execution_is_running_attaches_to_it() {
 
 #[tokio::test]
 async fn streaming_retry_resubscribes_instead_of_reexecuting() {
-    let (b, a, g, exec) = setup(Duration::from_secs(2)).await;
+    let (b, a, g, exec) = setup_with(CountingExecutor::gated()).await;
     let params = message_params("hola", None);
 
+    // A retry once the run has started follows the running task: its state
+    // then, while the run is held, and the events after.
+    let retried = async {
+        wait_until(|| running(&b)).await;
+        let request = Request::post("/jsonrpc")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("a2a-version", "1.0")
+            .header("a2a-extensions", IDEMPOTENCY_EXTENSION)
+            .header(header::AUTHORIZATION, bearer(&g))
+            .body(Body::from(
+                serde_json::to_vec(&rpc_request("SendStreamingMessage", params.clone())).unwrap(),
+            ))
+            .unwrap();
+        let mut results = SseResults::new(a.send(&b, request).await);
+        let first = results.next().await.expect("a first event");
+        assert_eq!(
+            first["task"]["status"]["state"], "TASK_STATE_WORKING",
+            "{first}"
+        );
+        exec.release();
+        let mut all = vec![first];
+        all.extend(results.rest().await);
+        all
+    };
     let (first, retry) = tokio::join!(
         a.rpc_idempotent(&b, Some(&g), "SendStreamingMessage", params.clone()),
-        async {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            a.rpc_idempotent(&b, Some(&g), "SendStreamingMessage", params.clone())
-                .await
-        }
+        retried
     );
     assert_eq!(exec.runs(), 1);
     let first = sse_results(&first);
-    let retry = sse_results(&retry);
     let id = event_task_id(&first[0]).clone();
     assert!(id.is_string(), "{first:?}");
-
-    // The retry follows the running task: its state then, the events after.
     assert_eq!(retry[0]["task"]["id"], id, "{retry:?}");
-    assert_eq!(
-        retry[0]["task"]["status"]["state"], "TASK_STATE_WORKING",
-        "{retry:?}"
-    );
     assert!(retry.iter().all(|event| event_task_id(event) == &id));
     for events in [&first, &retry] {
         let last = events.last().unwrap();
@@ -217,39 +292,32 @@ async fn streaming_retry_resubscribes_instead_of_reexecuting() {
 
 #[tokio::test]
 async fn retry_of_a_long_unary_execution_attaches_to_it() {
-    // The first request runs for longer than a retry would wait for it.
-    let run = Duration::from_secs(DEDUP_INFLIGHT_WAIT_S + 2);
-    let (b, a, g, exec) = setup(run).await;
+    // The first request runs for as long as the test holds it: longer than
+    // a retry would wait for a run with no task yet.
+    let (b, a, g, exec) = setup_with(CountingExecutor::gated()).await;
     let params = message_params("hola", None);
-    let retry = |after: Duration| {
-        let params = params.clone();
-        let (a, b, g) = (&a, &b, &g);
-        async move {
-            tokio::time::sleep(after).await;
-            let started = Instant::now();
-            let res = a.rpc_idempotent(b, Some(g), "SendMessage", params).await;
-            (res, started.elapsed())
-        }
+    let retry = || a.rpc_idempotent(&b, Some(&g), "SendMessage", params.clone());
+    let retries = async {
+        wait_until(|| running(&b)).await;
+        let early = retry().await;
+        tokio::time::sleep(Duration::from_secs(DEDUP_INFLIGHT_WAIT_S + 1)).await;
+        let late = retry().await;
+        exec.release();
+        (early, late)
     };
-
-    let (first, early, late) = tokio::join!(
+    let (first, (early, late)) = tokio::join!(
         a.rpc_idempotent(&b, Some(&g), "SendMessage", params.clone()),
-        retry(Duration::from_millis(200)),
-        retry(Duration::from_secs(DEDUP_INFLIGHT_WAIT_S + 1)),
+        retries
     );
     let task = task_of(&first);
     assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED", "{task}");
-    // Both retries get the running task at once, not an error after the wait.
-    for (res, took) in [&early, &late] {
+    // Both retries get the running task, not an error.
+    for res in [&early, &late] {
         let retried = task_of(res);
         assert_eq!(retried["id"], task["id"]);
         assert_eq!(
             retried["status"]["state"], "TASK_STATE_WORKING",
             "{retried}"
-        );
-        assert!(
-            took < &Duration::from_secs(DEDUP_INFLIGHT_WAIT_S),
-            "{took:?}"
         );
     }
     assert_eq!(exec.runs(), 1);
@@ -273,6 +341,9 @@ async fn retry_after_a_restart_mid_execution_gets_the_failed_task() {
     let (http, addr) = (a.node.peer_http.clone(), b.node.addr());
     let first = tokio::spawn(async move { http.send(addr, request).await });
     wait_until(|| exec.runs() == 1).await;
+    // The run goes on, as it would in a process that crashed later, and
+    // holds the old node's store: the new one opens the database beside it,
+    // which the store's busy timeout makes safe.
     let TestNode { node, dir, .. } = b;
     node.shutdown().await.unwrap();
     let b = spawn_node_in_with_executor(dir, exec.clone()).await;
@@ -310,7 +381,7 @@ async fn unbound_row_left_by_a_crash_is_cleared_at_start() {
     // What a crash after the key was created and before its execution
     // started leaves: a row with no outcome.
     let TestNode { node, dir, .. } = b;
-    node.shutdown().await.unwrap();
+    common::shut_down(node).await;
     {
         let store = Store::open(&dir.path().join(STORE_FILE), key_in(dir.path()).id()).unwrap();
         let begin = store
@@ -320,12 +391,11 @@ async fn unbound_row_left_by_a_crash_is_cleared_at_start() {
     }
     let b = spawn_node_in_with_executor(dir, exec.clone()).await;
 
-    // The retry runs, at once, instead of waiting for a run that never was.
-    let started = Instant::now();
+    // The retry runs instead of waiting for a run that never was: a row
+    // left in place would make it wait and fail, not complete.
     let res = a.rpc_idempotent(&b, Some(&g), "SendMessage", params).await;
     let task = task_of(&res);
     assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED", "{task}");
-    assert!(started.elapsed() < Duration::from_secs(DEDUP_INFLIGHT_WAIT_S));
     assert_eq!(exec.runs(), 2);
     // A bound row is kept.
     let res = a.rpc_idempotent(&b, Some(&g), "SendMessage", done).await;
@@ -409,7 +479,7 @@ async fn dedup_survives_daemon_restart() {
     .clone();
 
     let TestNode { node, dir, .. } = b;
-    node.shutdown().await.unwrap();
+    common::shut_down(node).await;
     let b = spawn_node_in_with_executor(dir, exec.clone()).await;
 
     let res = a

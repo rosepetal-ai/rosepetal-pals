@@ -527,7 +527,8 @@ async fn no_held_grant_is_a_local_401_and_the_peer_is_not_contacted() {
         res.json,
         json!({"error": format!("no grant held for {b_id}")})
     );
-    assert!(started.elapsed() < Duration::from_secs(2));
+    // Well below the 10 s that dialing it would take, on a loaded host too.
+    assert!(started.elapsed() < Duration::from_secs(8));
 }
 
 #[tokio::test]

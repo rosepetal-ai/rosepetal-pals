@@ -1,7 +1,8 @@
 //! The agent's local SQLite database, `<data_dir>/pals.db`.
 //!
 //! One connection behind a mutex, in WAL mode with `foreign_keys = ON` and a
-//! 5 s busy timeout, so the daemon and CLI commands can share the file. The
+//! 30 s busy timeout, so the daemon and CLI commands can share the file, even
+//! on a host so loaded that another connection holds a write for seconds. The
 //! schema version lives in `PRAGMA user_version`; a database written by a
 //! newer version is refused. All calls are synchronous.
 
@@ -29,7 +30,7 @@ pub use tasks::INTERRUPTED_MESSAGE;
 /// The schema this build writes and reads.
 const SCHEMA_VERSION: i64 = 1;
 const SCHEMA: &str = include_str!("schema.sql");
-const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
+const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The local store of one agent, its owner. `Send + Sync`: share it behind
 /// an `Arc`.
@@ -144,7 +145,7 @@ mod tests {
         };
         assert_eq!(pragma("journal_mode"), "wal");
         assert_eq!(pragma("foreign_keys"), "1");
-        assert_eq!(pragma("busy_timeout"), "5000");
+        assert_eq!(pragma("busy_timeout"), "30000");
         assert_eq!(pragma("user_version"), "1");
     }
 }

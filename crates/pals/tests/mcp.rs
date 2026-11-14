@@ -636,7 +636,8 @@ async fn pals_ask_returns_a_message_id_before_a_slow_answer() {
     // MCP clients time tool calls out (the TypeScript SDK after 60 s): the
     // default wait stays below that.
     assert_eq!(DEFAULT_WAIT_S, 50);
-    let exec = CountingExecutor::new(Duration::from_secs(12));
+    // An answer that waits until the test releases it.
+    let exec = CountingExecutor::gated();
     let b = spawn_node_with_executor(exec.clone()).await;
     let a = requester_of(&b).await;
     pals::install_crypto_provider();
@@ -648,16 +649,15 @@ async fn pals_ask_returns_a_message_id_before_a_slow_answer() {
         .await
         .expect("an MCP session with the gateway");
 
-    // A wait shorter than the answer: the call returns the handle.
-    let args = json!({"peer": "bob", "question": "hola", "wait_s": 5});
+    // A wait that ends before the answer: the call returns the handle, with
+    // the task as it was seen, which a loaded host may take seconds to see.
+    let args = json!({"peer": "bob", "question": "hola", "wait_s": 20});
     let mut params =
         CallToolRequestParams::new("pals_ask").with_arguments(args.as_object().cloned().unwrap());
     let mut meta = RequestMetaObject::default();
     meta.set_progress_token(ProgressToken(NumberOrString::String("ask-1".into())));
     params.meta = Some(meta);
-    let started = std::time::Instant::now();
     let out = ok_json(&client.call_tool(params).await.expect("a tool result"));
-    assert!(started.elapsed() < Duration::from_secs(12), "{out}");
     let message_id = out["message_id"].as_str().expect("a message id").to_owned();
     let state = out["state"].as_str().unwrap();
     assert!(
@@ -673,6 +673,7 @@ async fn pals_ask_returns_a_message_id_before_a_slow_answer() {
     );
 
     // Polling by that id gets the answer, from the one run.
+    exec.release();
     let answered = ok_json(
         &call(
             &client,

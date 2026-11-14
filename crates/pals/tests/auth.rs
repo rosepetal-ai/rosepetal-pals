@@ -672,9 +672,34 @@ async fn second_daemon_on_same_data_dir_refuses_to_start() {
     // Once the first one shuts down, the directory is free again.
     let TestNode { node, dir, .. } = b;
     let id = node.id;
-    node.shutdown().await.unwrap();
+    common::shut_down(node).await;
     let again = spawn_node_in(dir, WorkerCfg::Echo, |_| {}).await;
     assert_eq!(again.id(), id);
+}
+
+#[tokio::test]
+async fn shutdown_lets_go_of_the_store_before_it_returns() {
+    // A node that served a request, and a peer that knows it.
+    let (b, a) = pair().await;
+    let g = grant(&b, &a, &SEND_AND_READ, 3600);
+    a.ask(&b, &g, "hola").await;
+    let TestNode {
+        node, dir: _dir, ..
+    } = b;
+    let store = Arc::downgrade(&node.store);
+    node.shutdown().await.unwrap();
+    // Its background tasks are over and every handle on the store it held
+    // is gone, as when its process exits: the lock was released last.
+    common::wait_for_store_to_close(&store).await;
+
+    // A node with nothing in flight lets go of it before shutdown returns.
+    let c = spawn_node(WorkerCfg::Echo).await;
+    let TestNode {
+        node, dir: _dir, ..
+    } = c;
+    let store = Arc::downgrade(&node.store);
+    node.shutdown().await.unwrap();
+    assert_eq!(store.strong_count(), 0, "the store outlives its node");
 }
 
 #[tokio::test]

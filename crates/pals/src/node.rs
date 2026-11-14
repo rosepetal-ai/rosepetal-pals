@@ -166,31 +166,57 @@ impl Node {
     /// Stops the gateway from accepting requests and ends its MCP sessions,
     /// stops purging, closes the connections to peers, stops serving,
     /// closes the endpoint, lets the gateway's open connections finish for
-    /// up to [`GATEWAY_STOP_TIMEOUT`], and releases the data directory.
+    /// up to [`GATEWAY_STOP_TIMEOUT`], stops the blob service, and only then
+    /// lets go of the store and, last, of the data directory's lock.
+    ///
+    /// Every task of the node's own (the purge, the gateway, the blob
+    /// provider's authorizer) is over when it returns, so the store is
+    /// closed then unless an execution still running or a connection still
+    /// being torn down holds it: a node started on the same data directory
+    /// in the same process opens the database alone once those are gone too.
     pub async fn shutdown(self) -> anyhow::Result<()> {
+        let Node {
+            id: _,
+            store,
+            peer_http,
+            blobs,
+            outbox,
+            router,
+            gateway,
+            dedup_purge,
+            _lock: lock,
+        } = self;
         let GatewayServer {
             url: _,
             stopping,
             stop,
-            mut task,
-        } = self.gateway;
+            task: mut gateway_task,
+        } = gateway;
         // The MCP sessions' streams would hold the server open.
         stopping.cancel();
         // The server may have stopped already; then there is nothing to tell.
         let _ = stop.send(());
-        drop(self.dedup_purge);
-        self.peer_http.close_all().await;
-        let stopped = self
-            .router
+        dedup_purge.stop().await;
+        peer_http.close_all().await;
+        let stopped = router
             .shutdown()
             .await
             .context("the node did not shut down cleanly");
-        if tokio::time::timeout(GATEWAY_STOP_TIMEOUT, &mut task.0)
+        if tokio::time::timeout(GATEWAY_STOP_TIMEOUT, &mut gateway_task.0)
             .await
             .is_err()
         {
             tracing::debug!("dropping the gateway connections still open");
+            gateway_task.stop().await;
         }
+        blobs.shutdown().await;
+        drop((outbox, blobs, peer_http));
+        tracing::debug!(
+            handles = Arc::strong_count(&store),
+            "the store's handles at shutdown, this one included"
+        );
+        drop(store);
+        drop(lock);
         stopped
     }
 }
@@ -438,6 +464,16 @@ async fn purge_dedup_hourly(store: Arc<Store>) {
 
 /// A spawned task, aborted when this value is dropped.
 struct AbortOnDrop(JoinHandle<()>);
+
+impl AbortOnDrop {
+    /// Aborts the task, unless it is over, and waits until it is. Not for a
+    /// task already awaited to its end.
+    async fn stop(mut self) {
+        self.0.abort();
+        // Cancelled, or over before; either way it is done.
+        let _ = (&mut self.0).await;
+    }
+}
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {

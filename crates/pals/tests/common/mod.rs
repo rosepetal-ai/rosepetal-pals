@@ -341,17 +341,43 @@ pub async fn spawn_node_in_with_executor(
     }
 }
 
+/// Shuts `node` down and waits until nothing holds its store any more, as
+/// when its process exits, so that a node spawned on its data directory
+/// next opens the database alone.
+pub async fn shut_down(node: Node) {
+    let store = Arc::downgrade(&node.store);
+    node.shutdown().await.expect("shut the node down");
+    wait_for_store_to_close(&store).await;
+}
+
+/// Waits up to 30 s for every handle on `store` to be gone.
+pub async fn wait_for_store_to_close(store: &std::sync::Weak<pals_core::store::Store>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while store.strong_count() > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the store outlived its node: {} handles",
+            store.strong_count()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// The text of the error a [`CountingExecutor::failing`] run ends with.
 pub const WORKER_CRASHED: &str = "the worker crashed";
 
 /// The echo executor, counting how many times it runs, that takes `delay`
-/// between its first event (the task in `WORKING`) and the rest. Clones
-/// share the count.
+/// between its first event (the task in `WORKING`) and the rest, or, when
+/// [gated](CountingExecutor::gated), waits there until the test
+/// [releases](CountingExecutor::release) it. Clones share the count and the
+/// gate.
 #[derive(Clone)]
 pub struct CountingExecutor {
     runs: Arc<AtomicUsize>,
     delay: Duration,
     fail: bool,
+    /// Closed, it lets every run go on.
+    gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl CountingExecutor {
@@ -360,6 +386,24 @@ impl CountingExecutor {
             runs: Arc::new(AtomicUsize::new(0)),
             delay,
             fail: false,
+            gate: None,
+        }
+    }
+
+    /// An executor whose runs, once the task is `WORKING`, wait until
+    /// [`CountingExecutor::release`].
+    pub fn gated() -> Self {
+        Self {
+            gate: Some(Arc::new(tokio::sync::Semaphore::new(0))),
+            ..Self::new(Duration::ZERO)
+        }
+    }
+
+    /// Lets every run of a [gated](CountingExecutor::gated) executor go on,
+    /// those waiting and those to come.
+    pub fn release(&self) {
+        if let Some(gate) = &self.gate {
+            gate.close();
         }
     }
 
@@ -393,16 +437,24 @@ impl AgentExecutor for CountingExecutor {
                     .chain(stream::iter([crashed])),
             );
         }
-        let delay = self.delay;
+        let (delay, gate) = (self.delay, self.gate.clone());
         Box::pin(
             EchoExecutor
                 .execute(ctx)
                 .enumerate()
-                .then(move |(n, event)| async move {
-                    if n == 1 {
-                        tokio::time::sleep(delay).await;
+                .then(move |(n, event)| {
+                    let gate = gate.clone();
+                    async move {
+                        if n == 1 {
+                            if let Some(gate) = gate {
+                                // Closed once released: no permit is ever
+                                // given.
+                                let _ = gate.acquire().await;
+                            }
+                            tokio::time::sleep(delay).await;
+                        }
+                        event
                     }
-                    event
                 }),
         )
     }
@@ -451,6 +503,25 @@ pub async fn stub_peer(a: &TestNode, name: &str, key: &AgentKey, app: axum::Rout
             TunnelServer::new(app, TunnelLimits::default()),
         )
         .spawn()
+}
+
+/// The tasks `node` serves that are in `state`, as its store has them.
+pub fn tasks_in(node: &TestNode, state: a2a::TaskState) -> Vec<a2a::Task> {
+    let request = a2a::ListTasksRequest {
+        context_id: None,
+        status: Some(state),
+        page_size: Some(100),
+        page_token: None,
+        history_length: Some(0),
+        status_timestamp_after: None,
+        include_artifacts: None,
+        tenant: None,
+    };
+    node.node
+        .store
+        .tasks_list(&request)
+        .expect("list the tasks")
+        .tasks
 }
 
 /// The key of the agent whose data directory is `dir`, created if missing.

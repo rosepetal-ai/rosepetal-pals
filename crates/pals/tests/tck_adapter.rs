@@ -430,9 +430,10 @@ async fn streaming_sequences_match_the_feature_file() {
 
 #[tokio::test]
 async fn resubscribe_task_stays_active_for_twice_the_timeout() {
-    // As if the daemon ran with TCK_STREAMING_TIMEOUT=0.2.
-    let timeout = streaming_timeout(Some("0.2"));
-    assert_eq!(timeout, Duration::from_millis(200));
+    // As if the daemon ran with TCK_STREAMING_TIMEOUT=2: long enough for the
+    // subscription to arrive while the task runs, on a loaded host too.
+    let timeout = streaming_timeout(Some("2"));
+    assert_eq!(timeout, Duration::from_secs(2));
     let b = spawn_node_with_executor(TckExecutor::new(timeout)).await;
     let s = with_provider(b).await;
 
@@ -460,7 +461,7 @@ async fn resubscribe_task_stays_active_for_twice_the_timeout() {
         "{described:?}"
     );
     assert!(
-        elapsed >= Duration::from_millis(400),
+        elapsed >= 2 * timeout,
         "the task completed after {elapsed:?}"
     );
 
@@ -482,7 +483,7 @@ async fn resubscribe_task_stays_active_for_twice_the_timeout() {
         ]
     );
     assert!(
-        elapsed >= Duration::from_millis(400),
+        elapsed >= 2 * timeout,
         "the task completed after {elapsed:?}"
     );
 }
