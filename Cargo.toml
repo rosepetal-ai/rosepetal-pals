@@ -20,6 +20,9 @@ iroh-tickets = "=1.0.0"
 a2a = { package = "a2a-lf", version = "=0.4.2" }
 a2a-server = { package = "a2a-server-lf", version = "=0.5.3", default-features = false }
 a2a-client = { package = "a2a-client-lf", version = "=0.2.9", default-features = false }
+# The SDK's ProtoJSON types, for the canonical forms of a signed Agent Card
+# that other SDKs verify. Already in the lock: the SDKs bring it.
+a2a-pb = "=0.3.2"
 rmcp = "=3.10.0"
 
 pals-core = { path = "crates/pals-core" }
@@ -71,4 +74,7 @@ tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 
 # Test-only.
 assert_cmd = "=2.2.2"
+# HMAC-SHA256 for the algorithm-confusion test of card signatures. Pinned to
+# the version ed25519-dalek already brings.
+sha2 = "=0.11.0"
 tempfile = "=3.27.0"

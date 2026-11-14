@@ -1,0 +1,14 @@
+{
+  "name": "pals-card-signatures-js",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Checks a PALS Agent Card signature with the official A2A JS SDK",
+  "type": "module",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@a2a-js/sdk": "1.3.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

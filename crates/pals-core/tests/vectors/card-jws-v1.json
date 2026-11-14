@@ -1,0 +1,191 @@
+{
+  "agent_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+  "canonical_hex": "7b226361706162696c6974696573223a7b22657874656e6465644167656e7443617264223a747275652c22657874656e73696f6e73223a5b7b226465736372697074696f6e223a224f70742d696e206964656d706f74656e6379206279206d65737361676549643a20612072657472792077697468207468652073616d65206d657373616765496420616e6420636f6e74656e7420617474616368657320746f2074686520666972737420726571756573742773207461736b206f7220616e7377657220696e7374656164206f662072756e6e696e6720616761696e2e222c22757269223a2268747470733a2f2f6769746875622e636f6d2f726f7365706574616c2d61692f726f7365706574616c2d70616c732f657874656e73696f6e732f6964656d706f74656e63792f7631227d2c7b226465736372697074696f6e223a225369676e656420696e76656e746f727920766965777320616e6420736572766963652071756572696573206f766572206167656e746e65742d646973636f766572792f302e222c22706172616d73223a7b22646973636f76657279416c706e223a226167656e746e65742d646973636f766572792f30222c2270726f66696c65223a226167656e746e65742e696e76656e746f72792f31227d2c22757269223a2268747470733a2f2f6769746875622e636f6d2f726f7365706574616c2d61692f726f7365706574616c2d70616c732f657874656e73696f6e732f696e76656e746f72792f7631227d5d2c22707573684e6f74696669636174696f6e73223a66616c73652c2273747265616d696e67223a747275657d2c2264656661756c74496e7075744d6f646573223a5b22746578742f706c61696e222c222a2f2a225d2c2264656661756c744f75747075744d6f646573223a5b22746578742f706c61696e222c226170706c69636174696f6e2f6f637465742d73747265616d225d2c226465736372697074696f6e223a2246726f7a656e206361726420766563746f72222c226e616d65223a22766563746f72222c227365637572697479526571756972656d656e7473223a5b7b22736368656d6573223a7b226167656e746e65744772616e74223a7b226c697374223a5b22736b696c6c3a61736b225d7d7d7d5d2c227365637572697479536368656d6573223a7b226167656e746e65744772616e74223a7b2268747470417574685365637572697479536368656d65223a7b22626561726572466f726d6174223a226167656e746e65742e6772616e742f31222c22736368656d65223a22426561726572227d7d7d2c22736b696c6c73223a5b7b226465736372697074696f6e223a22416e73776572732061207175657374696f6e20776974682074686520636f6e74657874206f66206f6e6520617574686f72697a65642070726f6a6563742e222c226964223a2261736b222c226e616d65223a2241736b222c2274616773223a5b2261736b225d7d2c7b226465736372697074696f6e223a224c656520656c20746578746f206772616261646f20656e207069657a6173206d6574c3a16c696361732e222c226964223a226f63722d6d6574616c2d7631222c22696e7075744d6f646573223a5b22696d6167652f706e67222c22696d6167652f6a706567225d2c226e616d65223a224f4352206f6e206d6574616c207061727473222c226f75747075744d6f646573223a5b22746578742f706c61696e225d2c2274616773223a5b226167656e746e65743a6361706162696c6974793a76313a766973696f6e2e6f6372225d7d5d2c22737570706f72746564496e7465726661636573223a5b7b2270726f746f636f6c42696e64696e67223a2268747470733a2f2f6769746875622e636f6d2f726f7365706574616c2d61692f726f7365706574616c2d70616c732f62696e64696e67732f687474702d6f7665722d69726f682f76312f6a736f6e727063222c2270726f746f636f6c56657273696f6e223a22312e30222c2275726c223a2269726f683a2f2f386138386533646437343039663139356664353264623264336362613564373263613637303962663164393431323162663337343838303162343066366635632f6a736f6e727063227d2c7b2270726f746f636f6c42696e64696e67223a2268747470733a2f2f6769746875622e636f6d2f726f7365706574616c2d61692f726f7365706574616c2d70616c732f62696e64696e67732f687474702d6f7665722d69726f682f76312f687474702d6a736f6e222c2270726f746f636f6c56657273696f6e223a22312e30222c2275726c223a2269726f683a2f2f386138386533646437343039663139356664353264623264336362613564373263613637303962663164393431323162663337343838303162343066366635632f72657374227d5d2c2276657273696f6e223a22302e302e30227d",
+  "card": {
+    "capabilities": {
+      "extendedAgentCard": true,
+      "extensions": [
+        {
+          "description": "Opt-in idempotency by messageId: a retry with the same messageId and content attaches to the first request's task or answer instead of running again.",
+          "uri": "https://github.com/rosepetal-ai/rosepetal-pals/extensions/idempotency/v1"
+        },
+        {
+          "description": "Signed inventory views and service queries over agentnet-discovery/0.",
+          "params": {
+            "discoveryAlpn": "agentnet-discovery/0",
+            "profile": "agentnet.inventory/1"
+          },
+          "uri": "https://github.com/rosepetal-ai/rosepetal-pals/extensions/inventory/v1"
+        }
+      ],
+      "pushNotifications": false,
+      "streaming": true
+    },
+    "defaultInputModes": [
+      "text/plain",
+      "*/*"
+    ],
+    "defaultOutputModes": [
+      "text/plain",
+      "application/octet-stream"
+    ],
+    "description": "Frozen card vector",
+    "name": "vector",
+    "securityRequirements": [
+      {
+        "schemes": {
+          "agentnetGrant": {
+            "list": [
+              "skill:ask"
+            ]
+          }
+        }
+      }
+    ],
+    "securitySchemes": {
+      "agentnetGrant": {
+        "httpAuthSecurityScheme": {
+          "bearerFormat": "agentnet.grant/1",
+          "scheme": "Bearer"
+        }
+      }
+    },
+    "skills": [
+      {
+        "description": "Answers a question with the context of one authorized project.",
+        "id": "ask",
+        "name": "Ask",
+        "tags": [
+          "ask"
+        ]
+      },
+      {
+        "description": "Lee el texto grabado en piezas metálicas.",
+        "id": "ocr-metal-v1",
+        "inputModes": [
+          "image/png",
+          "image/jpeg"
+        ],
+        "name": "OCR on metal parts",
+        "outputModes": [
+          "text/plain"
+        ],
+        "tags": [
+          "agentnet:capability:v1:vision.ocr"
+        ]
+      }
+    ],
+    "supportedInterfaces": [
+      {
+        "protocolBinding": "https://github.com/rosepetal-ai/rosepetal-pals/bindings/http-over-iroh/v1/jsonrpc",
+        "protocolVersion": "1.0",
+        "url": "iroh://8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c/jsonrpc"
+      },
+      {
+        "protocolBinding": "https://github.com/rosepetal-ai/rosepetal-pals/bindings/http-over-iroh/v1/http-json",
+        "protocolVersion": "1.0",
+        "url": "iroh://8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c/rest"
+      }
+    ],
+    "version": "0.0.0"
+  },
+  "description": "Agent Card JWS test vector (A2A §8.4, EdDSA). The agent's Ed25519 secret key is 32 bytes of 0x01 (signing_key_hex); agent_id is its public key in hex, the kid. card is the normalized card without signatures; canonical_hex is JCS (RFC 8785) of card, the same bytes in the three canonical forms (Raw, ProtoJson, ProtoJsonClean); protected is base64url without padding of JCS({\"alg\":\"EdDSA\",\"kid\":agent_id,\"typ\":\"JOSE\"}); signature is Ed25519 over protected || \".\" || base64url(canonical bytes), base64url without padding; signed_card is card with signatures [{protected, signature}]; hash is \"blake3:\" and the hex of BLAKE3 over JCS(signed_card).",
+  "hash": "blake3:856acc066c7304adbae9c444204c10a0c2e3d113491fca62c1a06da74fedd4fe",
+  "protected": "eyJhbGciOiJFZERTQSIsImtpZCI6IjhhODhlM2RkNzQwOWYxOTVmZDUyZGIyZDNjYmE1ZDcyY2E2NzA5YmYxZDk0MTIxYmYzNzQ4ODAxYjQwZjZmNWMiLCJ0eXAiOiJKT1NFIn0",
+  "signature": "ZkrVYUwihluq7q0ZGPRRUet4G3raJVky28mIkQPdGW0R986ICsDIw9_w-GKe5ocf0uLvHpz8WERGJDvgK-gwDg",
+  "signed_card": {
+    "capabilities": {
+      "extendedAgentCard": true,
+      "extensions": [
+        {
+          "description": "Opt-in idempotency by messageId: a retry with the same messageId and content attaches to the first request's task or answer instead of running again.",
+          "uri": "https://github.com/rosepetal-ai/rosepetal-pals/extensions/idempotency/v1"
+        },
+        {
+          "description": "Signed inventory views and service queries over agentnet-discovery/0.",
+          "params": {
+            "discoveryAlpn": "agentnet-discovery/0",
+            "profile": "agentnet.inventory/1"
+          },
+          "uri": "https://github.com/rosepetal-ai/rosepetal-pals/extensions/inventory/v1"
+        }
+      ],
+      "pushNotifications": false,
+      "streaming": true
+    },
+    "defaultInputModes": [
+      "text/plain",
+      "*/*"
+    ],
+    "defaultOutputModes": [
+      "text/plain",
+      "application/octet-stream"
+    ],
+    "description": "Frozen card vector",
+    "name": "vector",
+    "securityRequirements": [
+      {
+        "schemes": {
+          "agentnetGrant": {
+            "list": [
+              "skill:ask"
+            ]
+          }
+        }
+      }
+    ],
+    "securitySchemes": {
+      "agentnetGrant": {
+        "httpAuthSecurityScheme": {
+          "bearerFormat": "agentnet.grant/1",
+          "scheme": "Bearer"
+        }
+      }
+    },
+    "signatures": [
+      {
+        "protected": "eyJhbGciOiJFZERTQSIsImtpZCI6IjhhODhlM2RkNzQwOWYxOTVmZDUyZGIyZDNjYmE1ZDcyY2E2NzA5YmYxZDk0MTIxYmYzNzQ4ODAxYjQwZjZmNWMiLCJ0eXAiOiJKT1NFIn0",
+        "signature": "ZkrVYUwihluq7q0ZGPRRUet4G3raJVky28mIkQPdGW0R986ICsDIw9_w-GKe5ocf0uLvHpz8WERGJDvgK-gwDg"
+      }
+    ],
+    "skills": [
+      {
+        "description": "Answers a question with the context of one authorized project.",
+        "id": "ask",
+        "name": "Ask",
+        "tags": [
+          "ask"
+        ]
+      },
+      {
+        "description": "Lee el texto grabado en piezas metálicas.",
+        "id": "ocr-metal-v1",
+        "inputModes": [
+          "image/png",
+          "image/jpeg"
+        ],
+        "name": "OCR on metal parts",
+        "outputModes": [
+          "text/plain"
+        ],
+        "tags": [
+          "agentnet:capability:v1:vision.ocr"
+        ]
+      }
+    ],
+    "supportedInterfaces": [
+      {
+        "protocolBinding": "https://github.com/rosepetal-ai/rosepetal-pals/bindings/http-over-iroh/v1/jsonrpc",
+        "protocolVersion": "1.0",
+        "url": "iroh://8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c/jsonrpc"
+      },
+      {
+        "protocolBinding": "https://github.com/rosepetal-ai/rosepetal-pals/bindings/http-over-iroh/v1/http-json",
+        "protocolVersion": "1.0",
+        "url": "iroh://8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c/rest"
+      }
+    ],
+    "version": "0.0.0"
+  },
+  "signing_key_hex": "0101010101010101010101010101010101010101010101010101010101010101"
+}

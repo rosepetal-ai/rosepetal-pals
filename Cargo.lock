@@ -2761,6 +2761,7 @@ name = "pals-core"
 version = "0.1.0"
 dependencies = [
  "a2a-lf",
+ "a2a-pb",
  "anyhow",
  "base64 0.23.1",
  "blake3",
@@ -2772,6 +2773,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
+ "sha2",
  "tempfile",
  "thiserror 2.0.21",
  "time",
