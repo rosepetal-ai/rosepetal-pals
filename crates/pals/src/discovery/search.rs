@@ -23,7 +23,11 @@
 //!    one is discarded, `card not verified`, and can still be asked by its
 //!    name. Its extended card is never read: a verified public card says
 //!    nothing of it. Nothing is taken from the absence of
-//!    `securityRequirements`, which one canonical form drops.
+//!    `securityRequirements`, which one canonical form drops. A card that
+//!    cannot be had is discarded with this agent's own words
+//!    (`card_failure`: `card: peer unreachable`, `card: refused (403)`,
+//!    `extended card: invalid: <why>`…), never the text of the transport's
+//!    error nor bytes the peer chose.
 //! 2. **Its offer**, PALS peers only. The query
 //!    ([`SearchRequest::query`]) is waited for the time the candidate has
 //!    left, and says so in `reply_timeout_ms`, at most 3000 ms
@@ -103,10 +107,10 @@ use tokio::sync::Semaphore;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use super::cards::{PeerCards, signed_card_json};
+use super::cards::{CardFetchError, PeerCards, signed_card_json};
 use super::client::{DiscoveryClient, DiscoveryError};
 use crate::config::DiscoveryCfg;
-use crate::gateway::plain::{fetch_plain_card, keep_plain_card};
+use crate::gateway::plain::{PlainError, fetch_plain_card, keep_plain_card};
 use crate::gateway::serves_tasks;
 use crate::net::peer_addr;
 use crate::outbox::{AskError, AskOutcome, AskRequest, INVALID_TASK_ID, Outbox};
@@ -654,7 +658,7 @@ impl Searcher {
                 let (public, size) = cards
                     .public_sized(id, addr.clone())
                     .await
-                    .map_err(|err| discard(name, Stage::Card, &format!("card: {err}")))?;
+                    .map_err(|err| discard(name, Stage::Card, &card_failure(id, "card", &err)))?;
                 tally.messages += 1;
                 tally.bytes_received += size;
                 let public_hash = card_hash(&signed_card_json(&public));
@@ -665,7 +669,8 @@ impl Searcher {
                         .extended_sized(id, addr.clone(), grant)
                         .await
                         .map_err(|err| {
-                            discard(name, Stage::Card, &format!("extended card: {err}"))
+                            let why = card_failure(id, "extended card", &err);
+                            discard(name, Stage::Card, &why)
                         })?;
                     tally.messages += 1;
                     tally.bytes_received += size;
@@ -711,7 +716,7 @@ impl Searcher {
                 let http = &self.inner.parts.plain_http;
                 let plain = fetch_plain_card(http, contact)
                     .await
-                    .map_err(|err| discard(name, Stage::Card, &format!("card: {err}")))?;
+                    .map_err(|err| discard(name, Stage::Card, &plain_card_failure(name, &err)))?;
                 tally.messages += 1;
                 tally.bytes_received +=
                     serde_json::to_vec(&plain.json).map_or(0, |json| json.len() as u64);
@@ -1175,6 +1180,39 @@ fn failure(err: &DiscoveryError, cut: &str) -> String {
         DiscoveryError::Offer(refused) => format!("offer refused: {refused}"),
         DiscoveryError::Report(why) => format!("report refused: {why}"),
     }
+}
+
+/// Why `stage` (`card` or `extended card`) of the peer `peer` could not be
+/// had, in this agent's words, as [`failure`] says it for an offer: never
+/// the text of the transport's error, nor bytes the peer chose, as a QUIC
+/// close reason is. The error itself is logged.
+fn card_failure(peer: &AgentId, stage: &str, err: &CardFetchError) -> String {
+    tracing::debug!(%peer, stage, error = ?err, "no card to use from a candidate");
+    let why = match err {
+        CardFetchError::Unreachable(_) => "peer unreachable".to_owned(),
+        CardFetchError::Protocol(_) => "protocol error".to_owned(),
+        CardFetchError::Refused(status) => format!("refused ({status})"),
+        // Fixed texts of this agent's.
+        CardFetchError::Invalid(why) => format!("invalid: {why}"),
+        CardFetchError::Timeout => TIMEOUT.to_owned(),
+    };
+    format!("{stage}: {why}")
+}
+
+/// Why the card of the plain A2A contact `name` could not be had, in this
+/// agent's words (see [`card_failure`]).
+fn plain_card_failure(name: &str, err: &PlainError) -> String {
+    tracing::debug!(contact = name, error = ?err, "no card to use from a plain candidate");
+    let why = match err {
+        PlainError::Unreachable(_) => "peer unreachable".to_owned(),
+        PlainError::Protocol(_) => "protocol error".to_owned(),
+        PlainError::Refused(status) => format!("refused ({status})"),
+        PlainError::Invalid(why) => format!("invalid: {why}"),
+        PlainError::NoInterface(_) => "no A2A 1.0 interface on the contact's origin".to_owned(),
+        PlainError::BadContact(_) => "the contact cannot be a plain contact".to_owned(),
+        PlainError::Timeout => TIMEOUT.to_owned(),
+    };
+    format!("card: {why}")
 }
 
 /// `reason`, a refusal that may quote a peer, as printable ASCII and short.

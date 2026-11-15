@@ -20,8 +20,8 @@ use common::{
 };
 use futures::stream::BoxStream;
 use pals::config::{INVENTORY_FILE, WorkerCfg};
-use pals::discovery::DiscoveryLimits;
-use pals::mcp::DEFAULT_WAIT_S;
+use pals::discovery::{DiscoveryLimits, Quotas};
+use pals::mcp::{DEFAULT_WAIT_S, OFFER_EXPIRED_REFUSAL, OFFER_UNKNOWN_REFUSAL};
 use pals::node::NodeOptions;
 use pals_core::clock::ManualClock;
 use pals_core::discovery::matching::Evaluation;
@@ -1074,6 +1074,50 @@ async fn pals_discover_ranks_candidates_and_explains_discards() {
     );
     assert_eq!(outcome["coverage"], "complete");
     assert_eq!(outcome["metrics"]["contacted"], 3, "{outcome}");
+    // Asked for `demo`, of which this agent holds their grants.
+    for candidate in outcome["ranked"].as_array().unwrap() {
+        assert_eq!(candidate["offer"]["scope"], "task:demo", "{candidate}");
+    }
+
+    // The project reaches the search: for one this agent holds no grant
+    // of, no candidate shows a grant held, nor is told the project.
+    let mut elsewhere = search.clone();
+    elsewhere["project"] = json!("elsewhere");
+    let outcome = ok_json(&call(&client, "pals_discover", elsewhere).await);
+    assert_eq!(ranked(&outcome), ["carol", "bob"], "{outcome}");
+    for candidate in outcome["ranked"].as_array().unwrap() {
+        assert_eq!(candidate["grant_held"], false, "{candidate}");
+        assert_eq!(candidate["offer"]["scope"], "public", "{candidate}");
+    }
+    // So do the media types: one that no card takes, or gives, discards
+    // every candidate at its card.
+    for (field, wanted, why) in [
+        (
+            "input_media_types",
+            "application/x-rust-crate",
+            "input media type application/x-rust-crate not accepted",
+        ),
+        (
+            "output_media_types",
+            "image/png",
+            "output media type image/png not produced",
+        ),
+    ] {
+        let mut asked = search.clone();
+        asked[field] = json!([wanted]);
+        let outcome = ok_json(&call(&client, "pals_discover", asked).await);
+        assert_eq!(outcome["ranked"], json!([]), "{outcome}");
+        for peer in ["bob", "carol", "dave"] {
+            let discard = json!({"peer": peer, "stage": "card", "reason": why});
+            let discarded = outcome["discarded"].as_array().unwrap();
+            assert!(discarded.contains(&discard), "{peer}: {outcome}");
+        }
+    }
+    // And the summary: one over 1 KiB makes no query.
+    let mut long = search.clone();
+    long["summary"] = json!("x".repeat(1025));
+    let text = error_text(&call(&client, "pals_discover", long).await);
+    assert!(text.contains("summary longer than 1 KiB"), "{text}");
 
     // `peers` restricts the candidates to those contacts; a name that is
     // no one is discarded as such.
@@ -1251,6 +1295,7 @@ async fn pals_ask_with_an_expired_offer_sends_nothing() {
     let refused = call(&client, "pals_ask", asked).await;
     assert_eq!(refused.is_error, Some(true), "{refused:?}");
     let text = error_text(&refused);
+    assert_eq!(text, OFFER_EXPIRED_REFUSAL);
     assert!(text.contains("offer expired"), "{text}");
     assert!(text.contains("nothing was sent"), "{text}");
     assert!(text.contains("pals_discover"), "{text}");
@@ -1262,6 +1307,8 @@ async fn pals_ask_with_an_expired_offer_sends_nothing() {
     // way, before anything is sent.
     let asked = json!({"peer": "bob", "question": "hello", "offer_id": "offer-other"});
     let text = error_text(&call(&client, "pals_ask", asked).await);
+    assert_eq!(text, OFFER_UNKNOWN_REFUSAL);
+    assert!(text.contains("nothing was sent"), "{text}");
     assert!(text.contains("pals_discover"), "{text}");
     assert!(a.node.store.outbox_all().unwrap().is_empty());
     assert_eq!((b.connections(), c.connections()), (0, 0));
@@ -1382,5 +1429,65 @@ async fn oversized_requirements_are_a_tool_error() {
     let outcome = ok_json(&call(&client, "pals_discover", search).await);
     assert_eq!(outcome["ranked"], json!([]), "{outcome}");
     assert!(b.connections() > 0, "{outcome}");
+    // It closed the connection for the card saying `not served`: the
+    // discard says why in this agent's words, never the peer's.
+    let discarded = outcome["discarded"].as_array().unwrap();
+    assert_eq!(discarded.len(), 1, "{outcome}");
+    assert_eq!(discarded[0]["peer"], "bob");
+    assert_eq!(discarded[0]["stage"], "card");
+    let reason = discarded[0]["reason"].as_str().unwrap();
+    assert!(
+        ["card: peer unreachable", "card: protocol error"].contains(&reason),
+        "{reason}"
+    );
+    assert!(!outcome.to_string().contains("not served"), "{outcome}");
+    client.cancel().await.expect("close the session");
+}
+
+#[tokio::test]
+async fn pals_inventory_says_when_to_try_again_after_a_rate_limit() {
+    // A provider that serves one discovery request a minute, by a clock
+    // that stands still.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(INVENTORY_FILE), plugins(3)).unwrap();
+    let opts = NodeOptions {
+        clock: Arc::new(ManualClock::new(now_unix())),
+        quotas: Quotas {
+            peer_per_minute: 1,
+            ..Quotas::default()
+        },
+        ..NodeOptions::default()
+    };
+    let exec = CountingExecutor::new(Duration::ZERO);
+    let b = spawn_node_in_configured(dir, exec, opts, |_| {}).await;
+    let a = spawn_node(WorkerCfg::Echo).await;
+    a.add_contact("bob", &b);
+    let client = mcp_client(&a).await;
+
+    let page = ok_json(
+        &call(
+            &client,
+            "pals_inventory",
+            json!({"peer": "bob", "sections": ["plugins"]}),
+        )
+        .await,
+    );
+    assert_eq!(page["entries"].as_array().unwrap().len(), 3, "{page}");
+    // Another page, which this agent does not keep: the peer refuses it
+    // for now, and the tool says when to ask again.
+    let refused = call(
+        &client,
+        "pals_inventory",
+        json!({"peer": "bob", "sections": ["mcp"]}),
+    )
+    .await;
+    let text = error_text(&refused);
+    assert!(text.contains("peer refused"), "{text}");
+    let wait = text
+        .split("try again in ")
+        .nth(1)
+        .and_then(|rest| rest.strip_suffix(" s"))
+        .and_then(|seconds| seconds.parse::<u64>().ok());
+    assert!(wait.is_some_and(|s| (1..=60).contains(&s)), "{text}");
     client.cancel().await.expect("close the session");
 }

@@ -46,7 +46,7 @@
 //! ([`checks`]); one that does not verify is a protocol error.
 //!
 //! **Inventory.** `GET /discovery/inventory/{peer}`, as the MCP tool
-//! `pals_inventory` ([`GatewayState::inventory_page`]), asks the peer for a
+//! `pals_inventory` (`GatewayState::inventory_page`), asks the peer for a
 //! page of its inventory view ([`DiscoveryClient`]), presenting the grant it
 //! would present to the peer's A2A server (below), or none, and answers with
 //! the page as the peer signed it, re-encoded in ASCII, once it verifies as
@@ -1787,6 +1787,12 @@ impl Refusal {
     /// What it says: fixed text, or a peer's words cut to printable ASCII.
     pub(crate) fn message(&self) -> &str {
         &self.message
+    }
+
+    /// How long the client is told to wait before it asks again, in
+    /// seconds, when it is told.
+    pub(crate) fn retry_after_s(&self) -> Option<u64> {
+        self.retry_after_s
     }
 }
 

@@ -26,9 +26,10 @@
 //! would be larger than 8 KiB, the search's own check, or that is no
 //! query, is a tool error that says so, before any peer is contacted.
 //! `pals_inventory` is the page `GET /discovery/inventory/{peer}` serves
-//! ([`GatewayState::inventory_page`]), verified as the peer's page for this
-//! agent, of which it returns only what the page says: its scope, its
-//! sequence, when it expires, its entries and the cursor of the next page.
+//! (the gateway's `inventory_page`, which both run), verified as the peer's
+//! page for this agent, of which it returns only what the page says: its
+//! scope, its sequence, when it expires, its entries and the cursor of the
+//! next page; and when the peer limits the requests, when to try again.
 //!
 //! `pals_ask` with an `offer_id` names that offer of the peer's
 //! ([`AskRequest::offer`]), looked up by (the peer's agent id, the offer
@@ -78,7 +79,6 @@
 //!
 //! [`Outbox`]: crate::outbox::Outbox
 //! [`Searcher::search`]: crate::discovery::Searcher::search
-//! [`GatewayState::inventory_page`]: crate::gateway::GatewayState::inventory_page
 //! [`received_offer_ref`]: crate::outbox::received_offer_ref
 
 use std::io;
@@ -146,11 +146,13 @@ pub const UNTRUSTED_ANSWER: &str = untrusted_answer!();
 /// model of.
 pub const UNTRUSTED_OFFERS: &str = untrusted_offers!();
 
-/// Why `pals_ask` with an expired offer sent nothing.
-const OFFER_EXPIRED: &str = "offer expired, so nothing was sent: call pals_discover again for \
+/// The tool error of `pals_ask` with an offer that expired: nothing was
+/// sent.
+pub const OFFER_EXPIRED_REFUSAL: &str = "offer expired, so nothing was sent: call pals_discover again for \
                              a new offer of the peer's, and ask with its offer_id";
-/// Why `pals_ask` with an offer this agent does not keep sent nothing.
-const OFFER_UNKNOWN: &str = "this agent keeps no offer of that peer's with that offer_id, so \
+/// The tool error of `pals_ask` with an offer this agent does not keep of
+/// that peer's: nothing was sent.
+pub const OFFER_UNKNOWN_REFUSAL: &str = "this agent keeps no offer of that peer's with that offer_id, so \
                              nothing was sent: take the peer and the offer_id of one candidate \
                              that pals_discover ranked";
 
@@ -159,7 +161,9 @@ const OFFER_UNKNOWN: &str = "this agent keeps no offer of that peer's with that 
 const INSTRUCTIONS: &str = "PALS links this agent with other AI agents, its peers. Ask a peer \
      with pals_ask, by the name pals_contacts lists or by agent id; a question that gets no \
      answer in time is kept, and pals_task takes it up again by its message_id without running \
-     it twice. Download the files of an answer with pals_fetch, which writes them only inside";
+     it twice. To find who serves a task best, search with pals_discover, then ask the \
+     candidate chosen with pals_ask, its peer and the offer_id of its offer. Download the files \
+     of an answer with pals_fetch, which writes them only inside";
 
 /// The server's instructions, naming `download_dir`, where `pals_fetch`
 /// writes, or saying why there is none.
@@ -428,10 +432,13 @@ impl PalsMcp {
                     "next_cursor": view.next_cursor,
                 })))
             }
-            Err(refusal) => Ok(refused(format!(
-                "cannot read the inventory: {}",
-                refusal.message()
-            ))),
+            Err(refusal) => {
+                let mut why = format!("cannot read the inventory: {}", refusal.message());
+                if let Some(seconds) = refusal.retry_after_s() {
+                    why.push_str(&format!("; try again in {seconds} s"));
+                }
+                Ok(refused(why))
+            }
         }
     }
 
@@ -752,8 +759,8 @@ fn search_refused(err: &SearchError) -> CallToolResult {
 /// kept nor sent.
 fn offer_refused(err: OfferLookupError) -> CallToolResult {
     match err {
-        OfferLookupError::Expired => refused(OFFER_EXPIRED),
-        OfferLookupError::Unknown => refused(OFFER_UNKNOWN),
+        OfferLookupError::Expired => refused(OFFER_EXPIRED_REFUSAL),
+        OfferLookupError::Unknown => refused(OFFER_UNKNOWN_REFUSAL),
         // This agent's own words about the peer the model named.
         OfferLookupError::NotAPeer(why) => refused(format!("{why}, so nothing was sent")),
         OfferLookupError::Store(detail) => {
@@ -809,6 +816,18 @@ mod tests {
         assert_eq!(wait(Some(1)), Ok(Duration::from_secs(1)));
         assert!(wait(Some(3601)).unwrap_err().contains("3600"));
         assert!(wait(Some(0)).is_err());
+    }
+
+    #[test]
+    fn the_instructions_lead_from_the_search_to_the_ask() {
+        let named = instructions(Ok(Path::new("/home/me/Downloads/pals")));
+        assert!(
+            named.contains(
+                "search with pals_discover, then ask the candidate chosen with pals_ask, its \
+                 peer and the offer_id of its offer"
+            ),
+            "{named}"
+        );
     }
 
     #[test]
