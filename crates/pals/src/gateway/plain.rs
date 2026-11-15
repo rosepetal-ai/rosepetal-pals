@@ -225,13 +225,18 @@ fn refused(status: u16) -> String {
 }
 
 /// The HTTP client for plain agents: no proxy, whatever the environment
-/// says; no redirect followed; [`CONNECT_TIMEOUT`] to connect; rustls with
-/// the platform's certificate verifier.
+/// says; no redirect followed; no request sent again by the client itself,
+/// so that a connect error on a call means the call never connected and
+/// the gateway's not-sent refusal holds (reqwest otherwise re-sends after
+/// some HTTP/2 refusals, which a hostile agent can send after it ran the
+/// question); [`CONNECT_TIMEOUT`] to connect; rustls with the platform's
+/// certificate verifier.
 pub fn http_client() -> reqwest::Client {
     crate::install_crypto_provider();
     reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
         .connect_timeout(CONNECT_TIMEOUT)
         .build()
         .expect("an HTTP client with no proxy builds once a crypto provider is installed")
@@ -638,7 +643,8 @@ fn failure_message(failure: &PlainError) -> String {
 /// for a plain contact whose request had the JSON-RPC `id`: on HTTP+JSON,
 /// `{"error": message}`, as for a peer; on JSON-RPC, whose client reads no
 /// HTTP status, a JSON-RPC error envelope of the same status, its code
-/// [`REFUSED_CODE`] for a `4xx` and `InternalError` otherwise, so that a
+/// that of `jsonrpc_code`: [`REFUSED_CODE`] for a `4xx` but `408` and
+/// `429`, and `InternalError` for those two and the rest, so that a
 /// refusal reads as one and a failure on the way as one.
 pub(super) fn plain_answer(
     binding: Binding,

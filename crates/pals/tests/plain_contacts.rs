@@ -2960,8 +2960,9 @@ async fn a_429_or_408_on_json_rpc_is_a_failure_on_the_way() {
 async fn a_pals_peers_error_with_the_not_sent_code_is_as_in_milestone_1() {
     let a = spawn_node(WorkerCfg::Echo).await;
     // A PALS peer whose A2A server answers every question, successfully,
-    // with a JSON-RPC error of the gateway's not-sent code and text, which
-    // the pinned client would read from the stream's end.
+    // with a JSON-RPC error of the gateway's not-sent code and text. Its
+    // string `id` passes the gateway's checks, so the pinned client reads
+    // it from the stream's end as an A2A error of that code.
     let asked = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&asked);
     let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
@@ -2969,34 +2970,20 @@ async fn a_pals_peers_error_with_the_not_sent_code_is_as_in_milestone_1() {
             counter.fetch_add(1, Ordering::SeqCst);
         }
         async move {
-            let body = json!({"jsonrpc": "2.0", "id": 1,
+            let body = json!({"jsonrpc": "2.0", "id": "1",
                 "error": {"code": NOT_SENT_CODE, "message": PLAIN_NOT_SENT}});
             raw_answer(200, "application/json", body.to_string().into_bytes())
         }
     });
     let key = AgentKey::generate();
     let _router = common::stub_peer(&a, "peer", &key, app).await;
-    // As in milestone 1: no event in it, so the gateway refuses it, and the
-    // outbox asks again, as on any failure on the way, the peer's own
-    // deduplication keeping it to one run. Never a not-sent match: no
-    // nonce goes to a PALS peer, and its errors keep milestone 1's reading
-    // (the outbox's unit tests: `the_not_sent_code_is_on_the_way_only_on_a_plain_json_rpc_route`).
+    // As in milestone 1: a peer's A2A error is its refusal, asked once.
+    // Never a not-sent match: no nonce goes to a PALS peer, and the code
+    // is on the way only on a plain contact's JSON-RPC route (the outbox's
+    // unit test `the_not_sent_code_is_on_the_way_only_on_a_plain_json_rpc_route`).
     let outcome = a.node.outbox().ask(hola("peer")).await;
-    assert!(
-        matches!(outcome, Err(AskError::Unreachable { .. })),
-        "{outcome:?}"
-    );
-    assert_eq!(asked.load(Ordering::SeqCst), 4);
-    let res = gateway_request(
-        &a.gateway_url(),
-        "POST",
-        &format!("/peers/{}/rest/message:stream", key.id()),
-        &VERSION,
-        Some(&message_params("hola", None)),
-    )
-    .await;
-    assert_eq!(res.status, 502);
-    assert_eq!(res.json, json!({"error": "peer protocol error"}));
+    assert_eq!(outcome, Err(AskError::Rejected(PLAIN_NOT_SENT.to_owned())));
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
