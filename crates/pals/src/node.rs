@@ -115,13 +115,13 @@ impl Default for NodeOptions {
 /// [`ALPN_A2A_HTTP`], its blobs, served on [`iroh_blobs::ALPN`] to the peers
 /// it shared them with, what it answers about itself on [`ALPN_DISCOVERY`]
 /// ([`DiscoveryServer`]), the clients it reaches peers with, and its local
-/// [gateway](crate::gateway) on `gateway.listen`.
+/// [gateway] on `gateway.listen`.
 ///
 /// The server is the SDK's, with the signed [public card](CardSet::public)
 /// at `/.well-known/agent-card.json` and the extended card of each request's
 /// scope for `GetExtendedAgentCard` ([`CardSet`]), JSON-RPC at `/jsonrpc`
-/// (behind [`jsonrpc_shim`]) and HTTP+JSON at `/rest` (behind
-/// [`rest_shim`]), both with [`echo_extensions`], behind grant
+/// (behind `jsonrpc_shim`) and HTTP+JSON at `/rest` (behind
+/// `rest_shim`), both with `echo_extensions`, behind grant
 /// authentication ([`crate::a2a::auth`]) and the ownership of tasks,
 /// idempotency of messages and the check of the offer a task names
 /// ([`GuardedHandler`], [`OfferCheck`]), on the durable task store. Its
@@ -307,7 +307,7 @@ impl Node {
     /// stops purging and renewing records and running the inventory adapters
     /// (a server they started is killed), closes the connections to peers,
     /// stops serving, closes the endpoint, lets the gateway's open
-    /// connections finish for up to [`GATEWAY_STOP_TIMEOUT`], stops the blob
+    /// connections finish for up to `GATEWAY_STOP_TIMEOUT`, stops the blob
     /// service, and only then lets go of the store and, last, of the data
     /// directory's lock.
     ///

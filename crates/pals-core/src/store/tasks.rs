@@ -283,7 +283,7 @@ impl Store {
     /// are left out unless `include_artifacts` is true.
     ///
     /// A page token is the cursor of where the page before ended
-    /// ([`Cursor`]); `INVALID_PARAMS` for one that is not. `next_page_token`
+    /// (`Cursor`); `INVALID_PARAMS` for one that is not. `next_page_token`
     /// is empty on the last page, and `total_size` counts the filtered list.
     pub fn tasks_list(&self, req: &ListTasksRequest) -> anyhow::Result<ListTasksResponse> {
         self.tasks_list_where(None, req)

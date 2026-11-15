@@ -60,7 +60,7 @@ type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 /// the pinned SDK that break A2A conformance.
 ///
 /// **Ownership.** The owner of a task is the peer, [`PEER_HEADER`], whose
-/// request created it. The [`BindingExecutor`](super::BindingExecutor)
+/// request created it. The `BindingExecutor`
 /// records it when the task's execution starts; the guard records it again,
 /// a no-op then, with the first task the inner handler returns or streams,
 /// before the peer sees the task's id. Getting,
@@ -71,11 +71,11 @@ type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 ///
 /// **Validation.** A `SendMessage` or `SendStreamingMessage` whose message
 /// has no `messageId`, no `role` or no parts, all REQUIRED in A2A, fails
-/// with `InvalidParamsError` before anything else ([`check_message`]).
+/// with `InvalidParamsError` before anything else (`check_message`).
 ///
 /// **Idempotency**, the opt-in [`IDEMPOTENCY_EXTENSION`]. A request that does
 /// not activate it with the `A2A-Extensions` service parameter
-/// ([`idempotency_requested`]) runs as the reference SDK runs it: every
+/// (`idempotency_requested`) runs as the reference SDK runs it: every
 /// message is new, whatever its `messageId`. A request that activates it is
 /// keyed by `(peer, messageId)`, with the BLAKE3 of the JCS form of the
 /// request's params (the same for both methods and both bindings) as its
@@ -83,7 +83,7 @@ type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 ///
 /// - The first request with a key runs. The key is bound to its task when
 ///   the task's execution starts, by the
-///   [`BindingExecutor`](super::BindingExecutor), so a retry attaches to it
+///   `BindingExecutor`, so a retry attaches to it
 ///   however long it runs, and after a restart that failed it. When the
 ///   agent answers with a message and no task, the guard binds the key to
 ///   that message as well, and the message is the outcome; with a task, the
@@ -127,7 +127,7 @@ type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 /// **Subscription to a task with no execution.** `SubscribeToTask` on a task
 /// that is not terminal and has no live execution, such as one waiting for
 /// input, streams the task as it is now and then follows it until it ends
-/// ([`follow`]); the SDK would answer `TaskNotFoundError`.
+/// (`follow`); the SDK would answer `TaskNotFoundError`.
 ///
 /// Push notification configs go to the inner handler unchecked, and it
 /// refuses them because the agent card declares none; serving them would

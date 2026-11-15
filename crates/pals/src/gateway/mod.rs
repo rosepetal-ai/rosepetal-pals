@@ -43,7 +43,7 @@
 //! (`GetExtendedAgentCard`, `GET /rest/extendedAgentCard` or
 //! `/rest/agent-card/extended`) is verified the same way and goes on as its
 //! [`gateway_view`], with [`CARD_HASH_HEADER`] naming the card verified
-//! ([`checks`]); one that does not verify is a protocol error.
+//! (`checks`); one that does not verify is a protocol error.
 //!
 //! **Inventory.** `GET /discovery/inventory/{peer}`, as the MCP tool
 //! `pals_inventory` (`GatewayState::inventory_page`), asks the peer for a
@@ -96,11 +96,11 @@
 //! before the request leaves.
 //!
 //! A peer's response never reaches the client as the peer sent it
-//! ([`checks`]): whether the client expects one JSON document or an event
+//! (`checks`): whether the client expects one JSON document or an event
 //! stream comes from its own call, never from the peer's `Content-Type`; a
 //! response with a `Content-Encoding` other than `identity` is refused; a
 //! body is read whole, an event of a stream as it completes, either bounded
-//! by [`MAX_REWRITE_BYTES`] (a body, or an event before its empty line,
+//! by `MAX_REWRITE_BYTES`, 16 MiB (a body, or an event before its empty line,
 //! that grows past it is refused); a successful body must be JSON, and an
 //! event's data, when it has any, too; no task id in them may be unsafe
 //! ([`is_safe_task_id`]), since a client resolving
@@ -687,7 +687,7 @@ impl GatewayState {
 }
 
 /// The newest grant `store` holds of `peer`'s, unexpired at `now_unix`,
-/// that [serves tasks](serves_tasks) in `project`, when there is one; else
+/// that serves tasks (`serves_tasks`) in `project`, when there is one; else
 /// the newest that serves tasks, of any project.
 pub fn held_task_grant(
     store: &Store,

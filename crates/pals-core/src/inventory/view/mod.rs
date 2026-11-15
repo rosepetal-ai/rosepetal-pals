@@ -251,7 +251,7 @@ impl SignedDoc for ViewPage {
     /// A scope key; an `audience` exactly when the scope is not `public`;
     /// `seq` from 1 to 2^53 - 1; a lifetime of at most [`VIEW_TTL_S`];
     /// sections in order without repeats, and every entry of one of them,
-    /// shown as a view shows it ([`shows_as_a_view_does`]); at most
+    /// shown as a view shows it (`shows_as_a_view_does`); at most
     /// [`MAX_PAGE_ENTRIES`] entries; a cursor of at most
     /// [`MAX_CURSOR_BYTES`], present exactly when a page limit ended the
     /// page.

@@ -297,7 +297,7 @@ impl BlobService {
 
     /// Stops serving and storing: ends the task that decides the
     /// provider's requests, which holds the agent's store, and shuts the
-    /// blob store down, within [`BLOB_STORE_STOP_TIMEOUT`]. Nothing of this
+    /// blob store down, within `BLOB_STORE_STOP_TIMEOUT`. Nothing of this
     /// service works afterwards.
     pub async fn shutdown(&self) {
         let authorizer = self

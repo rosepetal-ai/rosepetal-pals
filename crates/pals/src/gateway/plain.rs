@@ -45,7 +45,7 @@
 //! An absent `securityRequirements` says nothing of whether the agent needs
 //! credentials: protobuf forms of a card drop empty requirements.
 //!
-//! **Through the gateway** ([`forward`]), `/peers/<name>/...` reaches the
+//! **Through the gateway** (`forward`), `/peers/<name>/...` reaches the
 //! contact `<name>`:
 //!
 //! - its card as [`plain_view`]: [`gateway_view_for`] with only the
@@ -124,7 +124,7 @@ pub const ONLY_LOOPBACK: &str = "http:// is only for 127.0.0.1, [::1] and localh
 /// The gateway's `502` when it could not reach a plain agent and sent it
 /// nothing of the call: its card could not be read, or the connection to
 /// its origin could not be made. An agent's own answer never carries it:
-/// one that holds it is refused ([`is_forged_refusal`]).
+/// one that holds it is refused (`is_forged_refusal`).
 pub const PLAIN_NOT_SENT: &str = "plain agent unreachable: nothing was sent to it";
 /// Why a contact whose origin is this agent's own gateway is refused.
 pub const OWN_GATEWAY: &str =
