@@ -400,11 +400,13 @@ fn offered_tools<'a>(inventory: &'a Inventory, id: &str) -> Option<&'a [String]>
     other.then_some(&[])
 }
 
-/// The scopes `entry` must fit a page of, among those it shows in: the
-/// public one; the project and task scopes of each project of the
-/// configuration (`projects`) and of its visibility; and the widest of any
-/// other project a grant may name ([`Scope::widest`]), for an entry shown to
-/// every scope, whose grantees' projects nothing here lists.
+/// The scopes `entry` is fitted against, for every entry whatever its
+/// visibility: the public one; the project and task scopes of each project
+/// of the configuration (`projects`) and of its visibility; and the widest
+/// of any other project a grant may name ([`Scope::widest`]).
+/// `fit_observation` keeps of them those the entry shows in, so the widest
+/// count for an entry shown to every scope, whose grantees' projects
+/// nothing here lists.
 fn scopes_to_fit(entry: &Entry<McpConnection>, projects: &[String]) -> Vec<Scope> {
     let mut named: BTreeSet<&str> = projects.iter().map(String::as_str).collect();
     if let Visibility::Project(own) | Visibility::Task(own) = &entry.visibility {

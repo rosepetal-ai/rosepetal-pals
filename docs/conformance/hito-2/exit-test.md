@@ -348,7 +348,7 @@ Seis ensayos y una primera ejecución completa, en `0e1e4d0`, que superó los ca
 
 ## Lo que no cubre
 
-- Todos los agentes comparten el kernel, el reloj y la máquina, y entre ellos solo hay el bridge de Docker. No hay varias máquinas, redes ni NAT, y los relays solo se usaron para registrarse: el camino fue UDP directo. Los relojes nunca difieren, así que el desfase de 60 s de ofertas, vistas y registros no se ejercita aquí; lo hacen los tests (`expired_record_is_refused_beyond_skew`, `expired_page_is_refused_beyond_skew`).
+- Todos los agentes comparten el kernel, el reloj y la máquina, y entre ellos solo hay el bridge de Docker. No hay varias máquinas, redes ni NAT. Los relays no solo se usaron para registrarse: en el caso 1, parte del tráfico de A fue por el relay antes de pasar a UDP directo (el camino mixto de «Montaje y camino de red» y la observación 5). Los relojes nunca difieren, así que el desfase de 60 s de ofertas, vistas y registros no se ejercita aquí; lo hacen los tests (`expired_record_is_refused_beyond_skew`, `expired_page_is_refused_beyond_skew`).
 - F es un agente corriente sobre el SDK oficial de Python, en un contenedor, con un certificado de una CA de prueba: no un agente de terceros en internet.
 - La card alterada de un par PALS solo la sirven los pares de prueba de los tests de integración, en el anfitrión; en vivo, la card alterada es la de F.
 - H comparte el contenedor de G, y M1 y M2 el suyo: H solo tiene que estar caído, y el caso 8 es una migración en loopback.
