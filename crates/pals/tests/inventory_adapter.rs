@@ -32,8 +32,9 @@ use pals_core::discovery::query::{
 use pals_core::discovery::selection::SearchRequest;
 use pals_core::discovery::wire::{GetInventory, Request, request, response};
 use pals_core::grant::Operation::{TaskCancel, TaskRead, TaskSend};
-use pals_core::grant::{SignedGrant, format_timestamp};
+use pals_core::grant::{GRANT_SCHEMA, Grant, SignedGrant, format_timestamp};
 use pals_core::identity::{AgentId, AgentKey};
+use pals_core::inventory::scope::MAX_PROJECT_NAME_BYTES;
 use pals_core::inventory::view::{ViewEntry, ViewPage, verify_page};
 use pals_core::inventory::{
     AdapterMethod, DETAIL_TIMEOUT, DETAIL_TOO_MANY_TOOLS, DETAIL_UNREACHABLE, Entry,
@@ -1090,4 +1091,93 @@ async fn an_observation_change_turns_held_offers_stale() {
     assert_eq!(rpc_error(&res), (INVALID_PARAMS, "offer_stale".to_owned()));
     assert_eq!(exec.runs(), 0);
     assert_eq!(b.node.store.events_count("task.accepted").unwrap(), 0);
+}
+
+/// A public model, which shows after the MCP connections.
+const PUBLIC_MODEL: &str = r#"
+[[models]]
+id = "example:coder"
+description = "The coding model"
+provenance = "operator"
+visibility = "public"
+provider = "Example"
+model_id = "example-coder"
+revision = "2026-10-01"
+role = "primary"
+execution = { kind = "local" }
+"#;
+
+#[tokio::test]
+async fn a_grantee_of_any_project_reads_a_fitted_public_entry_page_by_page() {
+    // A public connection with 40 tools whose texts are of 1 KiB: far more
+    // than a page, so the adapter's observation is cut to fit; with no
+    // `[projects]` in the configuration.
+    let tools: Vec<String> = (0..40).map(|n| format!("tool_{n:02}")).collect();
+    let offered: Vec<&str> = tools.iter().map(String::as_str).collect();
+    let listed = tools.join(",");
+    let adapter = stdio_adapter(&["--tools", &listed, "--describe", "1024"], &[]);
+    let inventory = format!(
+        "{SERVICE}{}{PUBLIC_MODEL}",
+        mcp_entry(MCP, &offered, "\"public\"", &adapter)
+    );
+    let b = provider(&inventory).await;
+    assert_eq!(b.node.inventory().startup_refresh_done().await.ok, 1);
+    let a = spawn_node(WorkerCfg::Echo).await;
+    // A grant to send tasks in a project with the longest name, one that
+    // JSON writes with two characters a byte, which no configuration names.
+    let project = "\\".repeat(MAX_PROJECT_NAME_BYTES);
+    let now = now_unix();
+    let grant = SignedGrant::issue(
+        &key_in(b.dir.path()),
+        Grant {
+            schema: GRANT_SCHEMA.to_owned(),
+            grant_id: "g-long-project".to_owned(),
+            issuer: b.id(),
+            subject: a.id(),
+            audience: b.id(),
+            project: project.clone(),
+            resources: vec!["skill:ask".to_owned()],
+            operations: TASK_OPS.to_vec(),
+            issued_at: format_timestamp(now).unwrap(),
+            expires_at: format_timestamp(now + 3600).unwrap(),
+        },
+    )
+    .unwrap();
+
+    // Page by page, to the end: never `TooLarge`.
+    let mut cursor = String::new();
+    let mut ids = Vec::new();
+    for _ in 0..8 {
+        let request = Request {
+            version: 0,
+            max_response_bytes: 0,
+            grant_token: grant.to_token(),
+            op: Some(request::Op::GetInventory(GetInventory {
+                sections: Vec::new(),
+                cursor: cursor.clone(),
+                page_entries: 0,
+            })),
+        };
+        let reply = a
+            .node
+            .discovery()
+            .call(&b.id(), b.node.addr(), request, CALL)
+            .await
+            .expect("a reply");
+        let (page, _) = page_of(&reply, &b.id(), &a.id());
+        assert_eq!(page.scope, format!("task:{project}"));
+        if let Some(entry) = page.entries.iter().find(|entry| entry.id == MCP) {
+            // Its 40 tools, their texts cut to one cap.
+            let published: Vec<String> = tools.iter().map(|tool| format!("{MCP}/{tool}")).collect();
+            assert_eq!(tool_names(entry), published);
+            let description = entry.body["tools"][0]["description"].as_str().unwrap();
+            assert!(description.len() < 1024, "{}", description.len());
+        }
+        ids.extend(page.entries.iter().map(|entry| entry.id.clone()));
+        match page.next_cursor {
+            Some(next) => cursor = next,
+            None => break,
+        }
+    }
+    assert_eq!(ids, ["repo-review", MCP, "example:coder"]);
 }

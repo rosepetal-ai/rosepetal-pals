@@ -11,6 +11,7 @@ Arguments:
   --tools a,b,c        the tools it lists, in order (default: read_file,list_dir)
   --tools-file FILE    read that list from FILE instead, when it starts
   --page-size N        tools per page of tools/list (default: all in one page)
+  --describe N         every tool's description and title N characters long
   --endless            after its tools, list `tool-<n>` pages without end,
                        always with a next cursor
   --hang               read requests and never answer any
@@ -35,6 +36,7 @@ def parse_args():
     parser.add_argument("--tools", default="read_file,list_dir")
     parser.add_argument("--tools-file")
     parser.add_argument("--page-size", type=int, default=0)
+    parser.add_argument("--describe", type=int, default=0)
     parser.add_argument("--endless", action="store_true")
     parser.add_argument("--hang", action="store_true")
     parser.add_argument("--ready")
@@ -78,16 +80,17 @@ def write_environment(path):
     os.replace(temporary, path)
 
 
-def tool(name):
+def tool(name, describe=0):
+    text = "x" * describe if describe > 0 else None
     return {
         "name": name,
-        "description": "The %s tool of the fixture" % name,
+        "description": text or "The %s tool of the fixture" % name,
         "inputSchema": {"type": "object"},
-        "annotations": {"title": "Fixture %s" % name, "readOnlyHint": True},
+        "annotations": {"title": text or "Fixture %s" % name, "readOnlyHint": True},
     }
 
 
-def page_of(tools, size, endless, cursor):
+def page_of(tools, size, endless, cursor, describe=0):
     """The tools of the page at `cursor` (an offset, as text) and the
     cursor of the next one, if any."""
     start = int(cursor) if cursor else 0
@@ -97,10 +100,10 @@ def page_of(tools, size, endless, cursor):
             tools[n] if n < len(tools) else "tool-%d" % n
             for n in range(start, start + size)
         ]
-        return [tool(name) for name in names], str(start + size)
+        return [tool(name, describe) for name in names], str(start + size)
     names = tools[start : start + size]
     following = start + size
-    return [tool(name) for name in names], (
+    return [tool(name, describe) for name in names], (
         str(following) if following < len(tools) else None
     )
 
@@ -156,7 +159,9 @@ def main():
             )
         elif method == "tools/list":
             cursor = (message.get("params") or {}).get("cursor")
-            listed, following = page_of(tools, args.page_size, args.endless, cursor)
+            listed, following = page_of(
+                tools, args.page_size, args.endless, cursor, args.describe
+            )
             result = {"tools": listed}
             if following is not None:
                 result["nextCursor"] = following

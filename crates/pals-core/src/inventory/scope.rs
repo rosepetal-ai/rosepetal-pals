@@ -13,6 +13,12 @@ use crate::grant::{Grant, Operation};
 /// The resource whose task operations open a project's views.
 const ASK_RESOURCE: &str = "skill:ask";
 
+/// The longest project name, in bytes, of a grant that gets a view other
+/// than the public one: discovery refuses a grant with a longer one
+/// (`crate::discovery::answer`), and what is fitted to a page fits the
+/// scopes of a name this long ([`Scope::widest`]).
+pub const MAX_PROJECT_NAME_BYTES: usize = 64;
+
 /// The view a requester gets: public, or a project's, or a task's in a
 /// project, each also seeing what the views before it see.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -31,6 +37,16 @@ impl Scope {
             Scope::Project(project) => format!("project:{project}"),
             Scope::Task(project) => format!("task:{project}"),
         }
+    }
+
+    /// The scopes other than the public one whose pages leave an entry the
+    /// least room: a project's and a task's, of a project name of
+    /// [`MAX_PROJECT_NAME_BYTES`] backslashes, each of which JSON writes as
+    /// two characters, so that their key, in a page and in its cursor, is as
+    /// long as any scope's can be.
+    pub fn widest() -> [Scope; 2] {
+        let project = "\\".repeat(MAX_PROJECT_NAME_BYTES);
+        [Scope::Project(project.clone()), Scope::Task(project)]
     }
 
     /// The scope whose [`Scope::key`] is `key`, when its project is a project

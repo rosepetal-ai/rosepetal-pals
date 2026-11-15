@@ -11,7 +11,9 @@
 //!    not revoked, in force. One that allows no task operation is no error:
 //!    it only gives the public scope. One that is refused is
 //!    `UNAUTHENTICATED`, with the reason ([`GrantError::reason`]); so is one
-//!    whose project is not a project name, which no signed page can name.
+//!    whose project is not a project name, which no signed page can name,
+//!    or is longer than [`MAX_PROJECT_NAME_BYTES`], the longest a page's
+//!    entries are fitted for.
 //! 3. **Scope.** The grant's ([`Scope::for_grant`]); without a grant, the
 //!    public one, or an empty public view when the agent shows none: a view
 //!    of revision 1 whose pages are never cached, so that it and the public
@@ -48,6 +50,7 @@ use crate::benchmark::{BenchmarkReport, Subject, is_benchmark_id, references_for
 use crate::card_jws::CardHash;
 use crate::grant::{AcceptError, Acceptance, GrantError, Need, accept_grant};
 use crate::identity::AgentId;
+use crate::inventory::scope::MAX_PROJECT_NAME_BYTES;
 use crate::inventory::view::{
     INVENTORY_SECTIONS, PageRequest, VIEW_TTL_S, ViewEntry, ViewError, benchmark_subjects,
     content_hash, page, render, render_benchmarks, sign_page,
@@ -190,8 +193,12 @@ fn viewer(
         AcceptError::Store => internal(),
     })?;
     let scope = Scope::for_grant(Some(&grant.grant));
-    // A project no page can name: the grant is no use here.
-    if scope != Scope::Public && Scope::from_key(&scope.key()).is_none() {
+    // A project no page can name, or longer than any page is fitted for:
+    // the grant is no use here.
+    if scope != Scope::Public
+        && (Scope::from_key(&scope.key()).is_none()
+            || grant.grant.project.len() > MAX_PROJECT_NAME_BYTES)
+    {
         return Err(unauthenticated(GrantError::Malformed));
     }
     Ok(Viewer {
@@ -620,8 +627,10 @@ mod tests {
             .unwrap()
             .to_token()
         };
-        // A valid grant, whose project no signed page or offer could name.
-        for project in ["two words", "diseño", ""] {
+        // A valid grant, whose project no signed page or offer could name,
+        // or longer than an entry is fitted for.
+        let long = "p".repeat(MAX_PROJECT_NAME_BYTES + 1);
+        for project in ["two words", "diseño", "", long.as_str()] {
             let response = answer(&ctx, &peer, get(&grant_for(project)), NOW);
             let Some(response::Result::Error(error)) = response.result else {
                 panic!("{project:?}: an error, not {:?}", response.result);
@@ -629,9 +638,12 @@ mod tests {
             assert_eq!(error.code(), ErrorCode::Unauthenticated, "{project:?}");
             assert_eq!(error.message, "malformed", "{project:?}");
         }
-        // A project name is served.
+        // A project name is served, up to the longest.
         let page = page_of(&ctx, &peer, get(&grant_for("demo")));
         assert_eq!(page.scope, "task:demo");
+        let longest = "\\".repeat(MAX_PROJECT_NAME_BYTES);
+        let page = page_of(&ctx, &peer, get(&grant_for(&longest)));
+        assert_eq!(page.scope, format!("task:{longest}"));
     }
 
     /// A `ServiceQuery` for a capability nobody offers, presenting `token`.

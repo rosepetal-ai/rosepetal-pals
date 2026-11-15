@@ -32,8 +32,12 @@
 //! are), and keeps them in the store ([`Store::observation_put`]), each
 //! valid for twice the refresh interval. When the node starts, the
 //! observations kept that are still valid stand until the first run
-//! replaces them, but only those of connections with an adapter: a manual
-//! declaration is never an observation. A change of what a scope shows
+//! replaces them, fitted again, but only those of connections with an
+//! adapter: a manual declaration is never an observation. The scopes an
+//! observation is fitted to are the public one, those of the projects the
+//! configuration and the entry's visibility name, and, since a grant may
+//! name any project, the widest a grant's project may give
+//! (`Scope::widest`). A change of what a scope shows
 //! moves its view's revision, and the offers made at the old one are
 //! refused as `offer_stale` (`OfferCheck`).
 
@@ -134,15 +138,22 @@ impl InventoryState {
         };
         check_adapters(&inventory)
             .with_context(|| format!("cannot load the inventory {}", path.display()))?;
-        let mut kept = store
+        let kept = store
             .observations(clock.now_unix())
             .context("cannot read the observations kept")?;
-        kept.retain(|id, _| {
-            inventory
-                .mcp
-                .iter()
-                .any(|entry| entry.id == *id && entry.body.adapter.is_some())
-        });
+        let projects: Vec<String> = cfg.projects.keys().cloned().collect();
+        // Fitted again: the scopes to fit may have changed since it was kept.
+        let kept = kept
+            .into_iter()
+            .filter_map(|(id, observation)| {
+                let entry = inventory
+                    .mcp
+                    .iter()
+                    .find(|entry| entry.id == id && entry.body.adapter.is_some())?;
+                let fitted = fit_observation(entry, observation, &scopes_to_fit(entry, &projects));
+                Some((id, fitted))
+            })
+            .collect();
         let observations = sanitized(&inventory, kept);
         let refresh_s = cfg.inventory.refresh_interval_s;
         let validity_s = i64::try_from(refresh_s.saturating_mul(2)).unwrap_or(i64::MAX);
@@ -158,7 +169,7 @@ impl InventoryState {
                 store,
                 adapter,
                 refresh_interval: Duration::from_secs(refresh_s.max(1)),
-                projects: cfg.projects.keys().cloned().collect(),
+                projects,
                 refreshing: Mutex::new(()),
                 startup: watch::Sender::new(None),
             }),
@@ -390,8 +401,10 @@ fn offered_tools<'a>(inventory: &'a Inventory, id: &str) -> Option<&'a [String]>
 }
 
 /// The scopes `entry` must fit a page of, among those it shows in: the
-/// public one, and the project and task scopes of each project of the
-/// configuration (`projects`) and of its visibility.
+/// public one; the project and task scopes of each project of the
+/// configuration (`projects`) and of its visibility; and the widest of any
+/// other project a grant may name ([`Scope::widest`]), for an entry shown to
+/// every scope, whose grantees' projects nothing here lists.
 fn scopes_to_fit(entry: &Entry<McpConnection>, projects: &[String]) -> Vec<Scope> {
     let mut named: BTreeSet<&str> = projects.iter().map(String::as_str).collect();
     if let Visibility::Project(own) | Visibility::Task(own) = &entry.visibility {
@@ -404,6 +417,7 @@ fn scopes_to_fit(entry: &Entry<McpConnection>, projects: &[String]) -> Vec<Scope
                 Scope::Task(project.to_owned()),
             ]
         }))
+        .chain(Scope::widest())
         .collect()
 }
 
@@ -702,16 +716,75 @@ mod tests {
         ))
         .unwrap();
         let scopes = scopes_to_fit(&inventory.mcp[0], &["ops".to_owned()]);
+        let widest = "\\".repeat(pals_core::inventory::scope::MAX_PROJECT_NAME_BYTES);
         let keys: Vec<String> = scopes.iter().map(Scope::key).collect();
         assert_eq!(
             keys,
             [
-                "public",
-                "project:demo",
-                "task:demo",
-                "project:ops",
-                "task:ops"
+                "public".to_owned(),
+                "project:demo".to_owned(),
+                "task:demo".to_owned(),
+                "project:ops".to_owned(),
+                "task:ops".to_owned(),
+                format!("project:{widest}"),
+                format!("task:{widest}"),
             ]
+        );
+    }
+
+    #[test]
+    fn a_kept_observation_is_fitted_again_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        // A public connection with an adapter, offering 40 tools.
+        let tools: Vec<String> = (0..40).map(|n| format!("tool_{n:02}")).collect();
+        let entry = ADAPTED_ENTRY
+            .replace(
+                "offered_tools = [\"read_file\"]",
+                &format!("offered_tools = {}", serde_json::to_string(&tools).unwrap()),
+            )
+            .replace("provenance", "visibility = \"public\"\nprovenance");
+        fs::write(dir.path().join(INVENTORY_FILE), &entry).unwrap();
+        let store = store();
+        let now = 2_000_000_000;
+        // Kept whole, as a build that fitted only the public scope, or none,
+        // kept it: 40 tools with texts of 1 KiB, far more than a page.
+        let text = "x".repeat(pals_core::inventory::MAX_OBSERVED_DESCRIPTION_BYTES);
+        let mut kept = Observation {
+            source: ObservationSource::Adapter {
+                method: AdapterMethod::McpToolsList,
+            },
+            status: OperationalStatus::Ok,
+            observed_at: format_timestamp(now).unwrap(),
+            expires_at: format_timestamp(now + 1800).unwrap(),
+            detail: None,
+            tools: Vec::new(),
+        };
+        for name in &tools {
+            kept.tools.push(pals_core::inventory::ObservedTool {
+                name: name.clone(),
+                description: Some(text.clone()),
+                annotations: Some(serde_json::json!({"title": text})),
+            });
+        }
+        store.observation_put("example:adapted", &kept).unwrap();
+        let state = InventoryState::load_with(
+            &config_in(dir.path()),
+            store,
+            McpAdapter::new(MCP_ADAPTER_TIMEOUT),
+            Arc::new(ManualClock::new(now + 60)),
+        )
+        .unwrap();
+        let loaded = &state.snapshot().observations["example:adapted"];
+        assert_eq!(loaded.status, OperationalStatus::Ok);
+        assert_eq!(loaded.tools.len(), 40);
+        let cap = loaded.tools[0].description.as_ref().unwrap().len();
+        assert!(0 < cap && cap < text.len(), "cut to {cap}");
+        // As a run of the adapter fits it.
+        let inventory = Inventory::from_toml(&entry).unwrap();
+        let mcp = &inventory.mcp[0];
+        assert_eq!(
+            *loaded,
+            fit_observation(mcp, kept, &scopes_to_fit(mcp, &[]))
         );
     }
 }

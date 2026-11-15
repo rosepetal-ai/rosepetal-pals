@@ -210,6 +210,30 @@ mod tests {
     }
 
     #[test]
+    fn the_widest_scopes_leave_the_least_room() {
+        use crate::inventory::scope::MAX_PROJECT_NAME_BYTES;
+        let [project, task] = Scope::widest().map(|scope| entry_budget(&scope));
+        assert!(project <= task);
+        assert!(task < entry_budget(&Scope::Public));
+        let longest = |c: &str| c.repeat(MAX_PROJECT_NAME_BYTES);
+        for name in [
+            "demo".to_owned(),
+            longest("p"),
+            longest("\""),
+            longest("\\"),
+        ] {
+            assert!(
+                entry_budget(&Scope::Project(name.clone())) >= project,
+                "{name}"
+            );
+            assert!(
+                entry_budget(&Scope::Task(name.clone())) >= project,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn what_does_not_fit_even_without_texts_is_too_many_tools() {
         // 600 tools named with 128 characters: their names alone are more
         // than a page.
