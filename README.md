@@ -113,16 +113,16 @@ Between two machines, `net.relay = true` is required; it is the default. The ful
 Each provider describes in `~/.pals/inventory.toml` what it offers and with what; `pals init` writes the file with a commented example of every block. The daemon reads it only when it starts. A requester that holds contacts and grants, as above, searches among them and asks the best one:
 
 ```bash
-pals discover --capability code.rust.review --requirements-file req.json --ask "Review src/lib.rs"
+pals discover --capability code.rust.review --requirements-file req.json --project demo --ask "Review src/lib.rs"
 ```
 
-`req.json` holds the requirements, such as `{"external_cloud_allowed": false, "inventory": {"required": {"mcp_integration_ids": ["example:everything"], "min_offered_ram_mib": 4096}}}`. Without `--ask`, the command only searches; `pals ask <peer> "<question>" --offer <offer_id>` then asks with one of the offers it printed.
+`req.json` holds the requirements, such as `{"external_cloud_allowed": false, "inventory": {"required": {"mcp_integration_ids": ["example:everything"], "min_offered_ram_mib": 4096}}}`. Inventory ids go only to the candidates of which this agent holds a grant for `--project`: without `--project`, they go to no one, and a required one counts as not met. Without `--ask`, the command only searches; `pals ask <peer> "<question>" --offer <offer_id>` then asks with one of the offers it printed.
 
 | Command | What it does |
 |-|-|
 | `pals discover --capability <id> [--input MIME]… [--output MIME]… [--requirements-file FILE] [--project P] [--peer PEER]… [--ask "<question>"] [--wait 600s]` | Searches the contacts for a provider: verifies their cards, asks the PALS peers for offers and prints the ranking, with each offer's id and expiry, every discard with its reason, the coverage and the metrics. It runs nothing on any peer. With `--ask`, it asks the best candidate that takes the question, and exits as `pals ask` does |
 | `pals ask <peer> "<question>" --offer <offer_id>` | Asks naming an offer that `pals discover` printed; with an offer that expired by this agent's clock, it sends nothing and exits with `2` |
-| `pals query <peer> --capability <id> [--input MIME]… [--output MIME]… [--requirements-file FILE] [--project P]` | Asks one PALS peer for an offer and prints it as the peer signed it; asking runs nothing, and the offer authorizes nothing |
+| `pals query <peer> --capability <id> [--input MIME]… [--output MIME]… [--requirements-file FILE] [--project P]` | Asks one PALS peer for an offer and prints it as the peer signed it; asking runs nothing, and the offer authorizes nothing. Without a grant of the peer's for the project, or without a project, the query goes without the project and without inventory ids |
 | `pals card show [<peer>] [--extended]` | This agent's signed card, or a peer's, verified; with `--extended`, the peer's extended card as this agent's grant lets it see it |
 | `pals inventory show [--scope public\|project:<p>\|task:<p>] [--sections …]` | What a peer of that scope sees of this agent's inventory |
 | `pals inventory get <peer> [--sections …] [--all]` | A peer's inventory as this agent's grant lets it see it, each page as the peer signed it |

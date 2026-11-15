@@ -18,8 +18,9 @@
 //! - an offer that does not say every mandatory requirement of the request
 //!   is met ([`SearchRequest::mandatory`]): a requirement the provider left
 //!   out, or one never sent, as the inventory ids that go only to
-//!   candidates with a grant for the project, is unknown, and an unknown
-//!   requirement is never met (§7.2, §9.1);
+//!   candidates with a grant for the project (to none when the request
+//!   names no project), is unknown, and an unknown requirement is never met
+//!   (§7.2, §9.1);
 //! - a plain A2A agent, which has a card and no offer, when the request asks
 //!   for anything a card cannot confirm: inventory, region, cloud, language
 //!   or a requirement this agent does not know.
@@ -70,7 +71,8 @@ pub struct SearchRequest {
     #[serde(default)]
     pub requirements: Requirements,
     /// The project the task is for: only candidates with a grant for it
-    /// get the inventory ids of the requirements.
+    /// get the inventory ids of the requirements, and a request that names
+    /// none sends them to no one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     /// Contact names, plain contacts' names or agent ids; every contact
@@ -91,29 +93,20 @@ impl SearchRequest {
     /// and sources go only to authorized candidates, and a candidate without
     /// a grant for the project is not told which project it is).
     pub fn query(&self, query_id: &str, reply_timeout_ms: u32, with_ids: bool) -> ServiceQuery {
-        let mut requirements = self.requirements.clone();
-        if !with_ids {
-            requirements.inventory = requirements.inventory.and_then(|mut inventory| {
-                clear_ids(&mut inventory.required);
-                clear_ids(&mut inventory.preferred);
-                // No `"inventory": {}`: a query has one spelling.
-                (!inventory.required.is_empty() || !inventory.preferred.is_empty())
-                    .then_some(inventory)
-            });
-        }
-        ServiceQuery {
+        let query = ServiceQuery {
             schema: QUERY_SCHEMA.to_owned(),
             query_id: query_id.to_owned(),
             capability: self.capability.clone(),
             input_media_types: self.input_media_types.clone(),
             output_media_types: self.output_media_types.clone(),
-            requirements,
+            requirements: self.requirements.clone(),
             summary: self.summary.clone(),
             reply_timeout_ms: Some(reply_timeout_ms),
             requested_inventory_sections: Vec::new(),
-            project: self.project.clone().filter(|_| with_ids),
+            project: self.project.clone(),
             execution_authorized: false,
-        }
+        };
+        if with_ids { query } else { query.withheld() }
     }
 
     /// The mandatory requirements of the request, named as an offer's
@@ -180,14 +173,6 @@ impl SearchRequest {
 
 /// `set` without the ids of its entries: MCP connections, information
 /// sources, skill packages, plugins and models.
-fn clear_ids(set: &mut RequirementSet) {
-    set.mcp_integration_ids.clear();
-    set.information_source_ids.clear();
-    set.skill_package_ids.clear();
-    set.plugin_ids.clear();
-    set.model_ids.clear();
-}
-
 /// The requirements of the ids of `set`, as an offer names them.
 fn id_requirements(set: &RequirementSet) -> impl Iterator<Item = String> + '_ {
     set.mcp_integration_ids
@@ -373,9 +358,12 @@ pub fn stage_two(
     let mut ranked = Vec::new();
     let mut discarded = Vec::new();
     for candidate in candidates {
+        // The inventory ids went to it: with a grant for the project named.
+        let sent_ids = candidate.grant_held && req.project.is_some();
         let why = match &candidate.offer {
-            Some(offer) => offer_refusal(offer, &mandatory, candidate.grant_held)
-                .map(|reason| (Stage::Offer, reason)),
+            Some(offer) => {
+                offer_refusal(offer, &mandatory, sent_ids).map(|reason| (Stage::Offer, reason))
+            }
             None if req.needs_an_offer() => Some((
                 Stage::Card,
                 "a plain A2A agent cannot confirm the requirements".to_owned(),

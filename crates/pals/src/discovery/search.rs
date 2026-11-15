@@ -40,9 +40,12 @@
 //!    gateway's own times. It presents the grant this agent holds of the
 //!    peer's for the project (its newest that serves tasks when the request
 //!    names no project), and then carries the project and the inventory ids
-//!    of the requirements, required and preferred. A peer of which this
-//!    agent holds no such grant gets neither grant, project nor ids, and a
-//!    required id counts as unknown, which discards it (§7.1, §9.9).
+//!    of the requirements, required and preferred, only when the request
+//!    names a project. A peer of which this agent holds no grant for it gets
+//!    neither grant, project nor ids: a grant of another project is never
+//!    presented. A request that names no project sends the ids to no one.
+//!    Then a required id counts as unknown, which discards the candidate
+//!    (§7.1, §9.9).
 //!    Whatever the client refuses (an offer of another agent, for another
 //!    requester or query, expired, badly signed; a record that goes back)
 //!    is a discard with its reason. The announce record of the reply must
@@ -274,7 +277,8 @@ struct Target {
     id: AgentId,
     addr: EndpointAddr,
     grant: Option<SignedGrant>,
-    /// The inventory ids go to it: it holds a grant for the project.
+    /// The inventory ids go to it: the request names a project, and this
+    /// agent holds a grant of it for that project.
     with_ids: bool,
     /// The public card's hash, which its announce record must name.
     public_hash: CardHash,
@@ -690,7 +694,7 @@ impl Searcher {
                     id: *id,
                     addr: addr.clone(),
                     grant: grant.clone(),
-                    with_ids: *grant_held,
+                    with_ids: *grant_held && req.project.is_some(),
                     public_hash,
                     hashes,
                 };

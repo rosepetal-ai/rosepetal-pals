@@ -196,6 +196,16 @@ impl RequirementSet {
         *self == Self::default()
     }
 
+    /// Leaves out the ids of the inventory it names: MCP connections,
+    /// information sources, skill packages, plugins and models.
+    pub fn clear_ids(&mut self) {
+        self.mcp_integration_ids.clear();
+        self.information_source_ids.clear();
+        self.skill_package_ids.clear();
+        self.plugin_ids.clear();
+        self.model_ids.clear();
+    }
+
     /// Its lists, with their names, for the counts [`ServiceQuery::validate`]
     /// checks.
     fn lists(&self) -> [&[String]; 6] {
@@ -221,6 +231,23 @@ pub enum QueryError {
 }
 
 impl ServiceQuery {
+    /// This query as it goes to a peer of which the requester holds no
+    /// grant for the project it names, or when it names none: without the
+    /// inventory ids of its requirements, required and preferred, nor its
+    /// project (§7.1, §9.9: integrations and sources go only to candidates
+    /// authorized for the project, and one that is not is not told which
+    /// project it is). An `inventory` left with nothing is left out: a query
+    /// has one spelling.
+    pub fn withheld(mut self) -> Self {
+        self.requirements.inventory = self.requirements.inventory.and_then(|mut inventory| {
+            inventory.required.clear_ids();
+            inventory.preferred.clear_ids();
+            (!inventory.required.is_empty() || !inventory.preferred.is_empty()).then_some(inventory)
+        });
+        self.project = None;
+        self
+    }
+
     /// Reads a query as it travels: at most [`MAX_QUERY_BYTES`]
     /// ([`QueryError::TooLarge`], before it is parsed), its own JCS, in one
     /// spelling, with no field this schema does not know but under

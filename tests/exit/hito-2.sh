@@ -397,7 +397,7 @@ caso1() {
         before=$(counters)
         en_wait "$LOGS/caso1-$try.out" a <<EOS
 cd ~/pals-h2
-pals discover --capability code.rust.review --requirements-file req.json --ask "$PREGUNTA1"; echo "código \$?"
+pals discover --capability code.rust.review --requirements-file req.json --project demo --ask "$PREGUNTA1"; echo "código \$?"
 EOS
         out=$(cat "$LOGS/caso1-$try.out")
         echo "$out"
@@ -662,7 +662,7 @@ caso5() {
 
     say "5a. Una oferta vencida no se usa"
     en_wait "$LOGS/caso5a.out" a <<'EOS'
-pals discover --capability code.rust.review --requirements-file ~/pals-h2/req.json --peer b | tee ~/pals-h2/oferta-b.txt
+pals discover --capability code.rust.review --requirements-file ~/pals-h2/req.json --project demo --peer b | tee ~/pals-h2/oferta-b.txt
 read -r OFERTA HASTA < <(sed -nE 's/^  1\. b .*, offer ([^ ]+) until ([^ ]+)$/\1 \2/p' ~/pals-h2/oferta-b.txt)
 espera 30 "que venza la oferta" sh -c "[ \$(date +%s) -ge $(date -d "$HASTA" +%s) ]"
 echo "la oferta $OFERTA vence $HASTA; ahora $(date -u +%FT%TZ)"

@@ -291,12 +291,14 @@ ejecuciones() { cat "$H2/$AGENTE-ejecuciones.log" 2> /dev/null | wc -l; }
 # tools_list: cuántos tools/list ha recibido el servidor MCP del agente actual.
 tools_list() { grep -cE '"method": ?"tools/list"' "$H2/$AGENTE-mcp-entrada.log" 2> /dev/null || true; }
 # cuerpo [--ask <pregunta>] [<par>...]: el cuerpo de POST /discovery/search
-# para la búsqueda del caso 1, code.rust.review con req.json, entre esos
-# pares (entre todos los contactos si no se nombra ninguno).
+# para la búsqueda del caso 1, code.rust.review con req.json para el
+# proyecto demo, entre esos pares (entre todos los contactos si no se nombra
+# ninguno).
 cuerpo() {
     python3 - "$H2/req.json" "$@" <<'PY'
 import json, sys
-search = {'capability': 'code.rust.review', 'requirements': json.load(open(sys.argv[1]))}
+search = {'capability': 'code.rust.review', 'requirements': json.load(open(sys.argv[1])),
+          'project': 'demo'}
 args, body = sys.argv[2:], {}
 while args:
     arg = args.pop(0)
@@ -529,7 +531,7 @@ En A:
 ```bash
 . ~/pals-h2/funciones.sh; agente a
 cd ~/pals-h2
-pals discover --capability code.rust.review --requirements-file req.json --ask "Revisa src/lib.rs"; echo "código $?"
+pals discover --capability code.rust.review --requirements-file req.json --project demo --ask "Revisa src/lib.rs"; echo "código $?"
 ```
 
 **Esperado:** código 0 y, en este orden:
@@ -680,7 +682,7 @@ para && config_proveedor --oferta-ms 2000 && arranca
 
 ```bash
 . ~/pals-h2/funciones.sh; agente a
-pals discover --capability code.rust.review --requirements-file ~/pals-h2/req.json --peer b | tee ~/pals-h2/oferta-b.txt
+pals discover --capability code.rust.review --requirements-file ~/pals-h2/req.json --project demo --peer b | tee ~/pals-h2/oferta-b.txt
 read -r OFERTA HASTA < <(sed -nE 's/^  1\. b .*, offer ([^ ]+) until ([^ ]+)$/\1 \2/p' ~/pals-h2/oferta-b.txt)
 espera 30 "que venza la oferta" sh -c "[ \$(date +%s) -ge $(date -d "$HASTA" +%s) ]"
 pals ask b "pregunta con la oferta vencida" --offer "$OFERTA"; echo "código $?"

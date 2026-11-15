@@ -66,7 +66,10 @@
 //! with the reason, before the peer is asked), asks the peer
 //! ([`DiscoveryClient::query`]) presenting the grant it holds for the
 //! query's `project` when it holds one, else the grant it would present to
-//! the peer's A2A server, or none, and answers with the offer as the peer
+//! the peer's A2A server, or none; unless the grant presented is for the
+//! project the query names, the query goes [withheld](query_for_grant),
+//! with neither that project nor the inventory ids of its requirements, as
+//! one that names no project does. It answers with the offer as the peer
 //! signed it, re-encoded in ASCII, once the client accepted it, which keeps
 //! it ([`Store::offer_received_put`]). A refused offer is `502`; the peer's
 //! refusals and failures are answered as for the inventory.
@@ -666,17 +669,7 @@ impl GatewayState {
         let store = Arc::clone(&self.inner.store);
         blocking(move || {
             let now = chrono::Utc::now().timestamp();
-            let held: Vec<SignedGrant> = store
-                .grants_held_for(&peer, now)?
-                .into_iter()
-                .filter(|g| serves_tasks(&g.grant))
-                .collect();
-            let for_project =
-                project.and_then(|project| held.iter().position(|g| g.grant.project == project));
-            Ok(match for_project {
-                Some(at) => held.into_iter().nth(at),
-                None => held.into_iter().next(),
-            })
+            held_task_grant(&store, &peer, project.as_deref(), now)
         })
         .await
     }
@@ -688,6 +681,45 @@ impl GatewayState {
             HeaderValue::from_str(&format!("Bearer {}", g.to_token()))
                 .expect("a base64url token is a valid header value")
         }))
+    }
+}
+
+/// The newest grant `store` holds of `peer`'s, unexpired at `now_unix`,
+/// that [serves tasks](serves_tasks) in `project`, when there is one; else
+/// the newest that serves tasks, of any project.
+pub fn held_task_grant(
+    store: &Store,
+    peer: &AgentId,
+    project: Option<&str>,
+    now_unix: i64,
+) -> anyhow::Result<Option<SignedGrant>> {
+    let held: Vec<SignedGrant> = store
+        .grants_held_for(peer, now_unix)?
+        .into_iter()
+        .filter(|g| serves_tasks(&g.grant))
+        .collect();
+    let for_project =
+        project.and_then(|project| held.iter().position(|g| g.grant.project == project));
+    Ok(match for_project {
+        Some(at) => held.into_iter().nth(at),
+        None => held.into_iter().next(),
+    })
+}
+
+/// `query` as it is asked of a peer presenting `grant`: as it is when
+/// `grant` is for the project the query names; else
+/// [withheld](ServiceQuery::withheld), with neither that project nor the
+/// inventory ids of its requirements, as when it names none. A grant of
+/// another project never carries the first project's name or ids.
+pub fn query_for_grant(query: ServiceQuery, grant: Option<&SignedGrant>) -> ServiceQuery {
+    let for_its_project = query
+        .project
+        .as_deref()
+        .is_some_and(|project| grant.is_some_and(|g| g.grant.project == project));
+    if for_its_project {
+        query
+    } else {
+        query.withheld()
     }
 }
 
@@ -955,6 +987,7 @@ async fn peer_query(
         Ok(grant) => grant,
         Err(failure) => return failure.into_response(),
     };
+    let query = query_for_grant(query, grant.as_ref());
     let discovery = &state.inner.discovery;
     match discovery
         .query(

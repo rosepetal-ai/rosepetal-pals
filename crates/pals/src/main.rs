@@ -27,8 +27,8 @@ use iroh_tickets::endpoint::EndpointTicket;
 use pals::a2a::CardSet;
 use pals::config::{self, CONFIG_FILE, Config, INIT_TEMPLATE, INVENTORY_TEMPLATE, is_header_safe};
 use pals::discovery::cards::PUBLIC_CONTEXT;
-use pals::gateway::CARD_HASH_HEADER;
 use pals::gateway::plain::{self, fetch_plain_card};
+use pals::gateway::{CARD_HASH_HEADER, held_task_grant, query_for_grant};
 use pals::inventory::{InventoryState, RefreshReport};
 use pals::net::agent_id_of;
 use pals::node::{Node, STORE_FILE};
@@ -958,6 +958,24 @@ fn query(home: &Path, peer: &str, asked: Asked) -> anyhow::Result<()> {
     let (cfg, key) = load_agent(home)?;
     let store = open_store(&cfg, &key)?;
     let peer_id = peer_id(&store, peer)?;
+    // As the gateway sends it, so that the offer is for it.
+    let grant = held_task_grant(&store, &peer_id, query.project.as_deref(), now_unix())?;
+    let sent = query_for_grant(query.clone(), grant.as_ref());
+    if sent != query {
+        match &query.project {
+            Some(project) => eprintln!(
+                "pals: this agent holds no grant of {}'s for project {}: the query goes \
+                 without the project and without inventory ids",
+                shown(peer),
+                shown(project)
+            ),
+            None => eprintln!(
+                "pals: the query names no project, so it goes without inventory ids: they go \
+                 only with a grant for the project"
+            ),
+        }
+    }
+    let query = sent;
     let (listen, own) = (cfg.gateway.listen, key.id());
     runtime(false)?.block_on(async move {
         this_daemon(listen, &own).await?;

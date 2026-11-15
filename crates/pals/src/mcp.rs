@@ -237,7 +237,9 @@ struct DiscoverParams {
     /// `min_offered_vram_mib`. A requirement no one knows is never met.
     requirements: Option<Map<String, Value>>,
     /// The project the task is for: only candidates of which this agent
-    /// holds a grant for it are told it, and the inventory ids.
+    /// holds a grant for it are told it, and the inventory ids. Inventory
+    /// requirements need it: without a project, no candidate gets their
+    /// ids, and a required one counts as not met.
     project: Option<String>,
     /// The contacts to consider, by name as pals_contacts lists them or by
     /// agent id: every contact when left out or empty.
@@ -364,8 +366,10 @@ impl PalsMcp {
              whose offer_id pals_ask takes, with the candidate's peer, to delegate to it; those \
              discarded, with the stage and the reason; the coverage, partial when limits left \
              some out; and what the search took. `requirements` are mandatory, but those under \
-             inventory.preferred; `peers` restricts the search to those contacts. The query \
-             sent, the requirements included, is at most 8 KiB. ",
+             inventory.preferred; inventory requirements need `project`, since their ids go \
+             only to candidates with a grant for it: without one, a required id counts as not \
+             met. `peers` restricts the search to those contacts. The query sent, the \
+             requirements included, is at most 8 KiB. ",
             untrusted_offers!()
         )
     )]

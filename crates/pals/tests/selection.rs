@@ -1664,6 +1664,176 @@ async fn inventory_requirement_ids_go_only_to_authorized_candidates() {
     );
 }
 
+/// Requirements that name inventory ids: a required MCP connection and a
+/// preferred information source.
+fn id_requirements() -> Requirements {
+    Requirements {
+        inventory: Some(InventoryRequirements {
+            required: RequirementSet {
+                mcp_integration_ids: vec![MCP.to_owned()],
+                ..RequirementSet::default()
+            },
+            preferred: RequirementSet {
+                information_source_ids: vec!["project:repo-controller".to_owned()],
+                ..RequirementSet::default()
+            },
+        }),
+        ..Requirements::default()
+    }
+}
+
+/// Whether `query` names, anywhere, the project `demo` or an id of
+/// [`id_requirements`].
+fn names_demo_or_ids(query: &ServiceQuery) -> bool {
+    let bytes = String::from_utf8(query.to_jcs()).unwrap();
+    ["demo", MCP, "repo-reader", "repo-controller"]
+        .iter()
+        .any(|word| bytes.contains(word))
+}
+
+/// A stub `name` that offers, signing for whoever asks, keeping every
+/// request it reads, with a grant of `demo` when `with_grant`.
+async fn offering_stub(
+    a: &TestNode,
+    name: &str,
+    with_grant: bool,
+) -> (StubPeer, Arc<Mutex<Vec<wire::Request>>>) {
+    let key = AgentKey::generate();
+    let card = stub_card(&key, &public_service((1, 1)));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let answer = offering(Arc::clone(&requests), card.announce_hash.clone());
+    let stub =
+        stub_discovery_peer_with_card(a, name, key, StubMode::Answer(answer), card, with_grant)
+            .await;
+    (stub, requests)
+}
+
+#[tokio::test]
+async fn a_search_that_names_no_project_sends_inventory_ids_to_no_one() {
+    let a = requester().await;
+    // A grant of `demo` is held, which serves tasks.
+    let (_stub, kept) = offering_stub(&a, "granted", true).await;
+    let req = SearchRequest {
+        requirements: id_requirements(),
+        input_media_types: Vec::new(),
+        output_media_types: Vec::new(),
+        project: None,
+        ..plain_request()
+    };
+    let outcome = a.node.searcher().search(req).await.unwrap();
+
+    let asked = kept.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1);
+    // Its grant goes, but neither a project nor an id.
+    assert!(!asked[0].grant_token.is_empty());
+    let query = query_of(&asked[0]);
+    assert_eq!(query.requirements.inventory, None);
+    assert_eq!(query.project, None);
+    assert!(!names_demo_or_ids(&query), "{query:?}");
+    assert_eq!(
+        discard(&outcome, "granted"),
+        (
+            Stage::Offer,
+            "mcp_integration:example:repo-reader unknown: inventory ids go only to peers \
+             with a grant for the project"
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_grant_of_another_project_never_carries_this_ones_name_or_ids() {
+    let a = requester().await;
+    // a holds only a grant of `other` of the stub's.
+    let (stub, kept) = offering_stub(&a, "other", false).await;
+    let other = project_grant(&stub.key, a.id(), stub.id, "other", now_unix());
+    a.hold(&other);
+
+    // A search for `demo`: the grant of `other` is never presented, and
+    // neither `demo` nor the ids go.
+    let req = SearchRequest {
+        requirements: id_requirements(),
+        input_media_types: Vec::new(),
+        output_media_types: Vec::new(),
+        ..plain_request()
+    };
+    let outcome = a.node.searcher().search(req).await.unwrap();
+    let asked = kept.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1);
+    assert!(asked[0].grant_token.is_empty());
+    assert!(!names_demo_or_ids(&query_of(&asked[0])));
+    assert_eq!(
+        discard(&outcome, "other"),
+        (
+            Stage::Offer,
+            "mcp_integration:example:repo-reader unknown: inventory ids go only to peers \
+             with a grant for the project"
+        )
+    );
+
+    // A query for `demo` through the gateway: with the grant of `other`,
+    // but without `demo` or the ids.
+    let mut query = SearchRequest {
+        requirements: id_requirements(),
+        ..plain_request()
+    }
+    .query("q-gateway", 3000, true);
+    assert!(names_demo_or_ids(&query));
+    let res = common::gateway_request(
+        &a.gateway_url(),
+        "POST",
+        &format!("/discovery/query/{}", stub.id),
+        &[],
+        Some(&serde_json::to_value(&query).unwrap()),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let asked = kept.lock().unwrap().clone();
+    assert_eq!(asked.len(), 2);
+    assert_eq!(asked[1].grant_token, other.to_token());
+    assert!(
+        !names_demo_or_ids(&query_of(&asked[1])),
+        "{:?}",
+        query_of(&asked[1])
+    );
+
+    // And with `pals query`, whose offer is for the query that went.
+    let home = a.dir.path();
+    let listen = a.gateway_url().replace("http://", "");
+    std::fs::write(
+        home.join("config.toml"),
+        format!("[gateway]\nlisten = \"{listen}\"\n\n[net]\nrelay = false\n"),
+    )
+    .unwrap();
+    query.query_id = "q-cli".to_owned();
+    let requirements = home.join("requirements.json");
+    std::fs::write(
+        &requirements,
+        serde_json::to_vec(&query.requirements).unwrap(),
+    )
+    .unwrap();
+    let (code, stdout, stderr) = pals(
+        home,
+        &[
+            "query",
+            "other",
+            "--capability",
+            CAPABILITY,
+            "--project",
+            "demo",
+            "--requirements-file",
+            requirements.to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("verified:"), "{stdout}");
+    assert!(stderr.contains("no grant"), "{stderr}");
+    let asked = kept.lock().unwrap().clone();
+    assert_eq!(asked.len(), 3);
+    assert_eq!(asked[2].grant_token, other.to_token());
+    assert!(!names_demo_or_ids(&query_of(&asked[2])));
+}
+
 #[tokio::test]
 async fn repeated_broad_searches_keep_the_aggregate_limits() {
     let a = requester().await;
