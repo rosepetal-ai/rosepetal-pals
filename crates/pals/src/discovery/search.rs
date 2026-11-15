@@ -18,7 +18,7 @@
 //! 1. **Its card**, stage 1 ([`stage_one`]). A PALS peer's public card, and
 //!    its extended card when this agent holds a grant for the project,
 //!    verified as signed by the peer ([`PeerCards`]). A plain A2A agent's
-//!    card ([`fetch_plain_card`]), which goes on only when its signature is
+//!    card ([`fetch_contact_card`]), which goes on only when its signature is
 //!    [`Verified`](SignatureStatus::Verified): an unverifiable or unsigned
 //!    one is discarded, `card not verified`, and can still be asked by its
 //!    name; and only when the card declares `capabilities.streaming`,
@@ -117,7 +117,7 @@ use tokio_util::sync::CancellationToken;
 use super::cards::{CardFetchError, PeerCards, signed_card_json};
 use super::client::{DiscoveryClient, DiscoveryError};
 use crate::config::DiscoveryCfg;
-use crate::gateway::plain::{PlainError, fetch_plain_card, keep_plain_card};
+use crate::gateway::plain::{PlainError, fetch_contact_card, keep_plain_card};
 use crate::gateway::serves_tasks;
 use crate::net::peer_addr;
 use crate::outbox::{AskError, AskOutcome, AskRequest, INVALID_TASK_ID, Outbox};
@@ -236,6 +236,9 @@ pub struct SearcherParts {
     pub outbox: Outbox,
     /// The client for plain A2A agents (`crate::gateway::plain::http_client`).
     pub plain_http: reqwest::Client,
+    /// The port this agent's gateway listens on, which no plain contact's
+    /// origin may be ([`fetch_contact_card`]).
+    pub gateway_port: u16,
     /// The node's clock, which offers and reports are judged by.
     pub clock: Arc<dyn Clock>,
     pub limits: DiscoveryLimits,
@@ -725,7 +728,7 @@ impl Searcher {
             }
             EntryKind::Plain(contact) => {
                 let http = &self.inner.parts.plain_http;
-                let plain = fetch_plain_card(http, contact)
+                let plain = fetch_contact_card(http, contact, self.inner.parts.gateway_port)
                     .await
                     .map_err(|err| discard(name, Stage::Card, &plain_card_failure(name, &err)))?;
                 tally.messages += 1;

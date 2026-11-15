@@ -27,7 +27,7 @@ use iroh_tickets::endpoint::EndpointTicket;
 use pals::a2a::CardSet;
 use pals::config::{self, CONFIG_FILE, Config, INIT_TEMPLATE, INVENTORY_TEMPLATE, is_header_safe};
 use pals::discovery::cards::PUBLIC_CONTEXT;
-use pals::gateway::plain::{self, fetch_plain_card};
+use pals::gateway::plain::{self, fetch_contact_card};
 use pals::gateway::{CARD_HASH_HEADER, held_task_grant, query_for_grant};
 use pals::inventory::{InventoryState, RefreshReport};
 use pals::net::agent_id_of;
@@ -1602,7 +1602,11 @@ fn contact_add_a2a(
         bail!("{name} is the name of a PALS contact already: one name, one contact");
     }
     let card = runtime(false)?
-        .block_on(fetch_plain_card(&plain::http_client(), &contact))
+        .block_on(fetch_contact_card(
+            &plain::http_client(),
+            &contact,
+            cfg.gateway.listen.port(),
+        ))
         .with_context(|| format!("cannot use the card at {}", contact.card_url))?;
     store.a2a_contact_put(&contact)?;
     let peer = format!("{PLAIN_PEER_PREFIX}{name}");

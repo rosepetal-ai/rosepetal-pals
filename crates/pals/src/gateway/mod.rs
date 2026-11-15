@@ -107,8 +107,9 @@
 //! `<gateway>/peers/<peer>/rest/tasks/<id>` with dot segments
 //! (`../../../<other>/rest/tasks/x`) would reach another peer with the
 //! grant the gateway holds for it. What goes on is the gateway's own ASCII
-//! encoding of the JSON it checked, its blob URLs the gateway's
-//! ([`rewrite::to_gateway`]): a body typed `application/json`, an event as
+//! encoding of the JSON it checked, a PALS peer's blob URLs the gateway's
+//! ([`rewrite::to_gateway`]; a plain contact's stay as sent, naming nothing
+//! the gateway serves): a body typed `application/json`, an event as
 //! `data: <JSON>` or a bare keepalive. A body refused is `502
 //! {"error":"peer protocol error"}`; a stream refused ends, broken, before
 //! the event at fault, which never reaches the client.
@@ -352,6 +353,7 @@ impl GatewayState {
             discovery: discovery.clone(),
             outbox: outbox.clone(),
             plain_http: plain_http.clone(),
+            gateway_port: local_addr.port(),
             clock: Arc::clone(&clock),
             limits: discovery_limits,
         });
@@ -1470,7 +1472,8 @@ impl GatewayState {
         if call == Call::Streaming && status.is_success() && media_type == EVENT_STREAM {
             headers.remove(CONTENT_LENGTH);
             headers.insert(CONTENT_TYPE, HeaderValue::from_static(EVENT_STREAM));
-            return Ok(checked_event_stream(body, self.base_url(), binding));
+            let blobs_at = matches!(owner, CardOwner::Peer(_)).then(|| self.base_url());
+            return Ok(checked_event_stream(body, blobs_at, binding));
         }
         let card = call == Call::ExtendedCard;
         let limit = if card {
@@ -1494,7 +1497,7 @@ impl GatewayState {
             }
             // An error a client takes no task id from, or nothing.
             Err(_) => {
-                if matches!(owner, CardOwner::Plain(_)) && plain::is_forged_refusal(&bytes) {
+                if matches!(owner, CardOwner::Plain(..)) && plain::is_forged_refusal(&bytes) {
                     return Err(TunnelError::Protocol(FORGED_REFUSAL.to_owned()));
                 }
                 return Ok(Body::from(bytes));
@@ -1509,9 +1512,12 @@ impl GatewayState {
         if let Some(id) = checks::unsafe_id(&value, binding) {
             return Err(TunnelError::Protocol(format!("an unsafe id {id}")));
         }
-        rewrite::rewrite_to_gateway(&mut value, &self.base_url());
+        // A plain agent's blob URLs are none of PALS's: they stay as sent.
+        if let CardOwner::Peer(_) = owner {
+            rewrite::rewrite_to_gateway(&mut value, &self.base_url());
+        }
         let bytes = checks::ascii_json(&value);
-        if matches!(owner, CardOwner::Plain(_)) && plain::is_forged_refusal(&bytes) {
+        if matches!(owner, CardOwner::Plain(..)) && plain::is_forged_refusal(&bytes) {
             return Err(TunnelError::Protocol(FORGED_REFUSAL.to_owned()));
         }
         let json_type = if media_type == A2A_JSON {
@@ -1543,13 +1549,14 @@ fn declare(part: &mut Map<String, Value>, blob: &BlobRef) {
 }
 
 /// `body`, an event stream on `binding`, sent on event by event as each is
-/// complete, [checked and rebuilt](checks::check_event): the stream ends,
+/// complete, [checked and rebuilt](checks::check_event), its blob URLs
+/// those of the gateway at `blobs_at` when given: the stream ends,
 /// broken, at the first event refused, before it, or once the event being
 /// received grows past [`MAX_REWRITE_BYTES`] before its empty line. An
 /// event the peer's stream ends in the middle of, before its empty line,
 /// is no event: SSE discards it, and so does the gateway, ending the stream
 /// as the peer did.
-fn checked_event_stream(body: Body, base_url: String, binding: Binding) -> Body {
+fn checked_event_stream(body: Body, blobs_at: Option<String>, binding: Binding) -> Body {
     struct Events {
         body: BodyDataStream,
         framer: EventFramer,
@@ -1557,13 +1564,14 @@ fn checked_event_stream(body: Body, base_url: String, binding: Binding) -> Body 
         input_ended: bool,
         /// Whether this stream has ended, broken or not.
         done: bool,
-        base_url: String,
+        /// The gateway whose blob URLs the events' become, when they do.
+        blobs_at: Option<String>,
         binding: Binding,
     }
     impl Events {
         /// `event`, checked and rebuilt, or the end of this stream.
         async fn send(self, event: &[u8]) -> Option<(io::Result<Bytes>, Self)> {
-            match checks::check_event(event, &self.base_url, self.binding) {
+            match checks::check_event(event, self.blobs_at.as_deref(), self.binding) {
                 Ok(checked) => Some((Ok(checked), self)),
                 Err(why) => self.fail(why).await,
             }
@@ -1585,7 +1593,7 @@ fn checked_event_stream(body: Body, base_url: String, binding: Binding) -> Body 
         framer: EventFramer::new(),
         input_ended: false,
         done: false,
-        base_url,
+        blobs_at,
         binding,
     };
     let stream = futures::stream::unfold(events, |mut events| async move {
@@ -2095,7 +2103,7 @@ mod tests {
         let (wire, local) = blob_urls(base);
         let event = |url: &str| json!({"result": {"artifact": {"parts": [{"url": url}]}}});
         let sent = format!("event: message\r\nid: 7\r\ndata:{}\r\n\r\n", event(&wire));
-        let checked = checks::check_event(sent.as_bytes(), base, Binding::JsonRpc).unwrap();
+        let checked = checks::check_event(sent.as_bytes(), Some(base), Binding::JsonRpc).unwrap();
         assert_eq!(
             String::from_utf8(checked.to_vec()).unwrap(),
             format!("data: {}\n\n", event(&local))
@@ -2104,7 +2112,7 @@ mod tests {
         let text = json!({"result": {"text": wire}});
         let checked = checks::check_event(
             format!("data: {text}\n\n").as_bytes(),
-            base,
+            Some(base),
             Binding::JsonRpc,
         )
         .unwrap();
@@ -2122,9 +2130,12 @@ mod tests {
             .map(|chunk| Ok(Bytes::from(chunk)))
             .collect();
         let body = Body::from_stream(futures::stream::iter(chunks));
-        let mut stream =
-            checked_event_stream(body, "http://127.0.0.1:7420".to_owned(), Binding::Rest)
-                .into_data_stream();
+        let mut stream = checked_event_stream(
+            body,
+            Some("http://127.0.0.1:7420".to_owned()),
+            Binding::Rest,
+        )
+        .into_data_stream();
         let mut received = Vec::new();
         while let Some(chunk) = stream.next().await {
             match chunk {

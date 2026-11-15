@@ -36,11 +36,13 @@
 //! ([`extended_card_view`]). A JSON-RPC error goes on as any other. A card
 //! that does not verify is refused, as a body that is not JSON is. A plain
 //! A2A contact's extended card ([`CardOwner::Plain`]) needs no signature: it
-//! must be a valid card ([`validate_card`]), and goes on as its view.
+//! must be a valid card ([`validate_card`]), and goes on as its view, which
+//! declares only the bindings its public card has.
 //!
 //! **A whole body** is read up to the gateway's bound; a `2xx` one must be
 //! empty or JSON (RFC 8259, UTF-8). JSON, of any status, is checked
-//! ([`unsafe_id`]), its blob URLs become the gateway's, and it goes on
+//! ([`unsafe_id`]), a PALS peer's blob URLs become the gateway's (a plain
+//! contact's stay as sent), and it goes on
 //! re-encoded ([`ascii_json`]), typed `application/json` (or
 //! `application/a2a+json` when the peer said so). A non-`2xx` body that is
 //! not JSON goes on as it came, bounded: a client takes no task id from an
@@ -94,8 +96,9 @@ use pals_core::identity::AgentId;
 use serde::Serialize;
 use serde_json::Value;
 
+use super::plain::{PlainCard, served_view};
 use super::rewrite;
-use crate::a2a::{gateway_view, gateway_view_for, is_safe_task_id};
+use crate::a2a::{gateway_view, is_safe_task_id};
 use crate::discovery::signed_card_json;
 
 /// The A2A binding a call speaks.
@@ -115,12 +118,14 @@ pub(crate) enum Call {
 }
 
 /// Whose answer the gateway checks: whose extended card it must be.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum CardOwner<'a> {
     /// A PALS peer: its card must be signed with its agent id as `kid`.
     Peer(&'a AgentId),
-    /// A plain A2A contact, by name: its card need not be signed.
-    Plain(&'a str),
+    /// A plain A2A contact, by name, with its public card as read for the
+    /// call: its extended card need not be signed, and its view declares
+    /// only the bindings that public card has, which the gateway serves.
+    Plain(&'a str, &'a PlainCard),
 }
 
 /// The JSON-RPC methods the pinned SDK answers with an event stream.
@@ -223,10 +228,10 @@ pub(crate) fn extended_card_view(
     };
     let peer = match owner {
         CardOwner::Peer(peer) => peer,
-        CardOwner::Plain(name) => {
+        CardOwner::Plain(name, plain) => {
             let valid = validate_card(card)
                 .map_err(|err| format!("an extended card that is not valid: {err}"))?;
-            let view = gateway_view_for(&valid, base_url, name);
+            let view = served_view(&valid, plain, base_url, name);
             *card = serde_json::to_value(view).expect("an AgentCard always serializes");
             return Ok(None);
         }
@@ -452,10 +457,15 @@ impl EventFramer {
 
 /// `event`, one event of a peer's stream on `binding`, as it goes to the
 /// client: `data: <JSON>\n\n` with its data checked ([`unsafe_id`]), its
-/// blob URLs the gateway's and re-encoded ([`ascii_json`]), or
+/// blob URLs those of the gateway at `blobs_at` when given (a PALS peer's
+/// answer, never a plain contact's) and re-encoded ([`ascii_json`]), or
 /// [`KEEPALIVE`] when it has no data. Refused when it is not UTF-8, its
 /// data is not JSON, or the data names an unsafe id.
-pub(crate) fn check_event(event: &[u8], base_url: &str, binding: Binding) -> Result<Bytes, String> {
+pub(crate) fn check_event(
+    event: &[u8],
+    blobs_at: Option<&str>,
+    binding: Binding,
+) -> Result<Bytes, String> {
     let text = std::str::from_utf8(event).map_err(|_| "an event that is not UTF-8".to_owned())?;
     let data: Vec<&str> = sse_lines(text).into_iter().filter_map(sse_data).collect();
     if data.is_empty() {
@@ -466,7 +476,9 @@ pub(crate) fn check_event(event: &[u8], base_url: &str, binding: Binding) -> Res
     if let Some(id) = unsafe_id(&value, binding) {
         return Err(format!("an event with an unsafe id {id}"));
     }
-    rewrite::rewrite_to_gateway(&mut value, base_url);
+    if let Some(base_url) = blobs_at {
+        rewrite::rewrite_to_gateway(&mut value, base_url);
+    }
     let mut out = b"data: ".to_vec();
     out.extend_from_slice(&ascii_json(&value));
     out.extend_from_slice(b"\n\n");
@@ -657,11 +669,33 @@ mod tests {
             "securitySchemes": {"bearer": {"httpAuthSecurityScheme": {"scheme": "Bearer"}}}
         });
         let valid = validate_card(&card).unwrap();
-        let view = serde_json::to_value(gateway_view_for(&valid, base, "echo")).unwrap();
+        // Its public card, as read for the call, has a JSON-RPC interface
+        // only: the view of its extended card declares no other.
+        let public = PlainCard {
+            card: valid.clone(),
+            json: card.clone(),
+            hash: card_hash(&card),
+            signature: pals_core::card_jws::SignatureStatus::Unsigned,
+            jsonrpc_url: Some("https://agent.example/rpc".to_owned()),
+            rest_url: None,
+        };
+        let view =
+            serde_json::to_value(crate::a2a::gateway_view_for(&valid, base, "echo")).unwrap();
         assert!(view.get("securitySchemes").is_none(), "{view}");
+        let mut extended = card.clone();
+        extended["supportedInterfaces"] = json!([
+            {"url": "https://agent.example/rpc", "protocolBinding": "JSONRPC",
+             "protocolVersion": "1.0"},
+            {"url": "https://agent.example/rest", "protocolBinding": "HTTP+JSON",
+             "protocolVersion": "1.0"}
+        ]);
+        let mut view = view;
+        view["supportedInterfaces"] = json!([view["supportedInterfaces"][0].clone()]);
+        assert_eq!(view["supportedInterfaces"][0]["protocolBinding"], "JSONRPC");
+        let card = extended;
 
         let mut rest = card.clone();
-        let owner = CardOwner::Plain("echo");
+        let owner = CardOwner::Plain("echo", &public);
         assert_eq!(
             extended_card_view(&mut rest, Binding::Rest, owner, base),
             Ok(None)
@@ -818,7 +852,7 @@ mod tests {
     #[test]
     fn events_go_on_rebuilt_from_their_checked_data() {
         let base = "http://127.0.0.1:7420";
-        let check = |event: &str| check_event(event.as_bytes(), base, Binding::Rest);
+        let check = |event: &str| check_event(event.as_bytes(), Some(base), Binding::Rest);
         // Fields, comments and ids go; data, joined, stays.
         let rebuilt =
             check("event: x\r\nid: 7\r\n: c\r\ndata: {\"a\":\r\ndata: 1}\r\n\r\n").unwrap();
@@ -843,6 +877,6 @@ mod tests {
         ] {
             assert!(check(refused).is_err(), "{refused:?}");
         }
-        assert!(check_event(b"data: \xff\n\n", base, Binding::Rest).is_err());
+        assert!(check_event(b"data: \xff\n\n", Some(base), Binding::Rest).is_err());
     }
 }

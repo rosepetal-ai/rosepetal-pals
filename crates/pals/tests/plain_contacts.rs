@@ -2110,3 +2110,149 @@ async fn plain_agent_that_compresses_is_asked_for_identity() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_plain_agents_blob_urls_pass_unchanged() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let gw = a.gateway_url();
+    // A blob URL naming this very agent as its holder, which the gateway
+    // would serve from its store, or fetch, if it were rewritten.
+    let blob = format!("iroh-blob://{}/{}", a.id(), "0".repeat(64));
+    let task = json!({"id": "t-1", "contextId": "c-1",
+        "status": {"state": "TASK_STATE_COMPLETED"},
+        "artifacts": [{"artifactId": "a-1", "parts": [{"url": blob, "filename": "x.txt"}]}]});
+    let (unary, streamed) = (task.clone(), task.clone());
+    let (origin, _agent) = serve_at(move |origin| {
+        card_app(card_json(origin))
+            .route(
+                "/rest/message:send",
+                post(move || {
+                    let reply = json!({"task": unary});
+                    async move { json_bytes(reply.to_string().into_bytes()) }
+                }),
+            )
+            .route(
+                "/rest/message:stream",
+                post(move || {
+                    let event = json!({"task": streamed});
+                    async move { event_stream(&[event]) }
+                }),
+            )
+    })
+    .await;
+    add_plain(&a, "blobs", &origin);
+
+    let res = gateway_request(
+        &gw,
+        "POST",
+        "/peers/blobs/rest/message:send",
+        &VERSION,
+        Some(&message_params("hola", None)),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["task"]["artifacts"][0]["parts"][0]["url"], blob);
+    let response = gateway_send(
+        &gw,
+        "POST",
+        "/peers/blobs/rest/message:stream",
+        &VERSION,
+        Some(&message_params("hola", None)),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let (received, ended_cleanly) = read_until_end(response).await;
+    assert!(ended_cleanly);
+    let received = String::from_utf8(received).unwrap();
+    assert_eq!(received, format!("data: {}\n\n", json!({"task": task})));
+    assert!(!received.contains("/blobs/"), "{received}");
+}
+
+#[tokio::test]
+async fn the_gateways_own_origin_is_no_plain_contact() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    // A PALS peer that a holds a grant of, which an alias through a's own
+    // gateway would reach with that grant.
+    let b = spawn_node(WorkerCfg::Echo).await;
+    a.add_contact("bob", &b);
+    a.hold(&grant(&b, &a, &[TaskSend, TaskRead], 3600));
+    let gw = a.gateway_url();
+    let port = gw.rsplit(':').next().unwrap().to_owned();
+    let home = cli_home(&a);
+    std::fs::write(
+        home.join("config.toml"),
+        format!("[gateway]\nlisten = \"127.0.0.1:{port}\"\n\n[net]\nrelay = false\n"),
+    )
+    .unwrap();
+    let own = "a plain contact cannot be this agent's own gateway";
+
+    for (name, origin) in [
+        ("alias", format!("http://127.0.0.1:{port}")),
+        ("alias-name", format!("http://localhost:{port}")),
+    ] {
+        // Refused when saved.
+        let url = format!("{origin}/peers/bob");
+        let (code, _, err) = pals(home, &["contact", "add-a2a", &url, "--name", name], &[]).await;
+        assert_ne!(code, 0, "{name}");
+        assert!(err.contains(own), "{name}: {err}");
+        assert!(a.node.store.a2a_contact_by_name(name).unwrap().is_none());
+
+        // Saved by other means: refused at every use.
+        a.node
+            .store
+            .a2a_contact_put(&A2aContact {
+                name: name.to_owned(),
+                card_url: format!("{url}/.well-known/agent-card.json"),
+                origin: origin.clone(),
+                bearer_env: None,
+                added_at: now_unix(),
+            })
+            .unwrap();
+        let call = rpc_request("SendMessage", message_params("hola", None));
+        for (method, path, body) in [
+            ("POST", format!("/peers/{name}/jsonrpc"), Some(&call)),
+            (
+                "GET",
+                format!("/peers/{name}/.well-known/agent-card.json"),
+                None,
+            ),
+        ] {
+            let res = gateway_request(&gw, method, &path, &VERSION, body).await;
+            assert_eq!(res.status, 502, "{path}: {}", res.json);
+            assert!(
+                res.json["error"].as_str().unwrap().contains(own),
+                "{path}: {}",
+                res.json
+            );
+        }
+        let asked = a.node.outbox().ask(hola(name)).await;
+        assert!(
+            matches!(&asked, Err(AskError::Local(why)) if why.contains(own)),
+            "{asked:?}"
+        );
+    }
+    // A search discards them at their card.
+    let outcome = a
+        .node
+        .searcher()
+        .search(SearchRequest {
+            capability: "code.rust.review".to_owned(),
+            peers: Some(vec!["alias".to_owned(), "alias-name".to_owned()]),
+            ..SearchRequest::default()
+        })
+        .await
+        .unwrap();
+    for name in ["alias", "alias-name"] {
+        let discarded = outcome
+            .discarded
+            .iter()
+            .find(|d| d.peer == name)
+            .unwrap_or_else(|| panic!("{name}: {outcome:#?}"));
+        assert_eq!(
+            discarded.reason, "card: the contact cannot be a plain contact",
+            "{name}"
+        );
+    }
+    // Nothing reached b through the alias.
+    assert_eq!(b.node.store.events_count("task.accepted").unwrap(), 0);
+}

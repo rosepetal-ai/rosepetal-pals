@@ -10,7 +10,9 @@
 //! ending in `.json`); `http://` only to `127.0.0.1`, `[::1]` or
 //! `localhost`, for local agents; no credentials, query or fragment in it.
 //! Its origin (scheme, host and port) is the agent's identity, and the only
-//! origin ever called. Credentials are none, or a bearer token read from
+//! origin ever called; it is never this agent's own gateway, a loopback
+//! host on the gateway's port ([`OWN_GATEWAY`]), when the contact is saved
+//! or used ([`fetch_contact_card`]). Credentials are none, or a bearer token read from
 //! the environment variable the contact names when a request is sent; the
 //! token is never kept. Files never go to a plain agent: they travel as
 //! blobs, between PALS peers only.
@@ -70,8 +72,9 @@
 //!   re-encoded in ASCII, a redirect a `502`, cookies and `x-agentnet-*`
 //!   headers dropped; and an answer read whole that holds the text of
 //!   [`PLAIN_NOT_SENT`] is refused as a protocol error, so that no agent
-//!   can say it. An extended card answered is validated and served as its
-//!   view, unsigned.
+//!   can say it. Its `iroh-blob://` URLs stay as sent: a plain agent holds
+//!   no PALS blob, and no blob is fetched on its word. An extended card
+//!   answered is validated and served as its view, unsigned.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -123,6 +126,9 @@ pub const ONLY_LOOPBACK: &str = "http:// is only for 127.0.0.1, [::1] and localh
 /// its origin could not be made. An agent's own answer never carries it:
 /// one that holds it is refused ([`is_forged_refusal`]).
 pub const PLAIN_NOT_SENT: &str = "plain agent unreachable: nothing was sent to it";
+/// Why a contact whose origin is this agent's own gateway is refused.
+pub const OWN_GATEWAY: &str =
+    "a plain contact cannot be this agent's own gateway: its peers are reached at /peers already";
 
 /// What a plain agent's card signature is worth: pals-core's, so that
 /// the selection of providers reads it too.
@@ -276,6 +282,39 @@ fn check_target(url: &Url) -> Result<(), PlainError> {
         "http" => Err(bad_url(ONLY_LOOPBACK)),
         other => Err(bad_url(&format!("not {other}://"))),
     }
+}
+
+/// Whether `origin`, a contact's, is the gateway listening on loopback at
+/// `gateway_port`: a loopback host (`localhost`, `127.0.0.0/8` or `[::1]`)
+/// on that port, of any scheme.
+pub fn is_own_gateway(origin: &str, gateway_port: u16) -> bool {
+    let Ok(url) = Url::parse(origin) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    loopback && url.port_or_known_default() == Some(gateway_port)
+}
+
+/// [`fetch_plain_card`] by an agent whose gateway listens on loopback at
+/// `gateway_port`: refused as [`OWN_GATEWAY`], before anything is sent,
+/// when the contact's origin is that gateway's ([`is_own_gateway`]), which
+/// would make an alias of a PALS peer that rides its grant, or a loop.
+pub async fn fetch_contact_card(
+    http: &reqwest::Client,
+    contact: &A2aContact,
+    gateway_port: u16,
+) -> Result<PlainCard, PlainError> {
+    if is_own_gateway(&contact.origin, gateway_port) {
+        return Err(PlainError::BadContact(OWN_GATEWAY.to_owned()));
+    }
+    fetch_plain_card(http, contact).await
 }
 
 /// The origin of `url` as a contact's is written.
@@ -484,7 +523,21 @@ fn own_interfaces(card: &AgentCard, origin: &str) -> (Option<String>, Option<Str
 /// `base_url` serves it: [`gateway_view_for`], declaring only the bindings
 /// the agent has.
 pub fn plain_view(plain: &PlainCard, base_url: &str, name: &str) -> AgentCard {
-    let mut view = gateway_view_for(&plain.card, base_url, name);
+    served_view(&plain.card, plain, base_url, name)
+}
+
+/// `card`, a card of the plain contact `name` (its public card or its
+/// extended one), as the gateway at `base_url` serves it:
+/// [`gateway_view_for`], declaring only the bindings that `plain`, its
+/// public card as read for the call, has, which are those the gateway
+/// serves.
+pub(crate) fn served_view(
+    card: &AgentCard,
+    plain: &PlainCard,
+    base_url: &str,
+    name: &str,
+) -> AgentCard {
+    let mut view = gateway_view_for(card, base_url, name);
     view.supported_interfaces
         .retain(|iface| match iface.protocol_binding.as_str() {
             TRANSPORT_PROTOCOL_JSONRPC => plain.jsonrpc_url.is_some(),
@@ -518,7 +571,7 @@ pub async fn keep_plain_card(store: &Arc<Store>, name: &str, plain: &PlainCard) 
 impl GatewayState {
     /// The card of `contact`, read and checked now, and kept.
     pub(super) async fn plain_card(&self, contact: &A2aContact) -> Result<PlainCard, PlainError> {
-        let plain = fetch_plain_card(&self.inner.plain_http, contact).await?;
+        let plain = fetch_contact_card(&self.inner.plain_http, contact, self.port()).await?;
         keep_plain_card(&self.inner.store, &contact.name, &plain).await;
         Ok(plain)
     }
@@ -640,7 +693,7 @@ pub(super) async fn forward(
     }
     let mut headers = incoming_headers(response.headers());
     let body = Body::from_stream(response.bytes_stream());
-    let owner = CardOwner::Plain(&contact.name);
+    let owner = CardOwner::Plain(&contact.name, &plain);
     match state
         .incoming_body(owner, binding, call, status, &mut headers, body)
         .await
@@ -804,6 +857,30 @@ mod tests {
             let err = card_and_origin(text).unwrap_err().to_string();
             assert!(err.starts_with(URL_RULE), "{text}: {err}");
         }
+    }
+
+    #[test]
+    fn the_gateways_own_origin_is_known_by_any_loopback_name() {
+        for origin in [
+            "http://127.0.0.1:7420",
+            "http://localhost:7420",
+            "http://LOCALHOST:7420",
+            "http://[::1]:7420",
+            "https://127.0.0.1:7420",
+            "https://127.1.2.3:7420",
+        ] {
+            assert!(is_own_gateway(origin, 7420), "{origin}");
+        }
+        for origin in [
+            "http://127.0.0.1:7421",
+            "https://agent.example:7420",
+            "https://localhost",
+            "http://10.0.0.1:7420",
+            "not a url",
+        ] {
+            assert!(!is_own_gateway(origin, 7420), "{origin}");
+        }
+        assert!(is_own_gateway("https://localhost", 443));
     }
 
     #[test]
