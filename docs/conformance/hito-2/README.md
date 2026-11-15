@@ -9,7 +9,7 @@ Evidencia de que el hito 2 no cambia la compatibilidad con A2A v1.0 del intercam
 | Dato | Valor |
 |-|-|
 | Fecha | 2026-11-15, de 11:01 a 11:03 UTC |
-| Commit de `pals` | `41cdeaf`, el código final del hito, con la tanda de correcciones de su revisión final y su corrección residual, que cambia también el camino del gateway hacia los pares PALS: un cuerpo de error que no es JSON llega tipado por el gateway, como texto, nunca como un flujo de eventos. Repite las ejecuciones anteriores, en `7a60c7c` y en `812f885` con el código de `eea2281`: requisito a requisito, los mismos estados y transportes en los dos niveles; solo cambian la URL del gateway, el id del proveedor temporal y las horas |
+| Commit de `pals` | `41cdeaf`, el código final del hito, con la tanda de correcciones de su revisión final y su corrección residual, que cambia también el camino del gateway hacia los pares PALS: un cuerpo de error que no es JSON llega tipado por el gateway, como texto (`text/plain; charset=utf-8`) o, si no es UTF-8, como `application/octet-stream`, nunca como un flujo de eventos. Repite las ejecuciones anteriores, en `7a60c7c` y en `812f885` con el código de `eea2281`: requisito a requisito, los mismos estados y transportes en los dos niveles; solo cambian la URL del gateway, el id del proveedor temporal y las horas |
 | TCK | `a2aproject/a2a-tck` en `104a7b4ae0d83f65c075e3793e322953a830eaba`, el mismo commit que en el hito 1. Python 3.15.2 y las dependencias de su `uv.lock` (`uv sync --frozen`, uv 0.13.8) |
 | Transportes | `jsonrpc` y `http_json`. El TCK no prueba gRPC, que PALS no ofrece |
 | `TCK_STREAMING_TIMEOUT` | `2.0` (el valor por defecto). Una sola ejecución de cada nivel, sin repetir ninguna prueba |
