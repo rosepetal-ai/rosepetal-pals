@@ -12,8 +12,8 @@
       "AUTH-SERVER-001",
       "BIND-CUSTOM-002"
     ],
-    "timestamp": "2026-11-15T06:57:30.989745+00:00",
-    "sut_url": "http://127.0.0.1:36279/peers/e45c158ce1d3afc7ecd2075fa993c581e3c269c5f4c8ff24342dd7de66d8a07a",
+    "timestamp": "2026-11-15T09:55:33.679512+00:00",
+    "sut_url": "http://127.0.0.1:59855/peers/970060b2df813918bbfbe30363f076ba39d2615ace22768985a9aa05b6483456",
     "spec_version": "",
     "overall_compatibility": "6.5%",
     "must_compatibility": "0.0%",
@@ -1085,12 +1085,12 @@
       {
         "protocolBinding": "JSONRPC",
         "protocolVersion": "1.0",
-        "url": "http://127.0.0.1:36279/peers/e45c158ce1d3afc7ecd2075fa993c581e3c269c5f4c8ff24342dd7de66d8a07a/jsonrpc"
+        "url": "http://127.0.0.1:59855/peers/970060b2df813918bbfbe30363f076ba39d2615ace22768985a9aa05b6483456/jsonrpc"
       },
       {
         "protocolBinding": "HTTP+JSON",
         "protocolVersion": "1.0",
-        "url": "http://127.0.0.1:36279/peers/e45c158ce1d3afc7ecd2075fa993c581e3c269c5f4c8ff24342dd7de66d8a07a/rest"
+        "url": "http://127.0.0.1:59855/peers/970060b2df813918bbfbe30363f076ba39d2615ace22768985a9aa05b6483456/rest"
       }
     ],
     "version": "0.1.0"
