@@ -325,7 +325,7 @@ fn configure_cli(home: &Path, gateway_url: &str) {
 
 #[tokio::test]
 async fn http_mcp_server_tools_are_observed_and_only_offered_ones_published() {
-    // Another node's MCP server, at its gateway's /mcp: six tools.
+    // Another node's MCP server, at its gateway's /mcp: eight tools.
     let server = spawn_node(WorkerCfg::Echo).await;
     let url = format!("{}/mcp", server.gateway_url());
     let inventory = mcp_entry(MCP, &["pals_whoami"], "\"public\"", &http_adapter(&url));

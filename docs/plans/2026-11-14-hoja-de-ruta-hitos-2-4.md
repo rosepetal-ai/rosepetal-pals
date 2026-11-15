@@ -1,6 +1,6 @@
 # PALS: hoja de ruta de los hitos 2 a 4
 
-**Fecha:** 2026-11-14 · **Spec:** [`docs/plans/initial.md`](initial.md) (revisión 3) · **Planes:** [hito 1](2026-11-14-hito-1-flujo-basico-a2a.md) (implementado) y [hito 2](2026-11-14-hito-2-consulta-de-servicios.md) (en curso)
+**Fecha:** 2026-11-14 · **Spec:** [`docs/plans/initial.md`](initial.md) (revisión 3) · **Planes:** [hito 1](2026-11-14-hito-1-flujo-basico-a2a.md) (implementado) y [hito 2](2026-11-14-hito-2-consulta-de-servicios.md) (implementado)
 
 Este documento no es un plan ejecutable. El spec cubre cuatro subsistemas que se construyen en orden y dice que «no se asignan tiempos de desarrollo o promesas de rendimiento sin construir y medir cada hito» (§14). Por eso cada hito recibe su propio plan paso a paso en `docs/plans/` cuando el anterior está construido, porque sus interfaces dependen de código que todavía no existe y, en el hito 3, de una comparación cuyo resultado no se conoce. Los hitos 1 y 2 ya tienen el suyo; el del hito 2 se escribió, a petición del responsable, antes de cerrar el hito 1.
 
@@ -11,7 +11,7 @@ Aquí queda fijado lo que ya se puede decidir: qué implica para cada hito el re
 | Hito | Estado | Plan | PR | Evidencia de salida |
 |-|-|-|-|-|
 | 1. Flujo básico | Implementado y revisado. Prueba de salida: 8 de 8 casos con un contenedor Docker en el papel de la segunda máquina. Pendiente del responsable: aceptar `AUTH-TLS-001`, decidir si esa ejecución basta o se repite en dos máquinas físicas, y unir la PR con `dev` | [Hito 1](2026-11-14-hito-1-flujo-basico-a2a.md) | [#1](https://github.com/rosepetal-ai/rosepetal-pals/pull/1), borrador contra `dev`, CI en verde | [Conformidad](../conformance/hito-1/README.md), [prueba de salida](../conformance/hito-1/exit-test.md), arnés [`tests/exit/`](../../tests/exit/README.md) |
-| 2. Consulta de servicios e inventario | En curso. La tarea 1 de 13 (firma JWS de la card en `pals-core`) está implementada y en revisión, sin conectar todavía al nodo: el daemon no sirve nada nuevo | [Hito 2](2026-11-14-hito-2-consulta-de-servicios.md) | [#2](https://github.com/rosepetal-ai/rosepetal-pals/pull/2), borrador apilado sobre `feat/hito-1` | Todavía no hay; la tarea 13 la deja en `docs/conformance/hito-2/`. De la tarea 1: [firmas de la card](../conformance/hito-2/card-signatures.md) |
+| 2. Consulta de servicios e inventario | Implementado: las 13 tareas del plan, en `feat/hito-2`. Prueba de salida: 8 de 8 casos con un contenedor Docker por agente, en una sola máquina, y el caso 9, la conformidad repetida, sin regresión. Pendiente del responsable: decidir si esa ejecución basta o se repite en máquinas físicas, y unir la PR con `dev` | [Hito 2](2026-11-14-hito-2-consulta-de-servicios.md) | [#2](https://github.com/rosepetal-ai/rosepetal-pals/pull/2), borrador apilado sobre `feat/hito-1` | [Conformidad](../conformance/hito-2/README.md), [prueba de salida](../conformance/hito-2/exit-test.md), [firmas de la card](../conformance/hito-2/card-signatures.md), arnés [`tests/exit/hito-2.sh`](../../tests/exit/README.md#prueba-de-salida-del-hito-2-con-docker) |
 | 3. Descubrimiento con Kademlia | Sin plan; se escribe con el hito 2 construido | — | — | — |
 | 4. Colaboración privada con P2panda | Solo si aparece un caso real; sin plan | — | — | — |
 
@@ -23,7 +23,7 @@ El intercambio final no cambia: sea cual sea el modo de encontrar o evaluar a un
 
 Como se cerró el hito 1, en la última tarea de cada plan:
 
-1. **Conformidad sin regresión.** Se repiten el TCK, en su commit fijado, y el cliente del SDK oficial de Python, con los informes en `docs/conformance/hito-N/` (la tarea 13 del hito 2 prevé la variable `PALS_CONFORMANCE_DIR` de `run_tck.sh` para elegir ese directorio). Ningún MUST fallido en `jsonrpc` ni en `http_json`, y cada diferencia con el hito anterior se explica requisito a requisito.
+1. **Conformidad sin regresión.** Se repiten el TCK, en su commit fijado, y el cliente del SDK oficial de Python, con los informes en `docs/conformance/hito-N/` (la variable `PALS_CONFORMANCE_DIR` de `run_tck.sh` elige ese directorio desde el hito 2). Ningún MUST fallido en `jsonrpc` ni en `http_json`, y cada diferencia con el hito anterior se explica requisito a requisito.
 2. **Prueba de salida con varios nodos.** Un runbook en `docs/runbooks/` con los casos del criterio de salida y los escenarios del §14 del hito, ejecutado con el arnés Docker de `tests/exit/`, ampliado a los nodos y redes que haga falta. Se registra en `docs/conformance/hito-N/exit-test.md` con las métricas del §14 y lo que no cubre. Un caso que falla se corrige y se repite. Repetirla en máquinas físicas en redes distintas es un extra opcional, como en el hito 1.
 3. **Revisión de toda la rama**, además de la de cada tarea, con sus correcciones, hasta que no quede nada crítico ni importante.
 4. **Versiones fijadas y MSRV.** Dependencias nuevas con `=` en `Cargo.toml` y el `Cargo.lock` versionado, comprobadas al escribir el plan; nunca `latest` (§14). Todo compila con la MSRV, Rust 1.91, que la CI comprueba aparte; si una dependencia exige otra, se anota como desviación, como iroh en el hito 1. Subir una versión fijada repite la conformidad.
@@ -48,12 +48,12 @@ Como se cerró el hito 1, en la última tarea de cada plan:
 | Id | Decisión | Opciones que había |
 |-|-|-|
 | H2-D1 | La card de un par se obtiene solo por las rutas A2A estándar ya tunelizadas en el hito 1 (`/.well-known/agent-card.json` y `GetExtendedAgentCard`). `agentnet-discovery/0` no tiene `GetAgentCard`. Es una desviación del spec §10, anotada en la tabla del plan | (a) Operación propia `GetAgentCard`, como dice el spec §10. (b) Solo las rutas estándar |
-| H2-D2 | Firma JWS de la card con `EdDSA` y la clave Ed25519 del agente, si la verifican las herramientas independientes; si no, una clave `ES256` aparte. La tarea 1, todavía en revisión, registra que el vector congelado verifica con los SDK oficiales de Python, Go y JS, y mantiene `EdDSA` ([firmas de la card](../conformance/hito-2/card-signatures.md)) | (a) `EdDSA` con la clave del agente. (b) `ES256` aparte |
+| H2-D2 | Firma JWS de la card con `EdDSA` y la clave Ed25519 del agente, si la verifican las herramientas independientes; si no, una clave `ES256` aparte. La tarea 1 registra que el vector congelado verifica con los SDK oficiales de Python, Go y JS, y mantiene `EdDSA`; la prueba de salida lo repite con la card en vivo de un par ([firmas de la card](../conformance/hito-2/card-signatures.md)) | (a) `EdDSA` con la clave del agente. (b) `ES256` aparte |
 | H2-D3 | Los contactos que son agentes A2A corrientes, por URL `https://` y sin daemon PALS, entran en este hito en sentido saliente. Exponer PALS por HTTPS sigue fuera (ver «Candidatos sin hito asignado») | Incluirlo en este hito o dejarlo sin fecha |
 
-**Tareas del plan**, en serie:
+**Tareas del plan**, en serie, todas implementadas:
 
-1. Firma JWS `EdDSA` de la card, formas canónicas, hash y verificación con los SDK de Python, Go y JS. *Implementada, en revisión.*
+1. Firma JWS `EdDSA` de la card, formas canónicas, hash y verificación con los SDK de Python, Go y JS.
 2. Registros firmados de contacto y de anuncio; esquema 2 del store, con migración desde el 1.
 3. Esquemas `agentnet.inventory/1`: bloques opcionales del §9.2, cinco dimensiones del §9.3, ámbitos de visibilidad.
 4. Card firmada en el nodo, card extendida según el grant y cards de pares verificadas en el gateway.

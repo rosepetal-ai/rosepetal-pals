@@ -2,13 +2,15 @@
 
 A peer-to-peer network where AI agents find each other, authorize each other and work together without depending on a central directory. Each agent runs a daemon, `pals`, which connects it to other agents, controls what they may ask of it and hands it the authorized work. Messages, tasks, their states, streaming and cancellation are [A2A](https://a2a-protocol.org/) v1.0: a standard A2A client reaches any peer through the local gateway with the JSON-RPC and HTTP+JSON bindings, and between peers those same bindings travel inside PALS's own binding, `http-over-iroh/v1`. File bytes travel separately, over iroh-blobs, outside A2A; A2A messages name them with a URL.
 
-> **Status.** PALS is a prototype; read the [known limitations](#known-limitations-of-milestone-1) before using it. Milestones are called *hitos* in the Spanish documentation.
+Before delegating, an agent can choose among the providers it knows: it verifies their signed Agent Cards, reads their inventories as its grants allow and asks them for offers over PALS's own discovery protocol, `agentnet-discovery/0`. No query runs any work; the chosen provider then gets the task over standard A2A, as before.
+
+> **Status.** PALS is a prototype; read the known limitations of [milestone 1](#known-limitations-of-milestone-1) and [milestone 2](#known-limitations-of-milestone-2) before using it. Milestones are called *hitos* in the Spanish documentation.
 >
 > - **Works today: milestone 1 (hito 1).** Implemented and reviewed. A2A conformance, with the exact scope set by the [conformance report](docs/conformance/hito-1/README.md#lo-que-queda-respaldado), is backed by the official conformance kit (TCK) and the official Python SDK. The [exit test](docs/conformance/hito-1/exit-test.md) passed all eight cases with a Docker container playing the second machine, with real network cuts and the public relays, but on a single physical host.
-> - **In progress: milestone 2 (hito 2), service queries and inventory.** The first of its 13 tasks, JWS signing and verification of Agent Cards in `pals-core`, is implemented and in review, but not yet wired into the daemon. The daemon serves nothing new yet.
-> - **Pending the project owner:** accepting `AUTH-TLS-001`, deciding whether the Docker run is enough or the exit test is repeated on two physical machines, and merging milestone 1 into `dev`.
+> - **Implemented on `feat/hito-2`: milestone 2 (hito 2), service queries and inventory.** All 13 tasks of its plan, in draft [PR #2](https://github.com/rosepetal-ai/rosepetal-pals/pull/2), stacked on milestone 1. The [exit test](docs/conformance/hito-2/exit-test.md) passed its cases 1 to 8 with one Docker container per agent, on a single host, and case 9, the A2A conformance rerun, with no regression ([conformance report](docs/conformance/hito-2/README.md)).
+> - **Pending the project owner:** accepting `AUTH-TLS-001`, deciding whether the Docker runs are enough or the exit tests are repeated on physical machines, and merging milestones 1 and 2 into `dev`.
 
-The design document calls the protocol "Agentnet"; that is why the identifiers that travel over the network keep the `agentnet` prefix (`agentnet.grant/1`, `agentnet-a2a-http/1`, `x-agentnet-peer`). The product, the binary and the crates are called `pals`.
+The design document calls the protocol "Agentnet"; that is why the identifiers that travel over the network keep the `agentnet` prefix (`agentnet.grant/1`, `agentnet-a2a-http/1`, `agentnet-discovery/0`, `x-agentnet-peer`). The product, the binary and the crates are called `pals`.
 
 ## What milestone 1 does
 
@@ -20,7 +22,7 @@ The design document calls the protocol "Agentnet"; that is why the identifiers t
 - **Files.** They travel separately, with iroh-blobs and outside A2A, verified with BLAKE3; in A2A messages they are parts with a URL. Whoever holds a file decides who downloads it: knowing the hash gives no access.
 - **Worker.** Incoming work is done by an adapter: `echo`, `exec` (any command, such as `claude -p`, in the project directory) or `tck` (only for the conformance tests).
 - **Reliable questions.** `pals ask` stores each question before sending it, retries and resubscribes without running the work twice.
-- **MCP.** A local MCP server with six tools, so that an AI application such as Claude Code can work with peers.
+- **MCP.** A local MCP server, so that an AI application such as Claude Code can work with peers; with milestone 2 it serves eight tools (see [Connecting an MCP client](#connecting-an-mcp-client)).
 - **Local store.** SQLite with tasks, contacts, grants, revocations, deduplication and a signed, hash-chained event log.
 
 ```mermaid
@@ -30,6 +32,21 @@ flowchart LR
   B --> W["worker<br/>e.g. claude -p"]
   GA <-. "files over iroh-blobs" .-> B
 ```
+
+## What milestone 2 adds
+
+Service queries and inventory: before delegating, an agent chooses among several providers it knows, and no query runs any work. The task itself is still sent with the standard A2A bindings of milestone 1.
+
+- **Signed Agent Cards.** Each daemon signs its card with JWS `EdDSA` and its own Ed25519 key (A2A §8.4); the official Python, Go and JS SDKs verify it ([independent verification](docs/conformance/hito-2/card-signatures.md)). The public card lists the services the inventory shows everyone; the extended card (`GetExtendedAgentCard`) adds those the caller's grant lets it see. A peer's card is used only when its signature verifies with the key that Iroh's handshake proved.
+- **Inventory.** `inventory.toml`, next to `config.toml`, in the format `agentnet.inventory/1` ([extension `inventory/v1`](docs/extensions/inventory-v1.md)): the services, which become skills of the card, and the skill packages, plugins, MCP connections, runtime, models, information sources, hardware and network behind them. Every block is optional, and what is left out is unknown, never zero. Each entry says who sees it: everyone, a grant for a project, a grant to send tasks in a project, or nobody.
+- **Views by permission.** A peer reads only what its grant lets it see, in signed pages chained by cursors (`agentnet.inventory-view/1`). Views are cached per authorization context, and a public view carries no count or hash of what it hides.
+- **Discovery protocol.** [`agentnet-discovery/0`](docs/protocols/agentnet-discovery-0.md), on an Iroh ALPN of its own: inventory pages, service queries and benchmark reports, each answer with the agent's signed contact and announce records. Answering reads metadata only: it never reaches the worker, an MCP tool or another peer. Quotas per peer and for all peers bound it.
+- **Service queries and offers.** A query (`agentnet.service-query/1`) names a capability, media types and requirements. The candidate matches it against its own metadata, with no model and no tool, and answers with a signed offer (`agentnet.service-offer/1`) bound to that query and that requester, valid 15 s by default. An offer reserves nothing and authorizes nothing: the task still needs the grant, and the provider checks the offer again when the task arrives.
+- **Benchmark reports.** Existing reports, signed by whoever measured (`agentnet.benchmark-report/1`), imported with `pals benchmark import`. Reading one never measures anything; an inventory view marks what has no report `no_measurement`, never a zero, and a search ranks it with no benchmark.
+- **Two-stage selection.** `pals discover` searches the contacts: first it discards by card (capability and media types), then it asks the rest for offers and ranks them, within the design's limits: 8 candidates, 3 queries at a time, 3 s per candidate and 15 s in all by default (`[discovery]` in `config.toml`). It prints the ranking, every discard with its reason, the coverage and the metrics. With `--ask`, the question goes to the best candidate that takes it, naming its offer in the A2A message's metadata.
+- **MCP inventory adapter.** For each MCP connection with an adapter, the daemon checks that the server really serves the tools offered: MCP `initialize` and `tools/list`, never `tools/call`, at start, every `refresh_interval_s` (900 s by default) and on `pals inventory refresh`. A declaration is never taken as proof that something works.
+- **Plain A2A agents as contacts,** outbound only ([below](#plain-a2a-agents-as-contacts)).
+- **Store schema 2.** A milestone 1 data directory is upgraded when it is first opened, and keeps its contacts, grants, tasks and events.
 
 ## Installation
 
@@ -87,9 +104,33 @@ More commands:
 | `pals grant ls [--issued \| --held]` · `pals grant revoke <grant_id>` | Grants issued and held; revoke an issued one |
 | `pals id` | The agent's id |
 
-Everything lives in `~/.pals`, or in the directory given by `$PALS_HOME` or `--home`: `config.toml`, the key (`agent.key`), the store (`pals.db`), the blobs and the tasks' working directories. For two agents on the same machine, use two directories with gateways on different ports.
+Everything lives in `~/.pals`, or in the directory given by `$PALS_HOME` or `--home`: `config.toml`, `inventory.toml`, the key (`agent.key`), the store (`pals.db`), the blobs and the tasks' working directories. For two agents on the same machine, use two directories with gateways on different ports.
 
 Between two machines, `net.relay = true` is required; it is the default. The full procedure for testing it, case by case, is in the [two-machine exit-test runbook](docs/runbooks/hito-1-dos-maquinas.md). The harness in [`tests/exit/`](tests/exit/README.md) runs it on a single Linux host, with a Docker container as the second machine.
+
+### Choosing a provider (milestone 2)
+
+Each provider describes in `~/.pals/inventory.toml` what it offers and with what; `pals init` writes the file with a commented example of every block. The daemon reads it only when it starts. A requester that holds contacts and grants, as above, searches among them and asks the best one:
+
+```bash
+pals discover --capability code.rust.review --requirements-file req.json --ask "Review src/lib.rs"
+```
+
+`req.json` holds the requirements, such as `{"external_cloud_allowed": false, "inventory": {"required": {"mcp_integration_ids": ["example:everything"], "min_offered_ram_mib": 4096}}}`. Without `--ask`, the command only searches; `pals ask <peer> "<question>" --offer <offer_id>` then asks with one of the offers it printed.
+
+| Command | What it does |
+|-|-|
+| `pals discover --capability <id> [--input MIME]… [--output MIME]… [--requirements-file FILE] [--project P] [--peer PEER]… [--ask "<question>"] [--wait 600s]` | Searches the contacts for a provider: verifies their cards, asks the PALS peers for offers and prints the ranking, with each offer's id and expiry, every discard with its reason, the coverage and the metrics. It runs nothing on any peer. With `--ask`, it asks the best candidate that takes the question, and exits as `pals ask` does |
+| `pals ask <peer> "<question>" --offer <offer_id>` | Asks naming an offer that `pals discover` printed; with an offer that expired by this agent's clock, it sends nothing and exits with `2` |
+| `pals query <peer> --capability <id> [--input MIME]… [--output MIME]… [--requirements-file FILE] [--project P]` | Asks one PALS peer for an offer and prints it as the peer signed it; asking runs nothing, and the offer authorizes nothing |
+| `pals card show [<peer>] [--extended]` | This agent's signed card, or a peer's, verified; with `--extended`, the peer's extended card as this agent's grant lets it see it |
+| `pals inventory show [--scope public\|project:<p>\|task:<p>] [--sections …]` | What a peer of that scope sees of this agent's inventory |
+| `pals inventory get <peer> [--sections …] [--all]` | A peer's inventory as this agent's grant lets it see it, each page as the peer signed it |
+| `pals inventory refresh` | Checks the MCP connections the inventory configures now (`tools/list`, never a tool call) |
+| `pals benchmark import <file> [--visibility …]` · `pals benchmark ls` | Keeps a signed benchmark report, as its measurer signed it, and says who sees it; lists those kept |
+| `pals contact add-a2a <url> --name <name> [--bearer-env VAR]` | Saves a [plain A2A agent](#plain-a2a-agents-as-contacts) as a contact |
+
+The [milestone 2 exit-test runbook](docs/runbooks/hito-2-consulta-de-servicios.md) sets up one requester and several providers, a real MCP server among them, case by case; [`tests/exit/hito-2.sh`](tests/exit/README.md#prueba-de-salida-del-hito-2-con-docker) runs it with one Docker container per agent.
 
 ## Connecting an MCP client
 
@@ -99,14 +140,20 @@ The MCP server is on the gateway, at `http://127.0.0.1:7420/mcp` (Streamable HTT
 claude mcp add --transport http pals http://127.0.0.1:7420/mcp
 ```
 
+It serves eight tools; `pals_discover` and `pals_inventory`, and `offer_id` in `pals_ask`, came with milestone 2:
+
 | Tool | What it does |
 |-|-|
 | `pals_whoami` | This agent's id, name and ticket |
-| `pals_contacts` | The saved peers, and whether a grant is held for each one |
-| `pals_ask` | Asks a peer, with files if needed, and waits `wait_s` seconds: 50 by default, 3600 at most |
+| `pals_contacts` | The saved contacts, PALS peers and plain A2A agents, and whether a grant is held for each PALS peer |
+| `pals_discover` | Searches the contacts for a provider of a capability, as `pals discover` does, without asking any of them to do anything: the candidates ranked, each with its offer and `offer_id`, those discarded with the reason, the coverage and the metrics |
+| `pals_inventory` | A page of a PALS peer's inventory, as the peer shows it to this agent, verified; `cursor` asks for the next one |
+| `pals_ask` | Asks a peer, with files if needed, and waits `wait_s` seconds: 50 by default, 3600 at most. With `offer_id`, the question names that offer of the peer's, as `pals_discover` returned it; with one that expired, nothing is sent |
 | `pals_task` | Resumes a question by its `message_id` without running it twice |
 | `pals_cancel` | Cancels a question's task |
 | `pals_fetch` | Downloads a file from an answer to a new file in the downloads directory |
+
+What peers send (offers, cards, inventory entries, answers) reaches the AI as data in the JSON of a result, never as instructions, and the tools' descriptions say so.
 
 `pals_ask` waits 50 s by default, less than the maximum call time of common MCP clients, and the wait includes uploading the attachments; if the answer takes longer, it returns the `message_id` and the AI continues with `pals_task`. A call that the client cancels before the question is stored asks nothing. The CLI waits 600 s.
 
@@ -119,6 +166,7 @@ Any A2A client talks to the peer `<peer>` (a contact name or an id) through the 
 | Resource | URL |
 |-|-|
 | Agent Card | `http://127.0.0.1:7420/peers/<peer>/.well-known/agent-card.json` |
+| Signed Agent Card, as the peer signed it, for tools that check the signature | `http://127.0.0.1:7420/peers/<peer>/signed-agent-card.json` |
 | JSON-RPC | `http://127.0.0.1:7420/peers/<peer>/jsonrpc` |
 | HTTP+JSON | `http://127.0.0.1:7420/peers/<peer>/rest` |
 | Files | `GET http://127.0.0.1:7420/blobs/<holder>/<hash>` to download; `POST http://127.0.0.1:7420/blobs` to upload |
@@ -129,19 +177,23 @@ The gateway never forwards a peer's answer as is. Whether the client expects a J
 
 `ListTasks` returns tasks from the most recently updated to the oldest, paginates with an opaque cursor and omits artifacts unless `includeArtifacts: true` is set (A2A §3.1.4); the pinned Rust SDK does not, and PALS corrects it in its store.
 
-### Plain A2A agents as contacts (milestone 2, in progress)
+### Plain A2A agents as contacts
 
 An agent with no PALS daemon, reached over HTTPS, can be saved as a contact and asked, outbound only: `pals contact add-a2a https://agent.example --name helper [--bearer-env HELPER_TOKEN]` reads and checks its card (`<url>/.well-known/agent-card.json`, or the card's own URL), and `pals ask helper ...`, `pals_ask` and `http://127.0.0.1:7420/peers/helper/...` reach it as they reach a peer. `http://` is accepted only for `127.0.0.1`, `[::1]` and `localhost`. Only the card's interfaces on the origin of the URL given are ever called, with no proxy and no redirects; the card is read again at every use (at most 32 KiB), and its JWS signature is reported (`verified <kid>` with an Ed25519 key of a JWK Set on the same origin, `unverifiable` or `unsigned`), not required. The only credential is a bearer token read from the named environment variable when a request is sent; the token is never saved, and no grant is ever sent. Its answers go through the same checks as a peer's.
+
+In `pals discover`, a plain agent is a candidate only when its card's signature verifies; it gets no service query, so it is ranked by its card alone, and a search that asks for anything a card cannot confirm (inventory, region, cloud, language) discards it. It can still be asked by name.
 
 Limitations: files cannot be sent to a plain agent (`attachments need a PALS peer`); the PALS client activates `idempotency/v1` as with a peer, but a plain agent may ignore it, and then a resend after a network cut can run the work twice.
 
 ## A2A compatibility
 
-What is backed, as established by the [conformance report](docs/conformance/hito-1/README.md):
+What is backed, as established by the conformance reports of [milestone 1](docs/conformance/hito-1/README.md) and [milestone 2](docs/conformance/hito-2/README.md):
 
 > **A2A v1.0 with the JSON-RPC and HTTP+JSON bindings through the local gateway; between peers, the custom binding `http-over-iroh/v1` (`…/v1/jsonrpc` and `…/v1/http-json`), which carries those same bindings.**
 
-The official TCK (`a2aproject/a2a-tck` at `104a7b4ae0d8`), run through the gateway, leaves no failed automated MUST requirement in `jsonrpc` or in `http_json` (72 passed; the skipped ones are skipped for capabilities PALS does not declare or for being gRPC), and the official Python SDK completes its 4 checks over both bindings. One `MANUAL` MUST-level requirement, `AUTH-TLS-001`, is still pending and needs the project owner's explicit acceptance. Not backed: the 16 MUST requirements without an automated test in the TCK, the `MANUAL` ones and the SHOULD `HTTP_JSON-SVC-001`. The details, and the workarounds for defects of the pinned Rust SDK, are in the report.
+The official TCK (`a2aproject/a2a-tck` at `104a7b4ae0d8`), run through the gateway, leaves no failed automated MUST requirement in `jsonrpc` or in `http_json` (72 passed; the skipped ones are skipped for capabilities PALS does not declare, for preconditions that do not hold or for being gRPC), and the official Python SDK completes its 4 checks over both bindings. One `MANUAL` MUST-level requirement, `AUTH-TLS-001`, is still pending and needs the project owner's explicit acceptance. Not backed: the 16 MUST requirements without an automated test in the TCK, the `MANUAL` ones and the SHOULD `HTTP_JSON-SVC-001`. The details, and the workarounds for defects of the pinned Rust SDK, are in the reports.
+
+Milestone 2 reran both with no regression. Two requirements changed state, both because the card now declares an extended card: `CARD-EXT-001` (an authenticated `GetExtendedAgentCard` returns the extended card) now passes, and `CORE-CAP-003`, which the TCK runs only when no extended card is declared, is now skipped. The card a daemon serves its peers is signed with JWS (A2A §8.4), which the TCK leaves to manual checks (`CARD-SIGN-001` to `004`); the official Python, Go and JS SDKs verify it ([card signatures](docs/conformance/hito-2/card-signatures.md)).
 
 Between peers, the Agent Card declares two interfaces, one per inner binding, specified in [`docs/bindings/http-over-iroh-v1.md`](docs/bindings/http-over-iroh-v1.md):
 
@@ -152,7 +204,7 @@ Between peers, the Agent Card declares two interfaces, one per inner binding, sp
 
 Both use the Iroh ALPN `agentnet-a2a-http/1`. The local gateway presents the same two interfaces to standard clients as `JSONRPC` and `HTTP+JSON`, with an `http://` URL.
 
-Idempotency by `messageId` is an optional A2A extension, [`idempotency/v1`](docs/extensions/idempotency-v1.md), which the PALS client always activates.
+Idempotency by `messageId` is an optional A2A extension, [`idempotency/v1`](docs/extensions/idempotency-v1.md), which the PALS client always activates. The card also declares the extension [`inventory/v1`](docs/extensions/inventory-v1.md) (`https://github.com/rosepetal-ai/rosepetal-pals/extensions/inventory/v1`): its views, queries and offers travel over `agentnet-discovery/0`, outside A2A, and the PALS client activates it when a question names an offer, which the provider then checks again. A request that does not activate it is served as in milestone 1.
 
 ## Known limitations of milestone 1
 
@@ -171,7 +223,20 @@ Idempotency by `messageId` is an optional A2A extension, [`idempotency/v1`](docs
 - **One grant per peer.** With several grants from the same peer, the gateway uses the most recent one: the project is not chosen question by question.
 - **Minimal logging.** The daemon writes to stderr its start, its stop, pending questions and its diagnostics from the `INFO` level up (`RUST_LOG` changes it, e.g. `RUST_LOG=pals=debug`); it does not report the network path (direct or relay).
 
-Outside milestone 1: the signed card (JWS) and the service inventory (milestone 2, in progress), discovery of unknown peers (milestone 3), and *push* notifications, the gRPC binding and direct HTTPS access for clients without a PALS daemon (no milestone yet).
+Outside milestone 1: the signed card (JWS) and the service inventory (milestone 2, below).
+
+## Known limitations of milestone 2
+
+Those of milestone 1 still hold, and:
+
+- **No DHT.** A search reaches only the agents already saved as contacts. Contact and announce records are signed, kept and sent with every discovery answer, but nothing publishes them yet: discovery of unknown peers is milestone 3.
+- **No clarifications.** A candidate whose offer lacks the information to confirm a mandatory requirement (`needs_information`) is discarded; there is no exchange to clarify it. An unknown requirement is never met, and it discards.
+- **Plain A2A contacts are outbound only and take no files.** In automatic selection (`pals discover`) they count only when their card's signature verifies, and they are ranked by their card alone (see [above](#plain-a2a-agents-as-contacts)).
+- **Foreign cards are verified in three canonical forms.** The official SDKs do not canonicalize a card the same way before checking its signature. PALS signs normalized cards, whose three forms are the same bytes, and accepts a foreign card whose valid signature covers any of the three, so a card that PALS accepts may fail in one of the SDKs ([card signatures](docs/conformance/hito-2/card-signatures.md)).
+- **Changing `inventory.toml` needs a daemon restart.** The inventory is read once, when the daemon starts; there is no live reload. Only the observations of the MCP adapters change while it runs.
+- **MCP adapter response size.** Over `http`, rmcp 3.10 caps a plain JSON response of an MCP server at a fixed 16 MiB, which PALS cannot lower; the lines of a `stdio` server and the events of an HTTP stream are held to 1 MiB.
+
+Outside milestones 1 and 2: discovery of unknown peers (milestone 3), and *push* notifications, the gRPC binding and direct HTTPS access for clients without a PALS daemon (no milestone yet).
 
 ## Roadmap
 
@@ -183,16 +248,16 @@ Four milestones, in the order of the [design](docs/plans/initial.md) (§14). In 
 - **Status:** implemented and reviewed; draft [PR #1](https://github.com/rosepetal-ai/rosepetal-pals/pull/1) against `dev`, CI green. The exit test passed 8 of 8 cases with a Docker container as the second machine; it did not cover two physical machines behind different NATs, or real Wi-Fi or mobile networks. Pending the project owner: `AUTH-TLS-001`, whether to repeat the test on two physical machines, and the merge.
 - **Links:** [plan](docs/plans/2026-11-14-hito-1-flujo-basico-a2a.md), [conformance report](docs/conformance/hito-1/README.md), [exit test](docs/conformance/hito-1/exit-test.md), [runbook](docs/runbooks/hito-1-dos-maquinas.md), [Docker harness](tests/exit/README.md).
 
-**2. Service queries and inventory: in progress.** Before delegating, an agent chooses among several known providers: it validates their signed Agent Cards, reads their inventories as its permissions allow and asks them whether they can handle its case, without any query running work.
+**2. Service queries and inventory: implemented.** Before delegating, an agent chooses among several known providers: it validates their signed Agent Cards, reads their inventories as its permissions allow and asks them whether they can handle its case, without any query running work.
 - **Deliverable:** Agent Cards, filtered inventories, existing benchmark reports, `ServiceQuery` and `ServiceOffer`.
 - **Exit criterion:** choose among at least three candidates; check requirements on integrations and resources; validate cards; run no work when querying.
-- **Status:** task 1 of 13 (JWS card signing in `pals-core`) implemented and in review, not yet wired into the daemon; draft [PR #2](https://github.com/rosepetal-ai/rosepetal-pals/pull/2), stacked on milestone 1.
-- **Links:** [plan](docs/plans/2026-11-14-hito-2-consulta-de-servicios.md), [independent verification of the card signature](docs/conformance/hito-2/card-signatures.md).
+- **Status:** the 13 tasks of the plan implemented on `feat/hito-2`; draft [PR #2](https://github.com/rosepetal-ai/rosepetal-pals/pull/2), stacked on milestone 1. The exit test passed 8 of 8 cases with one Docker container per agent, on a single host, and case 9, the conformance rerun, with no regression; it did not cover several physical machines or networks. Pending the project owner: whether to repeat the test on physical machines, and the merge.
+- **Links:** [plan](docs/plans/2026-11-14-hito-2-consulta-de-servicios.md), [conformance report](docs/conformance/hito-2/README.md), [exit test](docs/conformance/hito-2/exit-test.md), [runbook](docs/runbooks/hito-2-consulta-de-servicios.md), [Docker harness](tests/exit/README.md#prueba-de-salida-del-hito-2-con-docker), [independent verification of the card signature](docs/conformance/hito-2/card-signatures.md).
 
 **3. Discovery with Kademlia: planned.** Find providers without prior contact, over a backend chosen after a bounded comparison.
 - **Deliverable:** a bounded comparison of the backend, a capability registry and contact resolution.
 - **Exit criterion:** justify the chosen implementation; find a provider without prior contact; work without the original bootstrap node, and expire announcements.
-- **Status:** no plan yet. It is written once milestone 2 is built, and the backend comparison decides the rest.
+- **Status:** no plan yet. It is written now that milestone 2 is built, and the backend comparison decides the rest.
 
 **4. Private collaboration with P2panda: only if a real case appears.** Several authorized nodes keep a project's private catalog in sync without publishing it, even when they are not online at the same time.
 - **Deliverable:** a bounded trial of P2panda, if there is a need for replication.
@@ -205,12 +270,16 @@ The documentation under `docs/` is in Spanish.
 
 - [`docs/plans/initial.md`](docs/plans/initial.md): the network design, revision 3.
 - [`docs/plans/2026-11-14-hito-1-flujo-basico-a2a.md`](docs/plans/2026-11-14-hito-1-flujo-basico-a2a.md): the step-by-step plan for milestone 1, with the changes imposed by the A2A compatibility requirement.
-- [`docs/plans/2026-11-14-hito-2-consulta-de-servicios.md`](docs/plans/2026-11-14-hito-2-consulta-de-servicios.md): the step-by-step plan for milestone 2, in progress.
+- [`docs/plans/2026-11-14-hito-2-consulta-de-servicios.md`](docs/plans/2026-11-14-hito-2-consulta-de-servicios.md): the step-by-step plan for milestone 2, with its own spec-deviation table.
 - [`docs/plans/2026-11-14-hoja-de-ruta-hitos-2-4.md`](docs/plans/2026-11-14-hoja-de-ruta-hitos-2-4.md): the roadmap for milestones 2 to 4.
 - [`docs/bindings/http-over-iroh-v1.md`](docs/bindings/http-over-iroh-v1.md): the peer bindings.
 - [`docs/extensions/idempotency-v1.md`](docs/extensions/idempotency-v1.md): the idempotency extension.
+- [`docs/extensions/inventory-v1.md`](docs/extensions/inventory-v1.md): the inventory extension, with the JSON Schemas of its documents in [`docs/extensions/inventory-v1/`](docs/extensions/inventory-v1/).
+- [`docs/protocols/agentnet-discovery-0.md`](docs/protocols/agentnet-discovery-0.md): the discovery protocol, with its messages in [`agentnet-discovery-0.proto`](docs/protocols/agentnet-discovery-0.proto).
 - [`docs/conformance/hito-1/README.md`](docs/conformance/hito-1/README.md): A2A conformance (TCK and Python SDK), and [`sdk-issues.md`](docs/conformance/hito-1/sdk-issues.md), the defects of the Rust SDK.
 - [`docs/runbooks/hito-1-dos-maquinas.md`](docs/runbooks/hito-1-dos-maquinas.md) and [`docs/conformance/hito-1/exit-test.md`](docs/conformance/hito-1/exit-test.md): the two-machine exit test, its run with Docker as the second machine ([`tests/exit/`](tests/exit/README.md)) and the earlier rehearsal on one machine.
+- [`docs/conformance/hito-2/README.md`](docs/conformance/hito-2/README.md): the milestone 2 conformance rerun, requirement by requirement against milestone 1, and [`card-signatures.md`](docs/conformance/hito-2/card-signatures.md), the independent verification of the card signature.
+- [`docs/runbooks/hito-2-consulta-de-servicios.md`](docs/runbooks/hito-2-consulta-de-servicios.md) and [`docs/conformance/hito-2/exit-test.md`](docs/conformance/hito-2/exit-test.md): the milestone 2 exit test and its run with one Docker container per agent.
 
 ## Technology
 
@@ -226,4 +295,4 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 ```
 
-Conformance is rerun with `tests/interop/run_tck.sh` and `tests/interop/python_client.py` (see the [report](docs/conformance/hito-1/README.md#ejecución)). The milestone 1 exit test is rerun with `tests/exit/run.sh`, which needs Linux with Docker and internet access (see [`tests/exit/README.md`](tests/exit/README.md)). Guidelines for coding agents are in [`CLAUDE.md`](CLAUDE.md).
+Conformance is rerun with `tests/interop/run_tck.sh`, `tests/interop/python_client.py` and `tests/interop/check_schemas.py`; `PALS_CONFORMANCE_DIR=docs/conformance/hito-2` sends the TCK reports to the milestone 2 directory instead of `docs/conformance/hito-1` (see the [report](docs/conformance/hito-2/README.md#ejecución)). The exit tests are rerun with `tests/exit/run.sh` (milestone 1) and `tests/exit/hito-2.sh` (milestone 2), which need Linux with Docker and internet access (see [`tests/exit/README.md`](tests/exit/README.md)). Guidelines for coding agents are in [`CLAUDE.md`](CLAUDE.md).
