@@ -138,6 +138,7 @@ fn wanted() -> Wanted {
         profile: "service.task".to_owned(),
         profile_version: "1".to_owned(),
         config: json!({"image": {"width": 1024}, "task": "ocr-serial-v2", "concurrency": 1}),
+        model_revision: None,
         route: None,
         peer_pair: None,
     }
@@ -495,6 +496,88 @@ fn expired_other_config_and_other_route_are_not_usable() {
         comparable(&report, &other_profile, NOW + 31 * DAY),
         Comparability::Expired
     );
+}
+
+#[test]
+fn llm_reports_compare_only_with_the_same_model() {
+    let a = fixed_key(0x01).id();
+    let llm = |model: Option<&str>| BenchmarkReport {
+        procedure: Procedure {
+            profile: "compute.llm".to_owned(),
+            config: json!({"prompt_tokens": 512, "output_tokens": 128}),
+            ..task_report(a).procedure
+        },
+        environment: Environment {
+            model_revision: model.map(str::to_owned),
+            ..Environment::default()
+        },
+        ..task_report(a)
+    };
+    let wanted = |model: Option<&str>| Wanted {
+        profile: "compute.llm".to_owned(),
+        config: json!({"output_tokens": 128, "prompt_tokens": 512}),
+        model_revision: model.map(str::to_owned),
+        ..wanted()
+    };
+    let qwen = Some("qwen3-8b q4_k_m 2026-10");
+    let report = llm(qwen);
+    assert_eq!(
+        comparable(&report, &wanted(qwen), NOW),
+        Comparability::Usable
+    );
+    // Another model, or its tokenizer, is another measurement.
+    assert_eq!(
+        comparable(&report, &wanted(Some("llama-3.1-8b q4_k_m")), NOW),
+        Comparability::OtherModel
+    );
+    // Without the model asked for, or said, nothing of the profile counts.
+    assert_eq!(
+        comparable(&report, &wanted(None), NOW),
+        Comparability::OtherModel
+    );
+    assert_eq!(
+        comparable(&llm(None), &wanted(qwen), NOW),
+        Comparability::OtherModel
+    );
+    // Another configuration comes first.
+    let longer = Wanted {
+        config: json!({"prompt_tokens": 4096, "output_tokens": 128}),
+        ..wanted(qwen)
+    };
+    assert_eq!(
+        comparable(&report, &longer, NOW),
+        Comparability::OtherConfig
+    );
+    // Elsewhere the model is compared only when asked for.
+    let task = task_report(a);
+    assert_eq!(
+        comparable(&task, &wanted_task(None), NOW),
+        Comparability::Usable
+    );
+    assert_eq!(
+        comparable(&task, &wanted_task(Some("ocr-metal 2026.11")), NOW),
+        Comparability::Usable
+    );
+    assert_eq!(
+        comparable(&task, &wanted_task(Some("ocr-metal 2026.12")), NOW),
+        Comparability::OtherModel
+    );
+    // As a search asks for it: JSON, the absent fields left out.
+    let json = serde_json::to_value(wanted(qwen)).unwrap();
+    assert_eq!(json["model_revision"], "qwen3-8b q4_k_m 2026-10");
+    assert!(json.get("route").is_none(), "{json}");
+    assert_eq!(
+        serde_json::from_value::<Wanted>(json).unwrap(),
+        wanted(qwen)
+    );
+}
+
+/// [`wanted`], with the model `model` asked for.
+fn wanted_task(model: Option<&str>) -> Wanted {
+    Wanted {
+        model_revision: model.map(str::to_owned),
+        ..wanted()
+    }
 }
 
 #[test]

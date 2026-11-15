@@ -27,10 +27,12 @@
 //!
 //! **Comparability** ([`comparable`]): a report is usable for what a
 //! requester wants only when it is in force, of the profile and version
-//! asked, of the same configuration (compared as JCS) and of the route and
-//! pair of nodes asked, if any. Nothing measures: a search only reads
-//! reports that exist (§9.7), and a subject without any shows as
-//! `no_measurement`, never as zero ([`crate::inventory::view::render_benchmarks`]).
+//! asked, of the same configuration (compared as JCS), of the same model
+//! (`environment.model_revision`) for `compute.llm` and
+//! `compute.inference` or when one is asked, and of the route and pair of
+//! nodes asked, if any. Nothing measures: a search only reads reports that
+//! exist (§9.7), and a subject without any shows as `no_measurement`,
+//! never as zero ([`crate::inventory::view::render_benchmarks`]).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -378,16 +380,35 @@ impl MetricResult {
     }
 }
 
+/// The profiles whose results depend on the model and its tokenizer: a
+/// report of one of them compares only with the model asked for
+/// ([`Wanted::model_revision`]).
+pub const MODEL_PROFILES: [&str; 2] = ["compute.inference", "compute.llm"];
+
 /// What a requester wants a report for: a profile and version, a
-/// configuration, and a route or a pair of nodes when it matters.
-#[derive(Debug, Clone, PartialEq)]
+/// configuration, the model when it matters, and a route or a pair of
+/// nodes when it matters.
+///
+/// In JSON (a search asks for one), the fields by name, the absent ones
+/// left out.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Wanted {
     pub profile: String,
     pub profile_version: String,
     /// Compared with the report's as JCS.
     pub config: Value,
+    /// The model, and with it its tokenizer, as a report's
+    /// `environment.model_revision` names them. Required for the
+    /// [`MODEL_PROFILES`], where tokens per second of one model say nothing
+    /// of another: without it no report of theirs is usable. For any other
+    /// profile it is compared only when given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<Route>,
     /// In either order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_pair: Option<(AgentId, AgentId)>,
 }
 
@@ -401,6 +422,9 @@ pub enum Comparability {
     OtherProfile,
     /// Of another configuration.
     OtherConfig,
+    /// Of another model, or of a model it does not say, when the model
+    /// matters ([`Wanted::model_revision`]).
+    OtherModel,
     /// Of another route, or between other nodes, or of a route or nodes it
     /// does not say.
     OtherRoute,
@@ -411,7 +435,8 @@ pub enum Comparability {
 /// in the order of [`Comparability`], or [`Comparability::Usable`].
 ///
 /// A report is never compared across profiles, versions or configurations
-/// (design §9.7): tokens per second of one model say nothing of another,
+/// (design §9.7), nor, for the [`MODEL_PROFILES`], across models: tokens
+/// per second of one model, or with one tokenizer, say nothing of another,
 /// and an isolated inference is not a whole task.
 pub fn comparable(report: &BenchmarkReport, wanted: &Wanted, now_unix: i64) -> Comparability {
     let expired = parse_timestamp(&report.expires_at).is_none_or(|at| now_unix >= at);
@@ -424,6 +449,11 @@ pub fn comparable(report: &BenchmarkReport, wanted: &Wanted, now_unix: i64) -> C
         Comparability::OtherProfile
     } else if canonical(&procedure.config) != canonical(&wanted.config) {
         Comparability::OtherConfig
+    } else if (MODEL_PROFILES.contains(&wanted.profile.as_str()) || wanted.model_revision.is_some())
+        && (wanted.model_revision.is_none()
+            || report.environment.model_revision != wanted.model_revision)
+    {
+        Comparability::OtherModel
     } else if wanted
         .route
         .is_some_and(|route| report.environment.route != Some(route))
