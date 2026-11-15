@@ -2041,20 +2041,21 @@ async fn ask_with_an_expired_offer_sends_nothing() {
         true,
     )
     .await;
-    // Two providers, one offer id: b's expired an hour ago, c's in force.
+    // Two providers, one offer id: b's expired an hour ago, c's in force
+    // for longer than any loaded host's delays, on the system's clock.
     let query = review_query("q-shared");
     let now = now_unix();
-    let shared = |provider: &TestNode, issued: i64| {
+    let shared = |provider: &TestNode, issued: i64, valid_ms: u32| {
         let key = key_in(provider.dir.path());
         let hash = provider.node.cards().public().hash.clone();
-        let mut offer = stub_offer(&key, a.id(), &query, &hash, issued, 15_000);
+        let mut offer = stub_offer(&key, a.id(), &query, &hash, issued, valid_ms);
         offer.offer_id = "offer-shared".to_owned();
         let signed = sign_offer(&key, offer).unwrap();
         a.node.store.offer_received_put(&signed, now).unwrap();
         signed
     };
-    let _expired = shared(&b, now - 3600);
-    let in_force = shared(&c, now);
+    let _expired = shared(&b, now - 3600, 15_000);
+    let in_force = shared(&c, now, LONG_OFFER_MS);
 
     let home = cli_home(&a);
     let (code, stdout, stderr) =
