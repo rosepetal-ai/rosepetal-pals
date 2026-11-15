@@ -7,10 +7,17 @@
 //! to send it, with the peer it goes to as its [`PeerRef::key`]: an agent id,
 //! or `a2a:<name>` for a plain A2A contact (`crate::gateway::plain`), which
 //! is asked, kept and taken up again just the same. Every attempt goes
-//! through the gateway (`<gateway>/peers/<agent id>/rest`, or
-//! `/peers/<name>/rest` for a plain contact) with the stock A2A client, on
-//! the HTTP+JSON binding, whose errors keep the gateway's HTTP status, and
-//! with `A2A-Version: 1.0`:
+//! through the gateway with the stock A2A client and `A2A-Version: 1.0`: to
+//! a PALS peer at `<gateway>/peers/<agent id>/rest`, on the HTTP+JSON
+//! binding, whose errors keep the gateway's HTTP status; to a plain contact
+//! at `<gateway>/peers/<name>/rest`, or, when its card has no HTTP+JSON
+//! interface and has a JSON-RPC one, at `<gateway>/peers/<name>/jsonrpc`
+//! with the client's JSON-RPC transport. A plain contact's card is read
+//! through the gateway, which checks it (`Outbox::plain_speaks`), before
+//! anything is kept: when it cannot be had, or does not declare
+//! `capabilities.streaming`, which the outbox needs
+//! ([`PLAIN_NEEDS_STREAMING`]), the ask fails with [`AskError::Local`] and
+//! nothing is asked. Then:
 //!
 //! - while the peer's task is not known, the same request, byte for byte,
 //!   with `SendStreamingMessage`: the peer runs the first copy that reaches
@@ -67,14 +74,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use a2a::{
-    A2AError, CancelTaskRequest, GetTaskRequest, Message, Part, PartContent, Role,
-    SVC_PARAM_EXTENSIONS, SendMessageRequest, StreamResponse, SubscribeToTaskRequest, Task,
-    TaskState, error_code,
+    A2AError, AgentCard, CancelTaskRequest, GetTaskRequest, Message, Part, PartContent, Role,
+    SVC_PARAM_EXTENSIONS, SendMessageRequest, StreamResponse, SubscribeToTaskRequest,
+    TRANSPORT_PROTOCOL_HTTP_JSON, TRANSPORT_PROTOCOL_JSONRPC, Task, TaskState, error_code,
 };
 use a2a_client::A2AClient;
+use a2a_client::jsonrpc::JsonRpcTransport;
 use a2a_client::middleware::CallInterceptor;
 use a2a_client::rest::RestTransport;
-use a2a_client::transport::ServiceParams;
+use a2a_client::transport::{ServiceParams, Transport};
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -82,7 +90,7 @@ use http::header::AUTHORIZATION;
 use pals_core::discovery::query::OfferRef;
 use pals_core::grant::SignedGrant;
 use pals_core::inventory::{INVENTORY_EXTENSION, Scope};
-use pals_core::store::{OUTBOX_PENDING, OUTBOX_REFUSED, OutboxRow, PeerRef, Store};
+use pals_core::store::{A2aContact, OUTBOX_PENDING, OUTBOX_REFUSED, OutboxRow, PeerRef, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time::Instant;
@@ -108,9 +116,18 @@ const CANCEL_TIMEOUT: Duration = Duration::from_secs(30);
 const OCTET_STREAM: &str = "application/octet-stream";
 /// Why a peer's answer naming an unsafe or another task is refused.
 pub(crate) const INVALID_TASK_ID: &str = "the peer returned an invalid task id";
+/// Why a question to a plain A2A contact whose card does not declare
+/// streaming is refused, before anything is kept or sent.
+pub const PLAIN_NEEDS_STREAMING: &str = "the plain A2A agent's card does not declare \
+    streaming, which pals ask needs in milestone 2: a stock A2A client can still call it \
+    through the gateway";
+/// The most bytes of a plain contact's card read through the gateway.
+const MAX_PLAIN_CARD_BYTES: usize = 64 * 1024;
+/// The longest reason of the gateway's quoted.
+const MAX_REASON_CHARS: usize = 200;
 
 type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
-type Client = A2AClient<RestTransport>;
+type Client = A2AClient<Box<dyn Transport>>;
 
 /// A question for a peer.
 #[derive(Debug, Clone)]
@@ -223,10 +240,12 @@ impl Outbox {
     /// `req.wait` for the answer.
     ///
     /// Fails with [`AskError::Local`], having sent nothing, when the peer is
-    /// neither a contact nor an agent id, is a plain A2A contact and there
-    /// are attachments, or an attachment cannot be read or uploaded: one
-    /// that is not a regular file, is inside the data directory or is a
-    /// system file is refused.
+    /// neither a contact nor an agent id; is a plain A2A contact and there
+    /// are attachments or an offer, or its card cannot be read through the
+    /// gateway or does not declare streaming ([`PLAIN_NEEDS_STREAMING`]);
+    /// or an attachment cannot be read or uploaded: one that is not a
+    /// regular file, is inside the data directory or is a system file is
+    /// refused.
     pub async fn ask(&self, req: AskRequest) -> Result<AskOutcome, AskError> {
         self.ask_kept(req, &CancellationToken::new(), |_| {}).await
     }
@@ -263,13 +282,29 @@ impl Outbox {
                     "offers come only from PALS peers".to_owned(),
                 ));
             }
+            let plain = match &peer {
+                PeerRef::Plain(contact) => {
+                    let speaks = self.plain_speaks(contact).await.map_err(|why| {
+                        AskError::Local(format!(
+                            "cannot read the card of {} through the gateway ({why}): nothing \
+                             was asked",
+                            contact.name
+                        ))
+                    })?;
+                    if !speaks.streaming {
+                        return Err(AskError::Local(PLAIN_NEEDS_STREAMING.to_owned()));
+                    }
+                    Some(speaks)
+                }
+                PeerRef::Pals(_) => None,
+            };
             let mut parts = vec![Part::text(question)];
             for path in &attachments {
                 parts.push(self.upload(path).await?);
             }
-            Ok::<_, AskError>((peer, parts))
+            Ok::<_, AskError>((peer, plain, parts))
         };
-        let (peer, parts) = tokio::select! {
+        let (peer, plain, parts) = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(nothing_asked("the ask was canceled")),
             prepared = tokio::time::timeout_at(deadline, prepared) => match prepared {
@@ -312,43 +347,56 @@ impl Outbox {
             created_at: now,
             updated_at: now,
         };
+        let client = self.client(&peer, plain, &request).await?;
         if cancel.is_cancelled() {
             return Err(nothing_asked("the ask was canceled"));
         }
         self.with_store(move |store| store.outbox_insert(&row))
             .await?;
         kept(&message_id);
-        self.drive(Ask {
-            message_id,
-            peer,
-            request,
-            task_id: None,
-            deadline,
-        })
+        self.drive(
+            Ask {
+                message_id,
+                request,
+                task_id: None,
+                deadline,
+            },
+            client,
+        )
         .await
     }
 
     /// Takes up the question `message_id` again, as [`Outbox::ask`] left
     /// it, and waits up to `wait` for its answer: sends it again while its
     /// task is not known, follows the task once it is. A question that has
-    /// an outcome gets it again.
+    /// an outcome gets it again. A question to a plain contact whose card
+    /// cannot be read through the gateway now stays pending
+    /// ([`AskError::Unreachable`]); one whose card no longer declares
+    /// streaming is [`AskError::Local`], and stays as it was.
     pub async fn resume(&self, message_id: &str, wait: Duration) -> Result<AskOutcome, AskError> {
         let row = self.row(message_id).await?;
         check_stored_task(&row)?;
         let request = decode_request(&row.request_json)?;
         let peer = self.peer_of(&row).await?;
+        let plain = self.plain_speaks_of(&peer, &row.message_id).await?;
+        if plain.is_some_and(|speaks| !speaks.streaming) {
+            return Err(AskError::Local(PLAIN_NEEDS_STREAMING.to_owned()));
+        }
+        let client = self.client(&peer, plain, &request).await?;
         if row.state == OUTBOX_REFUSED {
             let id = row.message_id.clone();
             self.with_store(move |store| store.outbox_set_state(&id, OUTBOX_PENDING, now_unix()))
                 .await?;
         }
-        self.drive(Ask {
-            message_id: row.message_id,
-            peer,
-            request,
-            task_id: row.task_id,
-            deadline: Instant::now() + wait,
-        })
+        self.drive(
+            Ask {
+                message_id: row.message_id,
+                request,
+                task_id: row.task_id,
+                deadline: Instant::now() + wait,
+            },
+            client,
+        )
         .await
     }
 
@@ -370,7 +418,8 @@ impl Outbox {
         };
         let peer = self.peer_of(&row).await?;
         let asked = decode_request(&row.request_json)?;
-        let client = self.client(&peer, &asked).await?;
+        let plain = self.plain_speaks_of(&peer, message_id).await?;
+        let client = self.client(&peer, plain, &asked).await?;
         let request = CancelTaskRequest {
             id: task_id,
             metadata: None,
@@ -409,11 +458,10 @@ impl Outbox {
         self.store.outbox_pending()
     }
 
-    /// Attempts `ask` until it has an outcome, is refused, runs out of
-    /// retries or of time.
-    async fn drive(&self, mut ask: Ask) -> Result<AskOutcome, AskError> {
+    /// Attempts `ask` with `client` until it has an outcome, is refused,
+    /// runs out of retries or of time.
+    async fn drive(&self, mut ask: Ask, client: Client) -> Result<AskOutcome, AskError> {
         let deadline = ask.deadline;
-        let client = self.client(&ask.peer, &ask.request).await?;
         let mut failures: u32 = 0;
         // The state last seen, by this call.
         let mut seen: Option<TaskState> = None;
@@ -653,17 +701,22 @@ impl Outbox {
     }
 
     /// The A2A client for `peer`, through the gateway, for the question
-    /// `request`. Every request it sends activates the [idempotency
-    /// extension](IDEMPOTENCY_EXTENSION), which the resends of an ask rely
-    /// on; a plain A2A agent may ignore it. For a question that names an
-    /// offer, it activates the [inventory extension](INVENTORY_EXTENSION)
-    /// too, and presents the grant of the offer's scope
-    /// ([`Outbox::offer_grant`]) when this agent holds one, so that the
-    /// task runs under the scope it was offered for; any other question
-    /// goes with the grant the gateway chooses, as in milestone 1.
+    /// `request`: on the HTTP+JSON binding, `<gateway>/peers/<peer>/rest`,
+    /// but for a plain contact whose card has no HTTP+JSON interface and
+    /// has a JSON-RPC one (`plain`, from [`Outbox::plain_speaks`]), on the
+    /// JSON-RPC binding, `<gateway>/peers/<name>/jsonrpc`, with the pinned
+    /// client's JSON-RPC transport. Every request it sends activates the
+    /// [idempotency extension](IDEMPOTENCY_EXTENSION), which the resends of
+    /// an ask rely on; a plain A2A agent may ignore it. For a question that
+    /// names an offer, it activates the [inventory
+    /// extension](INVENTORY_EXTENSION) too, and presents the grant of the
+    /// offer's scope ([`Outbox::offer_grant`]) when this agent holds one, so
+    /// that the task runs under the scope it was offered for; any other
+    /// question goes with the grant the gateway chooses, as in milestone 1.
     async fn client(
         &self,
         peer: &PeerRef,
+        plain: Option<PlainSpeaks>,
         request: &SendMessageRequest,
     ) -> Result<Client, AskError> {
         let inventory = names_an_offer(request);
@@ -674,11 +727,83 @@ impl Outbox {
         } else {
             None
         };
-        let base_url = format!("{}/peers/{}/rest", self.gateway_url, path_segment(peer));
-        Ok(
-            A2AClient::new(RestTransport::new(self.http.clone(), base_url))
-                .with_interceptors(vec![Arc::new(Extensions { inventory, bearer })]),
-        )
+        let base_url = format!("{}/peers/{}", self.gateway_url, path_segment(peer));
+        let transport: Box<dyn Transport> = match plain {
+            Some(PlainSpeaks { jsonrpc: true, .. }) => Box::new(JsonRpcTransport::new(
+                self.http.clone(),
+                format!("{base_url}/jsonrpc"),
+            )),
+            _ => Box::new(RestTransport::new(
+                self.http.clone(),
+                format!("{base_url}/rest"),
+            )),
+        };
+        Ok(A2AClient::new(transport)
+            .with_interceptors(vec![Arc::new(Extensions { inventory, bearer })]))
+    }
+
+    /// What the card of the plain contact `contact` says of how to ask it:
+    /// the card as the gateway serves it
+    /// (`<gateway>/peers/<name>/.well-known/agent-card.json`), which the
+    /// gateway reads and checks now, with only the bindings the agent has;
+    /// why not, in the gateway's words, when it cannot be had.
+    async fn plain_speaks(&self, contact: &A2aContact) -> Result<PlainSpeaks, String> {
+        let url = format!(
+            "{}/peers/{}/.well-known/agent-card.json",
+            self.gateway_url, contact.name
+        );
+        let mut response = self
+            .http
+            .get(url)
+            .header("a2a-version", a2a::VERSION)
+            .send()
+            .await
+            .map_err(|err| format!("the gateway cannot be reached: {err}"))?;
+        let status = response.status();
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|err| format!("no answer from the gateway: {err}"))?
+        {
+            if body.len() + chunk.len() > MAX_PLAIN_CARD_BYTES {
+                return Err("the card is too large".to_owned());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        if status != http::StatusCode::OK {
+            let reason = serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|refusal| refusal["error"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let reason = crate::printable_ascii(&reason, MAX_REASON_CHARS);
+            return Err(format!("the gateway answered {status}: {reason}"));
+        }
+        let card: AgentCard = serde_json::from_slice(&body)
+            .map_err(|_| "the gateway answered something that is not a card".to_owned())?;
+        Ok(PlainSpeaks::of(&card))
+    }
+
+    /// [`Outbox::plain_speaks`] of `peer` when it is a plain contact, for
+    /// the question kept as `message_id`: [`AskError::Unreachable`] when
+    /// its card cannot be had, so that the question stays pending.
+    async fn plain_speaks_of(
+        &self,
+        peer: &PeerRef,
+        message_id: &str,
+    ) -> Result<Option<PlainSpeaks>, AskError> {
+        let PeerRef::Plain(contact) = peer else {
+            return Ok(None);
+        };
+        match self.plain_speaks(contact).await {
+            Ok(speaks) => Ok(Some(speaks)),
+            Err(why) => {
+                tracing::debug!(message_id, contact = %contact.name, %why, "no card of a plain contact");
+                Err(AskError::Unreachable {
+                    message_id: message_id.to_owned(),
+                })
+            }
+        }
     }
 
     /// The grant this agent holds of `peer`'s, a PALS peer, that serves
@@ -742,10 +867,34 @@ impl Outbox {
     }
 }
 
+/// What the card of a plain A2A contact says of how the outbox asks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlainSpeaks {
+    /// On the JSON-RPC binding: the card has a JSON-RPC interface and no
+    /// HTTP+JSON one.
+    jsonrpc: bool,
+    /// The card declares `capabilities.streaming`, which the outbox needs.
+    streaming: bool,
+}
+
+impl PlainSpeaks {
+    /// What `card`, a plain contact's card as the gateway serves it, says.
+    fn of(card: &AgentCard) -> Self {
+        let has = |binding: &str| {
+            card.supported_interfaces
+                .iter()
+                .any(|iface| iface.protocol_binding == binding)
+        };
+        Self {
+            jsonrpc: !has(TRANSPORT_PROTOCOL_HTTP_JSON) && has(TRANSPORT_PROTOCOL_JSONRPC),
+            streaming: card.capabilities.streaming == Some(true),
+        }
+    }
+}
+
 /// A question being attempted.
 struct Ask {
     message_id: String,
-    peer: PeerRef,
     /// What every attempt that sends it sends.
     request: SendMessageRequest,
     task_id: Option<String>,

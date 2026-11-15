@@ -21,13 +21,17 @@
 //!    card ([`fetch_plain_card`]), which goes on only when its signature is
 //!    [`Verified`](SignatureStatus::Verified): an unverifiable or unsigned
 //!    one is discarded, `card not verified`, and can still be asked by its
-//!    name. Its extended card is never read: a verified public card says
-//!    nothing of it. Nothing is taken from the absence of
-//!    `securityRequirements`, which one canonical form drops. A card that
-//!    cannot be had is discarded with this agent's own words
-//!    (`card_failure`: `card: peer unreachable`, `card: refused (403)`,
-//!    `extended card: invalid: <why>`…), never the text of the transport's
-//!    error nor bytes the peer chose.
+//!    name; and only when the card declares `capabilities.streaming`,
+//!    which the outbox needs to ask it
+//!    ([`PLAIN_NEEDS_STREAMING`](crate::outbox::PLAIN_NEEDS_STREAMING)):
+//!    one that does not is discarded, `card declares no streaming`, and
+//!    cannot be asked by the outbox at all. Its extended card is never
+//!    read: a verified public card says nothing of it. Nothing is taken
+//!    from the absence of `securityRequirements`, which one canonical form
+//!    drops. A card that cannot be had is discarded with this agent's own
+//!    words (`card_failure`: `card: peer unreachable`, `card: refused
+//!    (403)`, `extended card: invalid: <why>`…), never the text of the
+//!    transport's error nor bytes the peer chose.
 //! 2. **Its offer**, PALS peers only. The query
 //!    ([`SearchRequest::query`]) is waited for the time the candidate has
 //!    left, and says so in `reply_timeout_ms`, at most 3000 ms
@@ -127,6 +131,9 @@ const TIME_BUDGET: &str = "time budget";
 const CANDIDATE_LIMIT: &str = "candidate limit";
 /// Why a peer was not asked.
 const NO_GRANT: &str = "no grant held";
+/// Why a plain agent whose card does not declare streaming is discarded:
+/// the outbox cannot ask it in milestone 2.
+const NO_STREAMING: &str = "card declares no streaming";
 /// The reason a task refused for want of a place ends with
 /// (`WorkerExecutor`).
 const BUSY: &str = "busy";
@@ -723,6 +730,10 @@ impl Searcher {
                 keep_plain_card(&self.inner.parts.store, &contact.name, &plain).await;
                 if !matches!(plain.signature, SignatureStatus::Verified { .. }) {
                     return Err(discard(name, Stage::Card, "card not verified"));
+                }
+                // The outbox cannot ask it (`PLAIN_NEEDS_STREAMING`).
+                if plain.card.capabilities.streaming != Some(true) {
+                    return Err(discard(name, Stage::Card, NO_STREAMING));
                 }
                 let skill = self.first_stage(&plain.card, req, name, tally)?;
                 let key = format!("{PLAIN_PEER_PREFIX}{}", contact.name);

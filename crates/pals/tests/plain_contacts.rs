@@ -17,17 +17,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use a2a::{
-    Message, Part, Role, SendMessageRequest, SendMessageResponse, StreamResponse, TaskState,
+    AgentCapabilities, Message, Part, Role, SendMessageRequest, SendMessageResponse,
+    StreamResponse, TaskState,
 };
 use a2a_client::A2AClientFactory;
 use a2a_client::agent_card::AgentCardResolver;
+use a2a_server::jsonrpc::jsonrpc_router;
+use a2a_server::rest::rest_router;
+use a2a_server::{DefaultRequestHandler, InMemoryTaskStore};
 use axum::body::Body;
 use axum::routing::{get, post};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::{
-    TestNode, echo_app_at, echo_app_with_card, echo_card_at, gateway_request, gateway_send, grant,
-    message_params, now_unix, rpc_request, serve_at, spawn_node,
+    CountingExecutor, TestNode, echo_app_at, echo_app_with_card, echo_card_at, gateway_request,
+    gateway_send, grant, message_params, now_unix, rpc_request, serve_at, spawn_node,
 };
 use futures::StreamExt;
 use http_body_util::BodyExt;
@@ -36,8 +40,9 @@ use pals::config::WorkerCfg;
 use pals::gateway::plain::{
     MAX_JWKS_BYTES, PlainCard, PlainError, SignatureStatus, fetch_plain_card, http_client,
 };
-use pals::outbox::{AskError, AskRequest};
+use pals::outbox::{AskError, AskRequest, PLAIN_NEEDS_STREAMING};
 use pals_core::card_jws::{CanonicalForm, CardError, MAX_CARD_BYTES, canonical_payload, card_hash};
+use pals_core::discovery::selection::{SearchRequest, Stage};
 use pals_core::grant::Operation::{TaskRead, TaskSend};
 use pals_core::identity::AgentKey;
 use pals_core::jcs;
@@ -137,6 +142,33 @@ fn card_app(card: Value) -> axum::Router {
             async move { axum::Json(card) }
         }),
     )
+}
+
+/// The bindings a [`counting_app`] serves.
+#[derive(Clone, Copy)]
+enum Served {
+    JsonRpc,
+    Both,
+}
+
+/// A stock A2A agent whose work `exec` does, serving `card` exactly as
+/// given at `/.well-known/agent-card.json`, with the streaming its
+/// `capabilities` declare, and the bindings `served`: JSON-RPC at
+/// `/jsonrpc`, HTTP+JSON at `/rest`.
+fn counting_app(card: Value, exec: CountingExecutor, served: Served) -> axum::Router {
+    let capabilities = AgentCapabilities {
+        streaming: card["capabilities"]["streaming"].as_bool(),
+        push_notifications: Some(false),
+        ..AgentCapabilities::default()
+    };
+    let handler = Arc::new(
+        DefaultRequestHandler::new(exec, InMemoryTaskStore::new()).with_capabilities(capabilities),
+    );
+    let app = card_app(card).nest("/jsonrpc", jsonrpc_router(Arc::clone(&handler)));
+    match served {
+        Served::JsonRpc => app,
+        Served::Both => app.nest("/rest", rest_router(handler)),
+    }
 }
 
 /// `200` with `bytes` typed as JSON.
@@ -388,6 +420,153 @@ async fn ask_reaches_a_plain_a2a_agent_through_the_gateway() {
         let extensions = call.headers["a2a-extensions"].to_str().unwrap();
         assert!(extensions.contains("extensions/idempotency/v1"), "{call:?}");
     }
+}
+
+#[tokio::test]
+async fn ask_reaches_a_json_rpc_only_plain_agent_once() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let exec = CountingExecutor::new(Duration::ZERO);
+    let worker = exec.clone();
+    // Its card declares its JSON-RPC interface only, and streaming.
+    let (origin, agent) = serve_at(move |origin| {
+        let mut card = card_json(origin);
+        let jsonrpc = card["supportedInterfaces"][0].clone();
+        assert_eq!(jsonrpc["protocolBinding"], "JSONRPC");
+        card["supportedInterfaces"] = json!([jsonrpc]);
+        counting_app(card, worker, Served::JsonRpc)
+    })
+    .await;
+    add_plain(&a, "rpc", &origin);
+
+    let outcome = a
+        .node
+        .outbox()
+        .ask(AskRequest {
+            peer: "rpc".to_owned(),
+            question: "hola".to_owned(),
+            attachments: Vec::new(),
+            wait: WAIT,
+            offer: None,
+        })
+        .await
+        .expect("the JSON-RPC agent answers");
+    assert_eq!(outcome.state, "TASK_STATE_COMPLETED");
+    assert_eq!(outcome.answer.as_deref(), Some("echo: hola"));
+    assert_eq!(exec.runs(), 1, "asked once");
+    // Taken up again: the same outcome, and no other run.
+    let again = a
+        .node
+        .outbox()
+        .resume(&outcome.message_id, WAIT)
+        .await
+        .expect("the same outcome");
+    assert_eq!(again.answer.as_deref(), Some("echo: hola"));
+    assert_eq!(again.task_id, outcome.task_id);
+    assert_eq!(exec.runs(), 1);
+    // On its JSON-RPC binding only, activating idempotency as with a peer.
+    let calls: Vec<_> = agent
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST")
+        .collect();
+    assert!(!calls.is_empty());
+    for call in &calls {
+        assert_eq!(call.uri, "/jsonrpc", "{call:?}");
+        let extensions = call.headers["a2a-extensions"].to_str().unwrap();
+        assert!(extensions.contains("extensions/idempotency/v1"), "{call:?}");
+    }
+}
+
+#[tokio::test]
+async fn plain_agent_without_streaming_is_refused_before_anything_reaches_it() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let home = cli_home(&a);
+    let exec = CountingExecutor::new(Duration::ZERO);
+    let worker = exec.clone();
+    let key = AgentKey::generate();
+    let jwks = serde_json::to_vec(&okp_jwks("k1", &key)).unwrap();
+    // A verified card, with a skill of the capability searched for, that
+    // does not declare streaming.
+    let (origin, agent) = serve_at(move |origin| {
+        let mut card = card_json(origin);
+        card["capabilities"]["streaming"] = json!(false);
+        card["skills"][0]["tags"] = json!(["agentnet:capability:v1:code.rust.review"]);
+        let jku = format!("{origin}/jwks.json");
+        let card = sign(&card, &key, &header("EdDSA", "k1", &jku));
+        counting_app(card, worker, Served::Both)
+            .route("/jwks.json", get(move || async move { json_bytes(jwks) }))
+    })
+    .await;
+
+    // Saved, with a note that says so.
+    let (code, out, err) = pals(
+        home,
+        &["contact", "add-a2a", &origin, "--name", "unary"],
+        &[],
+    )
+    .await;
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("verified"), "{out}");
+    assert!(out.contains("does not declare streaming"), "{out}");
+
+    // Asked: refused, with nothing kept and nothing sent.
+    let asked = a
+        .node
+        .outbox()
+        .ask(AskRequest {
+            peer: "unary".to_owned(),
+            question: "hola".to_owned(),
+            attachments: Vec::new(),
+            wait: WAIT,
+            offer: None,
+        })
+        .await;
+    assert_eq!(
+        asked,
+        Err(AskError::Local(PLAIN_NEEDS_STREAMING.to_owned()))
+    );
+    assert!(a.node.store.outbox_all().unwrap().is_empty());
+
+    // Discarded by a search, at its card, so never chosen.
+    let outcome = a
+        .node
+        .searcher()
+        .search(SearchRequest {
+            capability: "code.rust.review".to_owned(),
+            ..SearchRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(outcome.ranked.is_empty(), "{outcome:#?}");
+    let discarded = outcome
+        .discarded
+        .iter()
+        .find(|d| d.peer == "unary")
+        .unwrap_or_else(|| panic!("discarded: {outcome:#?}"));
+    assert_eq!(
+        (discarded.stage, discarded.reason.as_str()),
+        (Stage::Card, "card declares no streaming")
+    );
+    // Only its card was ever read.
+    assert!(
+        agent.requests().iter().all(|r| r.method == "GET"),
+        "{:?}",
+        agent.requests()
+    );
+    assert_eq!(exec.runs(), 0);
+
+    // A stock client still reaches it through the gateway.
+    let res = gateway_request(
+        &a.gateway_url(),
+        "POST",
+        "/peers/unary/jsonrpc",
+        &VERSION,
+        Some(&rpc_request("SendMessage", message_params("hola", None))),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(answer_in(&res.json["result"]), "echo: hola");
+    assert_eq!(exec.runs(), 1);
 }
 
 #[tokio::test]

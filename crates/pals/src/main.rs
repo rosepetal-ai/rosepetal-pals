@@ -1592,6 +1592,13 @@ fn contact_add_a2a(
         "saved contact {name}: {} ({}), card signature {}",
         contact.origin, card.card.name, card.signature
     );
+    if card.card.capabilities.streaming != Some(true) {
+        println!(
+            "note: its card does not declare streaming, so pals ask, pals_ask and pals \
+             discover cannot ask it in milestone 2; a stock A2A client can still call it \
+             through the gateway, at /peers/{name}/"
+        );
+    }
     Ok(())
 }
 
