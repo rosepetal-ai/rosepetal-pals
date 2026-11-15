@@ -99,7 +99,7 @@ More commands:
 | Command | What it does |
 |-|-|
 | `pals ask <peer> "<question>" [--attach FILE]… [--wait 600s]` | Asks and waits for the answer. Writes the `messageId` to stderr as soon as it stores the question, so it can be resumed if the command is interrupted. Exits with `0` if the task completes, `2` if it fails, is rejected or is canceled, and `3` if the peer does not answer or the wait runs out; in that case the question stays stored |
-| `pals task ls` · `pals task resume <messageId>` · `pals task cancel <messageId>` | The questions asked; resume one without running it twice; cancel its task |
+| `pals task ls` · `pals task resume <messageId>` · `pals task cancel <messageId>` | The questions asked; resume one without running it twice (but see the [plain A2A agents](#plain-a2a-agents-as-contacts) that do not declare `idempotency/v1`); cancel its task |
 | `pals contact ls` | The saved peers |
 | `pals grant ls [--issued \| --held]` · `pals grant revoke <grant_id>` | Grants issued and held; revoke an issued one |
 | `pals id` | The agent's id |
@@ -149,7 +149,7 @@ It serves eight tools; `pals_discover` and `pals_inventory`, and `offer_id` in `
 | `pals_discover` | Searches the contacts for a provider of a capability, as `pals discover` does, without asking any of them to do anything: the candidates ranked, each with its offer and `offer_id`, those discarded with the reason, the coverage and the metrics |
 | `pals_inventory` | A page of a PALS peer's inventory, as the peer shows it to this agent, verified; `cursor` asks for the next one |
 | `pals_ask` | Asks a peer, with files if needed, and waits `wait_s` seconds: 50 by default, 3600 at most. With `offer_id`, the question names that offer of the peer's, as `pals_discover` returned it; with one that expired, nothing is sent |
-| `pals_task` | Resumes a question by its `message_id` without running it twice |
+| `pals_task` | Resumes a question by its `message_id` without running it twice (to a plain A2A agent, only if it declares `idempotency/v1`) |
 | `pals_cancel` | Cancels a question's task |
 | `pals_fetch` | Downloads a file from an answer to a new file in the downloads directory |
 

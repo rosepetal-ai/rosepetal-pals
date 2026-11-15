@@ -457,7 +457,9 @@ impl PalsMcp {
              (TASK_STATE_COMPLETED when answered), the answer, and the files the peer answered \
              with, to download with pals_fetch. When the peer cannot be reached, or the wait \
              ends first, the question is kept: pals_task takes it up again by its message_id, \
-             and it never runs twice. ",
+             and a PALS peer never runs it twice. A plain A2A agent must declare streaming; \
+             when one that may run every copy may have received the question, it is kept and \
+             not sent again on its own, and the error says so. ",
             poll_guidance!(),
             untrusted_answer!()
         )
@@ -518,8 +520,10 @@ impl PalsMcp {
         description = concat!(
             "The answer to a question asked earlier with pals_ask, by its message_id: takes the \
              question up again where it stopped and waits up to wait_s seconds, 50 by default, \
-             at most 3600. It sends the question again only if it never reached the peer, and \
-             it never runs twice. Returns what pals_ask returns. ",
+             at most 3600. It sends the question again only if no task of it is known: a PALS \
+             peer, or a plain A2A agent that declares idempotency, never runs it twice; a plain \
+             agent whose earlier error said it may have received the question may run it \
+             again. Returns what pals_ask returns. ",
             poll_guidance!(),
             untrusted_answer!()
         )
