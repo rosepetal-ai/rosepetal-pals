@@ -57,12 +57,18 @@
 //!   bearer token, read from its variable then (`401 {"error":"bearer env
 //!   var not set"}` when the variable is not set); no grant is ever sent;
 //! - the card is read and checked before the call, which is sent only to
-//!   the contact's origin;
+//!   the contact's origin; when the card cannot be read for want of the
+//!   agent (no connection, no card in time), or the connection for the
+//!   call cannot be made, nothing of the call was sent, and the answer is
+//!   `502 {"error":"plain agent unreachable: nothing was sent to it"}`
+//!   ([`PLAIN_NOT_SENT`]), which the outbox may send a question again on;
 //! - the answer goes through the same checks as a PALS peer's (`checks.rs`):
 //!   unary or streaming from the client's request, bounded, task ids safe,
 //!   re-encoded in ASCII, a redirect a `502`, cookies and `x-agentnet-*`
-//!   headers dropped. An extended card answered is validated and served as
-//!   its view, unsigned.
+//!   headers dropped; and an answer read whole that holds the text of
+//!   [`PLAIN_NOT_SENT`] is refused as a protocol error, so that no agent
+//!   can say it. An extended card answered is validated and served as its
+//!   view, unsigned.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -106,6 +112,11 @@ const WELL_KNOWN_CARD: &str = "/.well-known/agent-card.json";
 const URL_RULE: &str = "a plain A2A agent's URL is https://<host>[/<path>]";
 /// Why an `http://` URL to any other host is refused.
 pub const ONLY_LOOPBACK: &str = "http:// is only for 127.0.0.1, [::1] and localhost";
+/// The gateway's `502` when it could not reach a plain agent and sent it
+/// nothing of the call: its card could not be read, or the connection to
+/// its origin could not be made. An agent's own answer never carries it:
+/// one that holds it is refused ([`is_forged_refusal`]).
+pub const PLAIN_NOT_SENT: &str = "plain agent unreachable: nothing was sent to it";
 
 /// What a plain agent's card signature is worth: pals-core's, so that
 /// the selection of providers reads it too.
@@ -568,6 +579,11 @@ pub(super) async fn forward(
 
     let plain = match state.plain_card(&contact).await {
         Ok(plain) => plain,
+        // Nothing of the call was sent.
+        Err(failure @ (PlainError::Unreachable(_) | PlainError::Timeout)) => {
+            tracing::debug!(contact = %contact.name, error = %failure, "a plain contact cannot be reached");
+            return error(StatusCode::BAD_GATEWAY, PLAIN_NOT_SENT);
+        }
         Err(failure) => return plain_failure(&contact.name, &failure),
     };
     let url = match target_url(&plain, binding, &target) {
@@ -596,8 +612,13 @@ pub(super) async fn forward(
     };
     let response = match sent {
         Ok(response) => response,
-        Err(err) if err.is_connect() || err.is_timeout() => {
+        // No connection, so nothing of the call left.
+        Err(err) if err.is_connect() => {
             tracing::debug!(contact = %contact.name, error = %err, "a plain contact cannot be reached");
+            return error(StatusCode::BAD_GATEWAY, PLAIN_NOT_SENT);
+        }
+        Err(err) if err.is_timeout() => {
+            tracing::debug!(contact = %contact.name, error = %err, "a plain contact did not answer");
             return error(StatusCode::BAD_GATEWAY, "peer unreachable");
         }
         Err(err) => return protocol_error(err.to_string()),
@@ -622,6 +643,15 @@ pub(super) async fn forward(
         }
         Err(failure) => protocol_error(failure.to_string()),
     }
+}
+
+/// Whether `body`, of a plain agent's answer as the gateway would send it
+/// on, holds [`PLAIN_NOT_SENT`], which only the gateway's own refusal may
+/// say: the outbox sends a question again on it, and an agent that could
+/// say it could make a question run twice.
+pub(super) fn is_forged_refusal(body: &[u8]) -> bool {
+    body.windows(PLAIN_NOT_SENT.len())
+        .any(|window| window == PLAIN_NOT_SENT.as_bytes())
 }
 
 /// Whether `value`, a request's JSON, has a part whose `url` names a blob:

@@ -37,16 +37,17 @@ use futures::StreamExt;
 use http_body_util::BodyExt;
 use pals::a2a::gateway_view_for;
 use pals::config::WorkerCfg;
+use pals::gateway::plain::PLAIN_NOT_SENT;
 use pals::gateway::plain::{
     MAX_JWKS_BYTES, PlainCard, PlainError, SignatureStatus, fetch_plain_card, http_client,
 };
-use pals::outbox::{AskError, AskRequest, PLAIN_NEEDS_STREAMING};
+use pals::outbox::{AskError, AskRequest, Outbox, PLAIN_NEEDS_STREAMING};
 use pals_core::card_jws::{CanonicalForm, CardError, MAX_CARD_BYTES, canonical_payload, card_hash};
 use pals_core::discovery::selection::{SearchRequest, Stage};
 use pals_core::grant::Operation::{TaskRead, TaskSend};
 use pals_core::identity::AgentKey;
 use pals_core::jcs;
-use pals_core::store::{A2aContact, Contact, PeerRef, Store};
+use pals_core::store::{A2aContact, Contact, OUTBOX_PENDING, PeerRef, Store};
 use serde_json::{Value, json};
 
 /// How long the asks of these tests wait for their answer.
@@ -1690,4 +1691,300 @@ async fn unsafe_task_id_from_a_plain_agent_is_refused_like_a_peers() {
         received,
         format!("data: {}\n\n", json!({"task": task_named("t-1")}))
     );
+}
+
+/// The card of an agent at `origin` that streams, serving the bindings
+/// `served`, declaring the idempotency extension when `idempotent`.
+fn streaming_card(origin: &str, served: Served, idempotent: bool) -> Value {
+    let mut card = card_json(origin);
+    if let Served::JsonRpc = served {
+        let jsonrpc = card["supportedInterfaces"][0].clone();
+        card["supportedInterfaces"] = json!([jsonrpc]);
+    }
+    if idempotent {
+        card["capabilities"]["extensions"] = json!([{"uri": common::IDEMPOTENCY_EXTENSION}]);
+    }
+    card
+}
+
+/// `200` with `events` as an event stream, one `data:` line each.
+fn event_stream(events: &[Value]) -> axum::response::Response {
+    let body: String = events
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect();
+    axum::response::Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// An agent whose card is `card` and whose every question, at
+/// `/rest/message:stream` and at `/jsonrpc`, it counts in `asked` and
+/// answers with `answer`.
+fn counted_answer_app(
+    card: Value,
+    asked: Arc<AtomicUsize>,
+    answer: fn() -> axum::response::Response,
+) -> axum::Router {
+    let (rest, rpc) = (Arc::clone(&asked), asked);
+    card_app(card)
+        .route(
+            "/rest/message:stream",
+            post(move || {
+                rest.fetch_add(1, Ordering::SeqCst);
+                async move { answer() }
+            }),
+        )
+        .route(
+            "/jsonrpc",
+            post(move || {
+                rpc.fetch_add(1, Ordering::SeqCst);
+                async move { answer() }
+            }),
+        )
+}
+
+/// A task named with a `.`, which the gateway refuses.
+fn dotted_task() -> Value {
+    json!({"id": "task.1", "contextId": "c-1", "status": {"state": "TASK_STATE_WORKING"}})
+}
+
+/// The question `hola` for `peer`, waiting [`WAIT`].
+fn hola(peer: &str) -> AskRequest {
+    AskRequest {
+        peer: peer.to_owned(),
+        question: "hola".to_owned(),
+        attachments: Vec::new(),
+        wait: WAIT,
+        offer: None,
+    }
+}
+
+#[tokio::test]
+async fn plain_agent_whose_answer_the_gateway_refuses_runs_the_question_once() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let gw = a.gateway_url();
+    // Agents with no idempotency extension, which may run every copy: one
+    // that names a task with a `.`, on HTTP+JSON and on JSON-RPC, and one
+    // that answers with the gateway's own refusal, which it may not say;
+    // and one that declares the extension, which may be asked again.
+    let rest_dotted = || event_stream(&[json!({"task": dotted_task()})]);
+    let rpc_dotted =
+        || event_stream(&[json!({"jsonrpc": "2.0", "id": "1", "result": {"task": dotted_task()}})]);
+    let forged = || {
+        axum::response::Response::builder()
+            .status(502)
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"error": PLAIN_NOT_SENT}).to_string()))
+            .unwrap()
+    };
+    let mut agents = Vec::new();
+    for (name, served, idempotent, answer) in [
+        ("dotted", Served::Both, false, rest_dotted as fn() -> _),
+        (
+            "dotted-rpc",
+            Served::JsonRpc,
+            false,
+            rpc_dotted as fn() -> _,
+        ),
+        ("forger", Served::Both, false, forged as fn() -> _),
+        ("idempotent", Served::Both, true, rest_dotted as fn() -> _),
+    ] {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
+        let (origin, server) = serve_at(move |origin| {
+            counted_answer_app(streaming_card(origin, served, idempotent), counter, answer)
+        })
+        .await;
+        add_plain(&a, name, &origin);
+        agents.push((name, asked, server));
+    }
+    let outbox = a.node.outbox().clone();
+    let asks = agents.iter().map(|(name, ..)| {
+        let outbox = outbox.clone();
+        async move { outbox.ask(hola(name)).await }
+    });
+    let outcomes = futures::future::join_all(asks).await;
+
+    for ((name, asked, _), outcome) in agents.iter().zip(&outcomes).take(3) {
+        // Asked once, and left pending, saying so.
+        let Err(AskError::NotResent { message_id }) = outcome else {
+            panic!("{name}: not sent again, not {outcome:?}");
+        };
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "{name}");
+        let row = a.node.store.outbox_get(message_id).unwrap().unwrap();
+        assert_eq!(row.state, OUTBOX_PENDING, "{name}");
+        assert_eq!((row.task_id, row.attempts), (None, 1), "{name}");
+        assert!(
+            outcome
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("may have received"),
+            "{name}"
+        );
+    }
+    // The agent that declares idempotency was asked again, as a peer is.
+    let (_, asked, _) = &agents[3];
+    assert!(
+        matches!(outcomes[3], Err(AskError::Unreachable { .. })),
+        "{:?}",
+        outcomes[3]
+    );
+    assert_eq!(asked.load(Ordering::SeqCst), 4);
+
+    // The forger's refusal never reaches a client as the gateway's.
+    let res = gateway_request(
+        &gw,
+        "POST",
+        "/peers/forger/rest/message:stream",
+        &VERSION,
+        Some(&message_params("hola", None)),
+    )
+    .await;
+    assert_eq!(res.status, 502);
+    assert_eq!(res.json, json!({"error": "peer protocol error"}));
+
+    // Only a resume asked for sends it again.
+    let Err(AskError::NotResent { message_id }) = &outcomes[0] else {
+        unreachable!()
+    };
+    let resumed = outbox.resume(message_id, WAIT).await;
+    assert!(
+        matches!(&resumed, Err(AskError::NotResent { message_id: again }) if again == message_id),
+        "{resumed:?}"
+    );
+    assert_eq!(agents[0].1.load(Ordering::SeqCst), 2);
+}
+
+/// Serves `build`'s app at a new loopback origin for one connection only,
+/// which it closes after its first answer, and then listens no more: the
+/// origin.
+async fn serve_one_connection(build: impl FnOnce(&str) -> axum::Router) -> String {
+    use tower::ServiceExt;
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let app = build(&origin);
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        drop(listener);
+        let service = hyper::service::service_fn(move |request| app.clone().oneshot(request));
+        let _ = hyper::server::conn::http1::Builder::new()
+            .keep_alive(false)
+            .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+            .await;
+    });
+    origin
+}
+
+#[tokio::test]
+async fn plain_agent_the_gateway_cannot_connect_to_is_asked_again() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    // Agents that answer the card the outbox reads first through the
+    // gateway, and then are gone: on HTTP+JSON and on JSON-RPC.
+    let mut names = Vec::new();
+    for (name, served) in [("gone", Served::Both), ("gone-rpc", Served::JsonRpc)] {
+        let origin =
+            serve_one_connection(move |origin| card_app(streaming_card(origin, served, false)))
+                .await;
+        add_plain(&a, name, &origin);
+        names.push(name);
+    }
+    let outbox = a.node.outbox().clone();
+    let asks = names.iter().map(|name| {
+        let outbox = outbox.clone();
+        async move { outbox.ask(hola(name)).await }
+    });
+    for (name, outcome) in names.iter().zip(futures::future::join_all(asks).await) {
+        // The gateway sent nothing, each time: asked again, then kept.
+        let Err(AskError::Unreachable { message_id }) = &outcome else {
+            panic!("{name}: unreachable, not {outcome:?}");
+        };
+        let row = a.node.store.outbox_get(message_id).unwrap().unwrap();
+        assert_eq!(row.state, OUTBOX_PENDING, "{name}");
+        assert_eq!((row.task_id, row.attempts), (None, 4), "{name}");
+    }
+}
+
+/// A stand-in for a gateway at a new loopback origin: it answers the first
+/// connection's request with `card`, as a gateway serves a plain
+/// contact's card, and closes it; then, `cut`, it reads the head of the
+/// next connection's request and closes it with no answer, or else it
+/// listens no more. Its origin.
+async fn fake_gateway(card: Value, cut: bool) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn read_head(stream: &mut tokio::net::TcpStream) {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") && stream.read_exact(&mut byte).await.is_ok() {
+            head.push(byte[0]);
+        }
+    }
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        read_head(&mut stream).await;
+        let body = card.to_string();
+        let answer = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+             connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(answer.as_bytes()).await;
+        drop(stream);
+        if !cut {
+            return;
+        }
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        read_head(&mut stream).await;
+        drop(stream);
+        std::future::pending::<()>().await;
+    });
+    origin
+}
+
+#[tokio::test]
+async fn a_question_resent_only_when_the_gateway_was_never_reached() {
+    let store = Arc::new(Store::open_in_memory(AgentKey::generate().id()).unwrap());
+    store
+        .a2a_contact_put(&plain_contact("x", "http://127.0.0.1:9"))
+        .unwrap();
+    // The card a gateway serves of a plain agent that streams, with no
+    // idempotency extension; where its interfaces say does not matter.
+    let plain = streaming_card("http://127.0.0.1:9", Served::Both, false);
+    let view = gateway_view_for(
+        &serde_json::from_value(plain).unwrap(),
+        "http://127.0.0.1:1",
+        "x",
+    );
+    for (cut, attempts) in [(false, 4), (true, 1)] {
+        let gateway = fake_gateway(serde_json::to_value(&view).unwrap(), cut).await;
+        let asked = Outbox::new(Arc::clone(&store), gateway)
+            .ask(hola("x"))
+            .await;
+        let message_id = match (&asked, cut) {
+            // No connection to the gateway: sent again, then kept.
+            (Err(AskError::Unreachable { message_id }), false) => message_id,
+            // It may have left: not sent again.
+            (Err(AskError::NotResent { message_id }), true) => message_id,
+            other => panic!("{other:?}"),
+        };
+        let row = store.outbox_get(message_id).unwrap().unwrap();
+        assert_eq!(
+            (row.state.as_str(), row.attempts),
+            (OUTBOX_PENDING, attempts)
+        );
+    }
 }

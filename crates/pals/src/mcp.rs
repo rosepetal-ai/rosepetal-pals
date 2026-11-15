@@ -107,7 +107,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::discovery::SearchError;
 use crate::gateway::{GatewayState, HeldBlob};
-use crate::outbox::{AskError, AskOutcome, AskRequest, OfferLookupError};
+use crate::outbox::{AskError, AskOutcome, AskRequest, OfferLookupError, PLAIN_NOT_RESENT};
 use crate::path_policy::{check_download, download_path};
 
 /// How long `pals_ask` and `pals_task` wait for an answer when `wait_s` is
@@ -733,6 +733,13 @@ fn outcome(result: Result<AskOutcome, AskError>) -> CallToolResult {
         Err(AskError::Unreachable { message_id }) => CallToolResult::structured_error(json!({
             "error": "the peer could not be reached; the question is kept: call pals_task with \
                       its message_id to try again",
+            "message_id": message_id,
+        })),
+        Err(AskError::NotResent { message_id }) => CallToolResult::structured_error(json!({
+            "error": format!(
+                "{PLAIN_NOT_RESENT}; the question is kept: call pals_task with its message_id \
+                 to send it again"
+            ),
             "message_id": message_id,
         })),
         Err(AskError::Rejected(reason)) => refused(format!("refused: {reason}")),

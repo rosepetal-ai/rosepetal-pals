@@ -33,7 +33,8 @@ use pals::inventory::{InventoryState, RefreshReport};
 use pals::net::agent_id_of;
 use pals::node::{Node, STORE_FILE};
 use pals::outbox::{
-    AskError, AskOutcome, AskRequest, OfferLookupError, Outbox, received_offer_ref,
+    AskError, AskOutcome, AskRequest, OfferLookupError, Outbox, PLAIN_NOT_RESENT,
+    received_offer_ref,
 };
 use pals_core::benchmark::{BenchmarkReport, MAX_REPORT_BYTES};
 use pals_core::card_jws::{CardSigner, verify_card};
@@ -1534,6 +1535,13 @@ fn refused_or_unreachable(err: AskError) -> anyhow::Result<ExitCode> {
             eprintln!(
                 "pals: the peer could not be reached: `pals task resume {message_id}` tries \
                  again"
+            );
+            Ok(ExitCode::from(EXIT_NO_OUTCOME))
+        }
+        AskError::NotResent { message_id } => {
+            eprintln!(
+                "pals: {PLAIN_NOT_RESENT}; the question is kept: `pals task resume \
+                 {message_id}` sends it again"
             );
             Ok(ExitCode::from(EXIT_NO_OUTCOME))
         }

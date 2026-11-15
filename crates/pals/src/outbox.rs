@@ -20,8 +20,9 @@
 //! nothing is asked. Then:
 //!
 //! - while the peer's task is not known, the same request, byte for byte,
-//!   with `SendStreamingMessage`: the peer runs the first copy that reaches
-//!   it, and attaches every other one to that run;
+//!   with `SendStreamingMessage`: a PALS peer runs the first copy that
+//!   reaches it, and attaches every other one to that run, as does a plain
+//!   agent whose card declares the idempotency extension;
 //! - once it is known, `GetTask`, and `SubscribeToTask` while it runs.
 //!
 //! A question asked with the offer its peer was chosen by
@@ -43,6 +44,25 @@
 //! that starts included. Any other refusal, of the gateway (`4xx`) or of the
 //! peer (an A2A error), is [`AskError::Rejected`], at once.
 //!
+//! A plain agent whose card does not declare the idempotency extension may
+//! run every copy that reaches it. So while its task is not known, the
+//! question goes again on its own only when it certainly never reached the
+//! agent: the gateway could not be reached, its connection never made
+//! (the route's own client, which keeps no connection, sees it), or the
+//! gateway answered its own `502` [`PLAIN_NOT_SENT`], that it could not
+//! reach the agent and sent it nothing, which it never lets an agent's
+//! answer say. On the JSON-RPC binding, whose client reads no HTTP status,
+//! that refusal is known by the client's message quoting it. Any other
+//! failure on the way then (every refusal of the agent's answer by the
+//! gateway, an unsafe task id, a `2xx` that is not JSON, an event too
+//! large or a `Content-Encoding`; a `5xx`; an `InternalError`; a stream
+//! broken after the question left) leaves the row pending, and the ask
+//! fails with [`AskError::NotResent`], [`PLAIN_NOT_RESENT`]: only
+//! [`Outbox::resume`], asked for, sends it again. Once the task is known,
+//! reading and following it are retried as for a peer. These messages are
+//! the pinned client's (`HTTP request failed: …`, `HTTP <status>: <body>`,
+//! `failed to parse JSON-RPC response: …`), to check again on an upgrade.
+//!
 //! An ask ends when its task does (`COMPLETED`, `FAILED`, `CANCELED`,
 //! `REJECTED`) or waits for the requester (`INPUT_REQUIRED`,
 //! `AUTH_REQUIRED`), with the task as it is then; or when its `wait` runs
@@ -57,7 +77,8 @@
 //! nor ever put in a URL; a task the peer answers for must be the one asked
 //! about. The gateway checks task ids first ([`crate::gateway`]): an answer
 //! that names an unsafe one never gets through it, so the attempt breaks
-//! as on a cut connection, and is retried.
+//! as on a cut connection, and is retried, but to a plain agent that may
+//! run every copy.
 //!
 //! Files go to PALS peers only: an ask to a plain contact with attachments
 //! is refused before anything is read or sent. An attachment is read only
@@ -71,6 +92,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use a2a::{
@@ -85,6 +108,7 @@ use a2a_client::rest::RestTransport;
 use a2a_client::transport::{ServiceParams, Transport};
 use async_trait::async_trait;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use http::header::AUTHORIZATION;
 use pals_core::discovery::query::OfferRef;
@@ -97,7 +121,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::a2a::{IDEMPOTENCY_EXTENSION, is_safe_task_id};
-use crate::gateway::plain::path_segment;
+use crate::gateway::plain::{PLAIN_NOT_SENT, path_segment};
 use crate::gateway::serves_tasks;
 use crate::path_policy::open_attachment;
 
@@ -125,6 +149,15 @@ pub const PLAIN_NEEDS_STREAMING: &str = "the plain A2A agent's card does not dec
 const MAX_PLAIN_CARD_BYTES: usize = 64 * 1024;
 /// The longest reason of the gateway's quoted.
 const MAX_REASON_CHARS: usize = 200;
+/// Why a question to a plain A2A contact that may have reached it is not
+/// sent again on its own ([`AskError::NotResent`]).
+pub const PLAIN_NOT_RESENT: &str = "the plain A2A agent may have received the question, and it \
+    is not sent again on its own, since the agent may run every copy that reaches it";
+/// How the pinned client's message for a request it could not send begins.
+const REQUEST_FAILED: &str = "HTTP request failed: ";
+/// How the pinned client's JSON-RPC message for a body that is no JSON-RPC
+/// response, such as the gateway's own refusal, begins.
+const JSONRPC_UNREAD: &str = "failed to parse JSON-RPC response: ";
 
 type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 type Client = A2AClient<Box<dyn Transport>>;
@@ -179,6 +212,12 @@ pub enum AskError {
     /// [`Outbox::resume`].
     #[error("the peer could not be reached; the question is kept as message {message_id}")]
     Unreachable { message_id: String },
+    /// The question may have reached a plain A2A agent that does not
+    /// declare the idempotency extension, and it is not sent again on its
+    /// own ([`PLAIN_NOT_RESENT`]): it is kept, pending, and
+    /// [`Outbox::resume`] sends it again.
+    #[error("{PLAIN_NOT_RESENT}; the question is kept as message {message_id}")]
+    NotResent { message_id: String },
     /// The gateway or the peer refused the request.
     #[error("refused: {0}")]
     Rejected(String),
@@ -347,7 +386,7 @@ impl Outbox {
             created_at: now,
             updated_at: now,
         };
-        let client = self.client(&peer, plain, &request).await?;
+        let route = self.route(&peer, plain, &request).await?;
         if cancel.is_cancelled() {
             return Err(nothing_asked("the ask was canceled"));
         }
@@ -361,7 +400,7 @@ impl Outbox {
                 task_id: None,
                 deadline,
             },
-            client,
+            route,
         )
         .await
     }
@@ -382,7 +421,7 @@ impl Outbox {
         if plain.is_some_and(|speaks| !speaks.streaming) {
             return Err(AskError::Local(PLAIN_NEEDS_STREAMING.to_owned()));
         }
-        let client = self.client(&peer, plain, &request).await?;
+        let route = self.route(&peer, plain, &request).await?;
         if row.state == OUTBOX_REFUSED {
             let id = row.message_id.clone();
             self.with_store(move |store| store.outbox_set_state(&id, OUTBOX_PENDING, now_unix()))
@@ -395,7 +434,7 @@ impl Outbox {
                 task_id: row.task_id,
                 deadline: Instant::now() + wait,
             },
-            client,
+            route,
         )
         .await
     }
@@ -419,7 +458,7 @@ impl Outbox {
         let peer = self.peer_of(&row).await?;
         let asked = decode_request(&row.request_json)?;
         let plain = self.plain_speaks_of(&peer, message_id).await?;
-        let client = self.client(&peer, plain, &asked).await?;
+        let client = self.route(&peer, plain, &asked).await?.client;
         let request = CancelTaskRequest {
             id: task_id,
             metadata: None,
@@ -458,16 +497,17 @@ impl Outbox {
         self.store.outbox_pending()
     }
 
-    /// Attempts `ask` with `client` until it has an outcome, is refused,
-    /// runs out of retries or of time.
-    async fn drive(&self, mut ask: Ask, client: Client) -> Result<AskOutcome, AskError> {
+    /// Attempts `ask` on `route` until it has an outcome, is refused, runs
+    /// out of retries or of time, or, to a plain agent that may run every
+    /// copy, may have been sent.
+    async fn drive(&self, mut ask: Ask, route: Route) -> Result<AskOutcome, AskError> {
         let deadline = ask.deadline;
         let mut failures: u32 = 0;
         // The state last seen, by this call.
         let mut seen: Option<TaskState> = None;
         loop {
             let attempts = self.count_attempt(&ask.message_id).await?;
-            let exchange = self.exchange(&client, &mut ask, &mut seen);
+            let exchange = self.exchange(&route, &mut ask, &mut seen);
             let Ok(ended) = tokio::time::timeout_at(deadline, exchange).await else {
                 return out_of_time(&ask, seen.as_ref(), attempts);
             };
@@ -489,12 +529,22 @@ impl Outbox {
                     return Err(AskError::Rejected(reason));
                 }
                 Ended::Local(err) => return Err(err),
-                Ended::Broken { progressed, reason } => {
+                Ended::Broken {
+                    progressed,
+                    reason,
+                    unsent,
+                } => {
                     tracing::debug!(
                         message_id = %ask.message_id,
                         %reason,
                         "an attempt did not get through"
                     );
+                    // Its task not known, the next attempt sends it again.
+                    if ask.task_id.is_none() && !unsent && route.resends_only_unsent() {
+                        return Err(AskError::NotResent {
+                            message_id: ask.message_id,
+                        });
+                    }
                     if progressed {
                         failures = 0;
                     }
@@ -516,16 +566,13 @@ impl Outbox {
 
     /// One attempt: the request, while the task is not known; else the task,
     /// and its events while it runs.
-    async fn exchange(
-        &self,
-        client: &Client,
-        ask: &mut Ask,
-        seen: &mut Option<TaskState>,
-    ) -> Ended {
+    async fn exchange(&self, route: &Route, ask: &mut Ask, seen: &mut Option<TaskState>) -> Ended {
+        let client = &route.client;
         let Some(task_id) = ask.task_id.clone() else {
+            route.before_send();
             return match client.send_streaming_message(&ask.request).await {
                 Ok(events) => self.follow(client, ask, events, seen).await,
-                Err(err) => Ended::failed(&err, false),
+                Err(err) => Ended::send_failed(&err, route.never_sent(&err)),
             };
         };
         let task = match get_task(client, &task_id).await {
@@ -611,6 +658,7 @@ impl Outbox {
         Ended::Broken {
             progressed,
             reason: "the stream ended before the task".to_owned(),
+            unsent: false,
         }
     }
 
@@ -700,12 +748,17 @@ impl Outbox {
             .with_media_type(media_type(path)))
     }
 
-    /// The A2A client for `peer`, through the gateway, for the question
-    /// `request`: on the HTTP+JSON binding, `<gateway>/peers/<peer>/rest`,
-    /// but for a plain contact whose card has no HTTP+JSON interface and
-    /// has a JSON-RPC one (`plain`, from [`Outbox::plain_speaks`]), on the
-    /// JSON-RPC binding, `<gateway>/peers/<name>/jsonrpc`, with the pinned
-    /// client's JSON-RPC transport. Every request it sends activates the
+    /// The route to `peer`, through the gateway, for the question
+    /// `request`: an A2A client on the HTTP+JSON binding,
+    /// `<gateway>/peers/<peer>/rest`, but for a plain contact whose card has
+    /// no HTTP+JSON interface and has a JSON-RPC one (`plain`, from
+    /// [`Outbox::plain_speaks`]), on the JSON-RPC binding,
+    /// `<gateway>/peers/<name>/jsonrpc`, with the pinned client's JSON-RPC
+    /// transport; and when a send that failed on the way goes again
+    /// ([`Resend`]): for a plain contact whose card does not declare the
+    /// idempotency extension, only when it certainly never left, which its
+    /// own HTTP client, with no pooled connections, tells for a connection
+    /// to the gateway ([`ConnectWatch`]). Every request it sends activates the
     /// [idempotency extension](IDEMPOTENCY_EXTENSION), which the resends of
     /// an ask rely on; a plain A2A agent may ignore it. For a question that
     /// names an offer, it activates the [inventory
@@ -713,12 +766,12 @@ impl Outbox {
     /// offer's scope ([`Outbox::offer_grant`]) when this agent holds one, so
     /// that the task runs under the scope it was offered for; any other
     /// question goes with the grant the gateway chooses, as in milestone 1.
-    async fn client(
+    async fn route(
         &self,
         peer: &PeerRef,
         plain: Option<PlainSpeaks>,
         request: &SendMessageRequest,
-    ) -> Result<Client, AskError> {
+    ) -> Result<Route, AskError> {
         let inventory = names_an_offer(request);
         let bearer = if inventory {
             self.offer_grant(peer, request)
@@ -728,18 +781,32 @@ impl Outbox {
             None
         };
         let base_url = format!("{}/peers/{}", self.gateway_url, path_segment(peer));
-        let transport: Box<dyn Transport> = match plain {
-            Some(PlainSpeaks { jsonrpc: true, .. }) => Box::new(JsonRpcTransport::new(
-                self.http.clone(),
-                format!("{base_url}/jsonrpc"),
-            )),
-            _ => Box::new(RestTransport::new(
-                self.http.clone(),
-                format!("{base_url}/rest"),
-            )),
+        let jsonrpc = plain.is_some_and(|speaks| speaks.jsonrpc);
+        let (http, resend) = match plain {
+            Some(speaks) if !speaks.idempotent => {
+                let no_connection = Arc::new(AtomicBool::new(false));
+                let http = reqwest::Client::builder()
+                    .no_proxy()
+                    .pool_max_idle_per_host(0)
+                    .connector_layer(ConnectWatch(Arc::clone(&no_connection)))
+                    .build()
+                    .map_err(|err| AskError::Local(format!("cannot build a client: {err}")))?;
+                let resend = Resend::OnlyUnsent {
+                    jsonrpc,
+                    no_connection,
+                };
+                (http, resend)
+            }
+            _ => (self.http.clone(), Resend::OnTheWay),
         };
-        Ok(A2AClient::new(transport)
-            .with_interceptors(vec![Arc::new(Extensions { inventory, bearer })]))
+        let transport: Box<dyn Transport> = if jsonrpc {
+            Box::new(JsonRpcTransport::new(http, format!("{base_url}/jsonrpc")))
+        } else {
+            Box::new(RestTransport::new(http, format!("{base_url}/rest")))
+        };
+        let client = A2AClient::new(transport)
+            .with_interceptors(vec![Arc::new(Extensions { inventory, bearer })]);
+        Ok(Route { client, resend })
     }
 
     /// What the card of the plain contact `contact` says of how to ask it:
@@ -875,6 +942,8 @@ struct PlainSpeaks {
     jsonrpc: bool,
     /// The card declares `capabilities.streaming`, which the outbox needs.
     streaming: bool,
+    /// The card declares the [idempotency extension](IDEMPOTENCY_EXTENSION).
+    idempotent: bool,
 }
 
 impl PlainSpeaks {
@@ -888,7 +957,145 @@ impl PlainSpeaks {
         Self {
             jsonrpc: !has(TRANSPORT_PROTOCOL_HTTP_JSON) && has(TRANSPORT_PROTOCOL_JSONRPC),
             streaming: card.capabilities.streaming == Some(true),
+            idempotent: card
+                .capabilities
+                .extensions
+                .iter()
+                .flatten()
+                .any(|extension| extension.uri == IDEMPOTENCY_EXTENSION),
         }
+    }
+}
+
+/// How the outbox reaches a peer, through the gateway.
+struct Route {
+    client: Client,
+    resend: Resend,
+}
+
+/// When a `SendStreamingMessage` that failed on the way is sent again.
+enum Resend {
+    /// After any failure on the way: a PALS peer, or a plain agent whose
+    /// card declares the idempotency extension, runs the first copy that
+    /// reaches it and attaches every other one to that run.
+    OnTheWay,
+    /// Only when it certainly never reached the agent, a plain one that may
+    /// run every copy: the route's client could make no connection to the
+    /// gateway (`no_connection`), or the gateway says it sent the agent
+    /// nothing ([`PLAIN_NOT_SENT`]), as an answer on the JSON-RPC binding
+    /// (`jsonrpc`) or on HTTP+JSON.
+    OnlyUnsent {
+        jsonrpc: bool,
+        no_connection: Arc<AtomicBool>,
+    },
+}
+
+impl Route {
+    /// Whether a send that failed on the way goes again only when it never
+    /// left.
+    fn resends_only_unsent(&self) -> bool {
+        matches!(self.resend, Resend::OnlyUnsent { .. })
+    }
+
+    /// Before each send: no connection failed yet.
+    fn before_send(&self) {
+        if let Resend::OnlyUnsent { no_connection, .. } = &self.resend {
+            no_connection.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Whether `err`, the pinned client's error for the send just made,
+    /// says that the question certainly never reached the agent: the
+    /// client could not send the request and could make no connection to
+    /// the gateway, or the gateway's answer is its own
+    /// [`PLAIN_NOT_SENT`], which it never lets an agent's answer carry
+    /// (`crate::gateway::plain`). Never for [`Resend::OnTheWay`], which
+    /// does not need to know.
+    fn never_sent(&self, err: &A2AError) -> bool {
+        let Resend::OnlyUnsent {
+            jsonrpc,
+            no_connection,
+        } = &self.resend
+        else {
+            return false;
+        };
+        if err.code != error_code::INTERNAL_ERROR {
+            return false;
+        }
+        if err.message.starts_with(REQUEST_FAILED) && no_connection.load(Ordering::SeqCst) {
+            return true;
+        }
+        says_not_sent(&err.message, *jsonrpc)
+    }
+}
+
+/// Whether `message`, of the pinned client's `InternalError` for a send on
+/// the JSON-RPC binding (`jsonrpc`) or on HTTP+JSON, is the gateway's
+/// `502` [`PLAIN_NOT_SENT`]: on HTTP+JSON, `HTTP 502 Bad Gateway: <body>`
+/// with that `error`; on JSON-RPC, whose client reads no HTTP status, the
+/// body that is no JSON-RPC response, `{"error": <that text>}`, which its
+/// message quotes.
+fn says_not_sent(message: &str, jsonrpc: bool) -> bool {
+    if jsonrpc {
+        message.starts_with(JSONRPC_UNREAD) && message.contains(&format!("{PLAIN_NOT_SENT:?}"))
+    } else {
+        http_failure(message)
+            .is_some_and(|(status, reason)| status == 502 && reason == PLAIN_NOT_SENT)
+    }
+}
+
+/// A connector layer for an HTTP client that sets its flag when a
+/// connection cannot be made: then the request it was for never left.
+#[derive(Clone)]
+struct ConnectWatch(Arc<AtomicBool>);
+
+impl<S> tower::Layer<S> for ConnectWatch {
+    type Service = Watched<S>;
+
+    fn layer(&self, inner: S) -> Watched<S> {
+        Watched {
+            inner,
+            failed: Arc::clone(&self.0),
+        }
+    }
+}
+
+/// A connector that [`ConnectWatch`] watches.
+#[derive(Clone)]
+struct Watched<S> {
+    inner: S,
+    failed: Arc<AtomicBool>,
+}
+
+impl<S, R> tower::Service<R> for Watched<S>
+where
+    S: tower::Service<R>,
+    S::Future: Send + 'static,
+    S::Response: 'static,
+    S::Error: 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = BoxFuture<'static, Result<S::Response, S::Error>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), S::Error>> {
+        let ready = self.inner.poll_ready(cx);
+        if matches!(ready, Poll::Ready(Err(_))) {
+            self.failed.store(true, Ordering::SeqCst);
+        }
+        ready
+    }
+
+    fn call(&mut self, request: R) -> Self::Future {
+        let failed = Arc::clone(&self.failed);
+        let connecting = self.inner.call(request);
+        Box::pin(async move {
+            let connected = connecting.await;
+            if connected.is_err() {
+                failed.store(true, Ordering::SeqCst);
+            }
+            connected
+        })
     }
 }
 
@@ -911,8 +1118,13 @@ enum Ended {
     /// Refused, by the gateway or by the peer.
     Refused(String),
     /// On the way: the attempt may be retried. `progressed` when it saw the
-    /// task move first.
-    Broken { progressed: bool, reason: String },
+    /// task move first; `unsent` when what it sent certainly never reached
+    /// the peer ([`Route::never_sent`]).
+    Broken {
+        progressed: bool,
+        reason: String,
+        unsent: bool,
+    },
     /// The outbox could not be written.
     Local(AskError),
 }
@@ -920,7 +1132,24 @@ enum Ended {
 impl Ended {
     fn failed(err: &A2AError, progressed: bool) -> Self {
         match Failure::of(err) {
-            Failure::Transport(reason) => Self::Broken { progressed, reason },
+            Failure::Transport(reason) => Self::Broken {
+                progressed,
+                reason,
+                unsent: false,
+            },
+            Failure::Refused(reason) => Self::Refused(reason),
+        }
+    }
+
+    /// How sending the question ended, with `err`; `unsent` when it
+    /// certainly never reached the peer.
+    fn send_failed(err: &A2AError, unsent: bool) -> Self {
+        match Failure::of(err) {
+            Failure::Transport(reason) => Self::Broken {
+                progressed: false,
+                reason,
+                unsent,
+            },
             Failure::Refused(reason) => Self::Refused(reason),
         }
     }
@@ -983,6 +1212,7 @@ async fn final_task(client: &Client, task_id: &str, seen: &mut Option<TaskState>
             Ended::Broken {
                 progressed: true,
                 reason: "the task is not final yet".to_owned(),
+                unsent: false,
             }
         }
         Err(err) => Ended::failed(&err, true),
@@ -1318,6 +1548,30 @@ mod tests {
             Failure::Refused("messageId reused".to_owned())
         );
         assert!(!transport(A2AError::task_not_found("t-1")));
+    }
+
+    #[test]
+    fn only_the_gateways_own_refusal_says_nothing_was_sent() {
+        let rest = format!(r#"HTTP 502 Bad Gateway: {{"error":"{PLAIN_NOT_SENT}"}}"#);
+        assert!(says_not_sent(&rest, false));
+        assert!(!says_not_sent(&rest, true));
+        // As the JSON-RPC client quotes a body that is no JSON-RPC response.
+        let rpc = format!(
+            "failed to parse JSON-RPC response: invalid type: string {PLAIN_NOT_SENT:?}, \
+             expected struct JsonRpcError at line 1 column 58"
+        );
+        assert!(says_not_sent(&rpc, true));
+        assert!(!says_not_sent(&rpc, false));
+        for other in [
+            r#"HTTP 502 Bad Gateway: {"error":"peer unreachable"}"#.to_owned(),
+            r#"HTTP 502 Bad Gateway: {"error":"peer protocol error"}"#.to_owned(),
+            format!(r#"HTTP 503 Service Unavailable: {{"error":"{PLAIN_NOT_SENT}"}}"#),
+            format!("SSE stream error: {PLAIN_NOT_SENT}"),
+            "HTTP request failed: error sending request".to_owned(),
+        ] {
+            assert!(!says_not_sent(&other, false), "{other}");
+            assert!(!says_not_sent(&other, true), "{other}");
+        }
     }
 
     #[test]

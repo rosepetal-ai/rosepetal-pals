@@ -227,6 +227,9 @@ const JSON: &str = "application/json";
 const A2A_JSON: &str = "application/a2a+json";
 /// The type of every blob the gateway serves, whatever its content.
 const OCTET_STREAM: &str = "application/octet-stream";
+/// Why a plain agent's answer that says [`plain::PLAIN_NOT_SENT`] is
+/// refused.
+const FORGED_REFUSAL: &str = "an answer that says what only the gateway says";
 /// How long asking a peer for a page of its inventory, or for an offer, may
 /// take, dialing included.
 const INVENTORY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -1050,7 +1053,9 @@ async fn discovery_search(State(state): State<GatewayState>, request: Request) -
                 } => {
                     answer["tried"] = json!(tried);
                     answer["discarded"] = json!(discarded);
-                    if let AskError::Unreachable { message_id } = error {
+                    if let AskError::Unreachable { message_id }
+                    | AskError::NotResent { message_id } = error
+                    {
                         answer["kept"] = json!(message_id);
                     }
                 }
@@ -1455,7 +1460,12 @@ impl GatewayState {
                 ));
             }
             // An error a client takes no task id from, or nothing.
-            Err(_) => return Ok(Body::from(bytes)),
+            Err(_) => {
+                if matches!(owner, CardOwner::Plain(_)) && plain::is_forged_refusal(&bytes) {
+                    return Err(TunnelError::Protocol(FORGED_REFUSAL.to_owned()));
+                }
+                return Ok(Body::from(bytes));
+            }
         };
         let card_hash = if card && status.is_success() {
             checks::extended_card_view(&mut value, binding, owner, &self.base_url())
@@ -1468,6 +1478,9 @@ impl GatewayState {
         }
         rewrite::rewrite_to_gateway(&mut value, &self.base_url());
         let bytes = checks::ascii_json(&value);
+        if matches!(owner, CardOwner::Plain(_)) && plain::is_forged_refusal(&bytes) {
+            return Err(TunnelError::Protocol(FORGED_REFUSAL.to_owned()));
+        }
         let json_type = if media_type == A2A_JSON {
             A2A_JSON
         } else {
