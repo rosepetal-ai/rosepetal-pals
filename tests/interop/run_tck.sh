@@ -13,13 +13,16 @@
 #   --sut-host http://127.0.0.1:<requester gateway>/peers/<provider id>
 #   --transport jsonrpc,http_json
 # once per level in LEVELS. The reports of the `must` run are copied to
-# docs/conformance/hito-1/compatibility.{json,html}, those of any other
+# $PALS_CONFORMANCE_DIR/compatibility.{json,html}, those of any other
 # level to compatibility-<level>.{json,html}; the logs of the run stay in
 # target/tck-run/<UTC time>/.
 #
 # Exit code: that of the `must` run (0 when no MUST requirement fails).
 #
 # Environment:
+#   PALS_CONFORMANCE_DIR   where the reports go, relative to the repository
+#                          root unless absolute (default docs/conformance/hito-1,
+#                          the hito 1 evidence; hito 2 uses docs/conformance/hito-2)
 #   TCK_STREAMING_TIMEOUT  seconds, for both the TCK and the provider
 #                          (default 2.0)
 #   LEVELS                 levels to run, in order (default "must should")
@@ -35,7 +38,11 @@ TCK_PYTHON=3.15
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 TCK_DIR=$ROOT/target/tck
 TOOLS_VENV=$ROOT/target/tck-venv
-REPORTS_OUT=$ROOT/docs/conformance/hito-1
+CONFORMANCE_DIR=${PALS_CONFORMANCE_DIR:-docs/conformance/hito-1}
+case $CONFORMANCE_DIR in
+    /*) REPORTS_OUT=$CONFORMANCE_DIR ;;
+    *) REPORTS_OUT=$ROOT/$CONFORMANCE_DIR ;;
+esac
 RUN_DIR=$ROOT/target/tck-run/$(date -u +%Y%m%dT%H%M%SZ)
 export TCK_STREAMING_TIMEOUT=${TCK_STREAMING_TIMEOUT:-2.0}
 LEVELS=${LEVELS:-must should}
