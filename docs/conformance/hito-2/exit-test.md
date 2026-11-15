@@ -6,7 +6,7 @@ Este documento recoge la ejecución de los casos del criterio de salida del hito
 
 ## Resultado (2026-11-15)
 
-Casos 1 a 8 superados en la ejecución registrada, a la primera, y superada también la comprobación final sobre toda la prueba: ningún servidor MCP recibió un `tools/call`. El caso 9 está **pendiente: ver [`README.md`](README.md) de este directorio**. Los ensayos sacaron a la luz un fallo de producto, corregido en `eea2281`, y varias correcciones del arnés y del runbook; la revisión de la tarea, otras, que esta ejecución ya incluye (ver [«Correcciones»](#correcciones-antes-de-esta-ejecución)).
+Casos 1 a 8 superados en la ejecución registrada, a la primera, y superada también la comprobación final sobre toda la prueba: ningún servidor MCP recibió un `tools/call`. El caso 9, superado también a la primera, el 2026-11-15 (ver [`README.md`](README.md) de este directorio). Los ensayos sacaron a la luz un fallo de producto, corregido en `eea2281`, y varias correcciones del arnés y del runbook; la revisión de la tarea, otras, que esta ejecución ya incluye (ver [«Correcciones»](#correcciones-antes-de-esta-ejecución)).
 
 | Caso | Resultado | Evidencia | Tiempo |
 |-|-|-|-|
@@ -18,7 +18,7 @@ Casos 1 a 8 superados en la ejecución registrada, a la primera, y superada tamb
 | 6. Vistas y caché por permisos | Superado | A (`task:demo`): 124 entradas en dos páginas, con las de proyecto. G (`public`): las 120 notas públicas, cada una idéntica a la de la vista pública de B, y nada más; ninguna clave fuera del esquema. Los cursores cruzados, `400` con el mismo error en los dos sentidos | 1 s |
 | 7. Contacto A2A corriente | Superado | F por `https`, con la CA de prueba en A: `card signature verified f-1`; `pals ask f`: `F: hola, F`; JSON-RPC y HTTP+JSON por el gateway de A, `TASK_STATE_COMPLETED`; `http://` a otra máquina, rechazado | 1 s |
 | 8. Migración | Superado | M1 y M2 del hito 1: esquema 1 → 2, cada fila de las nueve tablas del hito 1 conservada; `contact ls`, `grant ls` y `task ls` iguales con las dos versiones; una pregunta nueva con el hito 2; `events_verify: 7 events … verified` (M1) y `1 events … verified` (M2) | 3 s |
-| 9. Sin regresión A2A | Pendiente | Ver [`README.md`](README.md) de este directorio | |
+| 9. Sin regresión A2A | Superado | TCK con código 0 y ningún MUST fallido: 58 superados en `jsonrpc` y 57 en `http_json`, `CARD-EXT-001` superado y `CORE-CAP-003` saltado, porque la card declara ahora card extendida; el SDK de Python, `4 checks passed`; `check_schemas.py`, `7 documents valid`. Ver [`README.md`](README.md) | 4 min |
 | Sin `tools/call`, toda la prueba | Superado | Al desmontar, en lo que recibió el servidor MCP de cada proveedor y de H: `b 0 c 0 d 0 e 0 g 0 h 0` | |
 
 Las líneas del arnés:
@@ -280,9 +280,23 @@ caso 8: superado
 
 «Conservadas» compara, tabla por tabla, cada fila de las nueve tablas del hito 1 antes y después, columna por columna de las del hito 1. Los listados siguen siendo los mismos: el grant revocado sigue `revoked`, y la pregunta del hito 1, `TASK_STATE_COMPLETED`. `events_verify` ([`crates/pals-core/examples/events_verify.rs`](../../../crates/pals-core/examples/events_verify.rs)) es `Store::events_verify` sobre el directorio migrado. La cadena de M1 son los cinco eventos firmados por el hito 1 y, a continuación, los dos de la pregunta del hito 2, y verifica entera: secuencia sin huecos, hash del anterior, hash del contenido y firma de cada uno. Con `relay = false` el puerto de Iroh cambia en cada arranque, así que M2 guardó otra vez el ticket de M1 antes de la segunda pregunta.
 
-### Caso 9. Sin regresión A2A: pendiente
+### Caso 9. Sin regresión A2A: superado
 
-Pendiente: ver [`README.md`](README.md) de este directorio.
+En el anfitrión, en `812f885`, con el código de `eea2281` y el cambio de `run_tck.sh` que elige el directorio de los informes. Son las órdenes del runbook:
+
+```text
+$ PALS_CONFORMANCE_DIR=docs/conformance/hito-2 tests/interop/run_tck.sh
+│ MUST   │ 72     │ 0      │ 20      │ 7      │ 16         │ 115   │
+  jsonrpc:       75/90 (15 skipped) ✓
+  http_json:     71/85 (14 skipped) ✓
+[run_tck] TCK --level must exited 0
+$ target/interop-venv/bin/python tests/interop/python_client.py
+4 checks passed
+$ target/interop-venv/bin/python tests/interop/check_schemas.py
+7 documents valid
+```
+
+Por requisito, en `jsonrpc` hay 58 MUST superados (58 en el hito 1) y en `http_json`, 57 (56). Solo dos requisitos cambian de estado respecto al hito 1, los dos por la card extendida que la card declara ahora. `CARD-EXT-001` pasa a superado. `CORE-CAP-003`, que el TCK solo prueba sin card extendida, pasa a saltado. Los informes, los requisitos uno a uno y lo que queda respaldado están en [`README.md`](README.md). Los informes del hito 1 no cambian.
 
 ## Métricas del §14
 
