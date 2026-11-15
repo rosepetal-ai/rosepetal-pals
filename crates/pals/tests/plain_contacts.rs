@@ -2256,3 +2256,28 @@ async fn the_gateways_own_origin_is_no_plain_contact() {
     // Nothing reached b through the alias.
     assert_eq!(b.node.store.events_count("task.accepted").unwrap(), 0);
 }
+
+#[tokio::test]
+async fn contact_add_a2a_shows_the_card_s_words_as_printable_ascii() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let home = cli_home(&a);
+    let key = AgentKey::generate();
+    let kid = "k\u{1b}[2J1";
+    let jwks = serde_json::to_vec(&okp_jwks(kid, &key)).unwrap();
+    let (origin, _agent) = serve_at(move |origin| {
+        let mut card = card_json(origin);
+        card["name"] = json!("plain\u{1b}]0;owned\u{7}\necho");
+        let jku = format!("{origin}/jwks.json");
+        let card = sign(&card, &key, &header("EdDSA", kid, &jku));
+        card_app(card).route("/jwks.json", get(move || async move { json_bytes(jwks) }))
+    })
+    .await;
+    let (code, out, err) = pals(home, &["contact", "add-a2a", &origin, "--name", "esc"], &[]).await;
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("(plain]0;ownedecho), card signature verified k[2J1"),
+        "{out:?}"
+    );
+    assert!(!out.contains('\u{1b}') && !out.contains('\u{7}'), "{out:?}");
+    assert_eq!(out.lines().count(), 1, "{out:?}");
+}

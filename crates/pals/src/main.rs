@@ -1618,9 +1618,12 @@ fn contact_add_a2a(
         None,
         now_unix(),
     )?;
+    // The card's words are the agent's: shown, never printed raw.
     println!(
         "saved contact {name}: {} ({}), card signature {}",
-        contact.origin, card.card.name, card.signature
+        contact.origin,
+        shown(&card.card.name),
+        shown(&card.signature.to_string())
     );
     if card.card.capabilities.streaming != Some(true) {
         println!(
