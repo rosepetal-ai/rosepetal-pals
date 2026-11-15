@@ -1,4 +1,5 @@
-//! PALS core: the parts of an agent that do not touch the network.
+//! PALS core: the parts of an agent that open no sockets and hold no
+//! endpoint, worker or adapter handle.
 //!
 //! [`identity`] holds the agent's persistent Ed25519 key, [`jcs`] canonical
 //! JSON and the domain-separated signatures over it, [`grant`] the signed

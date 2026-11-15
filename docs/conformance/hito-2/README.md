@@ -13,7 +13,7 @@ Evidencia de que el hito 2 no cambia la compatibilidad con A2A v1.0 del intercam
 | TCK | `a2aproject/a2a-tck` en `104a7b4ae0d83f65c075e3793e322953a830eaba`, el mismo commit que en el hito 1. Python 3.15.2 y las dependencias de su `uv.lock` (`uv sync --frozen`, uv 0.13.8) |
 | Transportes | `jsonrpc` y `http_json`. El TCK no prueba gRPC, que PALS no ofrece |
 | `TCK_STREAMING_TIMEOUT` | `2.0` (el valor por defecto). Una sola ejecución de cada nivel, sin repetir ninguna prueba |
-| SDK de Rust | `a2a-lf =0.4.2`, `a2a-server-lf =0.5.3` y `a2a-client-lf =0.2.9`, con `a2a-pb 0.3.2` como dependencia de los anteriores. Son los mismos que en el hito 1 |
+| SDK de Rust | `a2a-lf =0.4.2`, `a2a-server-lf =0.5.3` y `a2a-client-lf =0.2.9`, los mismos que en el hito 1, y `a2a-pb =0.3.2`, fijado también directamente porque `pals-core` lo usa (formas protobuf de las cards), con `prost =0.14.6` para los mensajes de `agentnet-discovery/0` |
 | Resto | `iroh =1.4.1`, `iroh-blobs =0.105.0`, `rmcp =3.10.0`, Rust 1.99.1 |
 | Cliente independiente | `a2a-sdk==1.3.0` (SDK oficial de Python, protocolo 1.0), Python 3.12.3, dependencias fijadas en [`tests/interop/requirements.txt`](../../../tests/interop/requirements.txt) |
 | Validador de esquemas | `jsonschema==4.26.0` (Draft 2020-12), fijado en el mismo fichero |

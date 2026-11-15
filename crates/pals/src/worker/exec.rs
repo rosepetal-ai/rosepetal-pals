@@ -51,9 +51,11 @@ pub const STDERR_TAIL_BYTES: usize = 4096;
 /// started too. A run dropped before the command ends, as when the daemon
 /// stops, kills the group as well.
 ///
-/// Known limit: a descendant that leaves the group, with `setsid()` or
-/// `setpgid()`, escapes every one of these kills. Containing those would
-/// take a subreaper or a cgroup.
+/// Known limits: a descendant that leaves the group, with `setsid()` or
+/// `setpgid()`, escapes every one of these kills; and if the daemon itself
+/// is killed with SIGKILL, nothing kills the group, since no
+/// `PR_SET_PDEATHSIG` is set. Containing those would take a subreaper or a
+/// cgroup.
 pub struct ExecAdapter {
     cfg: ExecCfg,
     projects: BTreeMap<String, PathBuf>,

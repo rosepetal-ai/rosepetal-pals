@@ -1,6 +1,6 @@
 [package]
 name = "pals-core"
-description = "PALS core without networking: identity, grants, storage, the signed event log, the inventory and the answers of the discovery protocol"
+description = "PALS core, which opens no sockets and holds no endpoint, worker or adapter handle: identity, grants, storage, the signed event log, the inventory and the answers of the discovery protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

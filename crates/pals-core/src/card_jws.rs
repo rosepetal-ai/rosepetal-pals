@@ -26,10 +26,12 @@
 //! first ([`validate_card`]): size, depth, string length, element counts and
 //! an A2A 1.0 interface, before anything else reads it. The card a
 //! verification returns is read from the bytes the valid signature covers,
-//! never from the JSON received: over a protobuf form, that JSON may carry
-//! what the signature does not cover (unknown keys, snake_case names that
-//! only the protobuf types read, shapes that only `a2a-lf` reads), and none
-//! of it reaches the card.
+//! never from the JSON received, except its `signatures`, which no
+//! signature covers and which come from the JSON received as they are,
+//! those that do not verify and their unprotected headers included: over a
+//! protobuf form, that JSON may carry what the signature does not cover
+//! (unknown keys, snake_case names that only the protobuf types read,
+//! shapes that only `a2a-lf` reads), and none of it reaches the card.
 //!
 //! **Hash.** [`card_hash`] identifies the exact signed version of a card
 //! (spec §9, `agent_card_hash`): BLAKE3 over the JCS of the card as received,

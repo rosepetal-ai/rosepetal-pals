@@ -49,7 +49,7 @@ Lo que ve quien pregunta sale del grant que presenta y de nada más que envíe.
 
 1. **Grant.** Si `grant_token` no está vacío, se acepta con la misma regla que aplica la capa HTTP del hito 1 a las peticiones A2A (`pals_core::grant::accept_grant`): firma válida, emisor este agente o uno de sus emisores de confianza, audiencia este agente, sujeto el par de la conexión, no revocado y en plazo, con 60 s de desfase. Una operación no concedida no es un error de autenticación: solo deja el ámbito en público. Si el grant no se acepta, la respuesta es `UNAUTHENTICATED` con el motivo en minúsculas, el mismo que la capa HTTP pone en `WWW-Authenticate`: `expired`, `not_yet_valid`, `revoked`, `wrong_subject`, `wrong_audience`, `issuer_not_accepted`, `bad_signature`, `malformed`, `too_large` o `unknown_schema`. Un grant cuyo proyecto no es un nombre de proyecto (ASCII imprimible sin espacios) es `malformed`: ninguna página firmada podría nombrar su ámbito. También uno cuyo proyecto pasa de 64 bytes (`MAX_PROJECT_NAME_BYTES`): las entradas se recortan para caber en las páginas de un ámbito de ese nombre, no de uno más largo.
 2. **Ámbito.** El que da el grant (`Scope::for_grant`, [inventario](../extensions/inventory-v1.md#visibilidad-y-ámbitos)): el de tarea del proyecto con `task.send` sobre `skill:ask`, el del proyecto con otra operación de tarea, y el público en otro caso. Sin grant, el público; si el agente tiene `[discovery] public = false`, una vista pública vacía, de revisión 1, cuyas páginas nunca se guardan en la caché: así nunca ocupa el lugar de la vista pública que da un grant sin operaciones de tarea, ni al revés.
-3. **Operación.**
+3. **Operación.** La que pide la petición, contestada en ese ámbito (§5); una petición sin operación es `BAD_REQUEST` («no operation»).
 
 ## 5. Operaciones
 
@@ -118,7 +118,7 @@ Por stream, antes de leer nada de la petición:
 | Petición entera (prefijo, cuerpo y FIN) | 5 s | `BAD_REQUEST` «request timed out» |
 | Respuesta entera (frame y FIN) | 5 s | el stream se reinicia (`RESET_STREAM`) |
 
-Lo que pasa de una cuota se rechaza, no se encola. El plazo de la respuesta cubre también las de rechazo: un par que no concede crédito de control de flujo para leerla, o que no la lee, no retiene más de ese plazo ni un stream de su cuota ni uno del total. «Un par» es un `AgentId`, con todas sus conexiones. La conexión concede crédito para cuatro streams más que la cuota del par, para que el que la supera reciba su `RATE_LIMITED` en vez de quedarse esperando crédito.
+Lo que pasa de una cuota se rechaza, no se encola. El plazo de la respuesta cubre también las de rechazo: un par que no concede crédito de control de flujo para leerla, o que no la lee, no retiene más de ese plazo ni un stream de su cuota ni uno del total. «Un par» es un `AgentId`, con todas sus conexiones. Al aceptar una conexión, el servidor fija en cuatro streams más que la cuota del par el máximo de streams bidireccionales abiertos a la vez (`set_max_concurrent_bi_streams`), para que el que supera la cuota reciba su `RATE_LIMITED` en vez de quedarse esperando crédito. Ese máximo cuenta desde entonces: el crédito que el handshake ya concedió con el valor por defecto del transporte no se retira, porque QUIC nunca retira crédito, así que al principio de la conexión el par puede abrir más streams; la cuota se aplica igual, porque cada stream de más se rechaza con `RATE_LIMITED` antes de leer su petición.
 
 ## 8. Lo que el protocolo nunca hace
 
