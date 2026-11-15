@@ -15,6 +15,7 @@
 //! | any method, `/peers/{peer}/rest/{*rest}` | the peer's `/rest/{rest}` |
 //! | `GET /discovery/inventory/{peer}?sections=a,b&cursor=…` | a page of the peer's inventory view, over `agentnet-discovery/0`, verified, as the peer signed it |
 //! | `POST /discovery/query/{peer}` | the body, an `agentnet.service-query/1`, asked of the peer over `agentnet-discovery/0`: its offer, accepted and kept, as the peer signed it |
+//! | `POST /discovery/search` | `{"search": <request>, "ask"?, "wait_s"?}`: a search for a provider among the contacts ([`Searcher`]), and, with `ask`, the question asked of the one chosen |
 //! | `POST /blobs` | stores the raw body as a blob: `201 {"url", "hash", "size"}` |
 //! | `GET /blobs/{holder}/{hash}` | the blob, fetched from its holder first if need be |
 //! | any method, `/mcp` | the local [MCP server](crate::mcp), Streamable HTTP |
@@ -67,6 +68,11 @@
 //! signed it, re-encoded in ASCII, once the client accepted it, which keeps
 //! it ([`Store::offer_received_put`]). A refused offer is `502`; the peer's
 //! refusals and failures are answered as for the inventory.
+//!
+//! **Searches.** `POST /discovery/search` runs [`Searcher::search`] on the
+//! body's `search` (at most [`MAX_QUERY_BODY_BYTES`]), within the limits of
+//! `[discovery]` for the whole daemon, never the gateway's own times; with
+//! `ask`, [`Searcher::search_then_ask`].
 //!
 //! When the request carries no `Authorization`, the gateway presents the
 //! newest unexpired grant it holds for the peer that allows a task operation
@@ -162,6 +168,7 @@ use iroh_blobs::api::TempTag;
 use pals_core::clock::Clock;
 use pals_core::discovery::DISCOVERY_VERSION;
 use pals_core::discovery::query::{MAX_QUERY_BYTES, ServiceQuery};
+use pals_core::discovery::selection::SearchRequest;
 use pals_core::discovery::wire::{self, ErrorCode, request, response};
 use pals_core::grant::{Grant, Operation, SignedGrant, parse_timestamp};
 use pals_core::identity::AgentId;
@@ -181,11 +188,12 @@ use crate::blobs::{BLOB_META_KEY, BLOB_SHARE_TTL_S, BlobError, BlobRef, BlobServ
 use crate::config::LimitsCfg;
 use crate::discovery::cards::PUBLIC_CONTEXT;
 use crate::discovery::{
-    CardFetchError, DiscoveryClient, DiscoveryError, PeerCards, signed_card_json,
+    CardFetchError, DiscoveryClient, DiscoveryError, DiscoveryLimits, PeerCards, SearchError,
+    Searcher, SearcherParts, signed_card_json,
 };
 use crate::net::{PeerHttp, TunnelError, peer_addr};
 use crate::node::ticket_of;
-use crate::outbox::Outbox;
+use crate::outbox::{AskError, Outbox};
 
 /// The response header in which the gateway names the hash of the extended
 /// card it verified ([`pals_core::card_jws::card_hash`] of the card as the
@@ -265,6 +273,8 @@ struct Inner {
     cards: PeerCards,
     /// Discovery requests to peers.
     discovery: DiscoveryClient,
+    /// The search for a provider among the contacts.
+    searcher: Searcher,
     /// The HTTP client for plain A2A contacts ([`plain::http_client`]).
     plain_http: reqwest::Client,
     /// The node's clock, which pages of peers' views are judged by.
@@ -289,6 +299,8 @@ pub struct GatewayParts {
     pub endpoint: Endpoint,
     pub blobs: BlobService,
     pub limits: LimitsCfg,
+    /// What a search may take.
+    pub discovery_limits: DiscoveryLimits,
     /// The agent's data directory, whose files are never sent.
     pub data_dir: PathBuf,
     /// The only directory `pals_fetch` writes to, when configured; else
@@ -309,12 +321,23 @@ impl GatewayState {
             endpoint,
             blobs,
             limits,
+            discovery_limits,
             data_dir,
             download_dir,
         } = parts;
         let outbox =
             Outbox::new(Arc::clone(&store), base_url(&local_addr)).with_data_dir(&data_dir);
         let cards = PeerCards::new(peer_http.clone(), Arc::clone(&store));
+        let plain_http = plain::http_client();
+        let searcher = Searcher::new(SearcherParts {
+            store: Arc::clone(&store),
+            cards: cards.clone(),
+            discovery: discovery.clone(),
+            outbox: outbox.clone(),
+            plain_http: plain_http.clone(),
+            clock: Arc::clone(&clock),
+            limits: discovery_limits,
+        });
         Self {
             inner: Arc::new(Inner {
                 id,
@@ -328,7 +351,8 @@ impl GatewayState {
                 outbox,
                 cards,
                 discovery,
-                plain_http: plain::http_client(),
+                searcher,
+                plain_http,
                 clock,
                 download_dir,
                 stopping: CancellationToken::new(),
@@ -344,6 +368,11 @@ impl GatewayState {
     /// The questions this agent asks its peers, through this gateway.
     pub fn outbox(&self) -> &Outbox {
         &self.inner.outbox
+    }
+
+    /// The search for a provider among this agent's contacts.
+    pub fn searcher(&self) -> &Searcher {
+        &self.inner.searcher
     }
 
     /// The only directory `pals_fetch` writes to: the configured one, else
@@ -567,7 +596,7 @@ pub(crate) struct HeldBlob {
 /// Whether `grant` can serve a request of the bindings the gateway forwards:
 /// it allows at least one task operation, on a resource that covers
 /// `skill:ask`. A `blob.fetch` grant, for instance, cannot.
-fn serves_tasks(grant: &Grant) -> bool {
+pub(crate) fn serves_tasks(grant: &Grant) -> bool {
     let task_op = grant.operations.iter().any(|op| {
         matches!(
             op,
@@ -603,6 +632,7 @@ pub fn router(state: GatewayState) -> Router {
         .route("/peers/{peer}/rest/{*rest}", any(forward_rest))
         .route("/discovery/inventory/{peer}", get(peer_inventory))
         .route("/discovery/query/{peer}", post(peer_query))
+        .route("/discovery/search", post(discovery_search))
         .route("/blobs", post(upload_blob))
         .route("/blobs/{holder}/{hash}", get(download_blob))
         .route_service("/mcp", crate::mcp::service(state.clone()))
@@ -885,6 +915,110 @@ async fn peer_query(
     }
 }
 
+/// The body of `POST /discovery/search`: the search, and, to ask the
+/// candidate chosen, the question and how long to wait for its answer.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchBody {
+    search: SearchRequest,
+    #[serde(default)]
+    ask: Option<String>,
+    /// Seconds; [`DEFAULT_SEARCH_WAIT_S`] by default, at most
+    /// [`MAX_SEARCH_WAIT_S`].
+    #[serde(default)]
+    wait_s: Option<u64>,
+}
+
+/// How long `POST /discovery/search` with a question waits for the answer
+/// when the body does not say.
+const DEFAULT_SEARCH_WAIT_S: u64 = 600;
+/// The longest it waits.
+const MAX_SEARCH_WAIT_S: u64 = 7 * 24 * 3600;
+
+/// `POST /discovery/search`: the search the body asks for, its outcome as
+/// JSON ([`Searcher::search`]); with `ask`, the search and the candidate
+/// chosen and asked, `{"search", "chosen"}`, or why none took it,
+/// `{"search", "error", "tried", "discarded"}`, with `"kept"`, the message
+/// id, when the question waits for `pals task resume`
+/// ([`Searcher::search_then_ask`]). Everything a peer said is re-encoded
+/// in ASCII. `429` when too many searches run, `400` for a search that
+/// makes no query.
+async fn discovery_search(State(state): State<GatewayState>, request: Request) -> Response {
+    let Ok(body) = axum::body::to_bytes(request.into_body(), MAX_QUERY_BODY_BYTES).await else {
+        return error(StatusCode::PAYLOAD_TOO_LARGE, "search too large");
+    };
+    let body: SearchBody = match serde_json::from_slice(&body) {
+        Ok(body) => body,
+        Err(err) => return error(StatusCode::BAD_REQUEST, format!("invalid search: {err}")),
+    };
+    let searcher = &state.inner.searcher;
+    let Some(question) = body.ask else {
+        return match searcher.search(body.search).await {
+            Ok(outcome) => json_response(&json!(outcome)),
+            Err(err) => search_failure(&err),
+        };
+    };
+    let wait = Duration::from_secs(
+        body.wait_s
+            .unwrap_or(DEFAULT_SEARCH_WAIT_S)
+            .clamp(1, MAX_SEARCH_WAIT_S),
+    );
+    match searcher.search_then_ask(body.search, question, wait).await {
+        Ok((outcome, Ok(chosen))) => json_response(&json!({"search": outcome, "chosen": chosen})),
+        Ok((outcome, Err(err))) => {
+            let mut answer = json!({"search": outcome, "error": err.to_string()});
+            match err {
+                SearchError::NoProvider { tried, discarded } => {
+                    answer["tried"] = json!(tried);
+                    answer["discarded"] = json!(discarded);
+                }
+                SearchError::Ask {
+                    error,
+                    tried,
+                    discarded,
+                    ..
+                } => {
+                    answer["tried"] = json!(tried);
+                    answer["discarded"] = json!(discarded);
+                    if let AskError::Unreachable { message_id } = error {
+                        answer["kept"] = json!(message_id);
+                    }
+                }
+                _ => {}
+            }
+            json_response(&answer)
+        }
+        Err(err) => search_failure(&err),
+    }
+}
+
+/// The answer to a search that has no outcome.
+fn search_failure(err: &SearchError) -> Response {
+    match err {
+        SearchError::TooManySearches => {
+            let mut response = error(StatusCode::TOO_MANY_REQUESTS, err.to_string());
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+            response
+        }
+        SearchError::Invalid(_) => error(StatusCode::BAD_REQUEST, err.to_string()),
+        _ => {
+            tracing::warn!(error = %err, "a search failed");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+    }
+}
+
+/// `value` as the gateway answers JSON: re-encoded in ASCII.
+fn json_response(value: &Value) -> Response {
+    (
+        [(CONTENT_TYPE, HeaderValue::from_static(JSON))],
+        checks::ascii_json(value),
+    )
+        .into_response()
+}
+
 /// A verified page, or offer, as the gateway serves it: its JSON,
 /// re-encoded in ASCII.
 fn page_response(page: &[u8]) -> Response {
@@ -957,6 +1091,10 @@ fn discovery_failure(peer: &AgentId, failure: &DiscoveryError) -> Response {
         DiscoveryError::Offer(refused) => error(
             StatusCode::BAD_GATEWAY,
             format!("peer offer invalid: {refused}"),
+        ),
+        DiscoveryError::Report(why) => error(
+            StatusCode::BAD_GATEWAY,
+            format!("peer benchmark report invalid: {why}"),
         ),
         DiscoveryError::Remote(refusal) => {
             // The peer's words are data: printable ASCII only, and short.

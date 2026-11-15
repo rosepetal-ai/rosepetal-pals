@@ -4,10 +4,12 @@
 //! addresses change ([`renew_on_change`]); and the discovery protocol,
 //! `agentnet-discovery/0`, which carries those records in every answer: the
 //! server that answers on its ALPN ([`DiscoveryServer`]) and the client
-//! that asks peers ([`DiscoveryClient`]).
+//! that asks peers ([`DiscoveryClient`]); and the search that chooses a
+//! provider among the contacts with all of it ([`Searcher`]).
 
 pub mod cards;
 pub mod client;
+pub mod search;
 pub mod server;
 
 use std::collections::BTreeSet;
@@ -32,6 +34,7 @@ use pals_core::store::Store;
 
 pub use cards::{CardFetchError, PeerCards, signed_card_json};
 pub use client::{DiscoveryClient, DiscoveryError, Reply};
+pub use search::{Chosen, DiscoveryLimits, SearchError, Searcher, SearcherParts};
 pub use server::{DiscoveryHook, DiscoveryServer, Quotas};
 
 /// The ALPN of the discovery protocol, [`ALPN_DISCOVERY`] as text, which the

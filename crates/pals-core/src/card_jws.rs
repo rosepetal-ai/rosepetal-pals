@@ -161,6 +161,32 @@ impl<'de> Deserialize<'de> for CardHash {
     }
 }
 
+/// What a card's signature is worth to this agent. A PALS peer's card is
+/// used only [`Verified`](SignatureStatus::Verified), with its agent id as
+/// `kid`; a plain A2A agent's is reported, never required, and only a
+/// `Verified` one is chosen automatically (`pals::gateway::plain`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SignatureStatus {
+    /// Verified with the key `kid` names: a PALS peer's agent id, or the
+    /// OKP Ed25519 key `kid` of a JWK Set of a plain contact's origin.
+    Verified { kid: String },
+    /// Signed, but not in a way this agent verifies, or not validly.
+    Unverifiable,
+    /// Not signed.
+    Unsigned,
+}
+
+impl fmt::Display for SignatureStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Verified { kid } => write!(f, "verified {kid}"),
+            Self::Unverifiable => f.write_str("unverifiable"),
+            Self::Unsigned => f.write_str("unsigned"),
+        }
+    }
+}
+
 /// A card whose signature by an agent has been verified.
 ///
 /// `card` and `payload` are what the valid signature covers. `json` is the

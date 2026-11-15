@@ -100,6 +100,15 @@ public = true
 # in milliseconds, rounded up to whole seconds: at most 300000. An offer
 # reserves nothing and authorizes nothing.
 offer_valid_for_ms = 15000
+# What a search of this agent's (`pals discover`) may take: at most this
+# many candidates per search (up to 32), this many queries in flight for
+# the whole daemon (up to 8), this long for each candidate (up to 10000 ms;
+# a query itself waits at most 3000 ms) and this long in all (up to 60000
+# ms). Past them, a search answers with what it has and says it is partial.
+max_candidates = 8
+max_concurrent_queries = 3
+per_candidate_timeout_ms = 3000
+total_budget_ms = 15000
 
 [limits]
 max_body_bytes = 1048576      # 1 MiB
@@ -497,15 +506,41 @@ pub struct DiscoveryCfg {
     /// How long a service offer lasts, from 1 to
     /// [`MAX_OFFER_VALID_FOR_MS`]; rounded up to whole seconds.
     pub offer_valid_for_ms: u32,
+    /// The candidates a search contacts, from 1 to
+    /// [`MAX_SEARCH_CANDIDATES`].
+    pub max_candidates: usize,
+    /// The service queries in flight at once for the whole daemon, from 1
+    /// to [`MAX_CONCURRENT_QUERIES`].
+    pub max_concurrent_queries: usize,
+    /// How long a search gives each candidate, from 1 to
+    /// [`MAX_PER_CANDIDATE_TIMEOUT_MS`].
+    pub per_candidate_timeout_ms: u64,
+    /// How long a search takes at most, from 1 to
+    /// [`MAX_TOTAL_BUDGET_MS`].
+    pub total_budget_ms: u64,
 }
 
+/// The most candidates a search may be configured to contact.
+pub const MAX_SEARCH_CANDIDATES: usize = 32;
+/// The most service queries a daemon may be configured to have in flight.
+pub const MAX_CONCURRENT_QUERIES: usize = 8;
+/// The longest a search may be configured to give a candidate.
+pub const MAX_PER_CANDIDATE_TIMEOUT_MS: u64 = 10_000;
+/// The longest a search may be configured to take.
+pub const MAX_TOTAL_BUDGET_MS: u64 = 60_000;
+
 impl Default for DiscoveryCfg {
-    /// The public view, and offers valid 15 s, as the example of design
-    /// §7.2.
+    /// The public view, offers valid 15 s, as the example of design §7.2,
+    /// and the limits of a search of design §7.3: 8 candidates, 3 queries
+    /// at once, 3 s per candidate and 15 s in all.
     fn default() -> Self {
         Self {
             public: true,
             offer_valid_for_ms: 15_000,
+            max_candidates: 8,
+            max_concurrent_queries: 3,
+            per_candidate_timeout_ms: 3000,
+            total_budget_ms: 15_000,
         }
     }
 }
@@ -570,6 +605,38 @@ impl Config {
             bail!(
                 "invalid {}: discovery.offer_valid_for_ms must be from 1 to \
                  {MAX_OFFER_VALID_FOR_MS}",
+                path.display()
+            );
+        }
+        let discovery = &cfg.discovery;
+        let limits = [
+            (
+                "max_candidates",
+                u64::try_from(discovery.max_candidates).unwrap_or(u64::MAX),
+                MAX_SEARCH_CANDIDATES as u64,
+            ),
+            (
+                "max_concurrent_queries",
+                u64::try_from(discovery.max_concurrent_queries).unwrap_or(u64::MAX),
+                MAX_CONCURRENT_QUERIES as u64,
+            ),
+            (
+                "per_candidate_timeout_ms",
+                discovery.per_candidate_timeout_ms,
+                MAX_PER_CANDIDATE_TIMEOUT_MS,
+            ),
+            (
+                "total_budget_ms",
+                discovery.total_budget_ms,
+                MAX_TOTAL_BUDGET_MS,
+            ),
+        ];
+        if let Some((name, _, max)) = limits
+            .iter()
+            .find(|(_, value, max)| !(1..=*max).contains(value))
+        {
+            bail!(
+                "invalid {}: discovery.{name} must be from 1 to {max}",
                 path.display()
             );
         }
@@ -865,6 +932,40 @@ path = "/srv/demo"
                 Err(err) => {
                     assert!(!valid, "{ms}: {err:#}");
                     assert!(format!("{err:#}").contains("offer_valid_for_ms"), "{err:#}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn search_limits_default_to_the_design_and_are_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load(&write_config(dir.path(), "")).unwrap();
+        let discovery = &cfg.discovery;
+        assert_eq!(
+            (
+                discovery.max_candidates,
+                discovery.max_concurrent_queries,
+                discovery.per_candidate_timeout_ms,
+                discovery.total_budget_ms
+            ),
+            (8, 3, 3000, 15_000)
+        );
+        for (name, max) in [
+            ("max_candidates", 32),
+            ("max_concurrent_queries", 8),
+            ("per_candidate_timeout_ms", 10_000),
+            ("total_budget_ms", 60_000),
+        ] {
+            for (value, valid) in [(0, false), (1, true), (max, true), (max + 1, false)] {
+                let text = format!("[discovery]\n{name} = {value}\n");
+                match Config::load(&write_config(dir.path(), &text)) {
+                    Ok(_) => assert!(valid, "{name} = {value}"),
+                    Err(err) => {
+                        assert!(!valid, "{name} = {value}: {err:#}");
+                        let err = format!("{err:#}");
+                        assert!(err.contains(&format!("discovery.{name}")), "{err}");
+                    }
                 }
             }
         }

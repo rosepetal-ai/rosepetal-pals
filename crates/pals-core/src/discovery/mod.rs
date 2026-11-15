@@ -24,16 +24,17 @@
 mod answer;
 pub mod matching;
 pub mod query;
+pub mod selection;
 pub mod wire;
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-pub use answer::{answer, error_response};
+pub use answer::{answer, error_response, scope_revision};
 pub use matching::{Evaluation, evaluate};
 pub use query::{
-    MAX_OFFER_BYTES, MAX_OFFER_VALID_FOR_MS, MAX_QUERY_BYTES, OfferError, ServiceOffer,
+    MAX_OFFER_BYTES, MAX_OFFER_VALID_FOR_MS, MAX_QUERY_BYTES, OfferError, OfferRef, ServiceOffer,
     ServiceQuery, accept_offer,
 };
 pub use wire::{WireError, decode, encode_frame, frame_len};

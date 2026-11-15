@@ -17,6 +17,14 @@
 //!   it, and attaches every other one to that run;
 //! - once it is known, `GetTask`, and `SubscribeToTask` while it runs.
 //!
+//! A question asked with the offer its peer was chosen by
+//! ([`AskRequest::offer`]) names it in its message, under the inventory
+//! extension's URI in `metadata` ([`OfferRef`]), and every attempt
+//! activates that extension too: being in the request kept, the reference
+//! goes again with every retry. The provider checks the offer again, and
+//! refuses a message whose offer is unknown, expired or stale before it
+//! runs anything; the grant is checked first all the same.
+//!
 //! An attempt fails on the way when the gateway cannot be reached or answers
 //! a server error (`502` when it cannot reach the peer), when a stream
 //! breaks, or when it ends before the task does. The ask then waits 1 s,
@@ -52,6 +60,7 @@
 //! outside `/proc`, `/sys`, `/dev` and any procfs or sysfs; the file opened
 //! must be the one checked.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,8 +77,10 @@ use a2a_client::transport::ServiceParams;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use pals_core::discovery::query::OfferRef;
+use pals_core::inventory::INVENTORY_EXTENSION;
 use pals_core::store::{OUTBOX_PENDING, OUTBOX_REFUSED, OutboxRow, PeerRef, Store};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -107,10 +118,14 @@ pub struct AskRequest {
     pub attachments: Vec<PathBuf>,
     /// How long to wait for the answer.
     pub wait: Duration,
+    /// The offer the peer was chosen by, which the message names
+    /// ([`OfferRef`]); none for a question asked without one, which goes as
+    /// in milestone 1.
+    pub offer: Option<OfferRef>,
 }
 
 /// A file a peer answered with.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactRef {
     /// The name the peer gave it: untrusted, never a path.
     pub name: String,
@@ -119,7 +134,7 @@ pub struct ArtifactRef {
 }
 
 /// How an ask ended, or where it stands when its wait ran out.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskOutcome {
     pub message_id: String,
     /// The peer's task, once known.
@@ -231,12 +246,18 @@ impl Outbox {
             question,
             attachments,
             wait,
+            offer,
         } = req;
         let deadline = Instant::now() + wait;
         let prepared = async {
             let peer = self.resolve(peer).await?;
             if matches!(peer, PeerRef::Plain(_)) && !attachments.is_empty() {
                 return Err(AskError::Local("attachments need a PALS peer".to_owned()));
+            }
+            if matches!(peer, PeerRef::Plain(_)) && offer.is_some() {
+                return Err(AskError::Local(
+                    "offers come only from PALS peers".to_owned(),
+                ));
             }
             let mut parts = vec![Part::text(question)];
             for path in &attachments {
@@ -260,6 +281,12 @@ impl Outbox {
         let message_id = new_message_id();
         let mut message = Message::new(Role::User, parts);
         message.message_id = message_id.clone();
+        if let Some(offer) = &offer {
+            message.metadata = Some(HashMap::from([(
+                INVENTORY_EXTENSION.to_owned(),
+                offer.to_value(),
+            )]));
+        }
         let request = SendMessageRequest {
             message,
             configuration: None,
@@ -338,7 +365,7 @@ impl Outbox {
             )));
         };
         let peer = self.peer_of(&row).await?;
-        let client = self.client(&peer);
+        let client = self.client(&peer, false);
         let request = CancelTaskRequest {
             id: task_id,
             metadata: None,
@@ -381,7 +408,7 @@ impl Outbox {
     /// retries or of time.
     async fn drive(&self, mut ask: Ask) -> Result<AskOutcome, AskError> {
         let deadline = ask.deadline;
-        let client = self.client(&ask.peer);
+        let client = self.client(&ask.peer, names_an_offer(&ask.request));
         let mut failures: u32 = 0;
         // The state last seen, by this call.
         let mut seen: Option<TaskState> = None;
@@ -622,11 +649,13 @@ impl Outbox {
 
     /// The A2A client for `peer`, through the gateway. Every request it
     /// sends activates the [idempotency extension](IDEMPOTENCY_EXTENSION),
-    /// which the resends of an ask rely on; a plain A2A agent may ignore it.
-    fn client(&self, peer: &PeerRef) -> Client {
+    /// which the resends of an ask rely on, and, with `inventory`, the
+    /// [inventory extension](INVENTORY_EXTENSION) too, which a message that
+    /// names an offer activates; a plain A2A agent may ignore them.
+    fn client(&self, peer: &PeerRef, inventory: bool) -> Client {
         let base_url = format!("{}/peers/{}/rest", self.gateway_url, path_segment(peer));
         A2AClient::new(RestTransport::new(self.http.clone(), base_url))
-            .with_interceptors(vec![Arc::new(Idempotent)])
+            .with_interceptors(vec![Arc::new(Extensions { inventory })])
     }
 
     /// The row of `message_id`.
@@ -926,18 +955,82 @@ fn new_message_id() -> String {
 }
 
 /// Activates the [`IDEMPOTENCY_EXTENSION`] on every request, with the
-/// `A2A-Extensions` service parameter.
-struct Idempotent;
+/// `A2A-Extensions` service parameter, and the [`INVENTORY_EXTENSION`]
+/// after it with `inventory`.
+struct Extensions {
+    inventory: bool,
+}
 
 #[async_trait]
-impl CallInterceptor for Idempotent {
+impl CallInterceptor for Extensions {
     async fn before(&self, _method: &str, params: &mut ServiceParams) -> Result<(), A2AError> {
-        params.insert(
-            SVC_PARAM_EXTENSIONS.to_owned(),
-            vec![IDEMPOTENCY_EXTENSION.to_owned()],
-        );
+        let mut extensions = IDEMPOTENCY_EXTENSION.to_owned();
+        if self.inventory {
+            extensions.push_str(", ");
+            extensions.push_str(INVENTORY_EXTENSION);
+        }
+        params.insert(SVC_PARAM_EXTENSIONS.to_owned(), vec![extensions]);
         Ok(())
     }
+}
+
+/// Whether `request`, as the outbox keeps it, names an offer: then every
+/// attempt activates the inventory extension, as the first did.
+fn names_an_offer(request: &SendMessageRequest) -> bool {
+    OfferRef::in_metadata(request.message.metadata.as_ref()).is_some()
+}
+
+/// Why an offer received cannot be named in an ask.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OfferLookupError {
+    /// The peer is no PALS peer this agent knows: only those make offers.
+    #[error("{0}")]
+    NotAPeer(String),
+    /// This agent keeps no offer of the peer's with that id.
+    #[error("no such offer of the peer's: run pals discover again")]
+    Unknown,
+    /// It expired, by this agent's own clock.
+    #[error("offer expired: run pals discover again")]
+    Expired,
+    /// The store could not be read.
+    #[error("cannot read the offers: {0}")]
+    Store(String),
+}
+
+/// The reference to the offer `offer_id` that `peer` (a contact's name or
+/// an agent id) sent this agent and `store` keeps, looked up by (the
+/// peer's agent id, `offer_id`): two providers may use the same id. Refused
+/// when it is expired at `now_unix` by this agent's own clock, without
+/// skew: nothing is sent with an offer that no longer holds, and asking
+/// for a new one is a new search.
+pub fn received_offer_ref(
+    store: &Store,
+    peer: &str,
+    offer_id: &str,
+    now_unix: i64,
+) -> Result<OfferRef, OfferLookupError> {
+    let failed = |err: anyhow::Error| OfferLookupError::Store(format!("{err:#}"));
+    let provider = match store.resolve_peer(peer).map_err(failed)? {
+        Some(PeerRef::Pals(id)) => id,
+        Some(PeerRef::Plain(_)) => {
+            return Err(OfferLookupError::NotAPeer(format!(
+                "{peer} is a plain A2A agent, which makes no offers"
+            )));
+        }
+        None => {
+            return Err(OfferLookupError::NotAPeer(format!(
+                "unknown peer {peer}: neither a contact nor an agent id"
+            )));
+        }
+    };
+    let offer = store
+        .offer_received(&provider, offer_id)
+        .map_err(failed)?
+        .ok_or(OfferLookupError::Unknown)?;
+    if offer.doc.expired(now_unix) {
+        return Err(OfferLookupError::Expired);
+    }
+    Ok(OfferRef::of(&offer.doc))
 }
 
 /// The media type an attachment is sent with, from its extension;

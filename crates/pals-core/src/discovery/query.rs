@@ -36,8 +36,11 @@
 //!
 //! **Acceptance** ([`accept_offer`]): the one check of an offer received,
 //! which the requester's client runs before it keeps it.
+//!
+//! **Reference** ([`OfferRef`]): how the message of the task names the
+//! offer it was chosen by, for the provider to check it again.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -50,7 +53,9 @@ use crate::benchmark::{
 use crate::card_jws::CardHash;
 use crate::grant::{format_timestamp, parse_timestamp};
 use crate::identity::{AgentId, AgentKey};
-use crate::inventory::{Scope, Section, capability_tag, is_project_name, is_service_id};
+use crate::inventory::{
+    INVENTORY_EXTENSION, Scope, Section, capability_tag, is_project_name, is_service_id,
+};
 use crate::jcs::canonical;
 use crate::signed::{Signed, SignedDoc, SignedError, check_validity};
 
@@ -428,6 +433,56 @@ pub struct BenchmarkRef {
     pub expires_at: String,
 }
 
+/// The message of the `InvalidParams` error a task gets when the offer it
+/// names is not one the provider issued to its requester.
+pub const OFFER_UNKNOWN: &str = "offer_unknown";
+/// ... when the offer it names expired, by the provider's own clock.
+pub const OFFER_EXPIRED: &str = "offer_expired";
+/// ... when what the offer's scope shows changed since it was made: its
+/// card, or the revision of its view.
+pub const OFFER_STALE: &str = "offer_stale";
+
+/// The offer a task was chosen by, as the task's message names it: under
+/// the inventory extension's URI ([`INVENTORY_EXTENSION`]) in
+/// `message.metadata`, `{"offerId", "agentCardHash", "queryId"}`, with
+/// `A2A-Extensions` naming the extension. It reserves nothing and
+/// authorizes nothing: the provider checks the offer again, after the
+/// grant, before the task runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OfferRef {
+    pub offer_id: String,
+    pub agent_card_hash: CardHash,
+    pub query_id: String,
+}
+
+impl OfferRef {
+    /// The reference to `offer`.
+    pub fn of(offer: &ServiceOffer) -> Self {
+        Self {
+            offer_id: offer.offer_id.clone(),
+            agent_card_hash: offer.agent_card_hash.clone(),
+            query_id: offer.query_id.clone(),
+        }
+    }
+
+    /// Its JSON, the value of the metadata entry.
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).expect("an offer reference always serializes")
+    }
+
+    /// The reference `metadata`, a message's, carries: `None` when it names
+    /// no offer, `Some(None)` when its entry is not a reference (unknown
+    /// fields, ids that are no offer or query ids, a hash that is none).
+    pub fn in_metadata(metadata: Option<&HashMap<String, Value>>) -> Option<Option<Self>> {
+        let entry = metadata?.get(INVENTORY_EXTENSION)?;
+        let reference = Self::deserialize(entry)
+            .ok()
+            .filter(|r| is_offer_id(&r.offer_id) && is_offer_id(&r.query_id));
+        Some(reference)
+    }
+}
+
 /// Whether the service can be had now, and on what terms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -541,6 +596,16 @@ impl ServiceOffer {
             limitations: evaluation.limitations,
             benchmark_refs: Vec::new(),
         })
+    }
+}
+
+impl ServiceOffer {
+    /// Whether the offer is expired at `now_unix`, by the clock of whoever
+    /// judges it and without skew: whether it still serves to ask with,
+    /// for its requester, or to run a task with, for its provider. An
+    /// `expires_at` that does not read is expired.
+    pub fn expired(&self, now_unix: i64) -> bool {
+        parse_timestamp(&self.expires_at).is_none_or(|at| now_unix >= at)
     }
 }
 

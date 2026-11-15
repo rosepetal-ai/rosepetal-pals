@@ -279,6 +279,7 @@ impl PalsMcp {
             question: params.question,
             attachments,
             wait,
+            offer: None,
         };
         // A call the client gives up on before the question is kept, as
         // when its timeout comes during a long upload, asks nothing.

@@ -33,14 +33,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::a2a::auth::{Authenticator, JSONRPC_PATH, REST_PATH};
 use crate::a2a::{
-    BindingExecutor, CardSet, GuardedHandler, SqliteTaskStore, echo_extensions, jsonrpc_shim,
-    rest_shim,
+    BindingExecutor, CardSet, GuardedHandler, OfferCheck, SqliteTaskStore, echo_extensions,
+    jsonrpc_shim, rest_shim,
 };
 use crate::blobs::{BLOBS_DIR, BlobService};
 use crate::config::{Config, DataDirLock, WorkerCfg};
 use crate::discovery::{
-    ContactSource, DiscoveryClient, DiscoveryHook, DiscoveryServer, Quotas, Records,
-    announced_capabilities, iroh_contact, renew_on_change,
+    ContactSource, DiscoveryClient, DiscoveryHook, DiscoveryLimits, DiscoveryServer, Quotas,
+    Records, Searcher, announced_capabilities, iroh_contact, renew_on_change,
 };
 use crate::gateway::{self, GatewayParts, GatewayState};
 use crate::inventory::InventoryState;
@@ -74,8 +74,9 @@ const OFFER_RETENTION_S: i64 = 24 * 3600;
 const GATEWAY_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What a node runs with besides its configuration and executor: the clock
-/// its quotas, records and pages follow, the load its offers report, and,
-/// for tests, a hook in its discovery server and other quotas.
+/// its quotas, records, pages and offers follow, the load its offers
+/// report, and, for tests, a hook in its discovery server, other quotas and
+/// other limits for its searches.
 pub struct NodeOptions {
     pub clock: Arc<dyn Clock>,
     /// The worker's load; none for a worker without bounds.
@@ -83,16 +84,22 @@ pub struct NodeOptions {
     /// Awaited before every discovery answer. Tests only.
     pub discovery_hook: Option<Arc<dyn DiscoveryHook>>,
     pub quotas: Quotas,
+    /// The limits of the node's searches instead of those of `[discovery]`,
+    /// beyond its caps: for tests on loaded hosts, which give candidates
+    /// longer than a real search does.
+    pub search_limits: Option<DiscoveryLimits>,
 }
 
 impl Default for NodeOptions {
-    /// The system's clock, no load, no hook and the default quotas.
+    /// The system's clock, no load, no hook, the default quotas and the
+    /// search limits of the configuration.
     fn default() -> Self {
         Self {
             clock: Arc::new(SystemClock),
             load: None,
             discovery_hook: None,
             quotas: Quotas::default(),
+            search_limits: None,
         }
     }
 }
@@ -108,8 +115,11 @@ impl Default for NodeOptions {
 /// scope for `GetExtendedAgentCard` ([`CardSet`]), JSON-RPC at `/jsonrpc`
 /// (behind [`jsonrpc_shim`]) and HTTP+JSON at `/rest` (behind
 /// [`rest_shim`]), both with [`echo_extensions`], behind grant
-/// authentication ([`crate::a2a::auth`]) and the ownership of tasks and
-/// idempotency of messages ([`GuardedHandler`]), on the durable task store.
+/// authentication ([`crate::a2a::auth`]) and the ownership of tasks,
+/// idempotency of messages and the check of the offer a task names
+/// ([`GuardedHandler`], [`OfferCheck`]), on the durable task store. Its
+/// searches for a provider among its contacts ([`Searcher`]) keep the
+/// limits of `[discovery]` for the whole node.
 pub struct Node {
     pub id: AgentId,
     pub store: Arc<Store>,
@@ -121,6 +131,8 @@ pub struct Node {
     discovery: DiscoveryClient,
     /// The questions this agent asks its peers, through its gateway.
     outbox: Outbox,
+    /// The search for a provider among the contacts, through the outbox.
+    searcher: Searcher,
     /// The inventory, as read when the node started.
     inventory: InventoryState,
     /// The agent's cards, signed when the node started.
@@ -248,6 +260,12 @@ impl Node {
         &self.discovery
     }
 
+    /// The search for a provider among this agent's contacts, with the
+    /// limits of `[discovery]` for the whole daemon.
+    pub fn searcher(&self) -> &Searcher {
+        &self.searcher
+    }
+
     /// The agent's cards, signed when the node started.
     pub fn cards(&self) -> &CardSet {
         &self.cards
@@ -290,6 +308,7 @@ impl Node {
             blobs,
             discovery,
             outbox,
+            searcher,
             inventory,
             cards,
             records,
@@ -328,7 +347,7 @@ impl Node {
         }
         blobs.shutdown().await;
         drop((
-            outbox, blobs, peer_http, discovery, inventory, cards, records,
+            searcher, outbox, blobs, peer_http, discovery, inventory, cards, records,
         ));
         tracing::debug!(
             handles = Arc::strong_count(&store),
@@ -490,8 +509,14 @@ impl Opened {
             load,
             discovery_hook,
             quotas,
+            search_limits,
         } = opts;
-        let app = app(cfg, &key, &store, &cards, executor);
+        let offers = OfferCheck {
+            cards: cards.clone(),
+            inventory: inventory.clone(),
+            clock: Arc::clone(&clock),
+        };
+        let app = app(cfg, &key, &store, offers, executor);
         let discovery_server = {
             let ctx = discovery_context(cfg, &key, &store, &inventory, &cards, &records, load);
             let server = DiscoveryServer::new(ctx, quotas, Arc::clone(&clock));
@@ -529,12 +554,15 @@ impl Opened {
                 endpoint,
                 blobs: blobs.clone(),
                 limits: cfg.limits.clone(),
+                discovery_limits: search_limits
+                    .unwrap_or_else(|| DiscoveryLimits::from_config(&cfg.discovery)),
                 data_dir: cfg.data_dir.clone(),
                 download_dir: cfg.mcp.download_dir.clone(),
             },
             gateway_addr,
         );
         let outbox = state.outbox().clone();
+        let searcher = state.searcher().clone();
         let gateway = GatewayServer::start(listener, state);
         let dedup_purge = AbortOnDrop(tokio::spawn(purge_hourly(
             Arc::clone(&store),
@@ -549,6 +577,7 @@ impl Opened {
             blobs,
             discovery,
             outbox,
+            searcher,
             inventory,
             cards,
             records,
@@ -793,14 +822,16 @@ async fn bind_endpoint(cfg: &Config, key: &AgentKey) -> anyhow::Result<Endpoint>
     endpoint.context("cannot bind the Iroh endpoint")
 }
 
-/// The A2A server the node serves to its peers.
+/// The A2A server the node serves to its peers, checking again with
+/// `offers` the offer a task names.
 fn app(
     cfg: &Config,
     key: &Arc<AgentKey>,
     store: &Arc<Store>,
-    cards: &CardSet,
+    offers: OfferCheck,
     executor: impl AgentExecutor,
 ) -> axum::Router {
+    let cards = offers.cards.clone();
     let id = key.id();
     let tasks = SqliteTaskStore::new(Arc::clone(store)).with_events(Arc::clone(key));
     // Each execution is bound to its request before it runs.
@@ -811,11 +842,9 @@ fn app(
     let inner = DefaultRequestHandler::new(executor, tasks)
         .with_capabilities(cards.public().card.capabilities.clone())
         .with_extended_agent_card_resolver(cards.clone());
-    let handler = Arc::new(GuardedHandler::new(
-        inner,
-        Arc::clone(store),
-        Arc::clone(key),
-    ));
+    let handler = Arc::new(
+        GuardedHandler::new(inner, Arc::clone(store), Arc::clone(key)).with_offers(offers),
+    );
     let app = axum::Router::new()
         .merge(agent_card_router(Arc::new(cards.clone())))
         .nest(

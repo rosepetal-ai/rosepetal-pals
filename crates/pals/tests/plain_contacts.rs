@@ -346,6 +346,7 @@ async fn ask_reaches_a_plain_a2a_agent_through_the_gateway() {
             question: "hola".to_owned(),
             attachments: Vec::new(),
             wait: WAIT,
+            offer: None,
         })
         .await
         .expect("the plain agent answers");
@@ -1266,6 +1267,7 @@ async fn grants_are_never_sent_to_a_plain_contact() {
             question: "hola".to_owned(),
             attachments: Vec::new(),
             wait: WAIT,
+            offer: None,
         })
         .await
         .expect("answered");
@@ -1304,6 +1306,7 @@ async fn attachments_to_a_plain_contact_are_refused_locally() {
             question: "hola".to_owned(),
             attachments: vec![file],
             wait: WAIT,
+            offer: None,
         })
         .await;
     assert_eq!(

@@ -53,6 +53,7 @@ use crate::inventory::view::{
 };
 use crate::inventory::{InventorySnapshot, Scope, Section};
 use crate::signed::Signed;
+use crate::store::Store;
 use prost::Message;
 
 /// How long a signed page is served again from the cache: half its life, so
@@ -334,21 +335,43 @@ fn scope_view(
     scope: &Scope,
     now_unix: i64,
 ) -> Result<ScopeView, wire::Error> {
-    let (subjects, reports) = reports_seen(ctx, snapshot, scope)?;
+    view_of(&ctx.store, snapshot, scope, now_unix).map_err(|err| {
+        tracing::warn!(error = %format!("{err:#}"), "cannot read a view's reports or revision");
+        internal()
+    })
+}
+
+/// [`scope_view`] with `store`'s reports and revisions.
+fn view_of(
+    store: &Store,
+    snapshot: &InventorySnapshot,
+    scope: &Scope,
+    now_unix: i64,
+) -> anyhow::Result<ScopeView> {
+    let (subjects, reports) = reports_seen(store, snapshot, scope)?;
     let mut entries = render(snapshot, scope, &INVENTORY_SECTIONS);
     entries.extend(render_benchmarks(&reports, &subjects));
-    let revision = ctx
-        .store
-        .view_revision(&scope.key(), &content_hash(&entries), now_unix)
-        .map_err(|err| {
-            tracing::warn!(error = %format!("{err:#}"), "cannot read a view's revision");
-            internal()
-        })?;
+    let revision = store.view_revision(&scope.key(), &content_hash(&entries), now_unix)?;
     Ok(ScopeView {
         entries,
         reports,
         revision,
     })
+}
+
+/// The revision of `scope`'s view now: what an offer made now would name
+/// as its `inventory_revision`. It is rendered from `snapshot` and the
+/// reports `store` holds as an answer renders it, and it moves whenever
+/// what the scope shows changes, an observation's times included. The one
+/// rule the provider checks an offer again by when the task that names it
+/// arrives.
+pub fn scope_revision(
+    store: &Store,
+    snapshot: &InventorySnapshot,
+    scope: &Scope,
+    now_unix: i64,
+) -> anyhow::Result<u64> {
+    Ok(view_of(store, snapshot, scope, now_unix)?.revision)
 }
 
 /// What `scope` sees of the benchmark reports the agent holds, with the
@@ -360,21 +383,16 @@ fn scope_view(
 /// something the scope shows, or a pair of nodes
 /// ([`crate::benchmark::Subject::shown_among`]).
 ///
-/// `INTERNAL` only when the store cannot be read at all, whatever any one
-/// report is.
+/// An error, which answers `INTERNAL`, only when the store cannot be read
+/// at all, whatever any one report is.
 fn reports_seen(
-    ctx: &DiscoveryContext,
+    store: &Store,
     snapshot: &InventorySnapshot,
     scope: &Scope,
-) -> Result<(Vec<Subject>, Vec<Signed<BenchmarkReport>>), wire::Error> {
+) -> anyhow::Result<(Vec<Subject>, Vec<Signed<BenchmarkReport>>)> {
     let subjects = benchmark_subjects(snapshot, scope);
-    let reports = ctx
-        .store
-        .benchmarks_visible(scope)
-        .map_err(|err| {
-            tracing::warn!(error = %format!("{err:#}"), "cannot read the benchmark reports");
-            internal()
-        })?
+    let reports = store
+        .benchmarks_visible(scope)?
         .into_iter()
         .filter(|report| report.doc.subject.shown_among(&subjects))
         .collect();
@@ -395,7 +413,11 @@ fn get_benchmark_report(
     if viewer.empty || !is_benchmark_id(id) {
         return Err(not_found());
     }
-    let (_, reports) = reports_seen(ctx, &(ctx.inventory)(), &viewer.scope)?;
+    let (_, reports) =
+        reports_seen(&ctx.store, &(ctx.inventory)(), &viewer.scope).map_err(|err| {
+            tracing::warn!(error = %format!("{err:#}"), "cannot read the benchmark reports");
+            internal()
+        })?;
     reports
         .into_iter()
         .find(|report| report.doc.benchmark_id == id)

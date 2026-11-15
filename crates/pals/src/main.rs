@@ -4,8 +4,10 @@
 //! `pals benchmark import|ls` and `pals contact add-a2a` included, opens the
 //! store directly, which a running daemon shares; `pals contact add-a2a`
 //! reads the plain agent's card itself. `pals ask`, `pals task
-//! resume|cancel`, `pals card show <peer>`, `pals inventory get` and `pals
-//! query` reach peers through the running daemon's gateway.
+//! resume|cancel`, `pals card show <peer>`, `pals inventory get`, `pals
+//! query` and `pals discover` reach peers through the running daemon's
+//! gateway; `pals ask --offer` reads the offer it names from the store
+//! first, and sends nothing when it expired.
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -30,12 +32,15 @@ use pals::gateway::plain::{self, fetch_plain_card};
 use pals::inventory::InventoryState;
 use pals::net::agent_id_of;
 use pals::node::{Node, STORE_FILE};
-use pals::outbox::{AskError, AskOutcome, AskRequest, Outbox};
+use pals::outbox::{
+    AskError, AskOutcome, AskRequest, OfferLookupError, Outbox, received_offer_ref,
+};
 use pals_core::benchmark::{BenchmarkReport, MAX_REPORT_BYTES};
 use pals_core::card_jws::{CardSigner, verify_card};
 use pals_core::discovery::query::{
     MAX_QUERY_BYTES, MAX_REPLY_TIMEOUT_MS, QUERY_SCHEMA, Requirements, ServiceQuery, accept_offer,
 };
+use pals_core::discovery::selection::{Coverage, SearchOutcome, SearchRequest, Stage};
 use pals_core::grant::{
     GRANT_SCHEMA, Grant, GrantError, MAX_TOKEN_BYTES, Operation, SignedGrant, format_timestamp,
     parse_timestamp,
@@ -98,6 +103,50 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         attach: Vec<PathBuf>,
         /// How long to wait for the answer: a number and s, m, h or d
+        #[arg(long, default_value = "600s")]
+        wait: String,
+        /// The offer the peer made this agent to name in the question, by
+        /// its id, as `pals discover` printed it; one expired by this
+        /// agent's clock sends nothing and exits 2
+        #[arg(long, value_name = "OFFER_ID")]
+        offer: Option<String>,
+    },
+    /// Search the contacts for a provider of a capability, through the
+    /// running daemon's gateway: verify their cards, ask the PALS peers for
+    /// offers over agentnet-discovery/0, within the limits of [discovery],
+    /// and print the ranking, the candidates discarded and why, the
+    /// coverage and the metrics. Searching runs nothing on any peer. With
+    /// --ask, the question goes to the best candidate that takes it, with
+    /// its offer, and the command exits as `pals ask` does
+    Discover {
+        /// The capability: one of the common vocabulary, as vision.ocr, or
+        /// of its provider's namespace, as example:ocr
+        #[arg(long)]
+        capability: String,
+        /// A media type the provider must accept; repeat for more
+        #[arg(long = "input", value_name = "MIME")]
+        inputs: Vec<String>,
+        /// A media type the provider must produce; repeat for more
+        #[arg(long = "output", value_name = "MIME")]
+        outputs: Vec<String>,
+        /// A JSON file with the requirements: language,
+        /// external_cloud_allowed, required_region and inventory, with its
+        /// required and preferred ids and resources
+        #[arg(long, value_name = "JSON")]
+        requirements_file: Option<PathBuf>,
+        /// The project the task is for: only the contacts that gave this
+        /// agent a grant for it get the inventory ids of the requirements
+        #[arg(long)]
+        project: Option<String>,
+        /// A contact to search among, by name or agent id; repeat for more
+        /// [default: every contact]
+        #[arg(long = "peer", value_name = "PEER")]
+        peers: Vec<String>,
+        /// Ask the best candidate that takes it this question
+        #[arg(long, value_name = "QUESTION")]
+        ask: Option<String>,
+        /// With --ask, how long to wait for the answer: a number and s, m,
+        /// h or d
         #[arg(long, default_value = "600s")]
         wait: String,
     },
@@ -353,7 +402,30 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             question,
             attach,
             wait,
-        } => return ask(&home, peer, question, attach, &wait),
+            offer,
+        } => return ask(&home, peer, question, attach, &wait, offer.as_deref()),
+        Command::Discover {
+            capability,
+            inputs,
+            outputs,
+            requirements_file,
+            project,
+            peers,
+            ask,
+            wait,
+        } => {
+            let search = Searched {
+                asked: Asked {
+                    capability,
+                    inputs,
+                    outputs,
+                    requirements_file,
+                    project,
+                },
+                peers,
+            };
+            return discover(&home, search, ask, &wait);
+        }
         Command::Task(TaskCommand::Ls) => task_ls(&home),
         Command::Task(TaskCommand::Resume { message_id, wait }) => {
             return task_resume(&home, &message_id, &wait);
@@ -814,14 +886,7 @@ struct Asked {
 /// accepted here too ([`accept_offer`]), then `verified: <agent id> <offer
 /// id> <status>`. The query is checked before anything is asked.
 fn query(home: &Path, peer: &str, asked: Asked) -> anyhow::Result<()> {
-    let requirements = match &asked.requirements_file {
-        Some(path) => {
-            let text = fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
-            serde_json::from_slice::<Requirements>(&text)
-                .with_context(|| format!("invalid requirements in {}", path.display()))?
-        }
-        None => Requirements::default(),
-    };
+    let requirements = read_requirements(asked.requirements_file.as_deref())?;
     let query = ServiceQuery {
         schema: QUERY_SCHEMA.to_owned(),
         query_id: new_query_id(),
@@ -872,6 +937,196 @@ fn query(home: &Path, peer: &str, asked: Asked) -> anyhow::Result<()> {
     })
 }
 
+/// The requirements in the JSON file at `path`; none without one.
+fn read_requirements(path: Option<&Path>) -> anyhow::Result<Requirements> {
+    let Some(path) = path else {
+        return Ok(Requirements::default());
+    };
+    let text = fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    serde_json::from_slice::<Requirements>(&text)
+        .with_context(|| format!("invalid requirements in {}", path.display()))
+}
+
+/// What `pals discover` searches for.
+struct Searched {
+    asked: Asked,
+    peers: Vec<String>,
+}
+
+/// The longest answer of the gateway to a search.
+const MAX_SEARCH_ANSWER_BYTES: usize = 4 * 1024 * 1024;
+
+/// Searches the contacts for a provider through the running daemon's
+/// gateway (`POST /discovery/search`) and prints the outcome; with `ask`,
+/// asks the one chosen and exits as `pals ask` does.
+fn discover(
+    home: &Path,
+    searched: Searched,
+    ask: Option<String>,
+    wait: &str,
+) -> anyhow::Result<ExitCode> {
+    let wait = parse_wait(wait)?;
+    let Searched { asked, peers } = searched;
+    let search = SearchRequest {
+        requirements: read_requirements(asked.requirements_file.as_deref())?,
+        capability: asked.capability,
+        input_media_types: asked.inputs,
+        output_media_types: asked.outputs,
+        project: asked.project,
+        peers: (!peers.is_empty()).then_some(peers),
+        ..SearchRequest::default()
+    };
+    let (cfg, key) = load_agent(home)?;
+    let (listen, own) = (cfg.gateway.listen, key.id());
+    runtime(false)?.block_on(async move {
+        this_daemon(listen, &own).await?;
+        let mut body = json!({ "search": search });
+        // A search takes at most a minute; an ask, its wait too.
+        let mut timeout = Duration::from_secs(120);
+        if let Some(question) = &ask {
+            body["ask"] = json!(question);
+            body["wait_s"] = json!(wait.as_secs());
+            timeout += wait;
+        }
+        let (status, _, answer) = gateway_call_within(
+            listen,
+            http::Method::POST,
+            "/discovery/search",
+            Some(&body),
+            timeout,
+            MAX_SEARCH_ANSWER_BYTES,
+        )
+        .await?;
+        let answer = gateway_json(status, &answer)?;
+        if ask.is_none() {
+            print_search(&serde_json::from_value(answer)?);
+            return Ok(ExitCode::SUCCESS);
+        }
+        print_search(&serde_json::from_value(answer["search"].clone())?);
+        if let Some(chosen) = answer.get("chosen") {
+            let peer = shown(chosen["candidate"]["peer"].as_str().unwrap_or_default());
+            print_tried(&chosen["tried"]);
+            println!("asked: {peer}");
+            let outcome: AskOutcome = serde_json::from_value(chosen["outcome"].clone())?;
+            return report(&peer, wait, Ok(outcome));
+        }
+        print_tried(&answer["tried"]);
+        let error = shown(
+            answer["error"]
+                .as_str()
+                .unwrap_or("no candidate took the task"),
+        );
+        if let Some(message_id) = answer["kept"].as_str() {
+            eprintln!(
+                "pals: {error}; the question is kept: `pals task resume {}` tries again",
+                shown(message_id)
+            );
+            return Ok(ExitCode::from(EXIT_NO_OUTCOME));
+        }
+        eprintln!("pals: {error}");
+        Ok(ExitCode::from(EXIT_NOT_COMPLETED))
+    })
+}
+
+/// Prints a search's ranking, its discards with why, its coverage and its
+/// metrics, one line each. What a peer named is printed as printable ASCII.
+fn print_search(outcome: &SearchOutcome) {
+    println!("ranked:");
+    for (n, candidate) in outcome.ranked.iter().enumerate() {
+        let status = candidate.offer.as_ref().map_or_else(
+            || "card only".to_owned(),
+            |offer| match serde_json::to_value(offer.status) {
+                Ok(Value::String(status)) => status,
+                _ => "unknown".to_owned(),
+            },
+        );
+        let time = candidate
+            .offer
+            .as_ref()
+            .and_then(|offer| {
+                offer
+                    .estimated_start_delay_ms?
+                    .checked_add(offer.estimated_duration_ms?)
+            })
+            .map_or_else(|| "unknown".to_owned(), |ms| format!("{ms} ms"));
+        let benchmark = candidate.benchmark.as_ref().map_or_else(
+            || "none".to_owned(),
+            |(kind, value)| format!("{} {value}", shown(kind)),
+        );
+        let who = candidate
+            .agent_id
+            .map_or_else(|| "plain A2A agent".to_owned(), |id| format!("agent {id}"));
+        let grant = match (candidate.agent_id, candidate.grant_held) {
+            (None, _) => "no grant needed",
+            (Some(_), true) => "grant held",
+            (Some(_), false) => "no grant held",
+        };
+        println!(
+            "  {}. {} ({who}): {status}, skill {}, time {time}, preferred met {}, benchmark \
+             {benchmark}, completed {} failed {}, {grant}, card {}",
+            n + 1,
+            shown(&candidate.peer),
+            shown(candidate.skill_id.as_deref().unwrap_or("-")),
+            candidate.preferred_met,
+            candidate.experience.0,
+            candidate.experience.1,
+            shown(&candidate.card_signature.to_string()),
+        );
+    }
+    println!("discarded:");
+    for discarded in &outcome.discarded {
+        let stage = match discarded.stage {
+            Stage::Card => "card",
+            Stage::Offer => "offer",
+        };
+        println!(
+            "  {} ({stage}): {}",
+            shown(&discarded.peer),
+            shown(&discarded.reason)
+        );
+    }
+    match &outcome.coverage {
+        Coverage::Complete => println!("coverage: complete"),
+        Coverage::Partial { reasons } => {
+            let reasons: Vec<String> = reasons.iter().map(|r| shown(r)).collect();
+            println!("coverage: partial ({})", reasons.join(", "));
+        }
+    }
+    let metrics = &outcome.metrics;
+    let first = metrics
+        .time_to_first_valid_ms
+        .map_or_else(|| "none".to_owned(), |ms| format!("{ms} ms"));
+    println!(
+        "metrics: contacted {}, messages {}, bytes sent {}, bytes received {}, first valid \
+         {first}, matching {} us, elapsed {} ms",
+        metrics.contacted,
+        metrics.messages,
+        metrics.bytes_sent,
+        metrics.bytes_received,
+        metrics.matching_us,
+        metrics.elapsed_ms
+    );
+}
+
+/// Prints the candidates asked before the one chosen, and why they did not
+/// take the question: `tried`, a list of `[peer, why]`.
+fn print_tried(tried: &Value) {
+    for pair in tried.as_array().into_iter().flatten() {
+        let (peer, why) = (
+            pair[0].as_str().unwrap_or_default(),
+            pair[1].as_str().unwrap_or_default(),
+        );
+        println!("tried: {}: {}", shown(peer), shown(why));
+    }
+}
+
+/// `text`, which may come from a peer, as printable ASCII.
+fn shown(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .collect()
+}
+
 /// A new query id: `q-` and 16 random hex characters.
 fn new_query_id() -> String {
     let mut random = [0u8; 8];
@@ -914,6 +1169,26 @@ async fn gateway_call(
     body: Option<&Value>,
 ) -> anyhow::Result<(http::StatusCode, http::HeaderMap, Bytes)> {
     const TIMEOUT: Duration = Duration::from_secs(60);
+    gateway_call_within(
+        listen,
+        method,
+        path,
+        body,
+        TIMEOUT,
+        MAX_GATEWAY_ANSWER_BYTES,
+    )
+    .await
+}
+
+/// [`gateway_call`], within `timeout`, its answer read up to `max_bytes`.
+async fn gateway_call_within(
+    listen: SocketAddr,
+    method: http::Method,
+    path: &str,
+    body: Option<&Value>,
+    timeout: Duration,
+    max_bytes: usize,
+) -> anyhow::Result<(http::StatusCode, http::HeaderMap, Bytes)> {
     let exchange = async {
         let stream = tokio::net::TcpStream::connect(listen).await?;
         let (mut sender, connection) =
@@ -933,16 +1208,16 @@ async fn gateway_call(
         };
         let response = sender.send_request(request.body(Full::new(bytes))?).await?;
         let (parts, body) = response.into_parts();
-        let body = Limited::new(body, MAX_GATEWAY_ANSWER_BYTES)
+        let body = Limited::new(body, max_bytes)
             .collect()
             .await
             .map_err(|err| anyhow!("cannot read the gateway's answer: {err}"))?
             .to_bytes();
         Ok((parts.status, parts.headers, body))
     };
-    tokio::time::timeout(TIMEOUT, exchange)
+    tokio::time::timeout(timeout, exchange)
         .await
-        .map_err(|_| anyhow!("the gateway did not answer within {TIMEOUT:?}"))?
+        .map_err(|_| anyhow!("the gateway did not answer within {timeout:?}"))?
 }
 
 fn daemon(home: &Path) -> anyhow::Result<()> {
@@ -1025,8 +1300,29 @@ fn ask(
     question: String,
     attachments: Vec<PathBuf>,
     wait: &str,
+    offer: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     let wait = parse_wait(wait)?;
+    // Looked up by (the peer's agent id, its id): before anything is sent,
+    // and nothing is when it expired, by this agent's clock.
+    let offer = match offer {
+        Some(offer_id) => {
+            let (cfg, key) = load_agent(home)?;
+            let store = open_store(&cfg, &key)?;
+            match received_offer_ref(&store, &peer, offer_id, now_unix()) {
+                Ok(reference) => Some(reference),
+                Err(OfferLookupError::Expired) => {
+                    eprintln!("pals: {}", OfferLookupError::Expired);
+                    return Ok(ExitCode::from(EXIT_NOT_COMPLETED));
+                }
+                Err(OfferLookupError::Unknown) => {
+                    bail!("no offer {offer_id} from {peer}: run pals discover again")
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        None => None,
+    };
     let attachments = attachments
         .iter()
         .map(|path| {
@@ -1038,6 +1334,7 @@ fn ask(
         question,
         attachments,
         wait,
+        offer,
     };
     with_outbox(home, |outbox| async move {
         // At once, so that an interrupted command leaves the id to resume.

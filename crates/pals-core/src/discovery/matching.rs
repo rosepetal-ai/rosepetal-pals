@@ -345,8 +345,20 @@ impl Matcher<'_> {
 /// Unknown when the service declares none.
 fn media(kind: &str, declared: &[String], wanted: &str) -> RequirementResult {
     let name = format!("{kind}:{wanted}");
+    match covers_media(declared, wanted) {
+        None => unknown_result(name, true),
+        Some(true) => result(name, true, Met::Met, Basis::Declared),
+        Some(false) => result(name, true, Met::NotMet, Basis::Declared),
+    }
+}
+
+/// Whether the media types `declared` cover `wanted`: the same type,
+/// `type/*` of its type, or `*/*`, parameters and ASCII case aside; `None`
+/// when none are declared. The one rule for a service's modes and a card
+/// skill's.
+pub fn covers_media(declared: &[String], wanted: &str) -> Option<bool> {
     if declared.is_empty() {
-        return unknown_result(name, true);
+        return None;
     }
     let wanted = essence(wanted);
     let wanted_type = wanted.split_once('/').map(|(kind, _)| kind);
@@ -357,8 +369,7 @@ fn media(kind: &str, declared: &[String], wanted: &str) -> RequirementResult {
                 .strip_suffix("/*")
                 .is_some_and(|kind| Some(kind) == wanted_type)
     });
-    let met = if covered { Met::Met } else { Met::NotMet };
-    result(name, true, met, Basis::Declared)
+    Some(covered)
 }
 
 /// A media type without its parameters, in lowercase.

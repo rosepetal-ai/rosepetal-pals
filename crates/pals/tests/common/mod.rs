@@ -2,9 +2,12 @@
 //! no relay, an echo agent served through the tunnel, a client that goes
 //! through the production `PeerHttp`, complete PALS nodes ([`TestNode`])
 //! with the grants that let them talk to each other, an executor that counts
-//! its runs ([`CountingExecutor`]), nodes whose worker reports a fixed load
-//! ([`spawn_node_with_load`]), peers that speak only the discovery protocol,
-//! as the tests script them ([`stub_discovery_peer`]), stock A2A agents with
+//! its runs and can be gated or made busy ([`CountingExecutor`]), nodes whose
+//! worker reports a fixed load ([`spawn_node_with_load`]) or with their
+//! configuration and options both set ([`spawn_node_in_configured`]), peers
+//! that speak only the discovery protocol, as the tests script them
+//! ([`stub_discovery_peer`]), and serve a signed card too
+//! ([`stub_discovery_peer_with_card`]), stock A2A agents with
 //! no PALS behind them, served over plain HTTP on loopback ([`echo_app_at`],
 //! [`serve_at`]), and a plain HTTP client for a node's loopback gateway
 //! ([`gateway_request`]).
@@ -508,9 +511,21 @@ pub async fn spawn_node_in_with_options(
     executor: impl AgentExecutor,
     opts: NodeOptions,
 ) -> TestNode {
+    spawn_node_in_configured(dir, executor, opts, |_| {}).await
+}
+
+/// [`spawn_node_in_with_options`], with its configuration changed by `edit`
+/// first.
+pub async fn spawn_node_in_configured(
+    dir: tempfile::TempDir,
+    executor: impl AgentExecutor,
+    opts: NodeOptions,
+    edit: impl FnOnce(&mut Config),
+) -> TestNode {
     let downloads = tempfile::tempdir().expect("create a downloads directory");
     let mut cfg = test_config(dir.path(), WorkerCfg::Echo);
     cfg.mcp.download_dir = Some(download_dir_in(&downloads));
+    edit(&mut cfg);
     let node = Node::spawn_with_options(cfg, executor, opts)
         .await
         .expect("spawn the node");
@@ -573,8 +588,10 @@ pub const WORKER_CRASHED: &str = "the worker crashed";
 /// The echo executor, counting how many times it runs, that takes `delay`
 /// between its first event (the task in `WORKING`) and the rest, or, when
 /// [gated](CountingExecutor::gated), waits there until the test
-/// [releases](CountingExecutor::release) it. Clones share the count and the
-/// gate.
+/// [releases](CountingExecutor::release) it; or, [busy while
+/// held](CountingExecutor::busy_while_held), refuses every task while the
+/// test [holds](CountingExecutor::hold) it. Clones share the count, the
+/// gate and the hold.
 #[derive(Clone)]
 pub struct CountingExecutor {
     runs: Arc<AtomicUsize>,
@@ -582,7 +599,13 @@ pub struct CountingExecutor {
     fail: bool,
     /// Closed, it lets every run go on.
     gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// Set, every task is `REJECTED` as `busy` without running.
+    busy: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
+
+/// The reason a [`CountingExecutor::busy_while_held`] refuses with, the
+/// full worker's (`WorkerExecutor`).
+pub const BUSY: &str = "busy";
 
 impl CountingExecutor {
     pub fn new(delay: Duration) -> Self {
@@ -591,6 +614,27 @@ impl CountingExecutor {
             delay,
             fail: false,
             gate: None,
+            busy: None,
+        }
+    }
+
+    /// An executor that, while [held](CountingExecutor::hold), ends every
+    /// task `REJECTED` with the reason [`BUSY`] right after its first event,
+    /// as a worker with every place taken does, without counting a run;
+    /// and, while [released](CountingExecutor::release), as at first,
+    /// completes them.
+    pub fn busy_while_held() -> Self {
+        Self {
+            busy: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            ..Self::new(Duration::ZERO)
+        }
+    }
+
+    /// Makes a [busy while held](CountingExecutor::busy_while_held)
+    /// executor refuse every task from now on.
+    pub fn hold(&self) {
+        if let Some(busy) = &self.busy {
+            busy.store(true, Ordering::SeqCst);
         }
     }
 
@@ -604,10 +648,14 @@ impl CountingExecutor {
     }
 
     /// Lets every run of a [gated](CountingExecutor::gated) executor go on,
-    /// those waiting and those to come.
+    /// those waiting and those to come; makes a [busy while
+    /// held](CountingExecutor::busy_while_held) one take tasks again.
     pub fn release(&self) {
         if let Some(gate) = &self.gate {
             gate.close();
+        }
+        if let Some(busy) = &self.busy {
+            busy.store(false, Ordering::SeqCst);
         }
     }
 
@@ -631,6 +679,32 @@ impl AgentExecutor for CountingExecutor {
         &self,
         ctx: ExecutorContext,
     ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        if self
+            .busy
+            .as_ref()
+            .is_some_and(|busy| busy.load(Ordering::SeqCst))
+        {
+            let (task_id, context_id) = ctx.task_info();
+            let mut reason = a2a::Message::new(a2a::Role::Agent, vec![a2a::Part::text(BUSY)]);
+            reason.task_id = Some(task_id.clone());
+            reason.context_id = Some(context_id.clone());
+            let rejected = StreamResponse::StatusUpdate(a2a::TaskStatusUpdateEvent {
+                task_id,
+                context_id,
+                status: a2a::TaskStatus {
+                    state: a2a::TaskState::Rejected,
+                    message: Some(reason),
+                    timestamp: None,
+                },
+                metadata: None,
+            });
+            return Box::pin(
+                EchoExecutor
+                    .execute(ctx)
+                    .take(1)
+                    .chain(stream::iter([Ok(rejected)])),
+            );
+        }
         self.runs.fetch_add(1, Ordering::SeqCst);
         if self.fail {
             let crashed = Err(A2AError::internal(WORKER_CRASHED));
@@ -907,6 +981,63 @@ pub async fn stub_discovery_peer_with_key(
     key: AgentKey,
     mode: StubMode,
 ) -> StubPeer {
+    spawn_stub(a, name, key, mode, None, true).await
+}
+
+/// What a stub peer serves on the A2A binding: a card, and the hash its
+/// announce record names.
+#[derive(Debug, Clone)]
+pub struct StubCard {
+    /// Served, exactly as given, at `/.well-known/agent-card.json` and at
+    /// `/rest/extendedAgentCard`.
+    pub json: Value,
+    /// The `agent_card_hash` of the stub's announce record.
+    pub announce_hash: pals_core::card_jws::CardHash,
+}
+
+/// The public card of an agent with `key`'s identity and the inventory
+/// `inventory_toml`, signed by `key` as a node signs its own, with the
+/// announce record naming it as a node's does.
+pub fn stub_card(key: &AgentKey, inventory_toml: &str) -> StubCard {
+    let inventory = pals_core::inventory::Inventory::from_toml(inventory_toml)
+        .expect("a valid inventory for the stub");
+    let cfg = test_config(Path::new("/nonexistent-stub"), WorkerCfg::Echo);
+    let signer =
+        pals_core::card_jws::CardSigner::new(Arc::new(AgentKey::from_bytes(&key.to_bytes())));
+    let cards = pals::a2a::CardSet::build(&cfg, &signer, &inventory).expect("sign the stub's card");
+    StubCard {
+        json: cards.public().json.clone(),
+        announce_hash: cards.public().hash.clone(),
+    }
+}
+
+/// A stub peer that serves `agentnet-discovery/0` as `mode` says and, on
+/// the A2A binding, only `card` (public and extended): a candidate a search
+/// reads the card of and then asks. Saved in `a` as contact `name` with its
+/// address, and, when `grant`, with a grant of it to send, read and cancel
+/// tasks that `a` holds, as [`stub_peer`] does.
+pub async fn stub_discovery_peer_with_card(
+    a: &TestNode,
+    name: &str,
+    key: AgentKey,
+    mode: StubMode,
+    card: StubCard,
+    grant: bool,
+) -> StubPeer {
+    spawn_stub(a, name, key, mode, Some(card), grant).await
+}
+
+/// The stub of [`stub_discovery_peer_with_key`], serving `card` on the A2A
+/// binding when given, and only counting and closing connections there
+/// otherwise, with a grant held in `a` when `grant`.
+async fn spawn_stub(
+    a: &TestNode,
+    name: &str,
+    key: AgentKey,
+    mode: StubMode,
+    card: Option<StubCard>,
+    grant: bool,
+) -> StubPeer {
     let endpoint = Endpoint::builder(presets::Minimal)
         .secret_key(SecretKey::from_bytes(&key.to_bytes()))
         .relay_mode(RelayMode::Disabled)
@@ -937,9 +1068,14 @@ pub async fn stub_discovery_peer_with_key(
         schema: ANNOUNCE_SCHEMA.to_owned(),
         agent_id: id,
         seq: 1,
-        agent_card_hash: format!("blake3:{}", "0".repeat(64))
-            .parse()
-            .expect("a card hash"),
+        agent_card_hash: card.as_ref().map_or_else(
+            || {
+                format!("blake3:{}", "0".repeat(64))
+                    .parse()
+                    .expect("a card hash")
+            },
+            |card| card.announce_hash.clone(),
+        ),
         capabilities: Vec::new(),
         discovery_alpn: "agentnet-discovery/0".to_owned(),
         issued_at: format_timestamp(now).expect("a timestamp"),
@@ -968,7 +1104,9 @@ pub async fn stub_discovery_peer_with_key(
         Operation::TaskRead,
         Operation::TaskCancel,
     ];
-    a.hold(&issue_grant(&key, a.id(), id, &ops, now, now + 3600));
+    if grant {
+        a.hold(&issue_grant(&key, a.id(), id, &ops, now, now + 3600));
+    }
     a.node
         .store
         .contact_put(&Contact {
@@ -978,10 +1116,25 @@ pub async fn stub_discovery_peer_with_key(
             added_at: now,
         })
         .expect("save the stub");
-    let router = Router::builder(endpoint)
-        .accept(ALPN_DISCOVERY, discovery)
-        .accept(ALPN_A2A_HTTP, StubRefusal(Arc::clone(&seen)))
-        .spawn();
+    let router = Router::builder(endpoint).accept(ALPN_DISCOVERY, discovery);
+    let router = match card {
+        Some(card) => {
+            let json = Arc::new(card.json);
+            let served = move || {
+                let json = Arc::clone(&json);
+                async move { Json((*json).clone()) }
+            };
+            let app = axum::Router::new()
+                .route("/.well-known/agent-card.json", get(served.clone()))
+                .route("/rest/extendedAgentCard", get(served));
+            router.accept(
+                ALPN_A2A_HTTP,
+                TunnelServer::new(app, TunnelLimits::default()),
+            )
+        }
+        None => router.accept(ALPN_A2A_HTTP, StubRefusal(Arc::clone(&seen))),
+    }
+    .spawn();
     // Its connections come from whoever dials it; this one is its own.
     debug_assert_eq!(agent_id_of(&router.endpoint().id()), id);
     StubPeer {

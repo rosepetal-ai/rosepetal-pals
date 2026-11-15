@@ -602,6 +602,73 @@ async fn offer_references_reports_of_its_service_visible_in_scope() {
     assert!(refs.is_empty());
 }
 
+#[tokio::test]
+async fn client_takes_only_the_report_an_offer_refers_to_as_its_measurer_signed_it() {
+    let b = provider_with(EchoExecutor).await;
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let own = report(
+        &key_in(b.dir.path()),
+        "ocr-own",
+        ocr(),
+        MeasurementKind::OwnMeasurement,
+        DAY,
+    );
+    keep(&b, &own, Visibility::Public);
+    let (_, refs) = refs_offered(&a, &b, "vision.ocr", None).await;
+    assert_eq!(refs, [own.doc.reference()]);
+    let client = a.node.discovery();
+    let (fetched, reply) = client
+        .benchmark_report(&b.id(), b.node.addr(), &refs[0], None, CALL)
+        .await
+        .unwrap();
+    assert_eq!(fetched, own);
+    assert!(reply.bytes_received > 0);
+    // Not the report referred to: another time than the offer said.
+    let mut moved = refs[0].clone();
+    moved.measured_at = format_timestamp(now_unix()).unwrap();
+    let refused = client
+        .benchmark_report(&b.id(), b.node.addr(), &moved, None, CALL)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused,
+        DiscoveryError::Report("not the report the offer refers to")
+    );
+
+    // A peer that answers with what its measurer did not sign, or with
+    // another agent's own measurement as its own.
+    let other = AgentKey::generate();
+    let foreign = report(
+        &other,
+        "ocr-foreign",
+        ocr(),
+        MeasurementKind::OwnMeasurement,
+        DAY,
+    );
+    let mut forged = foreign.clone();
+    forged.doc.results[0].value = 1.0;
+    for (n, (answer, why)) in [
+        (forged.to_json(), "not a report its measurer signed"),
+        (
+            foreign.to_json(),
+            "an own measurement signed by another agent than the peer",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mode = common::StubMode::Answer(std::sync::Arc::new(move |asked| {
+            common::stub_response(asked, response::Result::BenchmarkReport(answer.clone()))
+        }));
+        let stub = common::stub_discovery_peer(&a, &format!("stub{n}"), mode).await;
+        let refused = client
+            .benchmark_report(&stub.id, stub.addr(), &foreign.doc.reference(), None, CALL)
+            .await
+            .unwrap_err();
+        assert_eq!(refused, DiscoveryError::Report(why));
+    }
+}
+
 /// `pals --home <home> <args>`: its exit code, stdout and stderr.
 async fn pals(home: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("pals");

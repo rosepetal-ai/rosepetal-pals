@@ -19,7 +19,9 @@
 //! A service query ([`DiscoveryClient::query`]) gets an offer, which the
 //! client takes only once [`accept_offer`] does (signed by the peer asked,
 //! for this agent, for this query, in force) and keeps
-//! ([`Store::offer_received_put`]).
+//! ([`Store::offer_received_put`]). A benchmark report an offer refers to
+//! ([`DiscoveryClient::benchmark_report`]) is taken only as its measurer
+//! signed it, and only when it is the one referred to.
 //!
 //! [`CLOCK_SKEW_S`]: pals_core::grant::CLOCK_SKEW_S
 
@@ -30,8 +32,11 @@ use std::time::Duration;
 
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt, WriteError};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
+use pals_core::benchmark::{BenchmarkReport, MeasurementKind};
 use pals_core::clock::{Clock, SystemClock};
-use pals_core::discovery::query::{MAX_QUERY_BYTES, OfferError, ServiceOffer, ServiceQuery};
+use pals_core::discovery::query::{
+    BenchmarkRef, MAX_QUERY_BYTES, OfferError, ServiceOffer, ServiceQuery,
+};
 use pals_core::discovery::wire::{self, request, response};
 use pals_core::discovery::{
     ALPN_DISCOVERY, DISCOVERY_VERSION, MAX_ERROR_MESSAGE_BYTES, MAX_REQUEST_FRAME_BYTES,
@@ -94,6 +99,10 @@ pub enum DiscoveryError {
     /// ([`accept_offer`]).
     #[error("the peer's offer is refused: {0}")]
     Offer(OfferError),
+    /// The peer's answer to `GetBenchmarkReport` is no report this agent
+    /// takes ([`DiscoveryClient::benchmark_report`]).
+    #[error("the peer's benchmark report is refused: {0}")]
+    Report(&'static str),
 }
 
 /// Calls peers on `agentnet-discovery/0`. Cloning is cheap, and clones
@@ -236,6 +245,59 @@ impl DiscoveryClient {
                 ))
             }
         }
+    }
+
+    /// Asks `peer`, dialed at the addresses of `addr`, for the benchmark
+    /// report an offer of its refers to as `reference`, presenting `grant`
+    /// when given, within `timeout`; the report, once it verifies, and the
+    /// reply it came in. Nothing is measured to answer: the peer only
+    /// reads a report it holds.
+    ///
+    /// The report is taken only as its measurer signed it
+    /// ([`Signed::from_json`]: the signature of the key of
+    /// `/provenance/measured_by`, under the report's domain, over the report
+    /// as received, at most 64 KiB, one spelling) and only when it is the
+    /// report the offer refers to: the same id, profile, kind of
+    /// measurement and times ([`BenchmarkReport::reference`]). An
+    /// `own_measurement` is the measurer's of itself, so it must be signed
+    /// by `peer`. Anything else is [`DiscoveryError::Report`];
+    /// an answer that is neither a report nor a refusal,
+    /// [`DiscoveryError::Protocol`].
+    pub async fn benchmark_report(
+        &self,
+        peer: &AgentId,
+        addr: EndpointAddr,
+        reference: &BenchmarkRef,
+        grant: Option<&SignedGrant>,
+        timeout: Duration,
+    ) -> Result<(Signed<BenchmarkReport>, Reply), DiscoveryError> {
+        let req = wire::Request {
+            version: DISCOVERY_VERSION,
+            max_response_bytes: 0,
+            grant_token: grant.map(SignedGrant::to_token).unwrap_or_default(),
+            op: Some(request::Op::GetBenchmarkReport(wire::GetBenchmarkReport {
+                benchmark_id: reference.benchmark_id.clone(),
+            })),
+        };
+        let reply = self.call(peer, addr, req, timeout).await?;
+        let Some(response::Result::BenchmarkReport(json)) = &reply.response.result else {
+            return Err(DiscoveryError::Protocol(
+                "an answer to GetBenchmarkReport that is not a report".to_owned(),
+            ));
+        };
+        let report = Signed::<BenchmarkReport>::from_json(json)
+            .map_err(|_| DiscoveryError::Report("not a report its measurer signed"))?;
+        if report.doc.reference() != *reference {
+            return Err(DiscoveryError::Report("not the report the offer refers to"));
+        }
+        if report.doc.measurement_kind == MeasurementKind::OwnMeasurement
+            && report.doc.provenance.measured_by != *peer
+        {
+            return Err(DiscoveryError::Report(
+                "an own measurement signed by another agent than the peer",
+            ));
+        }
+        Ok((report, reply))
     }
 
     /// Closes every cached connection; the next call dials again.

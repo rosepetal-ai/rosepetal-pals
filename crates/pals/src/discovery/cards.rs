@@ -92,13 +92,22 @@ impl PeerCards {
         peer: &AgentId,
         addr: EndpointAddr,
     ) -> Result<VerifiedCard, CardFetchError> {
+        Ok(self.public_sized(peer, addr).await?.0)
+    }
+
+    /// [`PeerCards::public`], with the bytes of the card's body.
+    pub async fn public_sized(
+        &self,
+        peer: &AgentId,
+        addr: EndpointAddr,
+    ) -> Result<(VerifiedCard, u64), CardFetchError> {
         let request = http::Request::get(WELL_KNOWN_CARD)
             .header("a2a-version", A2A_VERSION)
             .body(Body::empty())
             .expect("a valid request");
-        let verified = self.fetch(peer, addr, request).await?;
+        let (verified, size) = self.fetch(peer, addr, request).await?;
         self.keep(peer, PUBLIC_CONTEXT.to_owned(), &verified).await;
-        Ok(verified)
+        Ok((verified, size))
     }
 
     /// The extended card `grant` lets this agent see of `peer`, dialed at
@@ -111,25 +120,35 @@ impl PeerCards {
         addr: EndpointAddr,
         grant: &SignedGrant,
     ) -> Result<VerifiedCard, CardFetchError> {
+        Ok(self.extended_sized(peer, addr, grant).await?.0)
+    }
+
+    /// [`PeerCards::extended`], with the bytes of the card's body.
+    pub async fn extended_sized(
+        &self,
+        peer: &AgentId,
+        addr: EndpointAddr,
+        grant: &SignedGrant,
+    ) -> Result<(VerifiedCard, u64), CardFetchError> {
         let request = http::Request::get(EXTENDED_CARD)
             .header("a2a-version", A2A_VERSION)
             .header(AUTHORIZATION, format!("Bearer {}", grant.to_token()))
             .body(Body::empty())
             .expect("a grant token is a valid header value");
-        let verified = self.fetch(peer, addr, request).await?;
+        let (verified, size) = self.fetch(peer, addr, request).await?;
         let context = format!("grant:{}/{}", grant.grant.issuer, grant.grant.grant_id);
         self.keep(peer, context, &verified).await;
-        Ok(verified)
+        Ok((verified, size))
     }
 
     /// The card `request` gets from `peer`, read up to [`MAX_CARD_BYTES`]
-    /// and verified, within [`CARD_TIMEOUT`].
+    /// and verified, within [`CARD_TIMEOUT`], and the bytes of its body.
     async fn fetch(
         &self,
         peer: &AgentId,
         addr: EndpointAddr,
         request: http::Request<Body>,
-    ) -> Result<VerifiedCard, CardFetchError> {
+    ) -> Result<(VerifiedCard, u64), CardFetchError> {
         let exchange = async {
             let response = self.http.send(addr, request).await?;
             let status = response.status();
@@ -147,7 +166,8 @@ impl PeerCards {
                     }
                 })?
                 .to_bytes();
-            parse_and_verify(&body, peer).map_err(CardFetchError::Invalid)
+            let verified = parse_and_verify(&body, peer).map_err(CardFetchError::Invalid)?;
+            Ok((verified, body.len() as u64))
         };
         tokio::time::timeout(CARD_TIMEOUT, exchange)
             .await

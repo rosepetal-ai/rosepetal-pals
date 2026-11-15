@@ -107,27 +107,9 @@ const URL_RULE: &str = "a plain A2A agent's URL is https://<host>[/<path>]";
 /// Why an `http://` URL to any other host is refused.
 pub const ONLY_LOOPBACK: &str = "http:// is only for 127.0.0.1, [::1] and localhost";
 
-/// What a plain agent's card signature is worth.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum SignatureStatus {
-    /// Verified with the OKP Ed25519 key `kid` of a JWK Set of the
-    /// contact's origin.
-    Verified { kid: String },
-    /// Signed, but not in a way this agent verifies, or not validly.
-    Unverifiable,
-    /// Not signed.
-    Unsigned,
-}
-
-impl std::fmt::Display for SignatureStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Verified { kid } => write!(f, "verified {kid}"),
-            Self::Unverifiable => f.write_str("unverifiable"),
-            Self::Unsigned => f.write_str("unsigned"),
-        }
-    }
-}
+/// What a plain agent's card signature is worth: pals-core's, so that
+/// the selection of providers reads it too.
+pub use pals_core::card_jws::SignatureStatus;
 
 /// A plain agent's card, read and checked.
 #[derive(Debug, Clone, PartialEq)]

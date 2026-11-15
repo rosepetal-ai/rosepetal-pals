@@ -20,7 +20,7 @@ pub use card::{
     IDEMPOTENCY_EXTENSION, SECURITY_SCHEME, SignedCard, canonical_card, extended_card,
     gateway_view, gateway_view_for,
 };
-pub use guard::GuardedHandler;
+pub use guard::{GuardedHandler, OfferCheck};
 pub(crate) use shims::{echo_extensions, jsonrpc_shim, rest_shim};
 pub use task_store::SqliteTaskStore;
 

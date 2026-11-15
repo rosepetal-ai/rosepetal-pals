@@ -14,8 +14,10 @@ use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use serde_json::json;
 
+use pals_core::inventory::INVENTORY_EXTENSION;
+
 use super::IDEMPOTENCY_EXTENSION;
-use super::guard::names_idempotency;
+use super::guard::names_extension;
 
 /// The service parameter that names the client's protocol version.
 const VERSION_HEADER: &str = "a2a-version";
@@ -81,23 +83,30 @@ pub(crate) async fn jsonrpc_shim(mut request: Request, next: Next) -> Response {
 }
 
 /// A layer for both bindings' routers: the response to a request that
-/// activates the [`IDEMPOTENCY_EXTENSION`] lists it in its `A2A-Extensions`
-/// header, the extensions activated for the request, as A2A asks a server
-/// to (SHOULD). The idempotency extension is the only one the agent has.
+/// activates the [`IDEMPOTENCY_EXTENSION`], the [`INVENTORY_EXTENSION`] or
+/// both lists them, in that order, in its `A2A-Extensions` header, the
+/// extensions activated for the request, as A2A asks a server to (SHOULD).
+/// A request that activates only idempotency gets it alone, as in
+/// milestone 1; one that activates neither gets no header.
 pub(crate) async fn echo_extensions(request: Request, next: Next) -> Response {
-    let activated = names_idempotency(
-        request
-            .headers()
-            .get_all(EXTENSIONS_HEADER)
-            .iter()
-            .filter_map(|value| value.to_str().ok()),
-    );
+    let echoed = {
+        let values = || {
+            request
+                .headers()
+                .get_all(EXTENSIONS_HEADER)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+        };
+        let activated: Vec<&'static str> = [IDEMPOTENCY_EXTENSION, INVENTORY_EXTENSION]
+            .into_iter()
+            .filter(|uri| names_extension(values(), uri))
+            .collect();
+        activated.join(", ")
+    };
     let mut response = next.run(request).await;
-    if activated {
-        response.headers_mut().insert(
-            EXTENSIONS_HEADER,
-            HeaderValue::from_static(IDEMPOTENCY_EXTENSION),
-        );
+    if !echoed.is_empty() {
+        let value = HeaderValue::from_str(&echoed).expect("extension URIs are header values");
+        response.headers_mut().insert(EXTENSIONS_HEADER, value);
     }
     response
 }
