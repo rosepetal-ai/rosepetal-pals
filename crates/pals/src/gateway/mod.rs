@@ -110,7 +110,11 @@
 //! encoding of the JSON it checked, a PALS peer's blob URLs the gateway's
 //! ([`rewrite::to_gateway`]; a plain contact's stay as sent, naming nothing
 //! the gateway serves): a body typed `application/json`, an event as
-//! `data: <JSON>` or a bare keepalive. A body refused is `502
+//! `data: <JSON>` or a bare keepalive. An error body (not `2xx`) that is no
+//! JSON goes on as it came, but typed by the gateway, as text
+//! (`text/plain; charset=utf-8`, or `application/octet-stream` when it is
+//! no UTF-8), never as an event stream; a plain contact's is replaced by
+//! the gateway's own ([`plain`]). A body refused is `502
 //! {"error":"peer protocol error"}`; a stream refused ends, broken, before
 //! the event at fault, which never reaches the client.
 
@@ -231,8 +235,10 @@ const JSON: &str = "application/json";
 const A2A_JSON: &str = "application/a2a+json";
 /// The type of every blob the gateway serves, whatever its content.
 const OCTET_STREAM: &str = "application/octet-stream";
-/// Why a plain agent's answer that says [`plain::PLAIN_NOT_SENT`] is
-/// refused.
+/// The type of a peer's error page that is UTF-8 and no JSON.
+const ERROR_PAGE: &str = "text/plain; charset=utf-8";
+/// Why a plain agent's successful answer that says what only the gateway
+/// says ([`plain::forges_not_sent`]) is refused.
 const FORGED_REFUSAL: &str = "an answer that says what only the gateway says";
 /// How long asking a peer for a page of its inventory, or for an offer, may
 /// take, dialing included.
@@ -1256,15 +1262,28 @@ async fn forward_jsonrpc(
 ) -> Response {
     let (parts, body) = request.into_parts();
     let limit = state.inner.limits.max_body_bytes;
-    let bytes = match Limited::new(body, limit).collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(err) if err.downcast_ref::<LengthLimitError>().is_some() => {
-            return error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!("request body larger than {limit} bytes"),
-            );
+    let refused = match Limited::new(body, limit).collect().await {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(err) if err.downcast_ref::<LengthLimitError>().is_some() => Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("request body larger than {limit} bytes"),
+        )),
+        Err(_) => Err((
+            StatusCode::BAD_REQUEST,
+            "cannot read the request body".to_owned(),
+        )),
+    };
+    let bytes = match refused {
+        Ok(bytes) => bytes,
+        // To a plain contact, a JSON-RPC error its client can read.
+        Err((status, message)) => {
+            return match state.resolve(peer).await {
+                Ok(Some(Resolved::Plain(_))) => {
+                    plain::plain_answer(Binding::JsonRpc, None, status, message)
+                }
+                _ => error(status, message),
+            };
         }
-        Err(_) => return error(StatusCode::BAD_REQUEST, "cannot read the request body"),
     };
     if serde_json::from_slice::<Value>(&bytes)
         .is_ok_and(|body| checks::is_extended_card_batch(&body))
@@ -1494,11 +1513,12 @@ impl GatewayState {
             .and_then(|value| value.split(';').next())
             .map(|value| value.trim().to_ascii_lowercase())
             .unwrap_or_default();
+        let plain = matches!(owner, CardOwner::Plain(..));
         if call == Call::Streaming && status.is_success() && media_type == EVENT_STREAM {
             headers.remove(CONTENT_LENGTH);
             headers.insert(CONTENT_TYPE, HeaderValue::from_static(EVENT_STREAM));
-            let blobs_at = matches!(owner, CardOwner::Peer(_)).then(|| self.base_url());
-            return Ok(checked_event_stream(body, blobs_at, binding));
+            let blobs_at = (!plain).then(|| self.base_url());
+            return Ok(checked_event_stream(body, blobs_at, binding, plain));
         }
         let card = call == Call::ExtendedCard;
         let limit = if card {
@@ -1520,14 +1540,32 @@ impl GatewayState {
                     "a successful response that is not JSON".to_owned(),
                 ));
             }
-            // An error a client takes no task id from, or nothing.
+            // Nothing.
+            Err(_) if status.is_success() => return Ok(Body::from(bytes)),
+            // A plain agent's error that is no JSON: never its bytes, which
+            // a client could read otherwise than the gateway does.
+            Err(_) if plain => return Ok(replace_body(headers, binding, status)),
+            // A peer's error page, which no client takes a task id from:
+            // typed by the gateway, never as the peer said, so that no
+            // client reads it as events.
             Err(_) => {
-                if matches!(owner, CardOwner::Plain(..)) && plain::is_forged_refusal(&bytes) {
-                    return Err(TunnelError::Protocol(FORGED_REFUSAL.to_owned()));
-                }
+                let text_type = if std::str::from_utf8(&bytes).is_ok() {
+                    HeaderValue::from_static(ERROR_PAGE)
+                } else {
+                    HeaderValue::from_static(OCTET_STREAM)
+                };
+                headers.insert(CONTENT_TYPE, text_type);
+                headers.insert(CONTENT_LENGTH, HeaderValue::from(bytes.len()));
                 return Ok(Body::from(bytes));
             }
         };
+        // What only the gateway says, a plain agent never does.
+        if plain && plain::forges_not_sent(&value) {
+            if status.is_success() {
+                return Err(TunnelError::Protocol(FORGED_REFUSAL.to_owned()));
+            }
+            return Ok(replace_body(headers, binding, status));
+        }
         let card_hash = if card && status.is_success() {
             checks::extended_card_view(&mut value, binding, owner, &self.base_url())
                 .map_err(TunnelError::Protocol)?
@@ -1542,9 +1580,6 @@ impl GatewayState {
             rewrite::rewrite_to_gateway(&mut value, &self.base_url());
         }
         let bytes = checks::ascii_json(&value);
-        if matches!(owner, CardOwner::Plain(..)) && plain::is_forged_refusal(&bytes) {
-            return Err(TunnelError::Protocol(FORGED_REFUSAL.to_owned()));
-        }
         let json_type = if media_type == A2A_JSON {
             A2A_JSON
         } else {
@@ -1558,6 +1593,16 @@ impl GatewayState {
         }
         Ok(Body::from(bytes))
     }
+}
+
+/// The body that stands for a plain agent's answer of `status` on
+/// `binding` that the gateway does not pass on
+/// ([`plain::replaced_body`]), with `headers` typed and sized for it.
+fn replace_body(headers: &mut HeaderMap, binding: Binding, status: StatusCode) -> Body {
+    let body = plain::replaced_body(binding, status);
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(JSON));
+    headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
+    Body::from(body)
 }
 
 /// Sets the hash and size of `blob` as the metadata of `part`, a file part.
@@ -1581,7 +1626,12 @@ fn declare(part: &mut Map<String, Value>, blob: &BlobRef) {
 /// event the peer's stream ends in the middle of, before its empty line,
 /// is no event: SSE discards it, and so does the gateway, ending the stream
 /// as the peer did.
-fn checked_event_stream(body: Body, blobs_at: Option<String>, binding: Binding) -> Body {
+fn checked_event_stream(
+    body: Body,
+    blobs_at: Option<String>,
+    binding: Binding,
+    plain: bool,
+) -> Body {
     struct Events {
         body: BodyDataStream,
         framer: EventFramer,
@@ -1592,11 +1642,14 @@ fn checked_event_stream(body: Body, blobs_at: Option<String>, binding: Binding) 
         /// The gateway whose blob URLs the events' become, when they do.
         blobs_at: Option<String>,
         binding: Binding,
+        /// A plain agent's: an event that says what only the gateway says
+        /// is refused.
+        plain: bool,
     }
     impl Events {
         /// `event`, checked and rebuilt, or the end of this stream.
         async fn send(self, event: &[u8]) -> Option<(io::Result<Bytes>, Self)> {
-            match checks::check_event(event, self.blobs_at.as_deref(), self.binding) {
+            match checks::check_event(event, self.blobs_at.as_deref(), self.binding, self.plain) {
                 Ok(checked) => Some((Ok(checked), self)),
                 Err(why) => self.fail(why).await,
             }
@@ -1620,6 +1673,7 @@ fn checked_event_stream(body: Body, blobs_at: Option<String>, binding: Binding) 
         done: false,
         blobs_at,
         binding,
+        plain,
     };
     let stream = futures::stream::unfold(events, |mut events| async move {
         loop {
@@ -2128,7 +2182,8 @@ mod tests {
         let (wire, local) = blob_urls(base);
         let event = |url: &str| json!({"result": {"artifact": {"parts": [{"url": url}]}}});
         let sent = format!("event: message\r\nid: 7\r\ndata:{}\r\n\r\n", event(&wire));
-        let checked = checks::check_event(sent.as_bytes(), Some(base), Binding::JsonRpc).unwrap();
+        let checked =
+            checks::check_event(sent.as_bytes(), Some(base), Binding::JsonRpc, false).unwrap();
         assert_eq!(
             String::from_utf8(checked.to_vec()).unwrap(),
             format!("data: {}\n\n", event(&local))
@@ -2139,6 +2194,7 @@ mod tests {
             format!("data: {text}\n\n").as_bytes(),
             Some(base),
             Binding::JsonRpc,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -2159,6 +2215,7 @@ mod tests {
             body,
             Some("http://127.0.0.1:7420".to_owned()),
             Binding::Rest,
+            false,
         )
         .into_data_stream();
         let mut received = Vec::new();

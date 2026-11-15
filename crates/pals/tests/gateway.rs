@@ -905,7 +905,8 @@ async fn browser_requests_are_403_and_every_response_is_sandboxed() {
     assert_sandboxed(&res, "a peer's page");
     let res = gateway_request(&gw, "GET", "/peers/mallory/rest/error-page", &[], None).await;
     assert_eq!(res.status, 404, "{}", String::from_utf8_lossy(&res.body));
-    assert_eq!(res.header("content-type"), "text/html");
+    // Typed by the gateway, as text, whatever the peer said.
+    assert_eq!(res.header("content-type"), "text/plain; charset=utf-8");
     assert_sandboxed(&res, "a peer's error page");
 }
 

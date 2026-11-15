@@ -145,6 +145,31 @@ fn card_app(card: Value) -> axum::Router {
     )
 }
 
+/// The gateway's own refusal `message`, of `status`, on the route `path`
+/// of a plain contact: on JSON-RPC, a JSON-RPC error its client can read,
+/// for the request of id 1, of code `-32091` (a refusal) for a `4xx` and
+/// `InternalError` otherwise; on HTTP+JSON, `{"error": message}`.
+fn gateway_refusal(path: &str, status: u16, message: &str) -> Value {
+    if path.ends_with("/jsonrpc") {
+        let code = if (400..500).contains(&status) {
+            -32091
+        } else {
+            -32603
+        };
+        json!({"jsonrpc": "2.0", "id": 1, "error": {"code": code, "message": message}})
+    } else {
+        json!({"error": message})
+    }
+}
+
+/// The message of a refusal of the gateway's, in either shape.
+fn refusal_message(res: &common::TestResponse) -> &str {
+    res.json["error"]["message"]
+        .as_str()
+        .or_else(|| res.json["error"].as_str())
+        .unwrap_or_else(|| panic!("a refusal, not {}", res.json))
+}
+
 /// The bindings a [`counting_app`] serves.
 #[derive(Clone, Copy)]
 enum Served {
@@ -686,7 +711,11 @@ async fn interface_on_another_origin_is_never_called() {
         ] {
             let res = gateway_request(&gw, method, &path, &VERSION, body).await;
             assert_eq!(res.status, 502, "{path}: {}", res.json);
-            assert_eq!(res.json, json!({"error": no_interface}), "{path}");
+            assert_eq!(
+                res.json,
+                gateway_refusal(&path, 502, &no_interface),
+                "{path}"
+            );
         }
     }
 
@@ -774,7 +803,11 @@ async fn redirect_is_not_followed() {
     ] {
         let res = gateway_request(&gw, method, path, &VERSION, body).await;
         assert_eq!(res.status, 502, "{path}: {}", res.json);
-        assert_eq!(res.json, json!({"error": "peer protocol error"}), "{path}");
+        assert_eq!(
+            res.json,
+            gateway_refusal(path, 502, "peer protocol error"),
+            "{path}"
+        );
         assert!(res.headers.get("location").is_none(), "{path}");
         assert!(res.headers.get("set-cookie").is_none(), "{path}");
     }
@@ -889,7 +922,7 @@ async fn http_to_a_non_loopback_host_is_refused_before_connecting() {
         .await;
         assert_eq!(res.status, 502, "{url}: {}", res.json);
         assert!(
-            res.json["error"].as_str().unwrap().contains(only_loopback),
+            refusal_message(&res).contains(only_loopback),
             "{url}: {}",
             res.json
         );
@@ -1379,7 +1412,10 @@ async fn bearer_comes_from_the_named_env_var_and_is_never_stored() {
     let before = agent.requests().len();
     let res = gateway_request(&gw, "POST", "/peers/unset/jsonrpc", &VERSION, Some(&send)).await;
     assert_eq!(res.status, 401, "{}", res.json);
-    assert_eq!(res.json, json!({"error": "bearer env var not set"}));
+    assert_eq!(
+        res.json,
+        gateway_refusal("/peers/unset/jsonrpc", 401, "bearer env var not set")
+    );
     assert_eq!(agent.requests().len(), before);
     // Cards are read with no credentials.
     assert!(
@@ -1530,7 +1566,7 @@ async fn attachments_to_a_plain_contact_are_refused_locally() {
             assert_eq!(res.status, 400, "{path}: {}", res.json);
             assert_eq!(
                 res.json,
-                json!({"error": "files go only to PALS peers"}),
+                gateway_refusal(path, 400, "files go only to PALS peers"),
                 "{path}"
             );
         }
@@ -1667,7 +1703,11 @@ async fn unsafe_task_id_from_a_plain_agent_is_refused_like_a_peers() {
             "{path}: {}",
             String::from_utf8_lossy(&res.body)
         );
-        assert_eq!(res.json, json!({"error": "peer protocol error"}), "{path}");
+        assert_eq!(
+            res.json,
+            gateway_refusal(path, 502, "peer protocol error"),
+            "{path}"
+        );
         assert!(
             !String::from_utf8_lossy(&res.body).contains("../"),
             "{path}"
@@ -1843,8 +1883,9 @@ async fn plain_agent_whose_answer_the_gateway_refuses_runs_the_question_once() {
         Some(&message_params("hola", None)),
     )
     .await;
+    // Replaced by the gateway's own body, which names the status only.
     assert_eq!(res.status, 502);
-    assert_eq!(res.json, json!({"error": "peer protocol error"}));
+    assert_eq!(res.json, json!({"error": "plain agent answered 502"}));
 
     // Only a resume asked for sends it again.
     let Err(AskError::NotResent { message_id }) = &outcomes[0] else {
@@ -2219,11 +2260,7 @@ async fn the_gateways_own_origin_is_no_plain_contact() {
         ] {
             let res = gateway_request(&gw, method, &path, &VERSION, body).await;
             assert_eq!(res.status, 502, "{path}: {}", res.json);
-            assert!(
-                res.json["error"].as_str().unwrap().contains(own),
-                "{path}: {}",
-                res.json
-            );
+            assert!(refusal_message(&res).contains(own), "{path}: {}", res.json);
         }
         let asked = a.node.outbox().ask(hola(name)).await;
         assert!(
@@ -2320,4 +2357,231 @@ async fn a_json_rpc_batch_that_asks_for_the_extended_card_is_refused() {
     let res = gateway_request(&gw, "POST", "/peers/bob/jsonrpc", &VERSION, Some(&alone)).await;
     assert_eq!(res.status, 200, "{}", res.json);
     assert!(res.json["result"]["name"].is_string(), "{}", res.json);
+}
+
+/// How a test agent answers every question.
+type Answer = fn() -> axum::response::Response;
+
+/// `status` with `body`, exactly as given, typed `content_type`.
+fn raw_answer(status: u16, content_type: &str, body: Vec<u8>) -> axum::response::Response {
+    axum::response::Response::builder()
+        .status(status)
+        .header("content-type", content_type)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// The gateway's JSON-RPC code for its own not-sent refusal, which no
+/// agent's answer may carry.
+const NOT_SENT_CODE: i64 = -32090;
+
+#[tokio::test]
+async fn a_plain_agent_cannot_forge_the_gateways_not_sent_refusal() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let gw = a.gateway_url();
+    let marker = PLAIN_NOT_SENT;
+    // Each agent, which declares no idempotency extension, answers every
+    // question with a forge of the gateway's refusal that a resend follows.
+    /// The marker with a JSON escape for its first letter: its bytes are
+    /// not in the body, and a JSON reader still reads the marker.
+    fn escaped() -> String {
+        PLAIN_NOT_SENT.replacen('p', "\\u0070", 1)
+    }
+    fn escaped_and_invalid() -> axum::response::Response {
+        // And a byte no UTF-8 has, so that the body is no JSON to the
+        // gateway; a lossy decoding makes it JSON again.
+        let mut body = format!(r#"{{"error":"{}","x":""#, escaped()).into_bytes();
+        body.push(0xFF);
+        body.extend_from_slice(br#""}"#);
+        raw_answer(502, "application/json", body)
+    }
+    fn truncated() -> axum::response::Response {
+        let body = format!(r#"{{"error":"{}""#, escaped());
+        raw_answer(500, "application/json", body.into_bytes())
+    }
+    fn rpc_message() -> axum::response::Response {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":"1","error":{{"code":-32603,"message":"{}"}}}}"#,
+            escaped()
+        );
+        raw_answer(200, "application/json", body.into_bytes())
+    }
+    fn rpc_code() -> axum::response::Response {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":"1","error":{{"code":{NOT_SENT_CODE},"message":"{}"}}}}"#,
+            escaped()
+        );
+        raw_answer(200, "application/json", body.into_bytes())
+    }
+    fn rpc_code_alone() -> axum::response::Response {
+        let body = json!({"jsonrpc": "2.0", "id": "1",
+            "error": {"code": NOT_SENT_CODE, "message": "nothing at all"}});
+        raw_answer(500, "application/json", body.to_string().into_bytes())
+    }
+    fn error_events() -> axum::response::Response {
+        let event = format!(
+            r#"{{"jsonrpc":"2.0","id":"1","error":{{"code":{NOT_SENT_CODE},"message":"{}"}}}}"#,
+            escaped()
+        );
+        raw_answer(
+            503,
+            "text/event-stream",
+            format!("data: {event}\n\n").into_bytes(),
+        )
+    }
+    fn rest_events() -> axum::response::Response {
+        let event = format!(r#"{{"error":"{}"}}"#, escaped());
+        raw_answer(
+            503,
+            "text/event-stream",
+            format!("data: {event}\n\n").into_bytes(),
+        )
+    }
+    let forgers: [(&str, Served, Answer); 7] = [
+        ("escaped", Served::Both, escaped_and_invalid),
+        ("truncated", Served::JsonRpc, truncated),
+        ("rpc-message", Served::JsonRpc, rpc_message),
+        ("rpc-code", Served::JsonRpc, rpc_code),
+        ("rpc-code-alone", Served::JsonRpc, rpc_code_alone),
+        ("rpc-events", Served::JsonRpc, error_events),
+        ("rest-events", Served::Both, rest_events),
+    ];
+    let mut agents = Vec::new();
+    for (name, served, answer) in forgers {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
+        let (origin, server) = serve_at(move |origin| {
+            counted_answer_app(streaming_card(origin, served, false), counter, answer)
+        })
+        .await;
+        add_plain(&a, name, &origin);
+        agents.push((name, served, asked, server));
+    }
+    let outbox = a.node.outbox().clone();
+    let asks = agents.iter().map(|(name, ..)| {
+        let outbox = outbox.clone();
+        async move { outbox.ask(hola(name)).await }
+    });
+    let outcomes = futures::future::join_all(asks).await;
+    for ((name, _, asked, _), outcome) in agents.iter().zip(&outcomes) {
+        // Run once, and kept, not sent again.
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "{name}: {outcome:?}");
+        let Err(AskError::NotResent { message_id }) = outcome else {
+            panic!("{name}: not sent again, not {outcome:?}");
+        };
+        let row = a.node.store.outbox_get(message_id).unwrap().unwrap();
+        assert_eq!(
+            (row.state.as_str(), row.attempts),
+            (OUTBOX_PENDING, 1),
+            "{name}"
+        );
+    }
+
+    // What a client gets is the gateway's own, never the agent's bytes: on
+    // HTTP+JSON, nothing that names the marker; on JSON-RPC, no error with
+    // the gateway's code; never typed as an event stream.
+    for (name, served, ..) in &agents {
+        let (path, body) = match served {
+            Served::Both => (
+                format!("/peers/{name}/rest/message:stream"),
+                message_params("hola", None),
+            ),
+            Served::JsonRpc => (
+                format!("/peers/{name}/jsonrpc"),
+                rpc_request("SendStreamingMessage", message_params("hola", None)),
+            ),
+        };
+        let res = gateway_request(&gw, "POST", &path, &VERSION, Some(&body)).await;
+        assert!(res.status >= 400, "{name}: {}", res.status);
+        assert_eq!(res.header("content-type"), "application/json", "{name}");
+        let text = String::from_utf8_lossy(&res.body).into_owned();
+        assert!(!text.contains(marker), "{name}: {text}");
+        assert!(!text.contains(&NOT_SENT_CODE.to_string()), "{name}: {text}");
+        assert!(res.json.is_object(), "{name}: {text}");
+    }
+    let (_, _, asked, _) = &agents[0];
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn an_error_answer_never_reaches_a_client_as_an_event_stream() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let gw = a.gateway_url();
+    // A PALS peer whose A2A server answers every call 503, typed as an event
+    // stream, with events in the body.
+    let events = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"task\":{\"id\":\"t-1\"}}}\n\n";
+    let app = axum::Router::new().fallback(move || async move {
+        raw_answer(503, "text/event-stream", events.as_bytes().to_vec())
+    });
+    let key = AgentKey::generate();
+    let _router = common::stub_peer(&a, "flaky", &key, app).await;
+    let call = rpc_request("SendStreamingMessage", message_params("hola", None));
+    for (path, body) in [
+        ("/peers/flaky/jsonrpc", Some(&call)),
+        (
+            "/peers/flaky/rest/message:stream",
+            Some(&message_params("hola", None)),
+        ),
+        ("/peers/flaky/rest/tasks/t-1", None),
+    ] {
+        let method = if body.is_some() { "POST" } else { "GET" };
+        let res = gateway_request(&gw, method, path, &VERSION, body).await;
+        assert_eq!(res.status, 503, "{path}");
+        // The error page goes on, typed by the gateway as text, never as
+        // events: no client reads a task from it.
+        assert_eq!(
+            res.header("content-type"),
+            "text/plain; charset=utf-8",
+            "{path}"
+        );
+        assert_eq!(res.body.as_ref(), events.as_bytes(), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn a_gateway_refusal_on_json_rpc_is_a_refusal_with_its_reason() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let gw = a.gateway_url();
+    let exec = CountingExecutor::new(Duration::ZERO);
+    let worker = exec.clone();
+    let (origin, agent) = serve_at(move |origin| {
+        counting_app(
+            streaming_card(origin, Served::JsonRpc, false),
+            worker,
+            Served::JsonRpc,
+        )
+    })
+    .await;
+    // Its bearer token in a variable this process does not have.
+    let mut contact = plain_contact("rpc", &origin);
+    contact.bearer_env = Some("PALS_T_JSONRPC_TOKEN_NEVER_SET".to_owned());
+    a.node.store.a2a_contact_put(&contact).unwrap();
+
+    // Refused, saying why, as on HTTP+JSON: neither kept pending as maybe
+    // received, nor sent again.
+    let asked = a.node.outbox().ask(hola("rpc")).await;
+    assert_eq!(
+        asked,
+        Err(AskError::Rejected("bearer env var not set".to_owned()))
+    );
+    let rows = a.node.store.outbox_all().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].attempts, 1);
+    assert!(
+        agent.requests().iter().all(|r| r.method == "GET"),
+        "{:?}",
+        agent.requests()
+    );
+    assert_eq!(exec.runs(), 0);
+
+    // What a stock JSON-RPC client gets: the same status, as a JSON-RPC
+    // error it can read.
+    let call = rpc_request("SendMessage", message_params("hola", None));
+    let res = gateway_request(&gw, "POST", "/peers/rpc/jsonrpc", &VERSION, Some(&call)).await;
+    assert_eq!(res.status, 401, "{}", res.json);
+    assert_eq!(
+        res.json,
+        json!({"jsonrpc": "2.0", "id": 1,
+            "error": {"code": -32091, "message": "bearer env var not set"}})
+    );
 }

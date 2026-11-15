@@ -49,19 +49,26 @@
 //! question goes again on its own only when it certainly never reached the
 //! agent: the gateway could not be reached, its connection never made
 //! (the route's own client, which keeps no connection, sees it), or the
-//! gateway answered its own `502` [`PLAIN_NOT_SENT`], that it could not
-//! reach the agent and sent it nothing, which it never lets an agent's
-//! answer say. On the JSON-RPC binding, whose client reads no HTTP status,
-//! that refusal is known by the client's message quoting it. Any other
-//! failure on the way then (every refusal of the agent's answer by the
-//! gateway, an unsafe task id, a `2xx` that is not JSON, an event too
-//! large or a `Content-Encoding`; a `5xx`; an `InternalError`; a stream
-//! broken after the question left) leaves the row pending, and the ask
-//! fails with [`AskError::NotResent`], [`PLAIN_NOT_RESENT`]: only
-//! [`Outbox::resume`], asked for, sends it again. Once the task is known,
-//! reading and following it are retried as for a peer. These messages are
-//! the pinned client's (`HTTP request failed: …`, `HTTP <status>: <body>`,
-//! `failed to parse JSON-RPC response: …`), to check again on an upgrade.
+//! gateway answered exactly its own [`PLAIN_NOT_SENT`], that it could not
+//! reach the agent and sent it nothing. Exactly: on HTTP+JSON, the client's
+//! `HTTP 502 Bad Gateway: ` and then [`NOT_SENT_BODY`], byte for byte; on
+//! JSON-RPC, whose client reads no HTTP status, the JSON-RPC error of code
+//! [`NOT_SENT_CODE`] with that message. The gateway never lets a plain
+//! agent's answer be either (`crate::gateway::plain`): it replaces an
+//! error body that is no JSON, and any answer whose strings say that text
+//! or that carries that code. Any other failure on the way then (every
+//! refusal of the agent's answer by the gateway, an unsafe task id, a `2xx`
+//! that is not JSON, an event too large or a `Content-Encoding`; a `5xx`;
+//! an `InternalError`; a stream broken after the question left) leaves the
+//! row pending, and the ask fails with [`AskError::NotResent`],
+//! [`PLAIN_NOT_RESENT`]: only [`Outbox::resume`], asked for, sends it
+//! again. The gateway's own refusals before sending (a `4xx`, such as
+//! `bearer env var not set`) are refusals on both bindings: on JSON-RPC
+//! they come as JSON-RPC errors of their own code, and the ask is
+//! [`AskError::Rejected`] with the gateway's reason. Once the task is
+//! known, reading and following it are retried as for a peer. The client's
+//! messages read here are the pinned client's (`HTTP request failed: …`,
+//! `HTTP <status>: <body>`), to check again on an upgrade.
 //!
 //! An ask ends when its task does (`COMPLETED`, `FAILED`, `CANCELED`,
 //! `REJECTED`) or waits for the requester (`INPUT_REQUIRED`,
@@ -121,7 +128,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::a2a::{IDEMPOTENCY_EXTENSION, is_safe_task_id};
-use crate::gateway::plain::{PLAIN_NOT_SENT, path_segment};
+use crate::gateway::plain::{NOT_SENT_BODY, NOT_SENT_CODE, PLAIN_NOT_SENT, path_segment};
 use crate::gateway::serves_tasks;
 use crate::path_policy::open_attachment;
 
@@ -155,9 +162,9 @@ pub const PLAIN_NOT_RESENT: &str = "the plain A2A agent may have received the qu
     is not sent again on its own, since the agent may run every copy that reaches it";
 /// How the pinned client's message for a request it could not send begins.
 const REQUEST_FAILED: &str = "HTTP request failed: ";
-/// How the pinned client's JSON-RPC message for a body that is no JSON-RPC
-/// response, such as the gateway's own refusal, begins.
-const JSONRPC_UNREAD: &str = "failed to parse JSON-RPC response: ";
+/// How the pinned client's HTTP+JSON message for the gateway's `502`
+/// begins, before its body.
+const NOT_SENT_STATUS: &str = "HTTP 502 Bad Gateway: ";
 
 type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 type Client = A2AClient<Box<dyn Transport>>;
@@ -877,8 +884,9 @@ impl Outbox {
     /// tasks in the scope of the offer `request` names, as the offer this
     /// agent keeps says it ([`Store::offer_received`]); none when it keeps
     /// no such offer any more (expired and purged: a retry of a request
-    /// that ran attaches whatever grant it presents) or holds no such grant
-    /// (the provider then refuses the offer as `offer_stale`).
+    /// that ran attaches whatever grant it presents) or holds no such grant:
+    /// an offer of another scope than a task's, the public one among them,
+    /// the provider never keeps, and refuses as `offer_unknown`.
     async fn offer_grant(
         &self,
         peer: &PeerRef,
@@ -1007,10 +1015,10 @@ impl Route {
     /// Whether `err`, the pinned client's error for the send just made,
     /// says that the question certainly never reached the agent: the
     /// client could not send the request and could make no connection to
-    /// the gateway, or the gateway's answer is its own
-    /// [`PLAIN_NOT_SENT`], which it never lets an agent's answer carry
-    /// (`crate::gateway::plain`). Never for [`Resend::OnTheWay`], which
-    /// does not need to know.
+    /// the gateway, or the gateway's answer is exactly its own
+    /// [`PLAIN_NOT_SENT`] ([`is_not_sent`]), which no answer of an agent's
+    /// can be (`crate::gateway::plain`). Never for [`Resend::OnTheWay`],
+    /// which does not need to know.
     fn never_sent(&self, err: &A2AError) -> bool {
         let Resend::OnlyUnsent {
             jsonrpc,
@@ -1019,28 +1027,31 @@ impl Route {
         else {
             return false;
         };
-        if err.code != error_code::INTERNAL_ERROR {
-            return false;
-        }
-        if err.message.starts_with(REQUEST_FAILED) && no_connection.load(Ordering::SeqCst) {
+        if err.code == error_code::INTERNAL_ERROR
+            && err.message.starts_with(REQUEST_FAILED)
+            && no_connection.load(Ordering::SeqCst)
+        {
             return true;
         }
-        says_not_sent(&err.message, *jsonrpc)
+        is_not_sent(err, *jsonrpc)
     }
 }
 
-/// Whether `message`, of the pinned client's `InternalError` for a send on
-/// the JSON-RPC binding (`jsonrpc`) or on HTTP+JSON, is the gateway's
-/// `502` [`PLAIN_NOT_SENT`]: on HTTP+JSON, `HTTP 502 Bad Gateway: <body>`
-/// with that `error`; on JSON-RPC, whose client reads no HTTP status, the
-/// body that is no JSON-RPC response, `{"error": <that text>}`, which its
-/// message quotes.
-fn says_not_sent(message: &str, jsonrpc: bool) -> bool {
+/// Whether `err`, the pinned client's error for a call on the JSON-RPC
+/// binding (`jsonrpc`) or on HTTP+JSON, is exactly the gateway's
+/// [`PLAIN_NOT_SENT`], nothing more and nothing less: on HTTP+JSON, the
+/// `InternalError` `HTTP 502 Bad Gateway: ` followed by [`NOT_SENT_BODY`],
+/// byte for byte; on JSON-RPC, whose client reads no HTTP status, the
+/// JSON-RPC error of code [`NOT_SENT_CODE`] with that very message.
+fn is_not_sent(err: &A2AError, jsonrpc: bool) -> bool {
     if jsonrpc {
-        message.starts_with(JSONRPC_UNREAD) && message.contains(&format!("{PLAIN_NOT_SENT:?}"))
+        err.code == NOT_SENT_CODE && err.message == PLAIN_NOT_SENT
     } else {
-        http_failure(message)
-            .is_some_and(|(status, reason)| status == 502 && reason == PLAIN_NOT_SENT)
+        err.code == error_code::INTERNAL_ERROR
+            && err
+                .message
+                .strip_prefix(NOT_SENT_STATUS)
+                .is_some_and(|body| body == NOT_SENT_BODY)
     }
 }
 
@@ -1175,6 +1186,10 @@ impl Failure {
     /// and `429` is a refusal. Every other `InternalError` (no connection,
     /// a broken stream, a server error) is on the way.
     fn of(err: &A2AError) -> Self {
+        // The gateway's own word, on JSON-RPC, that nothing was sent.
+        if is_not_sent(err, true) {
+            return Self::Transport(err.message.clone());
+        }
         if err.code != error_code::INTERNAL_ERROR {
             return Self::Refused(err.message.clone());
         }
@@ -1551,26 +1566,52 @@ mod tests {
     }
 
     #[test]
-    fn only_the_gateways_own_refusal_says_nothing_was_sent() {
-        let rest = format!(r#"HTTP 502 Bad Gateway: {{"error":"{PLAIN_NOT_SENT}"}}"#);
-        assert!(says_not_sent(&rest, false));
-        assert!(!says_not_sent(&rest, true));
-        // As the JSON-RPC client quotes a body that is no JSON-RPC response.
-        let rpc = format!(
-            "failed to parse JSON-RPC response: invalid type: string {PLAIN_NOT_SENT:?}, \
-             expected struct JsonRpcError at line 1 column 58"
-        );
-        assert!(says_not_sent(&rpc, true));
-        assert!(!says_not_sent(&rpc, false));
-        for other in [
-            r#"HTTP 502 Bad Gateway: {"error":"peer unreachable"}"#.to_owned(),
-            r#"HTTP 502 Bad Gateway: {"error":"peer protocol error"}"#.to_owned(),
-            format!(r#"HTTP 503 Service Unavailable: {{"error":"{PLAIN_NOT_SENT}"}}"#),
+    fn only_the_gateways_exact_refusal_says_nothing_was_sent() {
+        let internal = |message: &str| A2AError::internal(message);
+        let rest = format!("HTTP 502 Bad Gateway: {NOT_SENT_BODY}");
+        assert!(is_not_sent(&internal(&rest), false));
+        assert!(!is_not_sent(&internal(&rest), true));
+        let rpc = A2AError {
+            code: NOT_SENT_CODE,
+            message: PLAIN_NOT_SENT.to_owned(),
+            details: None,
+        };
+        assert!(is_not_sent(&rpc, true));
+        assert!(!is_not_sent(&rpc, false));
+        // It goes again, as a failure on the way, never as a refusal.
+        assert!(matches!(Failure::of(&rpc), Failure::Transport(_)));
+        // Anything near it is not it: the text inside other words, another
+        // status, a body with more in it, a serde error that quotes it.
+        for message in [
+            format!("HTTP 502 Bad Gateway: {NOT_SENT_BODY} "),
+            format!("HTTP 503 Service Unavailable: {NOT_SENT_BODY}"),
+            format!("HTTP 502 Bad Gateway: {{\"error\":\"{PLAIN_NOT_SENT}\",\"x\":\"\u{fffd}\"}}"),
+            format!(
+                "failed to parse JSON-RPC response: invalid type: string {PLAIN_NOT_SENT:?}, \
+                 expected struct JsonRpcError at line 1 column 58"
+            ),
             format!("SSE stream error: {PLAIN_NOT_SENT}"),
+            PLAIN_NOT_SENT.to_owned(),
             "HTTP request failed: error sending request".to_owned(),
         ] {
-            assert!(!says_not_sent(&other, false), "{other}");
-            assert!(!says_not_sent(&other, true), "{other}");
+            assert!(!is_not_sent(&internal(&message), false), "{message}");
+            assert!(!is_not_sent(&internal(&message), true), "{message}");
+        }
+        // Another message, or another code.
+        for (code, message) in [
+            (NOT_SENT_CODE, format!("{PLAIN_NOT_SENT}.")),
+            (error_code::INTERNAL_ERROR, PLAIN_NOT_SENT.to_owned()),
+            (
+                crate::gateway::plain::REFUSED_CODE,
+                PLAIN_NOT_SENT.to_owned(),
+            ),
+        ] {
+            let err = A2AError {
+                code,
+                message: message.clone(),
+                details: None,
+            };
+            assert!(!is_not_sent(&err, true), "{code} {message}");
         }
     }
 

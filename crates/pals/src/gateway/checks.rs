@@ -48,8 +48,12 @@
 //! contact's stay as sent), and it goes on
 //! re-encoded ([`ascii_json`]), typed `application/json` (or
 //! `application/a2a+json` when the peer said so). A non-`2xx` body that is
-//! not JSON goes on as it came, bounded: a client takes no task id from an
-//! error page.
+//! not JSON goes on as it came, bounded, but typed by the gateway
+//! (`text/plain; charset=utf-8`, or `application/octet-stream` when it is
+//! no UTF-8), never as the peer said: so no client, not even the pinned
+//! JSON-RPC one, which reads events from any `text/event-stream` whatever
+//! the status, takes a task id from an error page. A plain contact's such
+//! body is replaced by the gateway's own (`plain::replaced_body`).
 //!
 //! **An event stream** is split into events by [`EventFramer`], in time
 //! linear in its bytes: an event ends at an empty line, lines end with
@@ -474,11 +478,14 @@ impl EventFramer {
 /// blob URLs those of the gateway at `blobs_at` when given (a PALS peer's
 /// answer, never a plain contact's) and re-encoded ([`ascii_json`]), or
 /// [`KEEPALIVE`] when it has no data. Refused when it is not UTF-8, its
-/// data is not JSON, or the data names an unsafe id.
+/// data is not JSON, or the data names an unsafe id; a plain agent's
+/// (`plain`), also when it says what only the gateway says
+/// (`plain::forges_not_sent`).
 pub(crate) fn check_event(
     event: &[u8],
     blobs_at: Option<&str>,
     binding: Binding,
+    plain: bool,
 ) -> Result<Bytes, String> {
     let text = std::str::from_utf8(event).map_err(|_| "an event that is not UTF-8".to_owned())?;
     let data: Vec<&str> = sse_lines(text).into_iter().filter_map(sse_data).collect();
@@ -489,6 +496,9 @@ pub(crate) fn check_event(
         .map_err(|_| "an event whose data is not JSON".to_owned())?;
     if let Some(id) = unsafe_id(&value, binding) {
         return Err(format!("an event with an unsafe id {id}"));
+    }
+    if plain && super::plain::forges_not_sent(&value) {
+        return Err("an event that says what only the gateway says".to_owned());
     }
     if let Some(base_url) = blobs_at {
         rewrite::rewrite_to_gateway(&mut value, base_url);
@@ -870,7 +880,7 @@ mod tests {
     #[test]
     fn events_go_on_rebuilt_from_their_checked_data() {
         let base = "http://127.0.0.1:7420";
-        let check = |event: &str| check_event(event.as_bytes(), Some(base), Binding::Rest);
+        let check = |event: &str| check_event(event.as_bytes(), Some(base), Binding::Rest, false);
         // Fields, comments and ids go; data, joined, stays.
         let rebuilt =
             check("event: x\r\nid: 7\r\n: c\r\ndata: {\"a\":\r\ndata: 1}\r\n\r\n").unwrap();
@@ -895,6 +905,6 @@ mod tests {
         ] {
             assert!(check(refused).is_err(), "{refused:?}");
         }
-        assert!(check_event(b"data: \xff\n\n", Some(base), Binding::Rest).is_err());
+        assert!(check_event(b"data: \xff\n\n", Some(base), Binding::Rest, false).is_err());
     }
 }

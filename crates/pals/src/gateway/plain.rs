@@ -53,28 +53,39 @@
 //! - `jsonrpc` goes to its JSON-RPC URL, and `rest/{*rest}` to its
 //!   HTTP+JSON URL followed by `/<rest>` and the query; a binding it lacks
 //!   is `404`;
+//! - the gateway's own answers name their reason: on HTTP+JSON as
+//!   `{"error": <reason>}`, as for a peer; on JSON-RPC, whose pinned client
+//!   reads no HTTP status, as a JSON-RPC error of the same HTTP status, of
+//!   code [`REFUSED_CODE`] for a refusal (a `4xx`) and `InternalError`
+//!   otherwise (`plain_answer`);
 //! - the body is read whole up to `limits.max_body_bytes` (beyond, `413`),
 //!   and one with a part that names a blob, of this gateway or between
-//!   peers, gets `400 {"error":"files go only to PALS peers"}`;
+//!   peers, gets `400 files go only to PALS peers`;
 //! - the client's `Accept-Encoding` is replaced by `identity`, since the
 //!   gateway refuses an encoded answer;
 //! - the client's `Authorization` passes intact; without one, the contact's
-//!   bearer token, read from its variable then (`401 {"error":"bearer env
-//!   var not set"}` when the variable is not set); no grant is ever sent;
+//!   bearer token, read from its variable then (`401 bearer env var not
+//!   set` when the variable is not set); no grant is ever sent;
 //! - the card is read and checked before the call, which is sent only to
 //!   the contact's origin; when the card cannot be read for want of the
 //!   agent (no connection, no card in time), or the connection for the
 //!   call cannot be made, nothing of the call was sent, and the answer is
-//!   `502 {"error":"plain agent unreachable: nothing was sent to it"}`
-//!   ([`PLAIN_NOT_SENT`]), which the outbox may send a question again on;
+//!   the `502` [`PLAIN_NOT_SENT`]: exactly [`NOT_SENT_BODY`] on HTTP+JSON,
+//!   the JSON-RPC error [`NOT_SENT_CODE`] on JSON-RPC. The outbox may send
+//!   a question again on it, and on nothing else;
 //! - the answer goes through the same checks as a PALS peer's (`checks.rs`):
 //!   unary or streaming from the client's request, bounded, task ids safe,
 //!   re-encoded in ASCII, a redirect a `502`, cookies and `x-agentnet-*`
-//!   headers dropped; and an answer read whole that holds the text of
-//!   [`PLAIN_NOT_SENT`] is refused as a protocol error, so that no agent
-//!   can say it. Its `iroh-blob://` URLs stay as sent: a plain agent holds
-//!   no PALS blob, and no blob is fetched on its word. An extended card
-//!   answered is validated and served as its view, unsigned.
+//!   headers dropped. And none of its bytes reach the client unchecked: an
+//!   error body that is no JSON (invalid UTF-8 included) is replaced by the
+//!   gateway's own (`replaced_body`), which names the status only, and so
+//!   is any error whose strings say the text of [`PLAIN_NOT_SENT`] or that
+//!   carries [`NOT_SENT_CODE`] (`forges_not_sent`); such a `2xx` answer is
+//!   a protocol error, and such an event ends the stream. So no agent can
+//!   say what only the gateway says. Its `iroh-blob://` URLs stay as sent:
+//!   a plain agent holds no PALS blob, and no blob is fetched on its word.
+//!   An extended card answered is validated and served as its view,
+//!   unsigned.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,7 +93,7 @@ use std::time::Duration;
 use a2a::{AgentCard, TRANSPORT_PROTOCOL_HTTP_JSON, TRANSPORT_PROTOCOL_JSONRPC};
 use axum::body::Body;
 use axum::extract::Request;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::VerifyingKey;
@@ -123,9 +134,21 @@ const URL_RULE: &str = "a plain A2A agent's URL is https://<host>[/<path>]";
 pub const ONLY_LOOPBACK: &str = "http:// is only for 127.0.0.1, [::1] and localhost";
 /// The gateway's `502` when it could not reach a plain agent and sent it
 /// nothing of the call: its card could not be read, or the connection to
-/// its origin could not be made. An agent's own answer never carries it:
-/// one that holds it is refused (`is_forged_refusal`).
+/// its origin could not be made. On HTTP+JSON it is exactly
+/// [`NOT_SENT_BODY`]; on JSON-RPC, a JSON-RPC error of the code
+/// [`NOT_SENT_CODE`] with this message. No answer of an agent's carries
+/// either (`forges_not_sent`): the outbox sends a question again on them.
 pub const PLAIN_NOT_SENT: &str = "plain agent unreachable: nothing was sent to it";
+/// The exact body of [`PLAIN_NOT_SENT`] on HTTP+JSON.
+pub const NOT_SENT_BODY: &str = r#"{"error":"plain agent unreachable: nothing was sent to it"}"#;
+/// The JSON-RPC error code of [`PLAIN_NOT_SENT`] on a plain contact's
+/// JSON-RPC route, which no agent's answer carries.
+pub const NOT_SENT_CODE: i32 = -32090;
+/// The JSON-RPC error code of a refusal (a `4xx`) on a plain contact's
+/// JSON-RPC route, the gateway's own or an agent's answer it replaced:
+/// whose client reads no HTTP status, so that it knows a refusal from a
+/// failure on the way, which is `InternalError`.
+pub const REFUSED_CODE: i32 = -32091;
 /// Why a contact whose origin is this agent's own gateway is refused.
 pub const OWN_GATEWAY: &str =
     "a plain contact cannot be this agent's own gateway: its peers are reached at /peers already";
@@ -581,16 +604,124 @@ impl GatewayState {
 /// use: `502`, saying why when the card, or the contact, is at fault.
 pub(super) fn plain_failure(name: &str, failure: &PlainError) -> Response {
     tracing::debug!(contact = name, error = %failure, "no usable card from a plain contact");
+    error(StatusCode::BAD_GATEWAY, failure_message(failure))
+}
+
+/// What the gateway says of a card it could not use, `failure`.
+fn failure_message(failure: &PlainError) -> String {
     match failure {
-        PlainError::Unreachable(_) | PlainError::Timeout => {
-            error(StatusCode::BAD_GATEWAY, "peer unreachable")
-        }
-        PlainError::Refused(_) | PlainError::Protocol(_) => {
-            error(StatusCode::BAD_GATEWAY, "peer protocol error")
-        }
+        PlainError::Unreachable(_) | PlainError::Timeout => "peer unreachable".to_owned(),
+        PlainError::Refused(_) | PlainError::Protocol(_) => "peer protocol error".to_owned(),
         PlainError::Invalid(_) | PlainError::NoInterface(_) | PlainError::BadContact(_) => {
-            error(StatusCode::BAD_GATEWAY, failure.to_string())
+            failure.to_string()
         }
+    }
+}
+
+/// The gateway's own answer, `status` and `message`, to a call on `binding`
+/// for a plain contact whose request had the JSON-RPC `id`: on HTTP+JSON,
+/// `{"error": message}`, as for a peer; on JSON-RPC, whose client reads no
+/// HTTP status, a JSON-RPC error envelope of the same status, its code
+/// [`REFUSED_CODE`] for a `4xx` and `InternalError` otherwise, so that a
+/// refusal reads as one and a failure on the way as one.
+pub(super) fn plain_answer(
+    binding: Binding,
+    id: Option<&Value>,
+    status: StatusCode,
+    message: impl Into<String>,
+) -> Response {
+    match binding {
+        Binding::Rest => error(status, message),
+        Binding::JsonRpc => {
+            let code = if status.is_client_error() {
+                REFUSED_CODE
+            } else {
+                a2a::error_code::INTERNAL_ERROR
+            };
+            jsonrpc_error(status, id, code, &message.into())
+        }
+    }
+}
+
+/// [`PLAIN_NOT_SENT`] on `binding`, for a request with the JSON-RPC `id`:
+/// `502` with exactly [`NOT_SENT_BODY`], or the JSON-RPC error
+/// [`NOT_SENT_CODE`].
+fn not_sent(binding: Binding, id: Option<&Value>) -> Response {
+    match binding {
+        Binding::Rest => {
+            json_bytes_response(StatusCode::BAD_GATEWAY, NOT_SENT_BODY.as_bytes().to_vec())
+        }
+        Binding::JsonRpc => {
+            jsonrpc_error(StatusCode::BAD_GATEWAY, id, NOT_SENT_CODE, PLAIN_NOT_SENT)
+        }
+    }
+}
+
+/// The body that stands, on `binding`, for a plain agent's answer of
+/// `status` that the gateway does not pass on: one that is no JSON, or one
+/// that says what only the gateway says ([`forges_not_sent`]). It names the
+/// status and nothing the agent sent.
+pub(super) fn replaced_body(binding: Binding, status: StatusCode) -> Vec<u8> {
+    let message = format!("plain agent answered {}", status.as_u16());
+    match binding {
+        Binding::Rest => serde_json::to_vec(&serde_json::json!({ "error": message })),
+        Binding::JsonRpc => {
+            let code = if status.is_client_error() {
+                REFUSED_CODE
+            } else {
+                a2a::error_code::INTERNAL_ERROR
+            };
+            serde_json::to_vec(&jsonrpc_envelope(None, code, &message))
+        }
+    }
+    .expect("a JSON value serializes")
+}
+
+/// A JSON-RPC 2.0 error response for the request `id` (`null` when it is
+/// not known).
+fn jsonrpc_envelope(id: Option<&Value>, code: i32, message: &str) -> Value {
+    let id = id
+        .filter(|id| id.is_string() || id.is_number())
+        .cloned()
+        .unwrap_or(Value::Null);
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": code, "message": message},
+    })
+}
+
+fn jsonrpc_error(status: StatusCode, id: Option<&Value>, code: i32, message: &str) -> Response {
+    let body =
+        serde_json::to_vec(&jsonrpc_envelope(id, code, message)).expect("a JSON value serializes");
+    json_bytes_response(status, body)
+}
+
+/// `status` with `body`, exactly, typed `application/json`.
+fn json_bytes_response(status: StatusCode, body: Vec<u8>) -> Response {
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
+/// Whether `value`, a plain agent's answer, says what only the gateway may
+/// say: a string or a key holding [`PLAIN_NOT_SENT`], once decoded, or a
+/// `code` of [`NOT_SENT_CODE`], anywhere in it. The gateway never passes
+/// such an answer on.
+pub(super) fn forges_not_sent(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.contains(PLAIN_NOT_SENT),
+        Value::Array(items) => items.iter().any(forges_not_sent),
+        Value::Object(members) => members.iter().any(|(key, member)| {
+            key.contains(PLAIN_NOT_SENT)
+                || (key == "code" && member.as_i64() == Some(i64::from(NOT_SENT_CODE)))
+                || forges_not_sent(member)
+        }),
+        _ => false,
     }
 }
 
@@ -615,19 +746,38 @@ pub(super) async fn forward(
     let bytes = match Limited::new(body, limit).collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(err) if err.downcast_ref::<LengthLimitError>().is_some() => {
-            return error(
+            return plain_answer(
+                binding,
+                None,
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!("request body larger than {limit} bytes"),
             );
         }
-        Err(_) => return error(StatusCode::BAD_REQUEST, "cannot read the request body"),
+        Err(_) => {
+            return plain_answer(
+                binding,
+                None,
+                StatusCode::BAD_REQUEST,
+                "cannot read the request body",
+            );
+        }
     };
     let request_json = serde_json::from_slice::<Value>(&bytes).ok();
+    // A JSON-RPC request's id, which its error answers.
+    let id = request_json
+        .as_ref()
+        .and_then(|request| request.get("id"))
+        .filter(|_| binding == Binding::JsonRpc);
     if request_json
         .as_ref()
         .is_some_and(|value| names_a_blob(value, &state.base_url()))
     {
-        return error(StatusCode::BAD_REQUEST, "files go only to PALS peers");
+        return plain_answer(
+            binding,
+            id,
+            StatusCode::BAD_REQUEST,
+            "files go only to PALS peers",
+        );
     }
     if !headers.contains_key(AUTHORIZATION)
         && let Some(var) = &contact.bearer_env
@@ -636,7 +786,9 @@ pub(super) async fn forward(
             Ok(bearer) => {
                 headers.insert(AUTHORIZATION, bearer);
             }
-            Err(refusal) => return refusal.into_response(),
+            Err(refusal) => {
+                return plain_answer(binding, id, refusal.status, refusal.message);
+            }
         }
     }
 
@@ -645,13 +797,21 @@ pub(super) async fn forward(
         // Nothing of the call was sent.
         Err(failure @ (PlainError::Unreachable(_) | PlainError::Timeout)) => {
             tracing::debug!(contact = %contact.name, error = %failure, "a plain contact cannot be reached");
-            return error(StatusCode::BAD_GATEWAY, PLAIN_NOT_SENT);
+            return not_sent(binding, id);
         }
-        Err(failure) => return plain_failure(&contact.name, &failure),
+        Err(failure) => {
+            tracing::debug!(contact = %contact.name, error = %failure, "no usable card from a plain contact");
+            return plain_answer(
+                binding,
+                id,
+                StatusCode::BAD_GATEWAY,
+                failure_message(&failure),
+            );
+        }
     };
     let url = match target_url(&plain, binding, &target) {
         Ok(url) => url,
-        Err(refusal) => return refusal.into_response(),
+        Err(refusal) => return plain_answer(binding, id, refusal.status, refusal.message),
     };
     // What the client expects, from its own call.
     let call = match binding {
@@ -671,18 +831,18 @@ pub(super) async fn forward(
         .await;
     let protocol_error = |why: String| {
         tracing::debug!(contact = %contact.name, %why, "a plain contact's answer was refused");
-        error(StatusCode::BAD_GATEWAY, "peer protocol error")
+        plain_answer(binding, id, StatusCode::BAD_GATEWAY, "peer protocol error")
     };
     let response = match sent {
         Ok(response) => response,
         // No connection, so nothing of the call left.
         Err(err) if err.is_connect() => {
             tracing::debug!(contact = %contact.name, error = %err, "a plain contact cannot be reached");
-            return error(StatusCode::BAD_GATEWAY, PLAIN_NOT_SENT);
+            return not_sent(binding, id);
         }
         Err(err) if err.is_timeout() => {
             tracing::debug!(contact = %contact.name, error = %err, "a plain contact did not answer");
-            return error(StatusCode::BAD_GATEWAY, "peer unreachable");
+            return plain_answer(binding, id, StatusCode::BAD_GATEWAY, "peer unreachable");
         }
         Err(err) => return protocol_error(err.to_string()),
     };
@@ -706,15 +866,6 @@ pub(super) async fn forward(
         }
         Err(failure) => protocol_error(failure.to_string()),
     }
-}
-
-/// Whether `body`, of a plain agent's answer as the gateway would send it
-/// on, holds [`PLAIN_NOT_SENT`], which only the gateway's own refusal may
-/// say: the outbox sends a question again on it, and an agent that could
-/// say it could make a question run twice.
-pub(super) fn is_forged_refusal(body: &[u8]) -> bool {
-    body.windows(PLAIN_NOT_SENT.len())
-        .any(|window| window == PLAIN_NOT_SENT.as_bytes())
 }
 
 /// Whether `value`, a request's JSON, has a part whose `url` names a blob:
