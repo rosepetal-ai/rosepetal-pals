@@ -157,7 +157,9 @@ impl OfferCheck {
     /// Why `reference`, named by a task of `peer`'s that presents a grant
     /// of the scope `scope`, does not hold now, if it does not:
     /// [`OFFER_UNKNOWN`] when the agent did not issue it to `peer` as
-    /// referred to (its id, card and query), [`OFFER_EXPIRED`] when it
+    /// referred to (its id, card and query) or does not keep it, as it never
+    /// keeps an offer made in another scope than a task's (the public one
+    /// among them), [`OFFER_EXPIRED`] when it
     /// expired by the agent's own clock, [`OFFER_STALE`] when it was made
     /// for another scope than the grant's, or its scope's card or the
     /// revision of its scope's view, computed now as an answer computes it

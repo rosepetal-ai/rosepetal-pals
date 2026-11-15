@@ -19,7 +19,8 @@
 //! 4. **Operation.** `GetInventory` is a signed page of the scope's view,
 //!    its `benchmarks` section included when asked for. `ServiceQuery` is a
 //!    signed offer ([`service_query`]), which refers to the reports of its
-//!    service the scope sees. `GetBenchmarkReport` is a report the agent
+//!    service the scope sees, and which the agent keeps only when it is a
+//!    task scope's. `GetBenchmarkReport` is a report the agent
 //!    holds, as its measurer signed it, when the scope sees it
 //!    ([`get_benchmark_report`]); one it does not see is `NOT_FOUND`, as
 //!    one that does not exist. Nothing is ever measured to answer. None is
@@ -246,8 +247,12 @@ fn get_inventory(
     Ok(bytes)
 }
 
-/// The offer for `peer`'s query `bytes`, signed and kept
-/// ([`crate::store::Store::offer_issued_put`]).
+/// The offer for `peer`'s query `bytes`, signed, and kept
+/// ([`crate::store::Store::offer_issued_put`]) only when a task can name
+/// it: when its scope is a task's, which only a grant that allows
+/// `task.send` gives. An offer of any other scope (the public one, an
+/// empty view's, a project's) is answered all the same and never kept, and
+/// a task that names it is refused as `offer_unknown`.
 ///
 /// The query must be one ([`ServiceQuery::from_jcs`]): `TOO_LARGE` over
 /// [`super::query::MAX_QUERY_BYTES`], `BAD_REQUEST` with the fixed reason
@@ -303,10 +308,15 @@ fn service_query(
         tracing::warn!(error = %err, "cannot sign an offer");
         internal()
     })?;
-    ctx.store.offer_issued_put(&signed).map_err(|err| {
-        tracing::warn!(error = %format!("{err:#}"), "cannot keep an offer");
-        internal()
-    })?;
+    // Only a task scope's offer can be named by a task: any other is
+    // answered and never kept, so that a requester with no grant writes
+    // nothing to the store.
+    if matches!(scope, Scope::Task(_)) {
+        ctx.store.offer_issued_put(&signed).map_err(|err| {
+            tracing::warn!(error = %format!("{err:#}"), "cannot keep an offer");
+            internal()
+        })?;
+    }
     Ok(signed.to_json())
 }
 
@@ -622,6 +632,87 @@ mod tests {
         // A project name is served.
         let page = page_of(&ctx, &peer, get(&grant_for("demo")));
         assert_eq!(page.scope, "task:demo");
+    }
+
+    /// A `ServiceQuery` for a capability nobody offers, presenting `token`.
+    fn query(token: &str) -> wire::Request {
+        let query = ServiceQuery {
+            schema: super::super::query::QUERY_SCHEMA.to_owned(),
+            query_id: "q-1".to_owned(),
+            capability: "vision.ocr".to_owned(),
+            input_media_types: Vec::new(),
+            output_media_types: Vec::new(),
+            requirements: Default::default(),
+            summary: None,
+            reply_timeout_ms: Some(3000),
+            requested_inventory_sections: Vec::new(),
+            project: None,
+            execution_authorized: false,
+        };
+        wire::Request {
+            version: DISCOVERY_VERSION,
+            max_response_bytes: 0,
+            grant_token: token.to_owned(),
+            op: Some(request::Op::ServiceQuery(wire::ServiceQuery {
+                query: query.to_jcs(),
+            })),
+        }
+    }
+
+    #[test]
+    fn only_an_offer_a_task_can_name_is_kept() {
+        let key = Arc::new(AgentKey::generate());
+        let mut ctx = hidden(&key);
+        let peer = AgentKey::generate().id();
+        let grant_of = |operations: Vec<Operation>| {
+            SignedGrant::issue(
+                &key,
+                Grant {
+                    schema: GRANT_SCHEMA.to_owned(),
+                    grant_id: format!("g-{}", operations.len()),
+                    issuer: key.id(),
+                    subject: peer,
+                    audience: key.id(),
+                    project: "demo".to_owned(),
+                    resources: vec!["skill:ask".to_owned()],
+                    operations,
+                    issued_at: format_timestamp(NOW).unwrap(),
+                    expires_at: format_timestamp(NOW + 3600).unwrap(),
+                },
+            )
+            .unwrap()
+            .to_token()
+        };
+        let offered = |ctx: &DiscoveryContext, token: &str| {
+            let response = answer(ctx, &peer, query(token), NOW);
+            let Some(response::Result::ServiceOffer(bytes)) = response.result else {
+                panic!("an offer, not {:?}", response.result);
+            };
+            Signed::<ServiceOffer>::from_json(&bytes)
+                .expect("signed")
+                .doc
+        };
+        // Without a grant, the empty view and then the public one; with a
+        // grant to read tasks only, a project's: each signed and answered,
+        // none kept, as no task can name it.
+        for (token, scope) in [
+            (String::new(), "public"),
+            (grant_of(vec![Operation::TaskRead]), "project:demo"),
+        ] {
+            let offer = offered(&ctx, &token);
+            assert_eq!(offer.scope, scope);
+            assert_eq!(offer.requester, peer);
+        }
+        ctx.public = true;
+        assert_eq!(offered(&ctx, "").scope, "public");
+        assert_eq!(ctx.store.offers_issued_count().unwrap(), 0);
+
+        // With a grant to send tasks: a task's, kept.
+        let offer = offered(&ctx, &grant_of(vec![Operation::TaskSend]));
+        assert_eq!(offer.scope, "task:demo");
+        assert_eq!(ctx.store.offers_issued_count().unwrap(), 1);
+        let kept = ctx.store.offer_issued(&offer.offer_id).unwrap().unwrap();
+        assert_eq!(kept.doc, offer);
     }
 
     #[test]

@@ -2284,9 +2284,11 @@ async fn offer_runs_only_under_a_grant_of_its_scope() {
     )
     .await;
     assert_eq!(rpc_error(&res), (INVALID_PARAMS, "offer_stale".to_owned()));
-    // An offer made without a grant is the public scope's.
+    // An offer made without a grant is the public scope's, which no task
+    // can name: b never kept it.
     let public = offer_from(&a, &b, "q-2", None).await;
     assert_eq!(public.scope, "public");
+    assert_eq!(b.node.store.offer_issued(&public.offer_id).unwrap(), None);
     let res = send_naming(
         &a,
         &b,
@@ -2294,7 +2296,10 @@ async fn offer_runs_only_under_a_grant_of_its_scope() {
         naming("m-2", "x", &OfferRef::of(&public)),
     )
     .await;
-    assert_eq!(rpc_error(&res), (INVALID_PARAMS, "offer_stale".to_owned()));
+    assert_eq!(
+        rpc_error(&res),
+        (INVALID_PARAMS, "offer_unknown".to_owned())
+    );
     assert_eq!(exec.runs(), 0);
     // Asked with the offer, the outbox presents the grant of its scope,
     // not the newest.

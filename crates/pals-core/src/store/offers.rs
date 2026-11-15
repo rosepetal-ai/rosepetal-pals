@@ -1,6 +1,7 @@
-//! Service offers ([`crate::discovery::query`]): those this agent issued,
-//! kept to check an offer again when the task that names it arrives, and
-//! those its peers sent it, kept to name the one it asks with.
+//! Service offers ([`crate::discovery::query`]): those this agent issued
+//! that a task can name, of a task scope, kept to check an offer again when
+//! the task that names it arrives, and those its peers sent it, kept to name
+//! the one it asks with.
 //!
 //! An offer is kept as the bytes of its signed JSON, with the columns that
 //! index it, and read back verified ([`Signed::from_json`]): a row that no
@@ -60,6 +61,14 @@ impl Store {
             )
             .optional()?;
         json.map(|json| read(&json)).transpose()
+    }
+
+    /// How many offers this agent issued it keeps.
+    pub fn offers_issued_count(&self) -> anyhow::Result<u64> {
+        let count: i64 =
+            self.conn()
+                .query_row("SELECT COUNT(*) FROM offers_issued", [], |row| row.get(0))?;
+        Ok(u64::try_from(count)?)
     }
 
     /// Deletes the offers issued that expired before `older_than_unix`; how

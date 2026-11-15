@@ -217,11 +217,13 @@ async fn offers_are_kept_by_both_sides() {
     let b = provider().await;
     let a = spawn_node(WorkerCfg::Echo).await;
     let query = spec_query();
-    let (first, _) = ask(&a, &b, &query, None).await.unwrap();
-    let (second, _) = ask(&a, &b, &query, None).await.unwrap();
+    let send = grant(&b, &a, &[TaskSend], 3600);
+    let (first, _) = ask(&a, &b, &query, Some(&send)).await.unwrap();
+    let (second, _) = ask(&a, &b, &query, Some(&send)).await.unwrap();
     // Each answer is an offer of its own.
     assert_ne!(first.doc.offer_id, second.doc.offer_id);
     for offer in [&first, &second] {
+        assert_eq!(offer.doc.scope, "task:demo");
         let id = &offer.doc.offer_id;
         let issued = b.node.store.offer_issued(id).unwrap();
         assert_eq!(issued.as_ref(), Some(offer), "b keeps what it issued");
@@ -231,6 +233,7 @@ async fn offers_are_kept_by_both_sides() {
         assert_eq!(a.node.store.offer_received(&a.id(), id).unwrap(), None);
         assert_eq!(b.node.store.offer_received(&b.id(), id).unwrap(), None);
     }
+    assert_eq!(b.node.store.offers_issued_count().unwrap(), 2);
 
     // A worker's fixed load is what the offers say.
     let dir = tempfile::tempdir().unwrap();
@@ -242,11 +245,41 @@ async fn offers_are_kept_by_both_sides() {
         max_queue: 4,
     };
     let busy = spawn_node_in_with_load(dir, EchoExecutor, Arc::new(full)).await;
-    let (offer, _) = ask(&a, &busy, &query, None).await.unwrap();
+    let send = grant(&busy, &a, &[TaskSend], 3600);
+    let (offer, _) = ask(&a, &busy, &query, Some(&send)).await.unwrap();
     assert_eq!(offer.doc.status, OfferStatus::Busy);
     assert!(offer.doc.compatible);
     let kept = busy.node.store.offer_issued(&offer.doc.offer_id).unwrap();
     assert_eq!(kept, Some(offer));
+}
+
+#[tokio::test]
+async fn an_offer_no_task_can_name_is_answered_and_never_kept() {
+    let b = provider().await;
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let query = spec_query();
+    // Without a grant, and with one that allows no task.send: the public
+    // and a project's scope, signed and answered, kept by a, not by b.
+    let read = grant(&b, &a, &[TaskRead], 3600);
+    for (grant, scope) in [(None, "public"), (Some(&read), "project:demo")] {
+        let (offer, _) = ask(&a, &b, &query, grant).await.unwrap();
+        assert_eq!(offer.doc.scope, scope);
+        assert_eq!(offer.doc.requester, a.id());
+        let id = &offer.doc.offer_id;
+        assert_eq!(b.node.store.offer_issued(id).unwrap(), None);
+        let received = a.node.store.offer_received(&b.id(), id).unwrap();
+        assert_eq!(received.as_ref(), Some(&offer));
+    }
+    assert_eq!(b.node.store.offers_issued_count().unwrap(), 0);
+    // With a grant to send tasks, exactly one row.
+    let send = grant(&b, &a, &[TaskSend], 3600);
+    let (offer, _) = ask(&a, &b, &query, Some(&send)).await.unwrap();
+    assert_eq!(offer.doc.scope, "task:demo");
+    assert_eq!(b.node.store.offers_issued_count().unwrap(), 1);
+    assert_eq!(
+        b.node.store.offer_issued(&offer.doc.offer_id).unwrap(),
+        Some(offer)
+    );
 }
 
 #[tokio::test]
