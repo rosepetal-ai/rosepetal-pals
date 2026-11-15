@@ -27,7 +27,7 @@ go -C tests/interop/card_signatures/go run . "$PWD/crates/pals-core/tests/vector
   && node tests/interop/card_signatures/js/verify.mjs crates/pals-core/tests/vectors/card-jws-v1.json
 ```
 
-El módulo de Go es su propio directorio (no hay `go.mod` en la raíz), por eso `go -C` y la ruta absoluta del vector. `card_signatures.py` acepta también `--gateway URL --peer ID`: lee la card firmada de un par en `URL/peers/ID/signed-agent-card.json` y le aplica las mismas tres comprobaciones.
+El módulo de Go es su propio directorio (no hay `go.mod` en la raíz), por eso `go -C` y la ruta absoluta del vector. `card_signatures.py` acepta también `--gateway URL --peer ID`: lee la card firmada de un par en `URL/peers/ID/signed-agent-card.json` y le aplica las mismas tres comprobaciones. Los de Go y JS aceptan también un id de agente y un fichero con esa card (`go -C tests/interop/card_signatures/go run . <id> <ruta absoluta del fichero>`, `node tests/interop/card_signatures/js/verify.mjs <id> <fichero>`), con las mismas tres comprobaciones; así los usa el caso 3 de la [prueba de salida](exit-test.md#caso-3-validar-cards-superado).
 
 ## Qué comprueba cada verificador
 
