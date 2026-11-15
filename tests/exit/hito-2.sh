@@ -81,6 +81,8 @@ F_HOST=$P-f
 LOGS=$WORK/registro
 # The question of case 1, as the runbook asks it.
 PREGUNTA1="Revisa src/lib.rs"
+# Case 4: the 50 searches in a row with every candidate's answer, at least.
+SEGUIDAS_COMPLETAS=45
 
 phases=("$@")
 [ ${#phases[@]} -gt 0 ] || phases=(todo)
@@ -167,8 +169,12 @@ en() {
 # en_wait FILE X: en X, its output in FILE, in the background and waited
 # for, so that a trapped signal interrupts the wait at once.
 en_wait() { en "$2" <&0 > "$1" 2>&1 & wait $!; }
-# Copies stdin to the file $2 in X's container ($1); a leading ~ is root's home.
-put() { docker exec -i "$(ctr "$1")" sh -c "cat > $2"; }
+# put X PATH: copies stdin to PATH, relative to the home directory, in X's
+# container. The path is an argument of the remote shell, never part of its
+# script.
+put() { docker exec -i "$(ctr "$1")" sh -c 'cat > "$HOME/$1"' sh "$2"; }
+# put_exec X PATH: put, and makes the file executable.
+put_exec() { docker exec -i "$(ctr "$1")" sh -c 'cat > "$HOME/$1" && chmod +x "$HOME/$1"' sh "$2"; }
 
 # Bytes through A's eth0, from the accounting rules `preparar` appends to
 # A's chains: UDP except DNS (the direct path between containers), and TCP
@@ -201,6 +207,30 @@ agent_id() { [ -n "${ID[$1]:-}" ] || ID[$1]=$(en "$1" <<< 'pals id'); echo "${ID
 
 # counts X: "task.accepted ejecuciones tools/list pid" of provider X.
 counts() { en "$1" <<< 'echo "$(eventos task.accepted) $(ejecuciones) $(tools_list) $(cat "$PALS_HOME/daemon.pid")"'; }
+
+# timer_ticks X T0 T1: how many times the 60 s timer of X's inventory
+# adapter (config_proveedor) can fire between T0 and T1 (Unix seconds),
+# counted from its first observation, at the daemon's start, the first line
+# of its *-mcp-arranques.log; 3 s of slack on each side.
+timer_ticks() {
+    local first k n=0
+    first=$(en "$1" <<< 'head -n 1 "$H2/$AGENTE-mcp-arranques.log"')
+    first=$(date -u -d "$first" +%s) || { echo 0; return; }
+    for (( k = 1; first + 60 * k <= $3 + 3; k++ )); do
+        if [ $(( first + 60 * k )) -ge $(( $2 - 3 )) ]; then n=$((n + 1)); fi
+    done
+    echo "$n"
+}
+# tools_calls: "<x> <n>" for every provider and H: the tools/call its MCP
+# server received, by the copy of its stdin.
+tools_calls() {
+    local x n out=
+    for x in b c d e g h; do
+        n=$(en "$x" <<< 'grep -c "\"tools/call\"" "$H2/$AGENTE-mcp-entrada.log" 2> /dev/null || true')
+        out="$out$x ${n:-0} "
+    done
+    echo "${out% }"
+}
 
 # A host-side Python check over files of the log: the script on stdin, the
 # arguments after.
@@ -246,11 +276,11 @@ preparar() {
     done
     note "red: $(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} gw {{.Gateway}}{{end}}' "$NET")"
 
-    # Every container: the binary, the repository as in this working tree,
-    # and the runbook's scripts in ~/pals-h2, the venv and the MCP server
-    # where the runbook installs them.
+    # Every container: the binary, the files git tracks as they are in this
+    # working tree (never an untracked one), and the runbook's scripts in
+    # ~/pals-h2, the venv and the MCP server where the runbook installs them.
     local tree=$WORK/repositorio.tar f
-    git -C "$REPO" ls-files -z --cached --others --exclude-standard \
+    git -C "$REPO" ls-files -z --cached \
         | tar -C "$REPO" --null -T - -c -f "$tree" 2> /dev/null || die "cannot pack the repository"
     for x in "${CONTAINERS[@]}"; do
         docker cp "$PALS" "$P-$x:/usr/local/bin/pals" > /dev/null || die "cannot copy pals into $x"
@@ -258,7 +288,7 @@ preparar() {
             || die "cannot copy the repository into $x"
         docker exec "$P-$x" sh -c 'cd ~/rosepetal-pals && pwd > ~/pals-h2/repo && ln -s /opt/venv ~/pals-h2/venv && ln -s /opt/mcp ~/pals-h2/mcp'
         for f in funciones.sh proveedor.sh mcp-everything.sh req.json metricas.py caso4.sh vista.py caso8.sh; do
-            extract "$f" | put "$x" "~/pals-h2/$f" || die "the runbook has no $f"
+            extract "$f" | put "$x" "pals-h2/$f" || die "the runbook has no $f"
         done
     done
     rm -f "$tree"
@@ -297,7 +327,7 @@ done
 openssl x509 -in ca.crt -noout -subject -fingerprint -sha256
 EOS
     # ca.crt, never ca.key, from F to A.
-    en f <<< 'cat ~/pals-h2/ca.crt' > "$WORK/ca.crt" && put a '~/pals-h2/ca.crt' < "$WORK/ca.crt" \
+    en f <<< 'cat ~/pals-h2/ca.crt' > "$WORK/ca.crt" && put a pals-h2/ca.crt < "$WORK/ca.crt" \
         || die "cannot copy F's CA certificate to A"
 
     say "2.2. A"
@@ -310,9 +340,11 @@ arranca
 EOS
     en a <<EOS || die "A does not reach F over HTTPS"
 for p in 8443 8444; do
-    espera 120 "F en el puerto \$p" curl -sSf -o /dev/null "https://$F_HOST:\$p/.well-known/agent-card.json" || exit 1
+    for doc in .well-known/agent-card.json jwks.json; do
+        espera 120 "F en el puerto \$p: \$doc" curl -sSf -o /dev/null "https://$F_HOST:\$p/\$doc" || exit 1
+    done
 done
-echo "F responde por https en 8443 y 8444, con el certificado de la CA de prueba"
+echo "F responde por https en 8443 y 8444, su card y su JWK Set, con el certificado de la CA de prueba"
 EOS
 
     say "2.3. Los proveedores"
@@ -463,6 +495,17 @@ caso3() {
     check "Python (a2a-sdk): 3 checks passed" has_line "$out" "3 checks passed"
     en a <<< "curl -sS \"\$(gw)/peers/$b/signed-agent-card.json\"" > "$LOGS/tarjeta-b.json"
     note "card de B por el gateway de A: $(wc -c < "$LOGS/tarjeta-b.json") bytes, sha256 $(sha256sum "$LOGS/tarjeta-b.json" | cut -c1-16)…"
+    out=$(py "$LOGS/tarjeta-b.json" <<'PY'
+import json, sys
+raw = open(sys.argv[1]).read()
+card = json.loads(raw)
+print('skills', ' '.join(s['id'] for s in card['skills']))
+print('menciones de proyecto', sorted(w for w in ('repo-review', 'example:everything', 'example:coder', 'example:host', 'demo') if w in raw) or 'ninguna')
+PY
+)
+    echo "$out"
+    check "la card pública de B: solo la skill ask" has_line "$out" "skills ask"
+    check "la card pública de B: nada de lo que es de proyecto" has_line "$out" "menciones de proyecto ninguna"
     out=$(go -C "$REPO/tests/interop/card_signatures/go" run . "$b" "$LOGS/tarjeta-b.json" 2>&1)
     echo "Go (a2a-go): $out"
     check "Go (a2a-go): verified" has_line "$out" "verified"
@@ -537,7 +580,7 @@ expected = {'d': 'external_cloud_allowed not met', 'e': 'mcp_integration:example
 # What the limits of a search and the providers' quotas discard.
 LIMITS = {'refused: RateLimited', 'timeout', 'time budget'}
 for mode in ('rafaga', 'seguidas'):
-    codes, bad, limited = Counter(), [], Counter()
+    codes, bad, limited, full = Counter(), [], Counter(), 0
     for c in sorted(d.glob(f'caso4-{mode}-*.codigo')):
         code = c.read_text().strip()
         codes[code] += 1
@@ -559,31 +602,45 @@ for mode in ('rafaga', 'seguidas'):
         if ranked != [p for p in ('b', 'c') if why.get(p) not in LIMITS] \
                 or set(ranked) | set(why) != {'b', 'c', 'd', 'e', 'g'}:
             bad.append(f'{c.stem}: {ranked}')
+        # Every candidate answered: b and c ranked, d, e and g discarded by
+        # their own offers.
+        if ranked == ['b', 'c'] and why == expected:
+            full += 1
     print(f"{mode}: {sum(codes.values())} búsquedas, códigos {dict(sorted(codes.items()))}, "
-          f"descartes por cuotas o plazos {dict(limited) or 'ninguno'}, anómalas {bad or 'ninguna'}")
+          f"completas {full}, descartes por cuotas o plazos {dict(limited) or 'ninguno'}, anómalas {bad or 'ninguna'}")
 PY
 )
     echo "$summary"
-    check "la ráfaga: 50 búsquedas, solo 200 y 429 (too many searches), al menos un 200, ninguna anómala" \
-        grep -qE "^rafaga: 50 búsquedas, códigos \{('200': [0-9]+)(, '429': [0-9]+)?\}, .*anómalas ninguna\$" <<< "$summary"
+    # The burst must be cut by the quota, and the searches in a row must
+    # reach the providers: at least SEGUIDAS_COMPLETAS of the 50 with every
+    # candidate's answer.
+    local full
+    full=$(sed -nE "s/^seguidas: .*, completas ([0-9]+), .*/\1/p" <<< "$summary")
+    check "la ráfaga: 50 búsquedas, al menos un 200 y un 429 (too many searches), ninguna anómala" \
+        grep -qE "^rafaga: 50 búsquedas, códigos \{'200': [0-9]+, '429': [0-9]+\}, .*anómalas ninguna\$" <<< "$summary"
     check "las seguidas: 50 búsquedas, todas 200, ninguna anómala" \
         grep -qE "^seguidas: 50 búsquedas, códigos \{'200': 50\}, .*anómalas ninguna\$" <<< "$summary"
+    check "las seguidas llegan a los proveedores: $full de 50 con el ranking completo (se exigen $SEGUIDAS_COMPLETAS)" \
+        test "${full:-0}" -ge "$SEGUIDAS_COMPLETAS"
     check "healthz 200 en A y en B a G" test -z "$(tr ' ' '\n' <<< "$health" | grep -E '^[0-9]+$' | grep -vx 200)"
     check "búsqueda de después, 200" test "$after_code" = 200
-    # The providers' adapters run every 60 s (config_proveedor).
-    local ticks=$(( (t1 - t0) / 60 + 1 )) a d detail=
+    local a d ticks detail= calls
     for x in "${PROVIDERS[@]}"; do
         read -r -a a <<< "${antes[$x]}"; read -r -a d <<< "${despues[$x]}"
-        detail="$detail $x: task.accepted +$((d[0] - a[0])), ejecuciones +$((d[1] - a[1])), tools/list +$((d[2] - a[2]));"
+        ticks=$(timer_ticks "$x" "$t0" "$t1")
+        detail="$detail $x: task.accepted +$((d[0] - a[0])), ejecuciones +$((d[1] - a[1])), tools/list +$((d[2] - a[2])) (temporizador $ticks);"
         check "$x: ningún task.accepted nuevo" test "${d[0]}" = "${a[0]}"
         check "$x: ninguna ejecución nueva" test "${d[1]}" = "${a[1]}"
         check "$x: el mismo daemon (PID ${a[3]})" test "${d[3]}" = "${a[3]}"
-        check "$x: tools/list solo por el temporizador (como mucho $ticks en $((t1 - t0)) s)" test "$((d[2] - a[2]))" -le "$ticks"
+        check "$x: tools/list solo por el temporizador (vencimientos en el caso: $ticks)" test "$((d[2] - a[2]))" -le "$ticks"
     done
+    calls=$(tools_calls)
+    note "tools/call recibidos hasta ahora por cada servidor MCP: $calls"
+    check "ningún tools/call en ningún servidor MCP" test -z "$(tr ' ' '\n' <<< "$calls" | grep -E '^[0-9]+$' | grep -vx 0)"
     note "arranques del servidor MCP de B (uno por comprobación del adaptador: al arrancar, pals inventory refresh y el temporizador de 60 s); el caso 4 fue de $(date -u -d "@$t0" +%T) a $(date -u -d "@$t1" +%T):"
     en b <<< 'cat "$H2/b-mcp-arranques.log"'
     [ "$FAILS" = 0 ] || ok=fail
-    result "caso 4" "$ok" "$codes;$detail"
+    result "caso 4" "$ok" "$codes; seguidas con el ranking completo: ${full:-0} de 50 (se exigen $SEGUIDAS_COMPLETAS);$detail tools/call: $calls"
 }
 
 caso5() {
@@ -659,7 +716,7 @@ PY
         check "intento $try: la hace b, completada" has_line "$summary" "elegido b TASK_STATE_COMPLETED b: pregunta del caso 5, intento $try"
         check "intento $try: b la ejecuta una vez" test "$qb" = 1
         check "intento $try: c no ejecuta nada" test "$nc" = "$runs_c"
-        if has_line "$summary" renovada || grep -q refused "$LOGS/caso5b-$try.out"; then
+        if has_line "$summary" renovada; then
             renewed=1
             note "intento $try: la oferta vencida se renovó"
             break
@@ -679,8 +736,8 @@ caso6() {
     out=$(en g <<< 'pals query b --capability code.rust.review | tail -n 1; pals query b --capability example:no-existe | tail -n 1')
     echo "$out"
     # Each cursor to the other requester's container.
-    en a <<< 'cat ~/pals-h2/vistas/a-1.cursor' | put g '~/pals-h2/vistas/a-1.cursor'
-    en g <<< 'cat ~/pals-h2/vistas/g-1.cursor' | put a '~/pals-h2/vistas/g-1.cursor'
+    en a <<< 'cat ~/pals-h2/vistas/a-1.cursor' | put g pals-h2/vistas/a-1.cursor
+    en g <<< 'cat ~/pals-h2/vistas/g-1.cursor' | put a pals-h2/vistas/g-1.cursor
     en g <<< 'export PRIVADAS; python3 ~/pals-h2/vista.py "$(gw)" b g-con-cursor-de-a ~/pals-h2/vistas/a-1.cursor'
     en a <<< 'export PRIVADAS; python3 ~/pals-h2/vista.py "$(gw)" b a-con-cursor-de-g ~/pals-h2/vistas/g-1.cursor'
     mkdir -p "$LOGS/vistas"
@@ -709,8 +766,9 @@ print('g menciones de proyecto', leaks or 'ninguna')
 schema = {'schema', 'agent_id', 'scope', 'audience', 'seq', 'issued_at', 'expires_at', 'agent_card_hash', 'sections', 'entries', 'next_cursor', 'truncated_by'}
 print('g claves fuera del esquema', sorted((set(g1) | set(g2)) - schema) or 'ninguna')
 local = json.loads((d / 'b-publica-local.json').read_text())
-local_ids = sorted(e['id'] for e in (local.get('entries', local) if isinstance(local, dict) else local))
-print('g igual a la vista pública de b', local_ids == sorted(g_ids))
+by_id = lambda e: e['id']
+local_entries = sorted(local['entries'], key=by_id)
+print('g igual a la vista pública de b', local_entries == sorted(g1['entries'] + g2['entries'], key=by_id))
 cross = [json.loads((d / f'{n}.json').read_text()) for n in ('g-con-cursor-de-a', 'a-con-cursor-de-g')]
 print('cursores cruzados', cross[0], cross[1], cross[0] == cross[1] and 'view' not in cross[0])
 PY
@@ -722,7 +780,7 @@ PY
     check "G: solo las 120 notas" has_line "$summary" "g solo notas True"
     check "G: nada que mencione lo de proyecto" has_line "$summary" "g menciones de proyecto ninguna"
     check "G: ninguna clave fuera del esquema" has_line "$summary" "g claves fuera del esquema ninguna"
-    check "G: la vista pública de B, entrada por entrada" has_line "$summary" "g igual a la vista pública de b True"
+    check "G: la vista pública de B, entrada por entrada (cada entrada entera)" has_line "$summary" "g igual a la vista pública de b True"
     check "cursores cruzados: rechazados, con el mismo error" grep -qE '^cursores cruzados .* True$' <<< "$summary"
     check "pals query desde G: not_offered en los dos casos" \
         test "$(grep -c "^verified: $(agent_id b) [^ ]* not_offered\$" <<< "$out")" = 2
@@ -792,8 +850,8 @@ caso8() {
         return 1
     fi
     [ -x "$EVENTS_VERIFY" ] || die "no events_verify at $EVENTS_VERIFY: cargo build --release --locked -p pals-core --example events_verify"
-    put m '~/pals-h2/pals-hito1 && chmod +x ~/pals-h2/pals-hito1' < "$PALS_H1" || die "cannot copy the milestone 1 pals"
-    put m '~/pals-h2/events_verify && chmod +x ~/pals-h2/events_verify' < "$EVENTS_VERIFY" || die "cannot copy events_verify"
+    put_exec m pals-h2/pals-hito1 < "$PALS_H1" || die "cannot copy the milestone 1 pals"
+    put_exec m pals-h2/events_verify < "$EVENTS_VERIFY" || die "cannot copy events_verify"
     en_wait "$LOGS/caso8.out" m <<< 'bash ~/pals-h2/caso8.sh ~/pals-h2/pals-hito1 ~/pals-h2/events_verify'
     cat "$LOGS/caso8.out"
     FAILS=0
@@ -814,6 +872,16 @@ desmontar() {
         en a <<< 'python3 ~/pals-h2/metricas.py' > "$LOGS/metricas.txt" 2>&1
         note "métricas de todas las búsquedas de A en $LOGS/metricas.txt:"
         grep -v '^[a-z0-9-]*	' "$LOGS/metricas.txt"
+    fi
+    # Over the whole run: no MCP server ever got a tools/call.
+    if [ "$(label_of "$P-b")" = "$WORK" ]; then
+        local calls
+        calls=$(tools_calls)
+        if [ -z "$(tr ' ' '\n' <<< "$calls" | grep -E '^[0-9]+$' | grep -vx 0)" ]; then
+            result "sin tools/call en toda la prueba" ok "$calls"
+        else
+            result "sin tools/call en toda la prueba" fail "$calls"
+        fi
     fi
     # Logs: daemons, workers' runs, MCP servers, F, A's searches.
     for c in $(ours_containers); do

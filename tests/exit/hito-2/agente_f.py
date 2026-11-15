@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import os
+import tempfile
 from pathlib import Path
 
 import uvicorn
@@ -87,13 +89,28 @@ def b64url(data: bytes) -> str:
 
 
 def signing_key(path: Path) -> Ed25519PrivateKey:
-    """The Ed25519 key in ``path``, created there first if need be."""
+    """The Ed25519 key in ``path``, created there first if need be.
+
+    Two F processes may start at once on the same file: the key is written
+    whole to a temporary file of the same directory and linked into place,
+    which fails if another process linked its own first. Either way, the
+    file is read only once it is complete, so both use the same key.
+    """
     if not path.exists():
         pem = Ed25519PrivateKey.generate().private_bytes(
             Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
         )
-        path.write_bytes(pem)
-        path.chmod(0o600)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f'.{path.name}.')
+        try:
+            os.write(fd, pem)
+            os.fchmod(fd, 0o600)
+            os.close(fd)
+            try:
+                os.link(tmp, path)
+            except FileExistsError:
+                pass
+        finally:
+            os.unlink(tmp)
     key = load_pem_private_key(path.read_bytes(), password=None)
     if not isinstance(key, Ed25519PrivateKey):
         raise SystemExit(f'{path} is not an Ed25519 key')
