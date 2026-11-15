@@ -45,8 +45,9 @@
 //! [`gateway_view`], with [`CARD_HASH_HEADER`] naming the card verified
 //! ([`checks`]); one that does not verify is a protocol error.
 //!
-//! **Inventory.** `GET /discovery/inventory/{peer}` asks the peer for a page
-//! of its inventory view ([`DiscoveryClient`]), presenting the grant it
+//! **Inventory.** `GET /discovery/inventory/{peer}`, as the MCP tool
+//! `pals_inventory` ([`GatewayState::inventory_page`]), asks the peer for a
+//! page of its inventory view ([`DiscoveryClient`]), presenting the grant it
 //! would present to the peer's A2A server (below), or none, and answers with
 //! the page as the peer signed it, re-encoded in ASCII, once it verifies as
 //! the peer's page for this agent ([`verify_page`]). `sections` are names
@@ -168,13 +169,13 @@ use iroh_blobs::Hash;
 use iroh_blobs::api::TempTag;
 use pals_core::clock::Clock;
 use pals_core::discovery::DISCOVERY_VERSION;
-use pals_core::discovery::query::{MAX_QUERY_BYTES, ServiceQuery};
+use pals_core::discovery::query::{MAX_QUERY_BYTES, OfferRef, ServiceQuery};
 use pals_core::discovery::selection::SearchRequest;
 use pals_core::discovery::wire::{self, ErrorCode, request, response};
 use pals_core::grant::{Grant, Operation, SignedGrant, parse_timestamp};
 use pals_core::identity::AgentId;
 use pals_core::inventory::Section;
-use pals_core::inventory::view::{INVENTORY_SECTIONS, verify_page};
+use pals_core::inventory::view::{INVENTORY_SECTIONS, ViewPage, verify_page};
 use pals_core::store::{A2aContact, Contact, Store};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -197,7 +198,7 @@ use crate::inventory::InventoryState;
 use crate::inventory::RefreshReport;
 use crate::net::{PeerHttp, TunnelError, peer_addr};
 use crate::node::ticket_of;
-use crate::outbox::{AskError, Outbox};
+use crate::outbox::{AskError, OfferLookupError, Outbox, received_offer_ref};
 
 /// The response header in which the gateway names the hash of the extended
 /// card it verified ([`pals_core::card_jws::card_hash`] of the card as the
@@ -513,6 +514,102 @@ impl GatewayState {
         }
     }
 
+    /// A page of the inventory view of `peer` (an agent id or a PALS
+    /// contact's name), of the sections `sections` names, all of them when
+    /// it names none, from `cursor`, a page's `next_cursor` (the first page
+    /// when empty), verified as the peer's page for this agent
+    /// ([`verify_page`]): kept from an earlier request with the same grant
+    /// while it lasts, else asked for on `agentnet-discovery/0` with the
+    /// grant the gateway holds for the peer, if any, and kept. What
+    /// `GET /discovery/inventory/{peer}` serves and `pals_inventory`
+    /// returns; refused as the [module](self) says that route answers.
+    pub(crate) async fn inventory_page(
+        &self,
+        peer: String,
+        sections: &[&str],
+        cursor: String,
+    ) -> Result<VerifiedPage, Refusal> {
+        let Some(sections) = inventory_sections(sections) else {
+            return Err(Refusal::new(StatusCode::BAD_REQUEST, "unknown section"));
+        };
+        let names: Vec<String> = sections.iter().map(|s| section_name(*s)).collect();
+        let target = self.resolve_pals(peer).await?;
+        let grant = self.held_grant(target.id).await?;
+        let context = grant.as_ref().map_or_else(
+            || PUBLIC_CONTEXT.to_owned(),
+            |g| format!("grant:{}/{}", g.grant.issuer, g.grant.grant_id),
+        );
+        let key = inventory_request_key(&names, &cursor);
+        let (own, now) = (self.inner.id, self.inner.clock.now_unix());
+
+        let kept = {
+            let (store, context, key) =
+                (Arc::clone(&self.inner.store), context.clone(), key.clone());
+            blocking(move || store.inventory_cache(&target.id, &context, &key, now)).await?
+        };
+        if let Some(page) = kept
+            && let Ok(view) = verify_page(&page, &target.id, Some(&own), now)
+        {
+            return Ok(VerifiedPage { bytes: page, view });
+        }
+
+        let req = wire::Request {
+            version: DISCOVERY_VERSION,
+            max_response_bytes: 0,
+            grant_token: grant
+                .as_ref()
+                .map(SignedGrant::to_token)
+                .unwrap_or_default(),
+            op: Some(request::Op::GetInventory(wire::GetInventory {
+                sections: names,
+                cursor,
+                page_entries: 0,
+            })),
+        };
+        let reply = self
+            .inner
+            .discovery
+            .call(&target.id, target.addr.clone(), req, INVENTORY_TIMEOUT)
+            .await
+            .map_err(|failure| discovery_refusal(&target.id, &failure))?;
+        let Some(response::Result::InventoryPage(page)) = reply.response.result else {
+            return Err(Refusal::new(StatusCode::BAD_GATEWAY, "peer protocol error"));
+        };
+        let view = verify_page(&page, &target.id, Some(&own), now).map_err(|err| {
+            tracing::debug!(peer = %target.id, error = %err, "an inventory page that does not verify");
+            Refusal::new(
+                StatusCode::BAD_GATEWAY,
+                format!("peer inventory page invalid: {err}"),
+            )
+        })?;
+        let expires_at = parse_timestamp(&view.expires_at).unwrap_or(now);
+        let store = Arc::clone(&self.inner.store);
+        let (kept_page, peer) = (page.clone(), target.id);
+        // A page that cannot be kept is still good to serve.
+        let _ = blocking(move || {
+            store.inventory_cache_put(&peer, &context, &key, &kept_page, expires_at)
+        })
+        .await;
+        Ok(VerifiedPage { bytes: page, view })
+    }
+
+    /// The reference to the offer `offer_id` that `peer` (a contact's name
+    /// or an agent id) sent this agent, looked up by (the peer's agent id,
+    /// `offer_id`), and refused when it expired by this agent's clock,
+    /// without skew ([`received_offer_ref`]): what an ask names, decided
+    /// before anything is sent.
+    pub(crate) async fn received_offer(
+        &self,
+        peer: String,
+        offer_id: String,
+    ) -> Result<OfferRef, OfferLookupError> {
+        let store = Arc::clone(&self.inner.store);
+        let now = self.inner.clock.now_unix();
+        tokio::task::spawn_blocking(move || received_offer_ref(&store, &peer, &offer_id, now))
+            .await
+            .unwrap_or_else(|err| Err(OfferLookupError::Store(err.to_string())))
+    }
+
     /// The agent `peer` names, an agent id, a contact's name or a plain
     /// contact's name, in that order, and where to dial a PALS peer; `None`
     /// when it names no one.
@@ -602,6 +699,14 @@ pub(crate) struct HeldBlob {
     pub(crate) size: u64,
     /// Keeps the blob from the store's garbage collection.
     pub(crate) held: TempTag,
+}
+
+/// A page of a peer's inventory view, verified as its page for this agent.
+pub(crate) struct VerifiedPage {
+    /// As the peer signed it.
+    pub(crate) bytes: Vec<u8>,
+    /// What it says.
+    pub(crate) view: ViewPage,
 }
 
 /// Whether `grant` can serve a request of the bindings the gateway forwards:
@@ -800,88 +905,24 @@ struct InventoryQuery {
     cursor: Option<String>,
 }
 
-/// A page of `peer`'s inventory view, verified as its page for this agent:
-/// kept from an earlier request with the same grant while it lasts, else
-/// asked for on `agentnet-discovery/0` with the grant the gateway holds for
-/// the peer, if any, and kept.
+/// A page of `peer`'s inventory view, verified as its page for this agent
+/// ([`GatewayState::inventory_page`]), as the peer signed it.
 async fn peer_inventory(
     State(state): State<GatewayState>,
     Path(peer): Path<String>,
     Query(query): Query<InventoryQuery>,
 ) -> Response {
-    let Some(sections) = inventory_sections(query.sections.as_deref()) else {
-        return error(StatusCode::BAD_REQUEST, "unknown section");
-    };
-    let names: Vec<String> = sections.iter().map(|s| section_name(*s)).collect();
+    let sections: Vec<&str> = query
+        .sections
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .collect();
     let cursor = query.cursor.unwrap_or_default();
-    let target = match state.resolve_pals(peer).await {
-        Ok(target) => target,
-        Err(refusal) => return refusal.into_response(),
-    };
-    let grant = match state.held_grant(target.id).await {
-        Ok(grant) => grant,
-        Err(failure) => return failure.into_response(),
-    };
-    let context = grant.as_ref().map_or_else(
-        || PUBLIC_CONTEXT.to_owned(),
-        |g| format!("grant:{}/{}", g.grant.issuer, g.grant.grant_id),
-    );
-    let key = inventory_request_key(&names, &cursor);
-    let (own, now) = (state.inner.id, state.inner.clock.now_unix());
-
-    let kept = {
-        let (store, context, key) = (Arc::clone(&state.inner.store), context.clone(), key.clone());
-        blocking(move || store.inventory_cache(&target.id, &context, &key, now)).await
-    };
-    match kept {
-        Ok(Some(page)) if verify_page(&page, &target.id, Some(&own), now).is_ok() => {
-            return page_response(&page);
-        }
-        Ok(_) => {}
-        Err(failure) => return failure.into_response(),
+    match state.inventory_page(peer, &sections, cursor).await {
+        Ok(page) => page_response(&page.bytes),
+        Err(refusal) => refusal.into_response(),
     }
-
-    let req = wire::Request {
-        version: DISCOVERY_VERSION,
-        max_response_bytes: 0,
-        grant_token: grant
-            .as_ref()
-            .map(SignedGrant::to_token)
-            .unwrap_or_default(),
-        op: Some(request::Op::GetInventory(wire::GetInventory {
-            sections: names,
-            cursor,
-            page_entries: 0,
-        })),
-    };
-    let discovery = &state.inner.discovery;
-    let reply = match discovery
-        .call(&target.id, target.addr.clone(), req, INVENTORY_TIMEOUT)
-        .await
-    {
-        Ok(reply) => reply,
-        Err(failure) => return discovery_failure(&target.id, &failure),
-    };
-    let Some(response::Result::InventoryPage(page)) = reply.response.result else {
-        return error(StatusCode::BAD_GATEWAY, "peer protocol error");
-    };
-    let expires_at = match verify_page(&page, &target.id, Some(&own), now) {
-        Ok(verified) => parse_timestamp(&verified.expires_at).unwrap_or(now),
-        Err(err) => {
-            tracing::debug!(peer = %target.id, error = %err, "an inventory page that does not verify");
-            return error(
-                StatusCode::BAD_GATEWAY,
-                format!("peer inventory page invalid: {err}"),
-            );
-        }
-    };
-    let store = Arc::clone(&state.inner.store);
-    let (kept_page, peer) = (page.clone(), target.id);
-    // A page that cannot be kept is still good to serve.
-    let _ =
-        blocking(move || store.inventory_cache_put(&peer, &context, &key, &kept_page, expires_at))
-            .await;
-    page_response(&page)
 }
 
 /// `peer`'s offer for the query the body holds, accepted and kept by this
@@ -1059,14 +1100,13 @@ fn page_response(page: &[u8]) -> Response {
         .into_response()
 }
 
-/// The inventory sections a comma separated list names, in order and without
-/// repeats; all of them when it names none; `None` when one is not an
-/// inventory section.
-fn inventory_sections(list: Option<&str>) -> Option<Vec<Section>> {
-    let names: Vec<&str> = list
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
+/// The inventory sections `names` names, blanks left out, in order and
+/// without repeats; all of them when it names none; `None` when one is not
+/// an inventory section.
+fn inventory_sections(names: &[&str]) -> Option<Vec<Section>> {
+    let names: Vec<&str> = names
+        .iter()
+        .map(|name| name.trim())
         .filter(|name| !name.is_empty())
         .collect();
     if names.is_empty() {
@@ -1105,23 +1145,32 @@ fn inventory_request_key(sections: &[String], cursor: &str) -> String {
 
 /// The answer to a discovery call to `peer` that got no page, or no offer.
 fn discovery_failure(peer: &AgentId, failure: &DiscoveryError) -> Response {
+    discovery_refusal(peer, failure).into_response()
+}
+
+/// What the gateway says of a discovery call to `peer` that got no page, or
+/// no offer: fixed messages, and the peer's own words only cut to printable
+/// ASCII; the error itself is logged.
+fn discovery_refusal(peer: &AgentId, failure: &DiscoveryError) -> Refusal {
     tracing::debug!(%peer, error = %failure, "no answer to use from the peer");
     match failure {
         DiscoveryError::Unreachable(_) | DiscoveryError::Timeout => {
-            error(StatusCode::BAD_GATEWAY, "peer unreachable")
+            Refusal::new(StatusCode::BAD_GATEWAY, "peer unreachable")
         }
         DiscoveryError::TooLarge | DiscoveryError::Protocol(_) => {
-            error(StatusCode::BAD_GATEWAY, "peer protocol error")
+            Refusal::new(StatusCode::BAD_GATEWAY, "peer protocol error")
         }
-        DiscoveryError::BadRecord(_) => error(StatusCode::BAD_GATEWAY, "peer record invalid"),
+        DiscoveryError::BadRecord(_) => {
+            Refusal::new(StatusCode::BAD_GATEWAY, "peer record invalid")
+        }
         DiscoveryError::Regression { .. } => {
-            error(StatusCode::BAD_GATEWAY, "peer record regression")
+            Refusal::new(StatusCode::BAD_GATEWAY, "peer record regression")
         }
-        DiscoveryError::Offer(refused) => error(
+        DiscoveryError::Offer(refused) => Refusal::new(
             StatusCode::BAD_GATEWAY,
             format!("peer offer invalid: {refused}"),
         ),
-        DiscoveryError::Report(why) => error(
+        DiscoveryError::Report(why) => Refusal::new(
             StatusCode::BAD_GATEWAY,
             format!("peer benchmark report invalid: {why}"),
         ),
@@ -1131,17 +1180,14 @@ fn discovery_failure(peer: &AgentId, failure: &DiscoveryError) -> Response {
             let message = format!("peer refused: {said}");
             match refusal.code() {
                 ErrorCode::BadRequest | ErrorCode::InvalidCursor => {
-                    error(StatusCode::BAD_REQUEST, message)
+                    Refusal::new(StatusCode::BAD_REQUEST, message)
                 }
                 ErrorCode::RateLimited => {
                     let seconds = refusal.retry_after_ms.div_ceil(1000).max(1);
-                    let mut response = error(StatusCode::TOO_MANY_REQUESTS, message);
-                    response
-                        .headers_mut()
-                        .insert(RETRY_AFTER, HeaderValue::from(seconds));
-                    response
+                    Refusal::new(StatusCode::TOO_MANY_REQUESTS, message)
+                        .retry_after(u64::from(seconds))
                 }
-                _ => error(StatusCode::BAD_GATEWAY, message),
+                _ => Refusal::new(StatusCode::BAD_GATEWAY, message),
             }
         }
     }
@@ -1714,24 +1760,51 @@ fn error(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({ "error": message.into() }))).into_response()
 }
 
-/// A request the gateway answers itself: `status` with `{"error": message}`.
-pub(crate) struct Refusal(StatusCode, String);
+/// A request the gateway answers itself: `status` with `{"error": message}`,
+/// and `Retry-After` when it says how long to wait.
+pub(crate) struct Refusal {
+    status: StatusCode,
+    message: String,
+    retry_after_s: Option<u64>,
+}
 
 impl Refusal {
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self(status, message.into())
+        Self {
+            status,
+            message: message.into(),
+            retry_after_s: None,
+        }
+    }
+
+    /// This refusal, telling the client to wait `seconds` before it asks
+    /// again.
+    fn retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after_s = Some(seconds);
+        self
+    }
+
+    /// What it says: fixed text, or a peer's words cut to printable ASCII.
+    pub(crate) fn message(&self) -> &str {
+        &self.message
     }
 }
 
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ({})", self.1, self.0)
+        write!(f, "{} ({})", self.message, self.status)
     }
 }
 
 impl IntoResponse for Refusal {
     fn into_response(self) -> Response {
-        error(self.0, self.1)
+        let mut response = error(self.status, self.message);
+        if let Some(seconds) = self.retry_after_s {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(seconds));
+        }
+        response
     }
 }
 
@@ -1740,7 +1813,13 @@ pub(crate) struct StoreUnavailable;
 
 impl IntoResponse for StoreUnavailable {
     fn into_response(self) -> Response {
-        error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        Refusal::from(self).into_response()
+    }
+}
+
+impl From<StoreUnavailable> for Refusal {
+    fn from(_: StoreUnavailable) -> Self {
+        Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
     }
 }
 
