@@ -1,0 +1,12 @@
+# The HTTP server of F (agente_f.py), installed together with
+# tests/interop/requirements.txt, which pins the SDK and its dependencies:
+#
+#   pip install --no-deps -r tests/interop/requirements.txt -r tests/exit/hito-2/requirements-f.txt
+#
+# a2a-sdk's `http-server` extra (starlette, sse-starlette) and uvicorn, with
+# the dependencies they add, pinned as resolved on 2026-11-15 for Python
+# 3.12 and 3.13 on Linux x86_64.
+click==8.5.0
+sse-starlette==3.6.0
+starlette==1.10.0
+uvicorn==0.54.0

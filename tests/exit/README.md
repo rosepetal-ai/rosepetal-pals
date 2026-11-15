@@ -1,5 +1,7 @@
 # Prueba de salida del hito 1 con Docker
 
+Este directorio tiene dos arneses: `run.sh`, del hito 1, en esta sección, y `hito-2.sh`, del hito 2, en la [siguiente](#prueba-de-salida-del-hito-2-con-docker).
+
 `run.sh` ejecuta los ocho casos del runbook [`docs/runbooks/hito-1-dos-maquinas.md`](../../docs/runbooks/hito-1-dos-maquinas.md) en una sola máquina Linux, con un contenedor Docker en el papel de la segunda máquina. Cada caso comprueba el resultado esperado del runbook e imprime `RESULTADO <caso>: superado` o `FALLIDO`. No sustituye a la prueba en dos máquinas físicas (ver «Lo que no cubre»).
 
 ## Topología
@@ -76,3 +78,89 @@ Diferencias con el runbook:
 - **El camino con `sudo`:** A trabaja como root, así que `$SUDO` va vacío y no se ejecuta ningún `sudo`.
 - **Las órdenes del runbook en B:** el paso 2 en B, el bloque del cambio de worker, la parte del caso 5 en B y la limpieza en B no se ejecutan tal como están escritas, porque el arnés las reimplementa.
 - **Las órdenes de A fuera de los seis guiones:** son copias en `run.sh`. Un cambio en esos bloques del runbook hay que llevarlo a mano a `run.sh` para probarlo.
+
+# Prueba de salida del hito 2 con Docker
+
+[`hito-2.sh`](hito-2.sh) ejecuta los casos 1 a 8 del runbook [`docs/runbooks/hito-2-consulta-de-servicios.md`](../../docs/runbooks/hito-2-consulta-de-servicios.md) en una sola máquina Linux, con un contenedor Docker por agente. Cada caso comprueba el resultado esperado del runbook e imprime `RESULTADO <caso>: superado` o `FALLIDO`. El caso 9, el TCK y el cliente de Python, se ejecuta aparte, como dice el runbook.
+
+## Topología
+
+Todos los contenedores salen de la imagen [`hito-2/Dockerfile`](hito-2/Dockerfile) (Debian trixie fijada por su digest, con Node, `@modelcontextprotocol/server-everything` fijado por [`hito-2/mcp/package-lock.json`](hito-2/mcp/package-lock.json), y un venv con el SDK oficial de Python fijado por [`../interop/requirements.txt`](../interop/requirements.txt) y [`hito-2/requirements-f.txt`](hito-2/requirements-f.txt)) y están en una red bridge propia, `pals-exit-h2-net`.
+
+| Contenedor | Agente | Qué |
+|-|-|-|
+| `pals-exit-h2-a` | A, quien pide | Worker `echo`; la CA de prueba de F en su almacén del sistema. Arranca con `--cap-add NET_ADMIN` solo para las cuatro reglas de `iptables` que cuentan bytes en su `eth0` y dicen el camino de red; no corta nada |
+| `pals-exit-h2-b` … `-e`, `-g` | B, C, D, E y G, los proveedores | Los inventarios de la tarea 10, con el worker de pruebas del runbook y su conexión MCP comprobada por el adaptador con server-everything por stdio |
+| `pals-exit-h2-g` | H, el contacto caído del caso 5 | Un segundo daemon en el contenedor de G, con su propio `PALS_HOME` |
+| `pals-exit-h2-f` | F, el agente A2A de serie | [`hito-2/agente_f.py`](hito-2/agente_f.py), por `https` en el 8443 con un certificado de una CA de prueba hecha en el contenedor, y su copia con la card alterada en el 8444 |
+| `pals-exit-h2-m` | M1 y M2 del caso 8 | El `pals` del hito 1 y el del hito 2 sobre los mismos directorios de datos, en loopback |
+
+Los daemons usan `net.relay = true`, los relays públicos de n0: con `relay = false` un daemon solo escucha en `127.0.0.1` y no lo alcanza otro contenedor. Entre contenedores el camino es UDP directo por el bridge (la línea `camino caso 1:` del registro lo mide). Al rearrancar B en el caso 5, A lo encuentra por su id sin volver a guardar su ticket.
+
+## Requisitos
+
+- Linux con Docker, con permiso para crear imágenes, redes y contenedores. Además, `bash`, `git`, `curl`, `python3`, `sha256sum`, `tar` y `awk`.
+- Go 1.26 o posterior y Node 20 o posterior en el anfitrión, para los verificadores de Go y JS del caso 3, y `cargo`, para sus tests de los pares de prueba (`PALS_EXIT_TESTS=omitir` los salta).
+- Salida a internet: los relays de n0 por TCP 443, y Debian, PyPI y el registro de npm para construir la imagen (y el proxy de módulos de Go y npm para los verificadores, si no están ya descargados).
+- `pals` compilado en el anfitrión, con una glibc no más nueva que la de Debian trixie: `cargo build --release --locked -p pals`. Se copia a cada contenedor.
+- Para el caso 8, el `pals` del hito 1 (commit `71092a0`) y el programa `events_verify`, como dice la sección 1 del runbook:
+
+  ```bash
+  git archive 71092a0 | tar -x -C <dir>/hito1-src
+  (cd <dir>/hito1-src && CARGO_TARGET_DIR=<dir>/hito1-target cargo build --release --locked -p pals)
+  cargo build --release --locked -p pals-core --example events_verify
+  ```
+
+- Espacio: la imagen ocupa unos 700 MB; los registros, unos pocos MB.
+- Tiempo: unos 5 min con la imagen ya construida, más la primera construcción.
+
+## Uso
+
+```bash
+cargo build --release --locked -p pals
+cargo build --release --locked -p pals-core --example events_verify
+export PALS_EXIT_DIR=$(mktemp -d)                 # nuevo o vacío: los registros
+export PALS_EXIT_BIN_HITO1=<el pals del hito 1>
+tests/exit/hito-2.sh                              # todo: preparar, casos 1 a 8 y desmontar
+```
+
+Las fases también se pueden ejecutar sueltas, en orden y con el mismo `PALS_EXIT_DIR`: `preparar`, `caso1` … `caso8` y `desmontar`. Por ejemplo, `tests/exit/hito-2.sh preparar caso1 caso2`, y después `tests/exit/hito-2.sh desmontar`. Los casos dependen de los anteriores: el 2 usa la búsqueda del 1, el 5 rearranca B, y el 7 busca entre F y el F alterado que guarda el 3.
+
+| Variable | Valor por defecto | Qué es |
+|-|-|-|
+| `PALS_EXIT_DIR` | (obligatoria) | Los registros (`registro/`) y el contexto de construcción de la imagen. `preparar` solo acepta uno nuevo o vacío |
+| `PALS_EXIT_BIN` | `target/release/pals` | El binario de `pals` |
+| `PALS_EXIT_BIN_HITO1` | (ninguno) | El `pals` del hito 1, para el caso 8; sin él, el caso 8 falla |
+| `PALS_EXIT_EVENTS_VERIFY` | `target/release/examples/events_verify` | El verificador de la cadena de eventos del caso 8 |
+| `PALS_EXIT_TESTS` | `cargo` | `omitir` salta, en el caso 3, los tests de los pares de prueba con la card alterada |
+| `PALS_EXIT_KEEP_IMAGE` | `1` | `0` borra también la imagen al desmontar |
+
+El registro completo queda en `$PALS_EXIT_DIR/registro/run.log` y los resultados en `registro/resultados.txt`; las respuestas de las búsquedas, en `registro/busquedas/`, y las páginas de las vistas del caso 6, en `registro/vistas/`. Al desmontar se copian ahí, por contenedor, los registros de los daemons, las ejecuciones de cada worker, lo que recibió y respondió cada servidor MCP y los de F. Contienen ids de agente, hashes e ids de grants y de ofertas, pero no los tokens de los grants ni los tickets: el arnés los pasa de un contenedor a otro sin imprimirlos.
+
+**Si una ejecución se interrumpe.** Con Ctrl-C o `SIGTERM`, el arnés desmonta antes de salir; los pasos largos corren en segundo plano mientras espera, así que lo hace en el acto. `todo` desmonta también cuando una fase falla. Después de cualquier otro final, ejecuta `tests/exit/hito-2.sh desmontar` con el mismo `PALS_EXIT_DIR`. Si ese directorio ya no existe y quedan contenedores o la red, comprueba antes su etiqueta (`docker inspect -f '{{ index .Config.Labels "pals-exit.dir" }}' pals-exit-h2-a`, `docker network inspect -f '{{ index .Labels "pals-exit.dir" }}' pals-exit-h2-net`) y bórralos a mano: `docker rm -f pals-exit-h2-{a,b,c,d,e,g,f,m}; docker network rm pals-exit-h2-net`.
+
+## Qué crea y qué toca
+
+- **Docker:** la imagen `pals-exit-h2:latest` (con la etiqueta `pals-exit.image`), y la red `pals-exit-h2-net` y los contenedores `pals-exit-h2-{a,b,c,d,e,g,f,m}`, todos con la etiqueta `pals-exit.dir=<PALS_EXIT_DIR>`. Al crear y borrar la red, Docker añade y quita sus propias reglas de cortafuegos y de NAT en el anfitrión. `preparar` se niega si existe ya algún recurso `pals-exit-h2-*`. `desmontar` borra solo los contenedores y la red cuya etiqueta es este `PALS_EXIT_DIR`, y la imagen solo con `PALS_EXIT_KEEP_IMAGE=0`. Nunca toca la imagen `pals-exit-a:latest` del hito 1 ni ningún otro recurso.
+- **En el anfitrión:** ningún daemon. El arnés no ejecuta `iptables`, `nft`, `tc` ni `sysctl` en el anfitrión; las únicas reglas de `iptables` son las de cuenta de bytes dentro de A. Ejecuta allí los verificadores de Go y JS del caso 3 sobre la card que guarda en el registro, y, con `cargo`, los dos tests de integración de los pares de prueba.
+- **Ficheros:** solo bajo `PALS_EXIT_DIR`. `preparar` lo marca con un fichero `.pals-exit`, y las demás fases se niegan a trabajar en uno sin esa marca. `desmontar` borra el contexto de la imagen y la copia del certificado de la CA de prueba (nunca sale su clave del contenedor de F); conserva `registro/` y la marca.
+- **Procesos:** todos los daemons y servidores viven en los contenedores. El `para` del runbook envía `SIGTERM` a un daemon solo si su PID sigue siendo el `pals daemon` de ese `PALS_HOME`, y el caso 8 hace lo mismo con los suyos.
+
+## Cómo sigue el runbook
+
+- Los ocho guiones que el runbook escribe en `~/pals-h2` (`funciones.sh`, `proveedor.sh`, `mcp-everything.sh`, `req.json`, `metricas.py`, `caso4.sh`, `vista.py` y `caso8.sh`) se extraen del propio runbook y se copian a cada contenedor: un cambio en ellos se prueba con el arnés.
+- Las demás órdenes del runbook están copiadas en `hito-2.sh`. Cada orden en un contenedor es una terminal nueva, como root, que carga `funciones.sh` y elige su agente con `agente <x>`. Un cambio en esos bloques del runbook hay que llevarlo a mano a `hito-2.sh`.
+
+Diferencias con el runbook:
+
+- El binario se compila en el anfitrión y se copia a cada contenedor, en lugar de `cargo install` en cada máquina. Cada contenedor recibe una copia del árbol de trabajo del repositorio en `~/rosepetal-pals`. El servidor MCP y el venv vienen en la imagen, en `/opt/mcp` y `/opt/venv`, enlazados desde `~/pals-h2/mcp` y `~/pals-h2/venv`, donde los instala el runbook.
+- El nombre de la máquina de F (`$F_HOST`) es el del contenedor, `pals-exit-h2-f`, que el DNS de la red de Docker resuelve. La CA de prueba pasa de F a A por el anfitrión; su clave no sale de F.
+- **Caso 3.** Los verificadores de Go y JS corren en el anfitrión, sobre la card que el gateway de A sirvió.
+- **Caso 4.** `tools/list` sin cambios, o como mucho uno por cada vez que pudo vencer el temporizador de 60 s de los proveedores durante el caso. El registro lista la hora de cada arranque del servidor MCP de B.
+- **Caso 5.** Si la oferta de B sigue en vigor cuando A pregunta (si H tardara menos que la oferta en descartarse), el arnés repite 5b con otra pregunta, hasta tres veces, y exige que en algún intento se renueve. Cada intento comprueba que su pregunta se ejecuta una sola vez.
+
+## Lo que no cubre
+
+- Todos los agentes comparten el kernel, el reloj y la máquina; entre ellos solo hay el bridge de Docker. No hay máquinas, redes ni NAT distintos: el camino es UDP directo, y los relays solo se usan para registrarse. Los relojes nunca difieren, así que el desfase de 60 s no se ejercita aquí (lo hacen los tests).
+- F es un agente corriente sobre el SDK de Python, con un certificado de una CA de prueba; no un agente de terceros en internet.
+- **Las órdenes del runbook fuera de los ocho guiones:** son copias en `hito-2.sh`.

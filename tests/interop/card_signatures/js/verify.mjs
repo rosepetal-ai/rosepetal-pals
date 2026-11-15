@@ -6,10 +6,14 @@
 // Usage, after `npm ci` in this directory:
 //
 //   node tests/interop/card_signatures/js/verify.mjs <vector.json>
+//   node tests/interop/card_signatures/js/verify.mjs <agent id> <signed-agent-card.json>
 //
-// The vector is crates/pals-core/tests/vectors/card-jws-v1.json: its
-// signed_card is checked with a key retriever that trusts only agent_id,
-// returning the OKP/Ed25519 JWK whose x is the kid, and only for that kid.
+// The card is a frozen vector's signed_card, checked against its agent_id
+// (crates/pals-core/tests/vectors/card-jws-v1.json), or a live card: the
+// body of GET <gateway>/peers/<agent id>/signed-agent-card.json of a PALS
+// gateway, saved to a file, checked against the agent id given. It is
+// checked with a key retriever that trusts only that agent, returning the
+// OKP/Ed25519 JWK whose x is the kid, and only for that kid.
 // A copy with skills[0].description changed must fail, and so must the card
 // when another agent is expected. Prints "verified" and exits 0, or names
 // the difference and exits 1.
@@ -52,12 +56,26 @@ function fail(what) {
   process.exit(1);
 }
 
-if (process.argv.length !== 3) {
-  fail('usage: node tests/interop/card_signatures/js/verify.mjs <vector.json>');
+// The card to check and the agent expected to have signed it: a vector's
+// signed_card and agent_id, or the agent id given and the card in the file
+// given.
+let card;
+let expected;
+if (process.argv.length === 3) {
+  const vector = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+  card = vector.signed_card;
+  expected = vector.agent_id;
+} else if (process.argv.length === 4) {
+  expected = process.argv[2];
+  card = JSON.parse(readFileSync(process.argv[3], 'utf8'));
+} else {
+  fail(
+    'usage: node tests/interop/card_signatures/js/verify.mjs <vector.json> | <agent id> <signed-agent-card.json>',
+  );
 }
-const vector = JSON.parse(readFileSync(process.argv[2], 'utf8'));
-const card = vector.signed_card;
-const expected = vector.agent_id;
+if (!Array.isArray(card.skills) || card.skills.length === 0) {
+  fail('the card has no skills[0] to change');
+}
 
 if (!(await verifies(card, expected))) {
   fail('the card does not verify');

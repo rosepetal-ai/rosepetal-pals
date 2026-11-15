@@ -1,15 +1,20 @@
 // Command go verifies a PALS Agent Card signature with the official Go SDK,
 // a2a-go (a2acrypto), as pinned in go.mod.
 //
-// Usage, from the repository root (the module is this directory):
+// Usage, from the repository root (the module is this directory), with
+// absolute paths:
 //
 //	go -C tests/interop/card_signatures/go run . "$PWD/crates/pals-core/tests/vectors/card-jws-v1.json"
+//	go -C tests/interop/card_signatures/go run . <agent id> /path/to/signed-agent-card.json
 //
-// The vector is crates/pals-core/tests/vectors/card-jws-v1.json: its
-// signed_card is checked as the Go resolver checks a card it fetched
+// The card is a frozen vector's signed_card, checked against its agent_id
+// (crates/pals-core/tests/vectors/card-jws-v1.json), or a live card: the
+// body of GET <gateway>/peers/<agent id>/signed-agent-card.json of a PALS
+// gateway, saved to a file, checked against the agent id given. It is
+// checked as the Go resolver checks a card it fetched
 // (agentcard.DefaultCardParser, then a2acrypto.Verifier.Verify over the
 // card's bytes for each signature until one verifies), with a
-// KeyResolverFunc that trusts only agent_id: the Ed25519 public key whose
+// KeyResolverFunc that trusts only that agent: the Ed25519 public key whose
 // hex is the kid, and only for that kid. A copy with skills[0].description
 // changed must fail, and so must the card when another agent is expected.
 // Prints "verified" and exits 0, or names the difference and exits 1.
@@ -40,47 +45,76 @@ func main() {
 	fmt.Println("verified")
 }
 
+const usage = "usage: go -C tests/interop/card_signatures/go run . <vector.json> | <agent id> <signed-agent-card.json>"
+
 func run() error {
-	if len(os.Args) != 2 {
-		return errors.New("usage: go -C tests/interop/card_signatures/go run . <vector.json>")
-	}
-	data, err := os.ReadFile(os.Args[1])
+	card, agentID, err := load(os.Args[1:])
 	if err != nil {
 		return err
 	}
-	var vector struct {
-		AgentID    string          `json:"agent_id"`
-		SignedCard json.RawMessage `json:"signed_card"`
-	}
-	if err := json.Unmarshal(data, &vector); err != nil {
-		return fmt.Errorf("vector: %w", err)
-	}
 
-	if err := verify(vector.SignedCard, vector.AgentID); err != nil {
+	if err := verify(card, agentID); err != nil {
 		return fmt.Errorf("the card does not verify: %w", err)
 	}
 
 	var tampered map[string]any
-	if err := json.Unmarshal(vector.SignedCard, &tampered); err != nil {
+	if err := json.Unmarshal(card, &tampered); err != nil {
 		return err
 	}
-	skill := tampered["skills"].([]any)[0].(map[string]any)
-	skill["description"] = skill["description"].(string) + " (tampered)"
+	skills, ok := tampered["skills"].([]any)
+	if !ok || len(skills) == 0 {
+		return errors.New("the card has no skills[0] to change")
+	}
+	skill, ok := skills[0].(map[string]any)
+	if !ok {
+		return errors.New("skills[0] is not an object")
+	}
+	description, _ := skill["description"].(string)
+	skill["description"] = description + " (tampered)"
 	tamperedBytes, err := json.Marshal(tampered)
 	if err != nil {
 		return err
 	}
-	if verify(tamperedBytes, vector.AgentID) == nil {
+	if verify(tamperedBytes, agentID) == nil {
 		return errors.New("a card with a changed skills[0].description verified")
 	}
 
-	if otherAgentID == vector.AgentID {
+	if otherAgentID == agentID {
 		return errors.New("the other agent id is the expected one")
 	}
-	if verify(vector.SignedCard, otherAgentID) == nil {
+	if verify(card, otherAgentID) == nil {
 		return fmt.Errorf("the card verified with %s expected", otherAgentID)
 	}
 	return nil
+}
+
+// load returns the card to check, as its bytes, and the agent expected to
+// have signed it: a vector's signed_card and agent_id, or the agent id
+// given and the card in the file given.
+func load(args []string) ([]byte, string, error) {
+	switch len(args) {
+	case 1:
+		data, err := os.ReadFile(args[0])
+		if err != nil {
+			return nil, "", err
+		}
+		var vector struct {
+			AgentID    string          `json:"agent_id"`
+			SignedCard json.RawMessage `json:"signed_card"`
+		}
+		if err := json.Unmarshal(data, &vector); err != nil {
+			return nil, "", fmt.Errorf("vector: %w", err)
+		}
+		return vector.SignedCard, vector.AgentID, nil
+	case 2:
+		card, err := os.ReadFile(args[1])
+		if err != nil {
+			return nil, "", err
+		}
+		return card, args[0], nil
+	default:
+		return nil, "", errors.New(usage)
+	}
 }
 
 // verify returns nil when one of the card's signatures verifies with the key
