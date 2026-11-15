@@ -8,8 +8,8 @@ Evidencia de que el hito 2 no cambia la compatibilidad con A2A v1.0 del intercam
 
 | Dato | Valor |
 |-|-|
-| Fecha | 2026-11-15, de 09:52 a 09:56 UTC |
-| Commit de `pals` | `7a60c7c`, el de la tanda de correcciones de la revisión final del hito (outbox y gateway de los contactos A2A corrientes, consultas y búsquedas, ajuste de las vistas). Repite la ejecución anterior, en `812f885` con el código de `eea2281`: requisito a requisito, los mismos estados y transportes en los dos niveles; solo cambian la URL del gateway, el id del proveedor temporal y las horas |
+| Fecha | 2026-11-15, de 11:01 a 11:03 UTC |
+| Commit de `pals` | `41cdeaf`, el código final del hito, con la tanda de correcciones de su revisión final y su corrección residual, que cambia también el camino del gateway hacia los pares PALS: un cuerpo de error que no es JSON llega tipado por el gateway, como texto, nunca como un flujo de eventos. Repite las ejecuciones anteriores, en `7a60c7c` y en `812f885` con el código de `eea2281`: requisito a requisito, los mismos estados y transportes en los dos niveles; solo cambian la URL del gateway, el id del proveedor temporal y las horas |
 | TCK | `a2aproject/a2a-tck` en `104a7b4ae0d83f65c075e3793e322953a830eaba`, el mismo commit que en el hito 1. Python 3.15.2 y las dependencias de su `uv.lock` (`uv sync --frozen`, uv 0.13.8) |
 | Transportes | `jsonrpc` y `http_json`. El TCK no prueba gRPC, que PALS no ofrece |
 | `TCK_STREAMING_TIMEOUT` | `2.0` (el valor por defecto). Una sola ejecución de cada nivel, sin repetir ninguna prueba |
@@ -17,7 +17,7 @@ Evidencia de que el hito 2 no cambia la compatibilidad con A2A v1.0 del intercam
 | Resto | `iroh =1.4.1`, `iroh-blobs =0.105.0`, `rmcp =3.10.0`, Rust 1.99.1 |
 | Cliente independiente | `a2a-sdk==1.3.0` (SDK oficial de Python, protocolo 1.0), Python 3.12.3, dependencias fijadas en [`tests/interop/requirements.txt`](../../../tests/interop/requirements.txt) |
 | Validador de esquemas | `jsonschema==4.26.0` (Draft 2020-12), fijado en el mismo fichero |
-| Anfitrión | Linux x86_64, 32 CPU, compartido con otros proyectos. Carga media al empezar: 65,4 / 64,1 / 51,5; al terminar: 85,9 / 78,5 / 59,9 |
+| Anfitrión | Linux x86_64, 32 CPU, compartido con otros proyectos. Carga media al empezar: 87,3 / 69,8 / 62,0; al terminar: 83,0 / 74,4 / 64,7 |
 
 **Montaje.** Es el del hito 1: dos daemons en la misma máquina, en directorios temporales, con Iroh solo en 127.0.0.1 y sin relay. Uno es el proveedor, con el adaptador `tck`; el otro, el solicitante, con su gateway. Intercambian contactos y un grant (`task.send,task.read,task.cancel` sobre `skill:ask`) con la CLI `pals`. El TCK habla con el gateway del solicitante, en `http://127.0.0.1:<puerto del gateway>/peers/<id del proveedor>`, y cada petición viaja por Iroh con los bindings propios [`http-over-iroh/v1`](../../bindings/http-over-iroh-v1.md).
 
@@ -51,7 +51,7 @@ Salida del TCK, nivel MUST:
   grpc:          0/65 (65 skipped) ✓
   jsonrpc:       75/90 (15 skipped) ✓
   http_json:     71/85 (14 skipped) ✓
-134 passed, 95 skipped, 34 deselected in 97.98s (0:01:37)
+134 passed, 95 skipped, 34 deselected in 80.81s (0:01:20)
 [run_tck] TCK --level must exited 0
 ```
 
