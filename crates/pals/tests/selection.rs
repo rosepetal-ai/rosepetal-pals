@@ -1941,6 +1941,69 @@ async fn discover_cli_prints_the_ranking_and_asks_the_best() {
     assert!(stderr.contains("invalid capability"), "{stderr}");
 }
 
+#[tokio::test]
+async fn ask_names_the_offer_discover_printed() {
+    let a = requester().await;
+    let exec = CountingExecutor::new(Duration::ZERO);
+    let _b = provider(
+        &a,
+        "bob",
+        &good((1, 1)),
+        exec.clone(),
+        OperationalStatus::Ok,
+    )
+    .await;
+    let listen = a.gateway_url().replace("http://", "");
+    std::fs::write(
+        a.dir.path().join("config.toml"),
+        format!("[gateway]\nlisten = \"{listen}\"\n\n[net]\nrelay = false\n"),
+    )
+    .unwrap();
+    let file = a.dir.path().join("req.json");
+    std::fs::write(&file, serde_json::to_vec(&requirements()).unwrap()).unwrap();
+    let search = [
+        "discover",
+        "--capability",
+        CAPABILITY,
+        "--requirements-file",
+        file.to_str().unwrap(),
+        "--project",
+        "demo",
+    ];
+    let (code, stdout, stderr) = pals(a.dir.path(), &search).await;
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    // The ranking names each candidate's offer and when it expires: what
+    // `pals ask --offer` takes, and when it stops taking it.
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("  1. bob "))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    let (_, offer) = line
+        .rsplit_once(", offer ")
+        .unwrap_or_else(|| panic!("no offer named: {line}"));
+    let (offer_id, until) = offer
+        .split_once(" until ")
+        .unwrap_or_else(|| panic!("no expiry named: {line}"));
+    assert!(offer_id.starts_with("offer-"), "{line}");
+    assert!(parse_timestamp(until).is_some(), "{line}");
+    assert_eq!(exec.runs(), 0);
+
+    let (code, stdout, stderr) = pals(
+        a.dir.path(),
+        &["ask", "bob", "hello", "--offer", offer_id, "--wait", "120s"],
+    )
+    .await;
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert_eq!(stdout, "echo: hello\n");
+    assert_eq!(exec.runs(), 1);
+    let rows = a.node.store.outbox_all().unwrap();
+    let sent: Value = serde_json::from_str(&rows[0].request_json).unwrap();
+    assert_eq!(
+        sent["message"]["metadata"][INVENTORY_EXTENSION]["offerId"],
+        json!(offer_id)
+    );
+}
+
 /// Waits up to 60 s for `condition`, looked at every 10 ms.
 async fn wait_until(what: &str, condition: impl Fn() -> bool) {
     let deadline = std::time::Instant::now() + Duration::from_secs(60);

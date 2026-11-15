@@ -115,8 +115,9 @@ enum Command {
     /// Search the contacts for a provider of a capability, through the
     /// running daemon's gateway: verify their cards, ask the PALS peers for
     /// offers over agentnet-discovery/0, within the limits of [discovery],
-    /// and print the ranking, the candidates discarded and why, the
-    /// coverage and the metrics. Searching runs nothing on any peer. With
+    /// and print the ranking, with the id and expiry of each offer, the
+    /// candidates discarded and why, the coverage and the metrics.
+    /// Searching runs nothing on any peer. With
     /// --ask, the question goes to the best candidate that takes it, with
     /// its offer, and the command exits as `pals ask` does
     Discover {
@@ -1075,7 +1076,9 @@ fn discover(
 }
 
 /// Prints a search's ranking, its discards with why, its coverage and its
-/// metrics, one line each. What a peer named is printed as printable ASCII.
+/// metrics, one line each; a candidate that made an offer ends its line
+/// with `, offer <offer id> until <expires_at>`, the id `pals ask --offer`
+/// takes. What a peer named is printed as printable ASCII.
 fn print_search(outcome: &SearchOutcome) {
     println!("ranked:");
     for (n, candidate) in outcome.ranked.iter().enumerate() {
@@ -1107,9 +1110,16 @@ fn print_search(outcome: &SearchOutcome) {
             (Some(_), true) => "grant held",
             (Some(_), false) => "no grant held",
         };
+        let offer = candidate.offer.as_ref().map_or_else(String::new, |offer| {
+            format!(
+                ", offer {} until {}",
+                shown(&offer.offer_id),
+                shown(&offer.expires_at)
+            )
+        });
         println!(
             "  {}. {} ({who}): {status}, skill {}, time {time}, preferred met {}, benchmark \
-             {benchmark}, completed {} failed {}, {grant}, card {}",
+             {benchmark}, completed {} failed {}, {grant}, card {}{offer}",
             n + 1,
             shown(&candidate.peer),
             shown(candidate.skill_id.as_deref().unwrap_or("-")),
