@@ -342,6 +342,10 @@ EOS
     tx=$(en b <<< 'pals id --ticket') || die "no ticket from B"
     en g <<< "pals contact add '$tx' --name b" || die "G cannot save B"
     en a <<< 'pals contact ls; pals grant ls --held'
+    out=$(en a <<< 'for x in b c d e g; do pals card show $x | tail -n 1; done' 2>&1)
+    echo "$out"
+    [ "$(grep -cE '^verified: [0-9a-f]{64} blake3:[0-9a-f]{64}$' <<< "$out")" = 5 ] \
+        || die "A does not see the signed card of every provider"
 
     say "2.5. C, lleno"
     en a <<< 'pals ask c "espera 3600" --wait 10s; echo "código $?"'
@@ -352,16 +356,28 @@ EOS
 
 caso1() {
     say "Caso 1. Elegir entre al menos tres candidatos"
-    local before x out runs=() ok=ok
+    local before x out runs=() ok=ok try
     for x in "${PROVIDERS[@]}"; do runs+=("$(en "$x" <<< ejecuciones)"); done
-    before=$(counters)
-    en_wait "$LOGS/caso1.out" a <<EOS
+    # As the runbook says: a search where no candidate answered within its
+    # time, with only timeouts, ran nothing, and is repeated, up to three
+    # times.
+    for try in 1 2 3; do
+        before=$(counters)
+        en_wait "$LOGS/caso1-$try.out" a <<EOS
 cd ~/pals-h2
 pals discover --capability code.rust.review --requirements-file req.json --ask "$PREGUNTA1"; echo "código \$?"
 EOS
-    out=$(cat "$LOGS/caso1.out")
-    echo "$out"
-    path "caso 1" "$before"
+        out=$(cat "$LOGS/caso1-$try.out")
+        echo "$out"
+        path "caso 1, intento $try" "$before"
+        if has_line "$out" "código 2" && has "$out" "pals: no candidate took the task" \
+            && ! grep -E '^  [a-z]+ \((card|offer)\): ' <<< "$out" | grep -qv ': timeout$'; then
+            note "intento $try: ningún candidato respondió a tiempo, solo descartes timeout, y nada se ejecutó: se repite"
+            continue
+        fi
+        break
+    done
+    cp "$LOGS/caso1-$try.out" "$LOGS/caso1.out"
     FAILS=0
     local b c
     b=$(agent_id b); c=$(agent_id c)
@@ -387,7 +403,7 @@ EOS
         else check "$x no ejecuta nada" test "$((n - runs[i]))" = 0; fi
     done
     [ "$FAILS" = 0 ] || ok=fail
-    result "caso 1" "$ok" "ejecuciones nuevas:$detail; $(grep '^metrics:' <<< "$out")"
+    result "caso 1" "$ok" "intentos: $try; ejecuciones nuevas:$detail; $(grep '^metrics:' <<< "$out")"
 }
 
 caso2() {
@@ -518,6 +534,8 @@ from pathlib import Path
 d = Path(sys.argv[1])
 expected = {'d': 'external_cloud_allowed not met', 'e': 'mcp_integration:example:everything not operational',
             'g': 'min_offered_ram_mib not met'}
+# What the limits of a search and the providers' quotas discard.
+LIMITS = {'refused: RateLimited', 'timeout', 'time budget'}
 for mode in ('rafaga', 'seguidas'):
     codes, bad, limited = Counter(), [], Counter()
     for c in sorted(d.glob(f'caso4-{mode}-*.codigo')):
@@ -534,15 +552,15 @@ for mode in ('rafaga', 'seguidas'):
         ranked = [x['peer'] for x in body['ranked']]
         why = {x['peer']: x['reason'] for x in body['discarded']}
         for peer, reason in why.items():
-            if reason == 'refused: RateLimited':
-                limited[peer] += 1
+            if reason in LIMITS:
+                limited[f'{peer} {reason}'] += 1
             elif expected.get(peer) != reason:
                 bad.append(f'{c.stem}: {peer} {reason}')
-        if ranked != [p for p in ('b', 'c') if why.get(p) != 'refused: RateLimited'] \
+        if ranked != [p for p in ('b', 'c') if why.get(p) not in LIMITS] \
                 or set(ranked) | set(why) != {'b', 'c', 'd', 'e', 'g'}:
             bad.append(f'{c.stem}: {ranked}')
     print(f"{mode}: {sum(codes.values())} búsquedas, códigos {dict(sorted(codes.items()))}, "
-          f"rechazadas por la cuota de los proveedores {dict(limited) or 'ninguna'}, anómalas {bad or 'ninguna'}")
+          f"descartes por cuotas o plazos {dict(limited) or 'ninguno'}, anómalas {bad or 'ninguna'}")
 PY
 )
     echo "$summary"

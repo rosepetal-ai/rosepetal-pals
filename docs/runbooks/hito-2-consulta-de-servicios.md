@@ -497,7 +497,12 @@ pals contact add <ticket de x> --name x
 pals grant import <token de x>
 # En G, con el ticket de B
 . ~/pals-h2/funciones.sh; agente g; pals contact add <ticket de B> --name b
+# En A: la card firmada de cada uno, verificada por su gateway
+. ~/pals-h2/funciones.sh; agente a
+for x in b c d e g; do pals card show $x | tail -n 1; done
 ```
+
+**Esperado:** en A, `verified: <id de x> blake3:…` para cada proveedor. Es también la primera conexión de A con cada uno: en una red lenta, abrirla dentro de la búsqueda puede agotar los 3 s que tiene cada candidato (caso 1).
 
 ### 2.5. C, lleno
 
@@ -544,6 +549,8 @@ b: Revisa src/lib.rs
 ```
 
 C es más rápido que B, pero está lleno. En cada proveedor, `ejecuciones`: B 1, C 1 (la tarea larga), D, E y G 0. Anota la línea `metrics:`.
+
+Si algún candidato sale descartado `timeout` y ninguno respondió (código 2, `no candidate took the task`), no se ejecutó nada: es la red, que no dio la card o la oferta dentro de los 3 s de cada candidato. Anótalo y repite la orden.
 
 ### Caso 2. Requisitos sobre integraciones y recursos
 
@@ -645,7 +652,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' "$(gw a)/healthz"; busca caso4-despues
 
 - La ráfaga: solo códigos `200` y `429` (`too many searches`: el daemon hace a lo sumo 4 búsquedas a la vez y rechaza en el acto las demás), al menos un `200` y ningún `5xx`.
 - Las seguidas: 50 `200`.
-- Cada búsqueda respondida, con B y C en su ranking, por ese orden. Un proveedor que ya recibió 60 consultas de A en el último minuto rechaza las siguientes (`refused: RateLimited`), y A lo descarta en esa búsqueda: es su cuota, no un fallo.
+- Cada búsqueda respondida, con B y C en su ranking, por ese orden, y D, E y G descartados por sus motivos. Los límites pueden recortar alguna: un proveedor que ya recibió 60 consultas de A en el último minuto rechaza las siguientes (`refused: RateLimited`), y un candidato que no acaba en sus 3 s sale `timeout`. A lo descarta en esa búsqueda: son las cuotas y los plazos, no un fallo.
 - Después, en B a G, los mismos `task.accepted` y ejecuciones que antes, los mismos PID y `tools/list` sin cambios, o uno más por cada vez que venció el temporizador de 60 s mientras tanto: `~/pals-h2/<x>-mcp-arranques.log` tiene la hora de cada comprobación; en A, `200`, y la búsqueda de después, `200`.
 
 ### Caso 5. Oferta vencida y proveedor ocupado
