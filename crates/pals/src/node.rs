@@ -43,7 +43,8 @@ use crate::discovery::{
     Records, Searcher, announced_capabilities, iroh_contact, renew_on_change,
 };
 use crate::gateway::{self, GatewayParts, GatewayState};
-use crate::inventory::InventoryState;
+use crate::inventory::mcp_adapter::MCP_ADAPTER_TIMEOUT;
+use crate::inventory::{InventoryState, McpAdapter};
 use crate::net::{ALPN_A2A_HTTP, PeerHttp, TunnelLimits, TunnelServer};
 use crate::outbox::Outbox;
 use crate::worker::TASKS_DIR;
@@ -74,9 +75,10 @@ const OFFER_RETENTION_S: i64 = 24 * 3600;
 const GATEWAY_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What a node runs with besides its configuration and executor: the clock
-/// its quotas, records, pages and offers follow, the load its offers
-/// report, and, for tests, a hook in its discovery server, other quotas and
-/// other limits for its searches.
+/// its quotas, records, pages, offers and observations follow, the load its
+/// offers report, and, for tests, a hook in its discovery server, other
+/// quotas, other limits for its searches and another time for its inventory
+/// adapter.
 pub struct NodeOptions {
     pub clock: Arc<dyn Clock>,
     /// The worker's load; none for a worker without bounds.
@@ -88,11 +90,15 @@ pub struct NodeOptions {
     /// beyond its caps: for tests on loaded hosts, which give candidates
     /// longer than a real search does.
     pub search_limits: Option<DiscoveryLimits>,
+    /// How long the inventory adapter takes at most to observe one MCP
+    /// connection, [`MCP_ADAPTER_TIMEOUT`] by default: for tests, which
+    /// give up sooner on a server that hangs, or never.
+    pub mcp_adapter_timeout: Duration,
 }
 
 impl Default for NodeOptions {
-    /// The system's clock, no load, no hook, the default quotas and the
-    /// search limits of the configuration.
+    /// The system's clock, no load, no hook, the default quotas, the
+    /// search limits of the configuration and [`MCP_ADAPTER_TIMEOUT`].
     fn default() -> Self {
         Self {
             clock: Arc::new(SystemClock),
@@ -100,6 +106,7 @@ impl Default for NodeOptions {
             discovery_hook: None,
             quotas: Quotas::default(),
             search_limits: None,
+            mcp_adapter_timeout: MCP_ADAPTER_TIMEOUT,
         }
     }
 }
@@ -133,7 +140,8 @@ pub struct Node {
     outbox: Outbox,
     /// The search for a provider among the contacts, through the outbox.
     searcher: Searcher,
-    /// The inventory, as read when the node started.
+    /// The inventory, as read when the node started, with what its adapters
+    /// observe.
     inventory: InventoryState,
     /// The agent's cards, signed when the node started.
     cards: CardSet,
@@ -149,6 +157,9 @@ pub struct Node {
     records_renewal: AbortOnDrop,
     /// Renews the records when the endpoint's addresses change.
     address_renewal: AbortOnDrop,
+    /// Runs the inventory adapters when the node starts and every
+    /// `[inventory] refresh_interval_s` ([`InventoryState`]).
+    inventory_refresh: AbortOnDrop,
     /// Held while the node runs.
     _lock: DataDirLock,
 }
@@ -180,14 +191,18 @@ impl Node {
     /// `<data_dir>/`[`BLOBS_DIR`]; takes up its contact and announce records,
     /// issuing those that need it ([`Records::start`]); and only then serves
     /// [`ALPN_A2A_HTTP`], [`iroh_blobs::ALPN`] and [`ALPN_DISCOVERY`] on the
-    /// endpoint and starts the gateway. With `net.relay` the endpoint uses
-    /// Iroh's N0 preset and its public relays; without it, it has no relay
-    /// and is bound to 127.0.0.1 only. While it runs, the node purges the
-    /// dedup rows, the expired pages of peers' views and the expired offers
-    /// again and renews its records every hour, and renews them too whenever
-    /// the endpoint's addresses change. With the `exec` worker, its offers
-    /// report the worker's load ([`WorkerExecutor::load_probe`]); with the
-    /// others, a load without bounds.
+    /// endpoint and starts the gateway, and then, in the background, the
+    /// first run of the inventory adapters, which delays none of it
+    /// ([`InventoryState::startup_refresh_done`]). With `net.relay` the
+    /// endpoint uses Iroh's N0 preset and its public relays; without it, it
+    /// has no relay and is bound to 127.0.0.1 only. While it runs, the node
+    /// purges the dedup rows, the expired pages of peers' views and the
+    /// expired offers again and renews its records every hour, renews them
+    /// too whenever the endpoint's addresses change, and runs the inventory
+    /// adapters every `[inventory] refresh_interval_s`. With the `exec`
+    /// worker, its offers report the worker's load
+    /// ([`WorkerExecutor::load_probe`]); with the others, a load without
+    /// bounds.
     pub async fn spawn(cfg: Config) -> anyhow::Result<Node> {
         #[cfg(not(unix))]
         if matches!(cfg.worker, WorkerCfg::Exec(_)) {
@@ -276,7 +291,8 @@ impl Node {
         &self.records
     }
 
-    /// The inventory, as read when the node started.
+    /// The inventory, as read when the node started, with what its adapters
+    /// observe.
     pub fn inventory(&self) -> &InventoryState {
         &self.inventory
     }
@@ -288,7 +304,8 @@ impl Node {
     }
 
     /// Stops the gateway from accepting requests and ends its MCP sessions,
-    /// stops purging and renewing records, closes the connections to peers,
+    /// stops purging and renewing records and running the inventory adapters
+    /// (a server they started is killed), closes the connections to peers,
     /// stops serving, closes the endpoint, lets the gateway's open
     /// connections finish for up to [`GATEWAY_STOP_TIMEOUT`], stops the blob
     /// service, and only then lets go of the store and, last, of the data
@@ -317,6 +334,7 @@ impl Node {
             dedup_purge,
             records_renewal,
             address_renewal,
+            inventory_refresh,
             _lock: lock,
         } = self;
         let GatewayServer {
@@ -332,6 +350,7 @@ impl Node {
         dedup_purge.stop().await;
         records_renewal.stop().await;
         address_renewal.stop().await;
+        inventory_refresh.stop().await;
         peer_http.close_all().await;
         discovery.close_all().await;
         let stopped = router
@@ -384,6 +403,7 @@ impl Opened {
         );
         let blocking_cfg = cfg.clone();
         let started = opts.clock.now_unix();
+        let (adapter_clock, adapter_timeout) = (Arc::clone(&opts.clock), opts.mcp_adapter_timeout);
         let (lock, key, store, inventory, cards, capabilities) =
             tokio::task::spawn_blocking(move || {
                 let cfg = blocking_cfg;
@@ -396,7 +416,12 @@ impl Opened {
                 let store = Arc::new(Store::open(&data_dir.join(STORE_FILE), key.id())?);
                 // Before anything is bound or changed: an inventory the node
                 // cannot serve stops it here.
-                let inventory = InventoryState::load(&cfg, Arc::clone(&store))?;
+                let inventory = InventoryState::load_with(
+                    &cfg,
+                    Arc::clone(&store),
+                    McpAdapter::new(adapter_timeout),
+                    adapter_clock,
+                )?;
                 let snapshot = inventory.snapshot();
                 let cards = CardSet::build(
                     &cfg,
@@ -510,6 +535,8 @@ impl Opened {
             discovery_hook,
             quotas,
             search_limits,
+            // The inventory's adapter has it already.
+            mcp_adapter_timeout: _,
         } = opts;
         let offers = OfferCheck {
             cards: cards.clone(),
@@ -556,6 +583,7 @@ impl Opened {
                 limits: cfg.limits.clone(),
                 discovery_limits: search_limits
                     .unwrap_or_else(|| DiscoveryLimits::from_config(&cfg.discovery)),
+                inventory: inventory.clone(),
                 data_dir: cfg.data_dir.clone(),
                 download_dir: cfg.mcp.download_dir.clone(),
             },
@@ -570,6 +598,8 @@ impl Opened {
         )));
         let records_renewal =
             AbortOnDrop(tokio::spawn(renew_records_hourly(records.clone(), clock)));
+        // Last, and in the background: nothing waits for the adapters.
+        let inventory_refresh = AbortOnDrop(tokio::spawn(inventory.clone().keep_refreshed()));
         Node {
             id,
             store,
@@ -586,6 +616,7 @@ impl Opened {
             dedup_purge,
             records_renewal,
             address_renewal,
+            inventory_refresh,
             _lock: lock,
         }
     }

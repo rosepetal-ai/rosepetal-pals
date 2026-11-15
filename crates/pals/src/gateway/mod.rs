@@ -16,6 +16,7 @@
 //! | `GET /discovery/inventory/{peer}?sections=a,b&cursor=…` | a page of the peer's inventory view, over `agentnet-discovery/0`, verified, as the peer signed it |
 //! | `POST /discovery/query/{peer}` | the body, an `agentnet.service-query/1`, asked of the peer over `agentnet-discovery/0`: its offer, accepted and kept, as the peer signed it |
 //! | `POST /discovery/search` | `{"search": <request>, "ask"?, "wait_s"?}`: a search for a provider among the contacts ([`Searcher`]), and, with `ask`, the question asked of the one chosen |
+//! | `POST /inventory/refresh` | runs this agent's inventory adapters now ([`InventoryState::refresh`]): `200` with the [`RefreshReport`], fixed codes only |
 //! | `POST /blobs` | stores the raw body as a blob: `201 {"url", "hash", "size"}` |
 //! | `GET /blobs/{holder}/{hash}` | the blob, fetched from its holder first if need be |
 //! | any method, `/mcp` | the local [MCP server](crate::mcp), Streamable HTTP |
@@ -191,6 +192,9 @@ use crate::discovery::{
     CardFetchError, DiscoveryClient, DiscoveryError, DiscoveryLimits, PeerCards, SearchError,
     Searcher, SearcherParts, signed_card_json,
 };
+use crate::inventory::InventoryState;
+#[cfg(doc)]
+use crate::inventory::RefreshReport;
 use crate::net::{PeerHttp, TunnelError, peer_addr};
 use crate::node::ticket_of;
 use crate::outbox::{AskError, Outbox};
@@ -281,6 +285,9 @@ struct Inner {
     clock: Arc<dyn Clock>,
     /// The only directory `pals_fetch` writes to, when configured.
     download_dir: Option<PathBuf>,
+    /// This agent's inventory, whose adapters `POST /inventory/refresh`
+    /// runs.
+    inventory: InventoryState,
     /// Cancelled when the gateway stops: ends the MCP sessions.
     stopping: CancellationToken,
 }
@@ -306,6 +313,8 @@ pub struct GatewayParts {
     /// The only directory `pals_fetch` writes to, when configured; else
     /// the default, resolved when it is needed.
     pub download_dir: Option<PathBuf>,
+    /// This agent's inventory.
+    pub inventory: InventoryState,
 }
 
 impl GatewayState {
@@ -324,6 +333,7 @@ impl GatewayState {
             discovery_limits,
             data_dir,
             download_dir,
+            inventory,
         } = parts;
         let outbox =
             Outbox::new(Arc::clone(&store), base_url(&local_addr)).with_data_dir(&data_dir);
@@ -355,6 +365,7 @@ impl GatewayState {
                 plain_http,
                 clock,
                 download_dir,
+                inventory,
                 stopping: CancellationToken::new(),
             }),
         }
@@ -633,6 +644,7 @@ pub fn router(state: GatewayState) -> Router {
         .route("/discovery/inventory/{peer}", get(peer_inventory))
         .route("/discovery/query/{peer}", post(peer_query))
         .route("/discovery/search", post(discovery_search))
+        .route("/inventory/refresh", post(inventory_refresh))
         .route("/blobs", post(upload_blob))
         .route("/blobs/{holder}/{hash}", get(download_blob))
         .route_service("/mcp", crate::mcp::service(state.clone()))
@@ -934,6 +946,23 @@ struct SearchBody {
 const DEFAULT_SEARCH_WAIT_S: u64 = 600;
 /// The longest it waits.
 const MAX_SEARCH_WAIT_S: u64 = 7 * 24 * 3600;
+
+/// `POST /inventory/refresh`: runs this agent's inventory adapters now,
+/// after any run in progress, and answers with what they observed
+/// ([`RefreshReport`]): fixed codes, never a raw error. `500` when the
+/// store cannot keep the observations, which the views show all the same.
+async fn inventory_refresh(State(state): State<GatewayState>) -> Response {
+    match state.inner.inventory.refresh().await {
+        Ok(report) => Json(report).into_response(),
+        Err(err) => {
+            tracing::warn!(error = ?err, "cannot keep the observations of the adapters");
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the observations were made, but cannot be kept",
+            )
+        }
+    }
+}
 
 /// `POST /discovery/search`: the search the body asks for, its outcome as
 /// JSON ([`Searcher::search`]); with `ask`, the search and the candidate

@@ -261,13 +261,17 @@
       "additionalProperties": false
     },
     "mcpAdapter": {
-      "description": "Cómo llega un adaptador de inventario al servidor. Es configuración del operador: nunca sale en una vista.",
+      "description": "Cómo llega un adaptador de inventario al servidor. Es configuración del operador: nunca sale en una vista. Como mucho 16 conexiones llevan adaptador; este esquema no puede contarlas.",
       "oneOf": [
         {
           "type": "object",
           "properties": {
             "transport": { "const": "http" },
-            "url": { "$ref": "#/$defs/text" }
+            "url": {
+              "$ref": "#/$defs/text",
+              "pattern": "^([Hh][Tt][Tt][Pp][Ss]://[^/?#@]+|[Hh][Tt][Tt][Pp]://([Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt]|127\\.0\\.0\\.1|\\[::1\\])(:[0-9]{1,5})?)([/?#].*)?$",
+              "description": "https://, o http:// solo a 127.0.0.1, [::1] o localhost, sin credenciales. El daemon la lee con el analizador de URL de su cliente."
+            }
           },
           "required": ["transport", "url"],
           "additionalProperties": false
@@ -282,7 +286,8 @@
               "items": { "type": "string", "maxLength": 4096 }
             },
             "env_passthrough": {
-              "$ref": "#/$defs/texts",
+              "type": "array",
+              "items": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "maxLength": 4096 },
               "description": "Nombres de las variables de entorno que recibe el proceso; nunca sus valores."
             }
           },

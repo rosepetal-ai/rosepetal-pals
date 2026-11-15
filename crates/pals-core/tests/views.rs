@@ -14,7 +14,7 @@ use pals_core::inventory::view::{
     verify_page,
 };
 use pals_core::inventory::{
-    ComponentLink, ComponentRole, Entry, Inventory, InventorySnapshot, Observation,
+    AdapterMethod, ComponentLink, ComponentRole, Entry, Inventory, InventorySnapshot, Observation,
     ObservationSource, ObservedTool, OperationalStatus, Plugin, Scope, Section, Visibility,
 };
 use pals_core::jcs;
@@ -204,7 +204,7 @@ fn plugins(count: usize, bytes: usize) -> InventorySnapshot {
 fn adapter_observation(tools: &[(&str, Option<&str>)]) -> Observation {
     Observation {
         source: ObservationSource::Adapter {
-            method: "mcp tools/list".to_owned(),
+            method: AdapterMethod::McpToolsList,
         },
         status: OperationalStatus::Ok,
         observed_at: ts(NOW),

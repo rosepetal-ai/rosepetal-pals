@@ -45,8 +45,8 @@ use pals_core::grant::Operation::{BlobFetch, TaskCancel, TaskRead, TaskSend};
 use pals_core::grant::{GRANT_SCHEMA, Grant, SignedGrant, format_timestamp, parse_timestamp};
 use pals_core::identity::{AgentId, AgentKey};
 use pals_core::inventory::{
-    INVENTORY_EXTENSION, Observation, ObservationSource, OperationalStatus, Visibility,
-    missing_tools_detail,
+    AdapterMethod, INVENTORY_EXTENSION, Observation, ObservationSource, OperationalStatus,
+    Visibility, missing_tools_detail,
 };
 use pals_core::jcs;
 use pals_core::signed::Signed;
@@ -149,7 +149,7 @@ fn observed(status: OperationalStatus, detail: Option<String>) -> BTreeMap<Strin
         MCP.to_owned(),
         Observation {
             source: ObservationSource::Adapter {
-                method: "mcp tools/list".to_owned(),
+                method: AdapterMethod::McpToolsList,
             },
             status,
             observed_at: ts(now),

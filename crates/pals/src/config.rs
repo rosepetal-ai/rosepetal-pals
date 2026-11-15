@@ -192,7 +192,11 @@ pub const INVENTORY_TEMPLATE: &str = r#"# What this agent offers and with what (
 # MCP connections. Peers may see only the offered tools, never the rest.
 # The adapter table says how this agent checks the connection and is never
 # shown to a peer: transport "stdio", with command, args and the names (never
-# the values) of the environment variables passed on, or "http", with url.
+# the values) of the environment variables passed on, or "http", with url
+# (https://, or http:// only to 127.0.0.1, [::1] or localhost). The daemon
+# asks the server for its tools (tools/list, never a tool call) when it
+# starts, every refresh_interval_s of config.toml and on `pals inventory
+# refresh`; at most 16 connections have an adapter.
 # [[mcp]]
 # id = "example:repo-reader"
 # description = "Reads the project repository"
@@ -1154,6 +1158,7 @@ max_output_bytes = 10
             .collect();
         let inventory =
             Inventory::from_toml(&uncommented).unwrap_or_else(|err| panic!("{err}\n{uncommented}"));
+        crate::inventory::mcp_adapter::check_adapters(&inventory).unwrap();
         assert!(!inventory.services.is_empty());
         assert!(!inventory.skills.is_empty());
         assert!(!inventory.plugins.is_empty());

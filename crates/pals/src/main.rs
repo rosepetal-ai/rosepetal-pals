@@ -29,7 +29,7 @@ use pals::config::{self, CONFIG_FILE, Config, INIT_TEMPLATE, INVENTORY_TEMPLATE,
 use pals::discovery::cards::PUBLIC_CONTEXT;
 use pals::gateway::CARD_HASH_HEADER;
 use pals::gateway::plain::{self, fetch_plain_card};
-use pals::inventory::InventoryState;
+use pals::inventory::{InventoryState, RefreshReport};
 use pals::net::agent_id_of;
 use pals::node::{Node, STORE_FILE};
 use pals::outbox::{
@@ -226,6 +226,13 @@ enum InventoryCommand {
         #[arg(long)]
         all: bool,
     },
+    /// Check now, through the running daemon, the MCP connections the
+    /// inventory configures an adapter for: initialize and tools/list on
+    /// each, never a tool call. Print `generation <n>`, `observed <n>, ok
+    /// <n>, failed <n>`, then `failed: <id> <code>` for each one not
+    /// operational. The daemon also checks them when it starts and every
+    /// [inventory] refresh_interval_s
+    Refresh,
 }
 
 #[derive(Subcommand)]
@@ -445,6 +452,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             sections,
             all,
         }) => inventory_get(&home, &peer, &sections, all),
+        Command::Inventory(InventoryCommand::Refresh) => inventory_refresh(&home),
         Command::Benchmark(BenchmarkCommand::Import { file, visibility }) => {
             benchmark_import(&home, &file, &visibility)
         }
@@ -756,6 +764,43 @@ fn inventory_get(home: &Path, peer: &str, sections: &[String], all: bool) -> any
             }
         }
         bail!("{peer} keeps sending pages: stopped after {MAX_PAGES}")
+    })
+}
+
+/// How long `pals inventory refresh` waits for the daemon: its adapters, at
+/// once, each within its time, and the kill of a stdio server.
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Runs the inventory adapters of the running daemon now (`POST
+/// /inventory/refresh` of its gateway) and prints their report: only fixed
+/// codes, which the daemon's log details.
+fn inventory_refresh(home: &Path) -> anyhow::Result<()> {
+    let (cfg, key) = load_agent(home)?;
+    let (listen, own) = (cfg.gateway.listen, key.id());
+    runtime(false)?.block_on(async move {
+        this_daemon(listen, &own).await?;
+        let (status, _, body) = gateway_call_within(
+            listen,
+            http::Method::POST,
+            "/inventory/refresh",
+            None,
+            REFRESH_TIMEOUT,
+            MAX_GATEWAY_ANSWER_BYTES,
+        )
+        .await?;
+        let report: RefreshReport = serde_json::from_value(gateway_json(status, &body)?)
+            .context("the gateway answered something that is not a refresh report")?;
+        println!("generation {}", report.generation);
+        println!(
+            "observed {}, ok {}, failed {}",
+            report.observed,
+            report.ok,
+            report.failed.len()
+        );
+        for (id, code) in &report.failed {
+            println!("failed: {} {}", shown(id), shown(code));
+        }
+        Ok(())
     })
 }
 

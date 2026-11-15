@@ -20,8 +20,8 @@ use pals_core::grant::{CLOCK_SKEW_S, format_timestamp};
 use pals_core::identity::{AgentId, AgentKey};
 use pals_core::inventory::view::{CursorKey, VIEW_SIG_DOMAIN, ViewCache};
 use pals_core::inventory::{
-    Inventory, InventorySnapshot, Observation, ObservationSource, OperationalStatus, Scope,
-    Service, Visibility,
+    AdapterMethod, Inventory, InventorySnapshot, Observation, ObservationSource, OperationalStatus,
+    Scope, Service, Visibility,
 };
 use pals_core::jcs;
 use pals_core::signed::{Signed, SignedError};
@@ -76,7 +76,7 @@ fn snapshot(inventory: Inventory, observations: &[(&str, Observation)]) -> Inven
 fn observed(status: OperationalStatus, observed_at: i64, expires_at: i64) -> Observation {
     Observation {
         source: ObservationSource::Adapter {
-            method: "mcp tools/list".to_owned(),
+            method: AdapterMethod::McpToolsList,
         },
         status,
         observed_at: ts(observed_at),

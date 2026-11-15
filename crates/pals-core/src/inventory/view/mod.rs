@@ -37,6 +37,9 @@
 //!   asked), or [`MAX_QUERY_TOTAL_BYTES`] summed over the pages of one chain
 //!   of cursors; [`ViewPage::truncated_by`] says which. The last page of a
 //!   chain cut at the total says [`PageLimit::QueryTotal`] and has no cursor.
+//!   An entry larger than a page ([`entry_budget`]) would stop every chain
+//!   of a scope that shows it: what an adapter observed of an MCP
+//!   connection is cut to fit before a view shows it ([`fit_observation`]).
 //! - **Cursors**: `base64url(JCS({scope, audience, sections, revision,
 //!   offset, bytes_so_far}))` `.` `base64url(BLAKE3-keyed(key, payload))`,
 //!   under a [`CursorKey`] drawn anew on every start: a cursor serves only
@@ -57,6 +60,7 @@
 //! serve the request is [`ViewError::InvalidCursor`], whatever the reason.
 
 mod cache;
+mod fit;
 mod page;
 mod render;
 
@@ -75,7 +79,8 @@ use crate::identity::AgentId;
 use crate::signed::{Signed, SignedDoc, SignedError, check_validity};
 
 pub use cache::ViewCache;
-pub use page::{CursorKey, PageRequest, PageSlice, page, sign_page};
+pub use fit::fit_observation;
+pub use page::{CursorKey, PageRequest, PageSlice, entry_budget, page, sign_page};
 pub use render::{benchmark_subjects, content_hash, render, render_benchmarks};
 
 /// The value of [`ViewPage::schema`].

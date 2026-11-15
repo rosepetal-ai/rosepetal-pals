@@ -1,5 +1,6 @@
 //! Pages of a view: where each one ends ([`page`]), the cursors that chain
-//! them ([`CursorKey`]), and the signed page ([`sign_page`]).
+//! them ([`CursorKey`]), the signed page ([`sign_page`]), and the most an
+//! entry may take to fit alone in one ([`entry_budget`]).
 
 use std::fmt;
 use std::sync::LazyLock;
@@ -9,8 +10,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    MAX_CURSOR_BYTES, MAX_PAGE_BYTES, MAX_QUERY_TOTAL_BYTES, PageLimit, SIGNATURE_CHARS,
-    VIEW_SCHEMA, VIEW_TTL_S, ViewEntry, ViewError, ViewPage, normalized, page_entries, to_value,
+    INVENTORY_SECTIONS, MAX_CURSOR_BYTES, MAX_PAGE_BYTES, MAX_QUERY_TOTAL_BYTES, MAX_SEQ,
+    PageLimit, SIGNATURE_CHARS, VIEW_SCHEMA, VIEW_TTL_S, ViewEntry, ViewError, ViewPage,
+    normalized, page_entries, to_value,
 };
 use crate::card_jws::CardHash;
 use crate::grant::format_timestamp;
@@ -161,7 +163,7 @@ pub fn page(
     };
 
     let max_entries = page_entries(req.page_entries);
-    let overhead = page_overhead(req, &binding, entries.len(), key);
+    let overhead = page_overhead(req, &binding, entries.len() as u64, key);
     let entry_bytes = |entry: &ViewEntry| canonical(&to_value(entry)).len();
     let mut size = overhead;
     let mut end = offset;
@@ -249,26 +251,51 @@ pub fn sign_page(
     })
 }
 
+/// The most bytes the JCS of one entry may take to fit alone in a page of
+/// `scope`, whoever asks, whatever sections, revision and cursor: one more,
+/// and [`page`] refuses it as [`ViewError::TooLarge`] in some page of the
+/// scope.
+pub fn entry_budget(scope: &Scope) -> usize {
+    let audience = (*scope != Scope::Public).then_some(*ANY_AGENT);
+    let mut sections = INVENTORY_SECTIONS.to_vec();
+    sections.push(Section::Benchmarks);
+    let req = PageRequest {
+        scope,
+        audience: audience.as_ref(),
+        sections: &sections,
+        cursor: None,
+        page_entries: None,
+        revision: MAX_SEQ,
+    };
+    let binding = Cursor {
+        scope: scope.key(),
+        audience,
+        sections: normalized(&sections),
+        revision: MAX_SEQ,
+        offset: 0,
+        bytes_so_far: 0,
+    };
+    // Every key makes cursors of the same length.
+    let key = CursorKey([0; 32]);
+    MAX_PAGE_BYTES.saturating_sub(page_overhead(&req, &binding, MAX_SEQ, &key))
+}
+
+/// Any agent id: every one has 64 characters.
+static ANY_AGENT: LazyLock<AgentId> = LazyLock::new(|| AgentKey::from_bytes(&[0; 32]).id());
+
 /// The bytes of a signed page of `req` without entries, at least: every
 /// field at its longest, a cursor with the largest numbers its chain of
 /// `entries` can reach and the longest limit. The entries add their JCS and
 /// a comma between each two. [`sign_page`] builds the page with these
 /// fields, and no other.
-fn page_overhead(
-    req: &PageRequest<'_>,
-    binding: &Cursor,
-    entries: usize,
-    key: &CursorKey,
-) -> usize {
-    /// Any agent id: every one has 64 characters.
-    static ANY_AGENT: LazyLock<AgentId> = LazyLock::new(|| AgentKey::from_bytes(&[0; 32]).id());
+fn page_overhead(req: &PageRequest<'_>, binding: &Cursor, entries: u64, key: &CursorKey) -> usize {
     /// Every timestamp has 20 characters, and every card hash 71.
     const ANY_TIMESTAMP: &str = "2026-11-14T00:00:00Z";
     const ANY_CARD_HASH: &str =
         "blake3:0000000000000000000000000000000000000000000000000000000000000000";
 
     let longest_cursor = Cursor {
-        offset: entries as u64,
+        offset: entries,
         bytes_so_far: MAX_QUERY_TOTAL_BYTES as u64,
         ..binding.clone()
     };

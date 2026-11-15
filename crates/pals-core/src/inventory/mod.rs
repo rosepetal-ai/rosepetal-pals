@@ -605,12 +605,21 @@ pub struct ObservedTool {
 }
 
 /// Who made an observation: the operator (`{"kind": "declared"}`) or an
-/// adapter (`{"kind": "adapter", "method": "…"}`).
+/// adapter (`{"kind": "adapter", "method": "mcp tools/list"}`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ObservationSource {
     Declared,
-    Adapter { method: String },
+    Adapter { method: AdapterMethod },
+}
+
+/// How an adapter observed an entry: one of a fixed set, never free text,
+/// which a view would carry as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AdapterMethod {
+    /// An MCP server's `tools/list`, after `initialize`.
+    #[serde(rename = "mcp tools/list")]
+    McpToolsList,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -779,6 +788,8 @@ impl Observation {
     /// a fixed code, timestamps not in the grant form, an observed tool with
     /// an invalid name or a description longer than
     /// [`MAX_OBSERVED_DESCRIPTION_BYTES`]. The error never quotes `detail`.
+    /// Its `source` needs no check: its method is one of a fixed set
+    /// ([`AdapterMethod`]).
     pub fn check(&self) -> Result<(), InventoryError> {
         if let Some(detail) = &self.detail
             && !is_fixed_detail(detail)
@@ -789,11 +800,6 @@ impl Observation {
         }
         check_timestamp("observed_at", &self.observed_at)?;
         check_timestamp("expires_at", &self.expires_at)?;
-        if let ObservationSource::Adapter { method } = &self.source
-            && (method.is_empty() || method.len() > MAX_STRING_BYTES)
-        {
-            return Err(invalid("an adapter observation names its method"));
-        }
         for tool in &self.tools {
             if !is_tool_name(&tool.name) {
                 return Err(invalid("an observed tool has an invalid name"));
