@@ -19,8 +19,9 @@
 //! at every use, with [`http_client`]: no proxy (the `*_PROXY` variables do
 //! not count), no redirect followed (a `3xx` is a refusal), the platform's
 //! certificate verifier, [`CONNECT_TIMEOUT`] to connect, [`CARD_TIMEOUT`] in
-//! all, `A2A-Version: 1.0`, read up to [`MAX_CARD_BYTES`] before it is
-//! parsed, and then validated ([`validate_card`]). Of its interfaces, only
+//! all, `A2A-Version: 1.0`, `Accept-Encoding: identity`, read up to
+//! [`MAX_CARD_BYTES`] before it is parsed, and then validated
+//! ([`validate_card`]). Of its interfaces, only
 //! the `JSONRPC` and `HTTP+JSON` ones with protocol version `1.0`, no
 //! tenant and the contact's origin are used, the first of each binding; the
 //! others are ignored, so that no card ever sends the gateway to another
@@ -53,6 +54,8 @@
 //! - the body is read whole up to `limits.max_body_bytes` (beyond, `413`),
 //!   and one with a part that names a blob, of this gateway or between
 //!   peers, gets `400 {"error":"files go only to PALS peers"}`;
+//! - the client's `Accept-Encoding` is replaced by `identity`, since the
+//!   gateway refuses an encoded answer;
 //! - the client's `Authorization` passes intact; without one, the contact's
 //!   bearer token, read from its variable then (`401 {"error":"bearer env
 //!   var not set"}` when the variable is not set); no grant is ever sent;
@@ -80,7 +83,7 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::VerifyingKey;
-use http::header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH};
+use http::header::{ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH};
 use http::{HeaderValue, StatusCode, Uri};
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use pals_core::card_jws::{
@@ -106,6 +109,9 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CARD_TIMEOUT: Duration = Duration::from_secs(20);
 /// The A2A protocol version asked for.
 const A2A_VERSION: &str = "1.0";
+/// The only content coding asked of a plain agent: the gateway reads no
+/// other.
+const IDENTITY: &str = "identity";
 /// The well-known path of a card, after a contact's base URL.
 const WELL_KNOWN_CARD: &str = "/.well-known/agent-card.json";
 /// What a plain contact's URL looks like.
@@ -327,6 +333,7 @@ async fn read_bounded(
         .get(url)
         .header("a2a-version", A2A_VERSION)
         .header(ACCEPT, "application/json")
+        .header(ACCEPT_ENCODING, IDENTITY)
         .send()
         .await
         .map_err(|err| PlainError::Unreachable(err.to_string()))?;
@@ -548,6 +555,9 @@ pub(super) async fn forward(
     let mut headers = outgoing_headers(&parts.headers);
     // The body goes as read, and reqwest declares its length.
     headers.remove(CONTENT_LENGTH);
+    // The gateway refuses an encoded answer: none is asked for, whatever
+    // the client takes.
+    headers.insert(ACCEPT_ENCODING, HeaderValue::from_static(IDENTITY));
     let limit = state.inner.limits.max_body_bytes;
     let bytes = match Limited::new(body, limit).collect().await {
         Ok(collected) => collected.to_bytes(),

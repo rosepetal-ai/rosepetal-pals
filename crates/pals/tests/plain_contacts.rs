@@ -1988,3 +1988,125 @@ async fn a_question_resent_only_when_the_gateway_was_never_reached() {
         );
     }
 }
+
+/// The CRC-32 of `data`, as gzip has it.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// `data` as a gzip member, in stored deflate blocks.
+fn gzip(data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
+    if data.is_empty() {
+        out.extend([1, 0, 0, 0xff, 0xff]);
+    }
+    let mut blocks = data.chunks(usize::from(u16::MAX)).peekable();
+    while let Some(block) = blocks.next() {
+        out.push(u8::from(blocks.peek().is_none()));
+        let len = u16::try_from(block.len()).unwrap();
+        out.extend(len.to_le_bytes());
+        out.extend((!len).to_le_bytes());
+        out.extend_from_slice(block);
+    }
+    out.extend(crc32(data).to_le_bytes());
+    out.extend(u32::try_from(data.len()).unwrap().to_le_bytes());
+    out
+}
+
+/// `app`, answering in gzip whenever the request's `Accept-Encoding`
+/// allows it, as HTTPS front ends do for JSON.
+fn compressing(app: axum::Router) -> axum::Router {
+    app.layer(axum::middleware::from_fn(
+        |request: axum::extract::Request, next: axum::middleware::Next| async move {
+            let gzip_allowed = request
+                .headers()
+                .get_all("accept-encoding")
+                .iter()
+                .any(|value| value.to_str().is_ok_and(|value| value.contains("gzip")));
+            let response = next.run(request).await;
+            if !gzip_allowed {
+                return response;
+            }
+            let (mut parts, body) = response.into_parts();
+            let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+            parts.headers.remove("content-length");
+            parts.headers.insert(
+                "content-encoding",
+                axum::http::HeaderValue::from_static("gzip"),
+            );
+            axum::response::Response::from_parts(parts, Body::from(gzip(&bytes)))
+        },
+    ))
+}
+
+#[tokio::test]
+async fn plain_agent_that_compresses_is_asked_for_identity() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let gw = a.gateway_url();
+    let (origin, agent) =
+        serve_at(|origin| compressing(echo_app_with_card(card_json(origin)))).await;
+    // It compresses for a client that allows it.
+    let direct = gateway_send(
+        &origin,
+        "GET",
+        "/.well-known/agent-card.json",
+        &[("accept-encoding", "gzip, deflate")],
+        None,
+    )
+    .await;
+    assert_eq!(direct.headers()["content-encoding"], "gzip");
+    add_plain(&a, "zip", &origin);
+    let before = agent.requests().len();
+
+    // A stock client that allows gzip and deflate, as httpx does.
+    let headers = [("a2a-version", "1.0"), ("accept-encoding", "gzip, deflate")];
+    let calls = [
+        (
+            "/peers/zip/rest/message:send",
+            message_params("por rest", None),
+        ),
+        (
+            "/peers/zip/jsonrpc",
+            rpc_request("SendMessage", message_params("por jsonrpc", None)),
+        ),
+    ];
+    for (path, body) in &calls {
+        let res = gateway_request(&gw, "POST", path, &headers, Some(body)).await;
+        assert_eq!(
+            res.status,
+            200,
+            "{path}: {}",
+            String::from_utf8_lossy(&res.body)
+        );
+        assert!(res.headers.get("content-encoding").is_none(), "{path}");
+    }
+    let res = gateway_request(
+        &gw,
+        "GET",
+        "/peers/zip/.well-known/agent-card.json",
+        &headers,
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    // Every request of the gateway's, cards included, asked for identity.
+    let seen = agent.requests();
+    assert!(seen.len() > before);
+    for request in &seen[before..] {
+        assert_eq!(
+            request.headers["accept-encoding"], "identity",
+            "{request:?}"
+        );
+    }
+}
