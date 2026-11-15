@@ -205,6 +205,16 @@ fn patient() -> DiscoveryLimits {
     }
 }
 
+/// How long the offers of a provider last when its test is not about
+/// expiry: far longer than any loaded host's delays between an offer and
+/// the ask that names it, on the system's clock.
+const LONG_OFFER_MS: u32 = 300_000;
+
+/// A provider's configuration with [`LONG_OFFER_MS`] offers.
+fn long_offers(cfg: &mut Config) {
+    cfg.discovery.offer_valid_for_ms = LONG_OFFER_MS;
+}
+
 /// The requester: an echo node with `opts`, whose searches are
 /// [`patient`] unless `opts` says otherwise, and its configuration changed
 /// by `edit`.
@@ -259,7 +269,7 @@ async fn provider(
         inventory,
         executor,
         NodeOptions::default(),
-        |_| {},
+        long_offers,
         true,
     )
     .await;
@@ -322,7 +332,7 @@ async fn chooses_among_three_candidates() {
         &good((10, 100)),
         carol.clone(),
         full(),
-        |_| {},
+        long_offers,
         true,
     )
     .await;
@@ -1076,7 +1086,7 @@ async fn model_change_requires_a_new_offer() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join(INVENTORY_FILE), good((1, 1))).unwrap();
     let exec = CountingExecutor::new(Duration::ZERO);
-    let b = spawn_node_in_configured(dir, exec.clone(), NodeOptions::default(), |_| {}).await;
+    let b = spawn_node_in_configured(dir, exec.clone(), NodeOptions::default(), long_offers).await;
     a.add_contact("bob", &b);
     let send = grant(&b, &a, &TASK_OPS, 3600);
     a.hold(&send);
@@ -1087,7 +1097,7 @@ async fn model_change_requires_a_new_offer() {
     shut_down(node).await;
     let edited = good((1, 1)).replace("2026-10-01", "2026-11-01");
     std::fs::write(dir.path().join(INVENTORY_FILE), edited).unwrap();
-    let b = spawn_node_in_configured(dir, exec.clone(), NodeOptions::default(), |_| {}).await;
+    let b = spawn_node_in_configured(dir, exec.clone(), NodeOptions::default(), long_offers).await;
     a.add_contact("bob", &b);
     // It keeps the offer, whose scope's view moved on.
     let kept = b.node.store.offer_issued(&offer.offer_id).unwrap().unwrap();
@@ -1142,7 +1152,7 @@ async fn an_offer_never_replaces_the_grant() {
         &public_service((1, 1)),
         exec.clone(),
         NodeOptions::default(),
-        |_| {},
+        long_offers,
         false,
     )
     .await;
@@ -1172,7 +1182,7 @@ async fn candidate_without_a_grant_is_not_asked() {
         &public_service((1, 1)),
         bob.clone(),
         NodeOptions::default(),
-        |_| {},
+        long_offers,
         false,
     )
     .await;
@@ -1182,7 +1192,7 @@ async fn candidate_without_a_grant_is_not_asked() {
         &public_service((100, 1000)),
         carol.clone(),
         NodeOptions::default(),
-        |_| {},
+        long_offers,
         true,
     )
     .await;
@@ -1726,7 +1736,7 @@ async fn tck_style_message_without_offer_is_unchanged() {
         &public_service((1, 1)),
         exec.clone(),
         NodeOptions::default(),
-        |_| {},
+        long_offers,
         false,
     )
     .await;
@@ -1952,7 +1962,7 @@ async fn refusal_once_the_task_exists_stops_the_choice() {
         &public_service((1, 1)),
         bob.clone(),
         defaults(),
-        |_| {},
+        long_offers,
         true,
     )
     .await;
@@ -1962,7 +1972,7 @@ async fn refusal_once_the_task_exists_stops_the_choice() {
         &public_service((100, 1000)),
         carol.clone(),
         defaults(),
-        |_| {},
+        long_offers,
         true,
     )
     .await;
@@ -2055,7 +2065,7 @@ async fn stale_offer_at_the_ask_is_renewed_once() {
             discovery_hook: Some(Arc::new(hook)),
             ..NodeOptions::default()
         },
-        |_| {},
+        long_offers,
         true,
     )
     .await;
@@ -2123,7 +2133,7 @@ async fn unreachable_provider_stops_the_choice() {
         &public_service((1, 1)),
         carol.clone(),
         full(),
-        |_| {},
+        long_offers,
         true,
     )
     .await;
@@ -2186,7 +2196,7 @@ async fn offer_runs_only_under_a_grant_of_its_scope() {
         &public_service((1, 1)),
         exec.clone(),
         NodeOptions::default(),
-        |_| {},
+        long_offers,
         false,
     )
     .await;

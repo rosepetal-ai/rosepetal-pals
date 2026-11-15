@@ -25,6 +25,8 @@ pub mod net;
 pub mod node;
 pub mod outbox;
 mod path_policy;
+#[cfg(unix)]
+mod process_group;
 pub mod worker;
 
 /// `text`, which may come from a peer, as printable ASCII, spaces kept and

@@ -604,6 +604,52 @@ pub struct ObservedTool {
     pub annotations: Option<Value>,
 }
 
+impl ObservedTool {
+    /// Cuts its description, and the `title` of its annotations, to at
+    /// most `cap` bytes each, on a character boundary: what an adapter keeps
+    /// of a server's texts ([`MAX_OBSERVED_DESCRIPTION_BYTES`]), and what a
+    /// view cuts them to for its entry to fit a page
+    /// ([`view::fit_observation`]). A text cut to nothing is left out, and so
+    /// are annotations left empty.
+    pub fn cut_texts(&mut self, cap: usize) {
+        if let Some(description) = &mut self.description {
+            description.truncate(cut_len(description, cap));
+        }
+        if self.description.as_deref() == Some("") {
+            self.description = None;
+        }
+        let emptied = match &mut self.annotations {
+            Some(Value::Object(annotations)) => {
+                let title_emptied = match annotations.get_mut("title") {
+                    Some(Value::String(title)) => {
+                        title.truncate(cut_len(title, cap));
+                        title.is_empty()
+                    }
+                    _ => false,
+                };
+                if title_emptied {
+                    annotations.remove("title");
+                }
+                annotations.is_empty()
+            }
+            _ => false,
+        };
+        if emptied {
+            self.annotations = None;
+        }
+    }
+}
+
+/// The length of the longest start of `text` of at most `cap` bytes that
+/// ends on a character boundary.
+fn cut_len(text: &str, cap: usize) -> usize {
+    let mut end = text.len().min(cap);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 /// Who made an observation: the operator (`{"kind": "declared"}`) or an
 /// adapter (`{"kind": "adapter", "method": "mcp tools/list"}`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -789,3 +789,40 @@ fn vector_parses_and_round_trips() {
         assert!(inventory.get(block).is_some(), "{block} missing");
     }
 }
+
+#[test]
+fn an_observed_tools_texts_are_cut_on_a_character_boundary() {
+    use pals_core::inventory::ObservedTool;
+
+    let tool = |description: &str, annotations: Value| ObservedTool {
+        name: "read_file".to_owned(),
+        description: Some(description.to_owned()),
+        annotations: Some(annotations),
+    };
+    // "añb" is 61 c3 b1 62: two bytes keep "a", three "añ".
+    let mut cut = tool("añb", json!({"title": "añb", "readOnlyHint": true}));
+    cut.cut_texts(2);
+    assert_eq!(cut.description.as_deref(), Some("a"));
+    assert_eq!(
+        cut.annotations,
+        Some(json!({"title": "a", "readOnlyHint": true}))
+    );
+    let mut cut = tool("añb", json!({"title": "añb"}));
+    cut.cut_texts(3);
+    assert_eq!(cut.description.as_deref(), Some("añ"));
+    assert_eq!(cut.annotations, Some(json!({"title": "añ"})));
+    let mut kept = tool("añb", json!({"title": "añb"}));
+    kept.cut_texts(10);
+    assert_eq!(kept, tool("añb", json!({"title": "añb"})));
+    // Cut to nothing, a text is left out, and so are annotations left empty.
+    let mut cut = tool("ñ", json!({"title": "ñ"}));
+    cut.cut_texts(1);
+    assert_eq!((cut.description, cut.annotations), (None, None));
+    let mut cut = tool("ñ", json!({"title": "ñ", "readOnlyHint": false}));
+    cut.cut_texts(0);
+    assert_eq!(cut.annotations, Some(json!({"readOnlyHint": false})));
+    // A title that is not text is not the cut's to touch.
+    let mut cut = tool("x", json!({"title": 7}));
+    cut.cut_texts(0);
+    assert_eq!(cut.annotations, Some(json!({"title": 7})));
+}

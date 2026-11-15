@@ -23,7 +23,7 @@
 //! | some offered tool not listed | `failed`, `missing tools: <those>`: the connection is configured but does not give what is offered |
 //! | no connection: nothing listens, the command does not start, the server hangs up | `failed`, [`DETAIL_UNREACHABLE`] |
 //! | the time ran out | `failed`, [`DETAIL_TIMEOUT`] |
-//! | an answer that is not MCP | `failed`, [`DETAIL_PROTOCOL_ERROR`] |
+//! | an answer that is not MCP | `failed`, [`DETAIL_PROTOCOL_ERROR`]; over stdio, a line that is not JSON or is longer than [`MAX_MCP_LINE_BYTES`] is skipped (rmcp's transport does so), and the server's silence ends as [`DETAIL_TIMEOUT`]: a fixed code all the same, within the adapter's time |
 //! | more than [`MAX_MCP_TOOLS`] tools or [`MAX_MCP_PAGES`] pages | `failed`, [`DETAIL_TOO_MANY_TOOLS`] |
 //!
 //! `detail` is only ever one of those fixed codes. The raw error, which may
@@ -46,9 +46,12 @@
 //!   environment with nothing but [`PASSED_ENV`] and the variables
 //!   `env_passthrough` names, taken from the daemon's own, whose values are
 //!   never kept, logged or published. When the observation ends, however it
-//!   ends, the whole group is killed and the command reaped. A descendant
-//!   that leaves the group (`setsid()`, `setpgid()`) escapes the kill, as
-//!   with the `exec` adapter.
+//!   ends, the whole group is killed and the command reaped (`GroupLeader`,
+//!   the `exec` adapter's own). A descendant that leaves the group
+//!   (`setsid()`, `setpgid()`) escapes the kill, as with the `exec`
+//!   adapter; and so does the whole group if the daemon is killed with
+//!   SIGKILL in the middle of an observation, since nothing sets
+//!   `PR_SET_PDEATHSIG`, the same limit as the `exec` adapter's.
 //!
 //! An inventory configures at most [`MAX_MCP_CONNECTIONS`] adapters
 //! ([`check_adapters`]).
@@ -96,10 +99,6 @@ pub const PASSED_ENV: [&str; 3] = ["PATH", "HOME", "LANG"];
 /// How long an observation lasts unless [`McpAdapter::with_validity`] says
 /// otherwise: twice the default refresh interval.
 const DEFAULT_VALIDITY_S: i64 = 1800;
-/// How long a killed `stdio` server has to be reaped before it is left to
-/// the runtime.
-#[cfg(unix)]
-const REAP_WAIT: Duration = Duration::from_secs(10);
 /// The hosts an `http://` adapter may reach.
 const LOOPBACK_HOSTS: [&str; 3] = ["127.0.0.1", "[::1]", "localhost"];
 
@@ -226,18 +225,28 @@ impl McpAdapter {
         }
     }
 
-    /// The client of the `http` transport.
-    fn http(&self) -> reqwest::Client {
-        let http = self.http.get_or_init(|| {
-            crate::install_crypto_provider();
-            reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(self.timeout)
-                .build()
-                .expect("an HTTP client with no proxy builds once a crypto provider is installed")
-        });
-        http.clone()
+    /// The client of the `http` transport, built the first time it is
+    /// needed; `None`, logged, when it cannot be built, which fails the
+    /// observation as [`DETAIL_UNREACHABLE`] and lets the next one try
+    /// again.
+    fn http(&self, id: &str) -> Option<reqwest::Client> {
+        if let Some(http) = self.http.get() {
+            return Some(http.clone());
+        }
+        crate::install_crypto_provider();
+        let built = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(self.timeout)
+            .build();
+        match built {
+            // Another observation may have built one meanwhile: either does.
+            Ok(http) => Some(self.http.get_or_init(|| http).clone()),
+            Err(err) => {
+                warn!(entry = id, error = ?err, "MCP connection not observed: no HTTP client");
+                None
+            }
+        }
     }
 
     /// Observations that last `validity_s` seconds from when they are made.
@@ -333,7 +342,8 @@ impl McpAdapter {
             .max_sse_event_size(MAX_MCP_LINE_BYTES)
             .reinit_on_expired_session(false);
         // Before the time starts: building the client is not the server's.
-        let transport = StreamableHttpClientTransport::with_client(self.http(), config);
+        let http = self.http(id).ok_or(Failure::Unreachable)?;
+        let transport = StreamableHttpClientTransport::with_client(http, config);
         let listed = tokio::time::timeout(self.timeout, self.list(id, transport, offered)).await;
         listed.unwrap_or_else(|_| {
             warn!(entry = id, "MCP connection not observed: timeout");
@@ -356,6 +366,8 @@ impl McpAdapter {
         use std::process::Stdio;
 
         use rmcp::transport::async_rw::AsyncRwTransport;
+
+        use crate::process_group::GroupLeader;
 
         let mut cmd = std::process::Command::new(command);
         cmd.args(args).env_clear();
@@ -380,8 +392,8 @@ impl McpAdapter {
             warn!(entry = id, error = ?err, "MCP connection not observed: unreachable");
             Failure::Unreachable
         })?;
-        let mut group = ChildGroup::new(child);
-        let (Some(stdin), Some(stdout)) = (group.child.stdin.take(), group.child.stdout.take())
+        let mut group = GroupLeader::new(child, "MCP server");
+        let (Some(stdin), Some(stdout)) = (group.child().stdin.take(), group.child().stdout.take())
         else {
             group.kill().await;
             warn!(
@@ -522,93 +534,20 @@ fn transport_failure(error: &DynamicTransportError) -> Failure {
 }
 
 /// What is kept of an offered tool the server listed: its name, its
-/// description and the `title` of its annotations cut to
-/// [`MAX_OBSERVED_DESCRIPTION_BYTES`], and its annotations.
+/// description and its annotations as the server declares them, its texts
+/// cut to [`MAX_OBSERVED_DESCRIPTION_BYTES`] ([`ObservedTool::cut_texts`]).
 fn observed_tool(tool: Tool) -> ObservedTool {
     let annotations = tool
         .annotations
         .and_then(|annotations| serde_json::to_value(annotations).ok())
-        .and_then(|value| match value {
-            Value::Object(mut annotations) => {
-                if let Some(Value::String(title)) = annotations.remove("title") {
-                    let title = cut_to(&title, MAX_OBSERVED_DESCRIPTION_BYTES);
-                    if !title.is_empty() {
-                        annotations.insert("title".to_owned(), Value::String(title));
-                    }
-                }
-                (!annotations.is_empty()).then_some(Value::Object(annotations))
-            }
-            _ => None,
-        });
-    ObservedTool {
+        .filter(Value::is_object);
+    let mut kept = ObservedTool {
         name: tool.name.into_owned(),
-        description: tool
-            .description
-            .map(|text| cut_to(&text, MAX_OBSERVED_DESCRIPTION_BYTES))
-            .filter(|text| !text.is_empty()),
+        description: tool.description.map(|text| text.into_owned()),
         annotations,
-    }
-}
-
-/// The longest start of `text` of at most `cap` bytes that ends on a
-/// character boundary.
-fn cut_to(text: &str, cap: usize) -> String {
-    let mut end = text.len().min(cap);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text[..end].to_owned()
-}
-
-/// A `stdio` server, leader of its own process group. Dropped before it is
-/// reaped, it kills the whole group.
-#[cfg(unix)]
-struct ChildGroup {
-    child: tokio::process::Child,
-    pgid: libc::pid_t,
-    /// Whether the leader is unreaped: then its pid cannot have been reused,
-    /// and the group id still names this group only.
-    unreaped: bool,
-}
-
-#[cfg(unix)]
-impl ChildGroup {
-    fn new(child: tokio::process::Child) -> Self {
-        let pid = child.id().expect("a child just spawned has a pid");
-        Self {
-            child,
-            pgid: libc::pid_t::try_from(pid).expect("a pid fits in pid_t"),
-            unreaped: true,
-        }
-    }
-
-    /// Sends SIGKILL to every process in the group, while the leader is
-    /// unreaped.
-    fn kill_group(&self) {
-        if self.unreaped {
-            // SAFETY: killpg(2) only sends a signal. The group's leader is an
-            // unreaped child of ours, so its id, the group's id, is not reused.
-            unsafe { libc::killpg(self.pgid, libc::SIGKILL) };
-        }
-    }
-
-    /// Kills the group and reaps its leader.
-    async fn kill(&mut self) {
-        self.kill_group();
-        match tokio::time::timeout(REAP_WAIT, self.child.wait()).await {
-            Ok(Ok(_)) => self.unreaped = false,
-            Ok(Err(err)) => warn!(error = %err, "cannot reap a killed MCP server"),
-            Err(_) => warn!("a killed MCP server is not gone yet"),
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for ChildGroup {
-    fn drop(&mut self) {
-        // Before `child` drops, whose own kill reaches the leader only.
-        self.kill_group();
-    }
+    };
+    kept.cut_texts(MAX_OBSERVED_DESCRIPTION_BYTES);
+    kept
 }
 
 #[cfg(test)]

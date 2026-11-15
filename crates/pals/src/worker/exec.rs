@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::Child;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -19,6 +18,7 @@ use super::{
     Adapter, AdapterError, AdapterOutput, MAX_OUTPUT_FILES, TOO_MANY_OUTPUT_FILES, TaskInput,
 };
 use crate::config::{ExecCfg, ProjectCfg};
+use crate::process_group::GroupLeader;
 
 /// The variables a command takes from the daemon's environment. It gets no
 /// other but the `PALS_*` ones that describe its task.
@@ -29,10 +29,6 @@ pub const TRUNCATED: &str = "\n[truncated]";
 
 /// How much of the end of stderr a failure reports.
 pub const STDERR_TAIL_BYTES: usize = 4096;
-
-/// How long a killed command has to be reaped before it is left to the
-/// runtime.
-const REAP_WAIT: Duration = Duration::from_secs(10);
 
 /// Runs [`ExecCfg::command`] for each task.
 ///
@@ -50,9 +46,10 @@ const REAP_WAIT: Duration = Duration::from_secs(10);
 /// | Command not found | `Failed("worker command not found")` |
 /// | Load | `max_concurrent` running and `max_queue` waiting, kept by the [`WorkerExecutor`](super::WorkerExecutor); beyond them, `Rejected("busy")` |
 ///
-/// The command leads a process group of its own, so that a kill reaches
-/// whatever it started too. A run dropped before the command ends, as when
-/// the daemon stops, kills the group as well.
+/// The command leads a process group of its own (`GroupLeader`, shared
+/// with the inventory's MCP adapter), so that a kill reaches whatever it
+/// started too. A run dropped before the command ends, as when the daemon
+/// stops, kills the group as well.
 ///
 /// Known limit: a descendant that leaves the group, with `setsid()` or
 /// `setpgid()`, escapes every one of these kills. Containing those would
@@ -110,10 +107,10 @@ impl Adapter for ExecAdapter {
             .command(&input, dir)
             .spawn()
             .map_err(|err| spawn_failure(&err, dir))?;
-        let mut running = Running::new(child);
-        let stdin = running.child.stdin.take();
-        let stdout = running.child.stdout.take();
-        let stderr = running.child.stderr.take();
+        let mut running = GroupLeader::new(child, "worker command");
+        let stdin = running.child().stdin.take();
+        let stdout = running.child().stdout.take();
+        let stderr = running.child().stderr.take();
 
         let max_output_bytes = self.cfg.max_output_bytes;
         let out_dir = input.out_dir;
@@ -138,11 +135,11 @@ impl Adapter for ExecAdapter {
             // group id its own, the group is killed, and with it anything the
             // command left running in the background with its pipes closed.
             // Only then is it reaped.
-            match exited_unreaped(running.pgid).await {
+            match running.exited_unreaped().await {
                 Ok(()) => running.kill_group(),
                 Err(err) => warn!(error = %err, "cannot wait for the worker command to exit"),
             }
-            let status = running.child.wait().await;
+            let status = running.child().wait().await;
             (stdout, stderr, status)
         };
         let timeout = Duration::from_secs(self.cfg.timeout_s);
@@ -205,87 +202,6 @@ enum Ended {
     Exited(((Vec<u8>, bool), Vec<u8>, io::Result<ExitStatus>)),
     TimedOut,
     Canceled,
-}
-
-/// A spawned command, leader of its own process group. Dropped before it is
-/// reaped, it kills the whole group.
-struct Running {
-    child: Child,
-    pgid: libc::pid_t,
-    /// Whether the leader is unreaped: then its pid cannot have been reused,
-    /// and the group id still names this group only.
-    unreaped: bool,
-}
-
-impl Running {
-    fn new(child: Child) -> Self {
-        let pid = child.id().expect("a child just spawned has a pid");
-        Self {
-            child,
-            pgid: libc::pid_t::try_from(pid).expect("a pid fits in pid_t"),
-            unreaped: true,
-        }
-    }
-
-    /// Records that the leader has been reaped: the group is no longer
-    /// this one to kill.
-    fn reaped(&mut self) {
-        self.unreaped = false;
-    }
-
-    /// Sends SIGKILL to every process in the group, while the leader is
-    /// unreaped.
-    fn kill_group(&self) {
-        if self.unreaped {
-            // SAFETY: killpg(2) only sends a signal. The group's leader is an
-            // unreaped child of ours, so its id, the group's id, is not reused.
-            unsafe { libc::killpg(self.pgid, libc::SIGKILL) };
-        }
-    }
-
-    /// Kills the group and reaps its leader.
-    async fn kill(&mut self) {
-        self.kill_group();
-        match tokio::time::timeout(REAP_WAIT, self.child.wait()).await {
-            Ok(Ok(_)) => self.reaped(),
-            Ok(Err(err)) => warn!(error = %err, "cannot reap a killed worker command"),
-            Err(_) => warn!("a killed worker command is not gone yet"),
-        }
-    }
-}
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        // Before `child` drops, whose own kill reaches the leader only.
-        self.kill_group();
-    }
-}
-
-/// Waits, on a blocking thread, until the child `pid` has exited, and leaves
-/// it unreaped (`WNOWAIT`): until it is reaped, its pid, and so the id of
-/// the group it leads, cannot be reused. POSIX `waitid`, as on Linux and
-/// macOS.
-async fn exited_unreaped(pid: libc::pid_t) -> io::Result<()> {
-    let id = libc::id_t::try_from(pid).map_err(io::Error::other)?;
-    tokio::task::spawn_blocking(move || {
-        loop {
-            // SAFETY: an all-zero `siginfo_t` is a valid value of this plain
-            // C struct, which `waitid` only writes to.
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            // SAFETY: `info` is valid for writes for the whole call.
-            let done =
-                unsafe { libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOWAIT) };
-            if done == 0 {
-                return Ok(());
-            }
-            let err = io::Error::last_os_error();
-            if err.kind() != io::ErrorKind::Interrupted {
-                return Err(err);
-            }
-        }
-    })
-    .await
-    .map_err(io::Error::other)?
 }
 
 /// The regular files directly in `dir`, sorted by name; once there are

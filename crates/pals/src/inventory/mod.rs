@@ -84,10 +84,10 @@ struct Inner {
     startup: watch::Sender<Option<RefreshReport>>,
 }
 
-/// What a run of the adapters observed: the snapshot's generation after it,
-/// how many connections it observed, how many it found operational, and,
-/// for each of the others, its id and the fixed code of its observation's
-/// `detail`.
+/// What a run of the adapters observed, as the snapshot and the store hold
+/// it: the snapshot's generation after it, how many connections it
+/// observed, how many it found operational, and, for each of the others,
+/// its id and the fixed code of its observation's `detail`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefreshReport {
     pub generation: u64,
@@ -274,13 +274,16 @@ impl InventoryState {
             }))
             .await;
 
+        // What the snapshot holds now, and what the store keeps and the
+        // report says: never anything else.
+        let (generation, kept) = self.merge_observations(observed);
         let mut report = RefreshReport {
-            generation: 0,
-            observed: observed.len(),
+            generation,
+            observed: kept.len(),
             ok: 0,
             failed: Vec::new(),
         };
-        for (id, observation) in &observed {
+        for (id, observation) in &kept {
             match (observation.status, &observation.detail) {
                 (OperationalStatus::Ok, _) => report.ok += 1,
                 (_, detail) => report.failed.push((
@@ -289,38 +292,48 @@ impl InventoryState {
                 )),
             }
         }
-        report.generation = self.merge_observations(&observed);
         let store = Arc::clone(&self.inner.store);
-        let kept = tokio::task::spawn_blocking(move || {
-            observed
-                .iter()
+        let stored = tokio::task::spawn_blocking(move || {
+            kept.iter()
                 .try_for_each(|(id, observation)| store.observation_put(id, observation))
         })
         .await
         .context("keeping the observations did not finish")
-        .and_then(|kept| kept);
-        (report, kept)
+        .and_then(|stored| stored);
+        (report, stored)
     }
 
     /// Replaces the observations of the entries of `observed` in a new
-    /// snapshot one generation later, keeping those of every other entry:
-    /// its generation.
-    fn merge_observations(&self, observed: &[(String, Observation)]) -> u64 {
+    /// snapshot one generation later, keeping those of every other entry
+    /// ([`sanitized`] all the same): its generation, and those of
+    /// `observed` it holds, in their order.
+    fn merge_observations(
+        &self,
+        observed: Vec<(String, Observation)>,
+    ) -> (u64, Vec<(String, Observation)>) {
         let mut snapshot = self
             .inner
             .snapshot
             .write()
             .unwrap_or_else(PoisonError::into_inner);
+        let ids: Vec<String> = observed.iter().map(|(id, _)| id.clone()).collect();
         let mut observations = snapshot.observations.clone();
-        observations.extend(observed.iter().cloned());
+        observations.extend(observed);
         let observations = sanitized(&snapshot.inventory, observations);
+        let kept = ids
+            .into_iter()
+            .filter_map(|id| {
+                let observation = observations.get(&id)?.clone();
+                Some((id, observation))
+            })
+            .collect();
         let generation = snapshot.generation + 1;
         *snapshot = Arc::new(InventorySnapshot {
             inventory: snapshot.inventory.clone(),
             observations,
             generation,
         });
-        generation
+        (generation, kept)
     }
 }
 
@@ -640,6 +653,45 @@ mod tests {
         )
         .unwrap();
         assert!(state.snapshot().observations.is_empty());
+    }
+
+    #[test]
+    fn a_merge_returns_only_what_the_snapshot_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(INVENTORY_FILE),
+            format!("{MCP_ENTRY}{OTHER_ENTRY}"),
+        )
+        .unwrap();
+        let state = InventoryState::load(&config_in(dir.path()), store()).unwrap();
+        // Kept by an earlier run, and untouched by this one.
+        state.replace_observations(BTreeMap::from([(
+            "example:other".to_owned(),
+            failed(DETAIL_UNREACHABLE),
+        )]));
+        let ok = Observation {
+            status: OperationalStatus::Ok,
+            detail: None,
+            ..failed(DETAIL_UNREACHABLE)
+        };
+        let (generation, kept) = state.merge_observations(vec![
+            (
+                "example:repo".to_owned(),
+                with_tool(ok.clone(), "read_file"),
+            ),
+            // An id of nothing, and a tool not offered: left out of both.
+            ("example:nothing".to_owned(), ok.clone()),
+            ("example:plugin".to_owned(), with_tool(ok, "read_file")),
+        ]);
+        let snapshot = state.snapshot();
+        assert_eq!(generation, snapshot.generation);
+        let kept_ids: Vec<&str> = kept.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(kept_ids, ["example:repo"]);
+        assert_eq!(kept[0].1, snapshot.observations["example:repo"]);
+        assert_eq!(
+            snapshot.observations.keys().collect::<Vec<_>>(),
+            ["example:other", "example:repo"]
+        );
     }
 
     #[test]

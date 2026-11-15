@@ -6,8 +6,6 @@
 
 use std::collections::BTreeMap;
 
-use serde_json::Value;
-
 use super::page::entry_budget;
 use super::render::render;
 use super::to_value;
@@ -87,40 +85,14 @@ fn rendered_bytes(entry: &Entry<McpConnection>, observation: &Observation, scope
         .map_or(0, |rendered| canonical(&to_value(rendered)).len())
 }
 
-/// `observation` with every tool's description, and its annotations'
-/// `title`, cut to at most `cap` bytes, on a character boundary; one cut to
-/// nothing is left out.
+/// `observation` with every tool's texts cut to `cap`
+/// ([`ObservedTool::cut_texts`](crate::inventory::ObservedTool::cut_texts)).
 fn cut_texts(observation: &Observation, cap: usize) -> Observation {
     let mut cut = observation.clone();
     for tool in &mut cut.tools {
-        tool.description = tool
-            .description
-            .take()
-            .map(|text| cut_to(&text, cap))
-            .filter(|text| !text.is_empty());
-        if let Some(Value::Object(annotations)) = &mut tool.annotations
-            && let Some(Value::String(title)) = annotations.remove("title")
-        {
-            let title = cut_to(&title, cap);
-            if !title.is_empty() {
-                annotations.insert("title".to_owned(), Value::String(title));
-            }
-        }
+        tool.cut_texts(cap);
     }
     cut
-}
-
-/// The longest start of `text` of at most `cap` bytes that ends on a
-/// character boundary.
-pub(crate) fn cut_to(text: &str, cap: usize) -> String {
-    if text.len() <= cap {
-        return text.to_owned();
-    }
-    let mut end = cap;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text[..end].to_owned()
 }
 
 #[cfg(test)]
@@ -248,13 +220,5 @@ mod tests {
         assert_eq!(fitted.detail.as_deref(), Some(DETAIL_TOO_MANY_TOOLS));
         assert!(fitted.tools.is_empty());
         assert!(rendered_bytes(&entry, &fitted, &Scope::Public) <= entry_budget(&Scope::Public));
-    }
-
-    #[test]
-    fn a_text_is_cut_on_a_character_boundary() {
-        assert_eq!(cut_to("añb", 2), "a");
-        assert_eq!(cut_to("añb", 3), "añ");
-        assert_eq!(cut_to("añb", 10), "añb");
-        assert_eq!(cut_to("ñ", 1), "");
     }
 }

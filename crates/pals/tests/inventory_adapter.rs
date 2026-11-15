@@ -23,7 +23,7 @@ use futures::FutureExt;
 use pals::config::{Config, INVENTORY_FILE, WorkerCfg};
 use pals::discovery::Reply;
 use pals::inventory::McpAdapter;
-use pals::inventory::mcp_adapter::{MAX_MCP_PAGES, MCP_ADAPTER_TIMEOUT};
+use pals::inventory::mcp_adapter::MAX_MCP_PAGES;
 use pals::node::NodeOptions;
 use pals_core::discovery::query::{
     InventoryRequirements, Met, OfferRef, OfferStatus, RequirementSet, Requirements, ServiceOffer,
@@ -58,6 +58,10 @@ const CALL: Duration = Duration::from_secs(30);
 /// How long a state a test waits for may take to come: only a broken test
 /// waits it out.
 const SETTLE: Duration = Duration::from_secs(60);
+/// How long an adapter that must reach its answer may take: Python's start
+/// and every round trip on a loaded host, far more than any needs. Only a
+/// broken test waits it out.
+const PATIENT: Duration = Duration::from_secs(60);
 /// Every task operation.
 const TASK_OPS: [pals_core::grant::Operation; 3] = [TaskSend, TaskRead, TaskCancel];
 /// `INVALID_PARAMS` of JSON-RPC.
@@ -131,12 +135,21 @@ async fn provider_with(
     spawn_node_in_configured(dir, executor, opts, edit).await
 }
 
-/// [`provider_with`] the default options and configuration.
+/// The options of a node whose adapter gets [`PATIENT`] for each
+/// connection.
+fn patient() -> NodeOptions {
+    NodeOptions {
+        mcp_adapter_timeout: PATIENT,
+        ..NodeOptions::default()
+    }
+}
+
+/// [`provider_with`] [`patient`] options and the default configuration.
 async fn provider(inventory: &str) -> TestNode {
     provider_with(
         inventory,
         CountingExecutor::new(Duration::ZERO),
-        NodeOptions::default(),
+        patient(),
         |_| {},
     )
     .await
@@ -433,8 +446,7 @@ async fn offered_tool_missing_makes_the_connection_not_operational() {
 
 #[tokio::test]
 async fn unreachable_or_hanging_server_fails_and_the_node_keeps_serving() {
-    // An input, never a measure: the adapter gives up after 300 ms.
-    let adapter = McpAdapter::new(Duration::from_millis(300));
+    // Nothing listens: refused at once, whatever time the adapter has.
     let closed = format!("http://127.0.0.1:{}/mcp", closed_port());
     let unreachable = entry_of(&mcp_entry(
         MCP,
@@ -442,11 +454,14 @@ async fn unreachable_or_hanging_server_fails_and_the_node_keeps_serving() {
         "\"public\"",
         &http_adapter(&closed),
     ));
-    let observed = adapter.observe(&unreachable).await;
+    let observed = McpAdapter::new(PATIENT).observe(&unreachable).await;
     assert_eq!(observed.status, OperationalStatus::Failed);
     assert_eq!(observed.detail.as_deref(), Some(DETAIL_UNREACHABLE));
     assert!(observed.tools.is_empty());
 
+    // An input, never a measure: the adapter gives up after 300 ms on a
+    // server that never answers.
+    let adapter = McpAdapter::new(Duration::from_millis(300));
     let hanging = entry_of(&mcp_entry(
         MCP,
         &["read_file"],
@@ -509,11 +524,13 @@ async fn unreachable_or_hanging_server_fails_and_the_node_keeps_serving() {
             &stdio_adapter(&["--hang"], &[]),
         ),
     );
+    // Long enough for the refusal to come first however loaded the host,
+    // and still an end for the server that never answers.
     let c = provider_with(
         &inventory,
         CountingExecutor::new(Duration::ZERO),
         NodeOptions {
-            mcp_adapter_timeout: Duration::from_millis(300),
+            mcp_adapter_timeout: Duration::from_secs(5),
             ..NodeOptions::default()
         },
         |_| {},
@@ -545,7 +562,7 @@ async fn unreachable_or_hanging_server_fails_and_the_node_keeps_serving() {
 
 #[tokio::test]
 async fn huge_tool_list_is_capped() {
-    let adapter = McpAdapter::new(MCP_ADAPTER_TIMEOUT);
+    let adapter = McpAdapter::new(PATIENT);
     let out = tempfile::tempdir().unwrap();
 
     // 100 tools a page, without end: past 256 tools it stops.
@@ -893,7 +910,7 @@ async fn child_environment_is_clean_and_its_group_is_killed() {
             &["PALS_TEST_PASSED_VARIABLE"],
         ),
     ));
-    let observed = McpAdapter::new(MCP_ADAPTER_TIMEOUT).observe(&entry).await;
+    let observed = McpAdapter::new(PATIENT).observe(&entry).await;
     assert_eq!(observed.status, OperationalStatus::Ok, "{observed:?}");
 
     let written = lines(&env_file);
@@ -1041,7 +1058,7 @@ async fn an_observation_change_turns_held_offers_stale() {
     );
     let exec = CountingExecutor::new(Duration::ZERO);
     // Offers that outlast any loaded host's delays.
-    let b = provider_with(&inventory, exec.clone(), NodeOptions::default(), |cfg| {
+    let b = provider_with(&inventory, exec.clone(), patient(), |cfg| {
         cfg.discovery.offer_valid_for_ms = 300_000;
     })
     .await;
