@@ -102,9 +102,11 @@ public = true
 offer_valid_for_ms = 15000
 # What a search of this agent's (`pals discover`) may take: at most this
 # many candidates per search (up to 32), this many queries in flight for
-# the whole daemon (up to 8), this long for each candidate (up to 10000 ms;
-# a query itself waits at most 3000 ms) and this long in all (up to 60000
-# ms). Past them, a search answers with what it has and says it is partial.
+# the whole daemon (up to 8), this long for each candidate, its card, its
+# offer and its benchmark reports (up to 10000 ms; a query waits for what
+# is left of it, and tells the peer at most 3000 ms) and this long in all
+# (up to 60000 ms). Past them, a search answers with what it has and says
+# it is partial.
 max_candidates = 8
 max_concurrent_queries = 3
 per_candidate_timeout_ms = 3000

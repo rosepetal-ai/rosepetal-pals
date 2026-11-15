@@ -1098,12 +1098,7 @@ fn discovery_failure(peer: &AgentId, failure: &DiscoveryError) -> Response {
         ),
         DiscoveryError::Remote(refusal) => {
             // The peer's words are data: printable ASCII only, and short.
-            let said: String = refusal
-                .message
-                .chars()
-                .filter(|c| c.is_ascii_graphic() || *c == ' ')
-                .take(MAX_PEER_MESSAGE_BYTES)
-                .collect();
+            let said = crate::printable_ascii(&refusal.message, MAX_PEER_MESSAGE_BYTES);
             let message = format!("peer refused: {said}");
             match refusal.code() {
                 ErrorCode::BadRequest | ErrorCode::InvalidCursor => {

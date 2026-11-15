@@ -352,6 +352,14 @@ impl ServiceQuery {
     }
 }
 
+/// A new query id: `q-` and 16 random hex characters.
+pub fn new_query_id() -> String {
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).expect("the OS random number generator failed");
+    let hex: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    format!("q-{hex}")
+}
+
 /// `blake3:` and the hex of BLAKE3 over `query_jcs`, the JCS of a query:
 /// what binds an offer to its query.
 pub fn query_hash(query_jcs: &[u8]) -> String {

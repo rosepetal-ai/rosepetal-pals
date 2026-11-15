@@ -29,6 +29,7 @@ use pals_core::store::{DEDUP_INFLIGHT_WAIT_S, DedupBegin, DedupRow, Store};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, warn};
 
+use super::auth::SCOPE_HEADER;
 use super::task_store::{a2a_error, blocking};
 use super::{CardSet, IDEMPOTENCY_EXTENSION};
 use crate::inventory::InventoryState;
@@ -110,7 +111,8 @@ type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 /// **Offers** ([`GuardedHandler::with_offers`]). A `SendMessage` or
 /// `SendStreamingMessage` that activates the inventory extension and names
 /// an offer in its message's metadata ([`OfferRef`]) runs only if the offer
-/// holds now ([`OfferCheck::refusal`]); else it fails with
+/// holds now, for the scope of the grant the request presents (see
+/// `OfferCheck::refusal`); else it fails with
 /// `InvalidParamsError`, [`OFFER_UNKNOWN`], [`OFFER_EXPIRED`] or
 /// [`OFFER_STALE`], before any task exists. The grant layer acted before:
 /// an offer never stands for a grant, and the capacity is still checked
@@ -152,18 +154,21 @@ pub struct OfferCheck {
 }
 
 impl OfferCheck {
-    /// Why `reference`, named by a task of `peer`'s, does not hold now, if
-    /// it does not: [`OFFER_UNKNOWN`] when the agent did not issue it to
-    /// `peer` as referred to (its id, card and query), [`OFFER_EXPIRED`]
-    /// when it expired by the agent's own clock, [`OFFER_STALE`] when its
-    /// scope's card or the revision of its scope's view, computed now as
-    /// an answer computes it ([`scope_revision`]), is another than the
-    /// offer's. An error when the store cannot be read.
+    /// Why `reference`, named by a task of `peer`'s that presents a grant
+    /// of the scope `scope`, does not hold now, if it does not:
+    /// [`OFFER_UNKNOWN`] when the agent did not issue it to `peer` as
+    /// referred to (its id, card and query), [`OFFER_EXPIRED`] when it
+    /// expired by the agent's own clock, [`OFFER_STALE`] when it was made
+    /// for another scope than the grant's, or its scope's card or the
+    /// revision of its scope's view, computed now as an answer computes it
+    /// ([`scope_revision`]), is another than the offer's. An error when the
+    /// store cannot be read.
     fn refusal(
         &self,
         store: &Store,
         peer: &AgentId,
         reference: &OfferRef,
+        scope: Option<&str>,
     ) -> anyhow::Result<Option<&'static str>> {
         let Some(offer) = store.offer_issued(&reference.offer_id)? else {
             return Ok(Some(OFFER_UNKNOWN));
@@ -178,6 +183,11 @@ impl OfferCheck {
         let now = self.clock.now_unix();
         if offer.expired(now) {
             return Ok(Some(OFFER_EXPIRED));
+        }
+        // An offer is for what the scope it was made in shows: a task under
+        // a grant of another scope asks for a new one.
+        if scope != Some(offer.scope.as_str()) {
+            return Ok(Some(OFFER_STALE));
         }
         let Some(scope) = Scope::from_key(&offer.scope) else {
             return Ok(Some(OFFER_UNKNOWN));
@@ -216,18 +226,20 @@ impl<H: RequestHandler> GuardedHandler<H> {
     }
 
     /// The offer `req` names, when it activates the inventory extension
-    /// and the guard checks offers: `Some(None)` for an entry that is no
-    /// reference.
-    fn offer_named(
-        &self,
-        params: &ServiceParams,
-        req: &SendMessageRequest,
-    ) -> Option<Option<OfferRef>> {
+    /// and the guard checks offers, with the scope of the grant the request
+    /// was accepted with ([`SCOPE_HEADER`]); its `reference` is `None` for
+    /// an entry that is no reference.
+    fn offer_named(&self, params: &ServiceParams, req: &SendMessageRequest) -> Option<Named> {
         self.offers.as_ref()?;
         if !inventory_requested(params) {
             return None;
         }
-        OfferRef::in_metadata(req.message.metadata.as_ref())
+        let reference = OfferRef::in_metadata(req.message.metadata.as_ref())?;
+        let scope = match params.get(SCOPE_HEADER).map(Vec::as_slice) {
+            Some([scope]) => Some(scope.clone()),
+            _ => None,
+        };
+        Some(Named { reference, scope })
     }
 
     /// Fails with `TaskNotFoundError` unless `peer` owns `task_id`.
@@ -252,7 +264,7 @@ impl<H: RequestHandler> GuardedHandler<H> {
         params: &ServiceParams,
         req: SendMessageRequest,
         key: Key,
-        named: Option<Option<OfferRef>>,
+        named: Option<Named>,
     ) -> Result<Start<SendMessageResponse>, A2AError> {
         let inner = Arc::clone(&self.inner);
         let store = Arc::clone(&self.store);
@@ -295,7 +307,7 @@ impl<H: RequestHandler> GuardedHandler<H> {
         params: &ServiceParams,
         req: SendMessageRequest,
         key: Key,
-        named: Option<Option<OfferRef>>,
+        named: Option<Named>,
     ) -> Result<Start<Events>, A2AError> {
         let inner = Arc::clone(&self.inner);
         let store = Arc::clone(&self.store);
@@ -545,23 +557,33 @@ pub(crate) fn names_extension<'a>(values: impl IntoIterator<Item = &'a str>, uri
         .any(|named| named.trim() == uri)
 }
 
+/// An offer a request names, and the scope of the grant it presents.
+struct Named {
+    /// `None` for a metadata entry that is no reference.
+    reference: Option<OfferRef>,
+    scope: Option<String>,
+}
+
 /// Refuses, with `InvalidParamsError`, a new request of `peer`'s whose
-/// offer `named` does not hold now ([`OfferCheck::refusal`]); an entry that
+/// offer `named` does not hold now (`OfferCheck::refusal`); an entry that
 /// is no reference is [`OFFER_UNKNOWN`]. Nothing to check, `Ok`.
 async fn check_offer(
     offers: Option<&OfferCheck>,
     store: &Arc<Store>,
     peer: AgentId,
-    named: Option<Option<OfferRef>>,
+    named: Option<Named>,
 ) -> Result<(), A2AError> {
-    let (Some(offers), Some(named)) = (offers, named) else {
+    let (Some(offers), Some(Named { reference, scope })) = (offers, named) else {
         return Ok(());
     };
-    let Some(reference) = named else {
+    let Some(reference) = reference else {
         return Err(A2AError::invalid_params(OFFER_UNKNOWN));
     };
     let offers = offers.clone();
-    let refusal = blocking(store, move |store| offers.refusal(store, &peer, &reference)).await?;
+    let refusal = blocking(store, move |store| {
+        offers.refusal(store, &peer, &reference, scope.as_deref())
+    })
+    .await?;
     match refusal {
         Some(why) => Err(A2AError::invalid_params(why)),
         None => Ok(()),

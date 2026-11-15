@@ -10,20 +10,21 @@ mod common;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::{
     BUSY, CountingExecutor, IDEMPOTENCY_EXTENSION, StubAnswer, StubAsked, StubMode, StubPeer,
-    TestNode, echo_app_with_card, echo_card_at, grant, key_in, now_unix, serve_at, shut_down,
-    spawn_node, spawn_node_in_configured, spawn_node_with, stub_card,
+    TestNode, echo_app_with_card, echo_card_at, grant, issue_grant, key_in, now_unix, serve_at,
+    shut_down, spawn_node, spawn_node_in_configured, spawn_node_with, stub_card,
     stub_discovery_peer_with_card, stub_response,
 };
 use futures::future::BoxFuture;
 use pals::config::{Config, INVENTORY_FILE, WorkerCfg};
 use pals::discovery::{DiscoveryHook, DiscoveryLimits, SearchError, Searcher};
+use pals::inventory::InventoryState;
 use pals::node::NodeOptions;
 use pals::outbox::{AskError, AskRequest, OfferLookupError, received_offer_ref};
 use pals_core::benchmark::{
@@ -41,7 +42,7 @@ use pals_core::discovery::selection::{Coverage, SearchOutcome, SearchRequest, St
 use pals_core::discovery::wire::{self, ErrorCode, request, response};
 use pals_core::discovery::{DISCOVERY_VERSION, Load, server_limits};
 use pals_core::grant::Operation::{BlobFetch, TaskCancel, TaskRead, TaskSend};
-use pals_core::grant::{SignedGrant, format_timestamp, parse_timestamp};
+use pals_core::grant::{GRANT_SCHEMA, Grant, SignedGrant, format_timestamp, parse_timestamp};
 use pals_core::identity::{AgentId, AgentKey};
 use pals_core::inventory::{
     INVENTORY_EXTENSION, Observation, ObservationSource, OperationalStatus, Visibility,
@@ -1618,11 +1619,14 @@ async fn inventory_requirement_ids_go_only_to_authorized_candidates() {
         inventory.preferred.information_source_ids,
         ["project:repo-controller"]
     );
+    assert_eq!(query_of(&granted[0]).project.as_deref(), Some("demo"));
     let stranger = kept[1].lock().unwrap().clone();
     assert_eq!(stranger.len(), 1);
     assert!(stranger[0].grant_token.is_empty());
     let query = query_of(&stranger[0]);
     assert_eq!(query.requirements.inventory, None);
+    // Nor which project it is for.
+    assert_eq!(query.project, None);
     let bytes = String::from_utf8(query.to_jcs()).unwrap();
     for id in [
         MCP,
@@ -1925,4 +1929,329 @@ async fn discover_cli_prints_the_ranking_and_asks_the_best() {
     let (code, _, stderr) = pals(a.dir.path(), &["discover", "--capability", "a b"]).await;
     assert_ne!(code, 0);
     assert!(stderr.contains("invalid capability"), "{stderr}");
+}
+
+/// Waits up to 60 s for `condition`, looked at every 10 ms.
+async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !condition() {
+        assert!(std::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn refusal_once_the_task_exists_stops_the_choice() {
+    let a = requester().await;
+    let bob = CountingExecutor::gated();
+    let carol = CountingExecutor::new(Duration::ZERO);
+    let defaults = NodeOptions::default;
+    let b = provider_for(
+        &a,
+        "bob",
+        &public_service((1, 1)),
+        bob.clone(),
+        defaults(),
+        |_| {},
+        true,
+    )
+    .await;
+    let _c = provider_for(
+        &a,
+        "carol",
+        &public_service((100, 1000)),
+        carol.clone(),
+        defaults(),
+        |_| {},
+        true,
+    )
+    .await;
+    let searcher = a.node.searcher().clone();
+    let choice = tokio::spawn(async move {
+        searcher
+            .choose_and_ask(plain_request(), "a long review".to_owned(), WAIT)
+            .await
+    });
+    // b runs it, and a knows its task.
+    wait_until("a knows b's task", || {
+        a.node
+            .store
+            .outbox_all()
+            .unwrap()
+            .iter()
+            .any(|row| row.task_id.is_some())
+    })
+    .await;
+    assert_eq!(bob.runs(), 1);
+    // Then b takes a's grant no more, the stream breaks, and the follow-up
+    // call is refused.
+    for held in a.node.store.grants_held_for(&b.id(), now_unix()).unwrap() {
+        b.node
+            .store
+            .revoke(&held.grant.grant_id, now_unix())
+            .unwrap();
+    }
+    a.node.close_peer_connections().await;
+    let err = choice.await.unwrap().unwrap_err();
+    let SearchError::Ask {
+        peer, error, tried, ..
+    } = &err
+    else {
+        panic!("the ask stops, not {err}");
+    };
+    assert_eq!(peer, "bob");
+    assert!(matches!(error, AskError::Rejected(_)), "{error}");
+    assert!(tried.is_empty(), "{tried:?}");
+    // c is never asked: b's task may still run.
+    assert_eq!(carol.runs(), 0);
+    assert_eq!(a.node.store.outbox_all().unwrap().len(), 1);
+    bob.release();
+}
+
+/// Counts the service queries and benchmark report requests a provider
+/// answers, and, at the first report requested, changes what its scope
+/// shows: between the search and the ask.
+struct StaleAtTheReport {
+    queries: Arc<AtomicUsize>,
+    reports: Arc<AtomicUsize>,
+    inventory: Arc<OnceLock<InventoryState>>,
+}
+
+impl DiscoveryHook for StaleAtTheReport {
+    fn before_answer(&self, _peer: &AgentId, req: &wire::Request) -> BoxFuture<'static, ()> {
+        match req.op {
+            Some(request::Op::ServiceQuery(_)) => {
+                self.queries.fetch_add(1, Ordering::SeqCst);
+            }
+            Some(request::Op::GetBenchmarkReport(_))
+                if self.reports.fetch_add(1, Ordering::SeqCst) == 0 =>
+            {
+                let inventory = self.inventory.get().expect("the provider's inventory");
+                inventory.replace_observations(observed(OperationalStatus::Ok, None));
+            }
+            _ => {}
+        }
+        Box::pin(async {})
+    }
+}
+
+#[tokio::test]
+async fn stale_offer_at_the_ask_is_renewed_once() {
+    let a = requester().await;
+    let (queries, reports) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let inventory = Arc::new(OnceLock::new());
+    let hook = StaleAtTheReport {
+        queries: Arc::clone(&queries),
+        reports: Arc::clone(&reports),
+        inventory: Arc::clone(&inventory),
+    };
+    let exec = CountingExecutor::new(Duration::ZERO);
+    let b = provider_for(
+        &a,
+        "bob",
+        &good((1, 1)),
+        exec.clone(),
+        NodeOptions {
+            discovery_hook: Some(Arc::new(hook)),
+            ..NodeOptions::default()
+        },
+        |_| {},
+        true,
+    )
+    .await;
+    assert!(inventory.set(b.node.inventory().clone()).is_ok());
+    let review = json!({"task": "review"});
+    let report = review_report(
+        &key_in(b.dir.path()),
+        "bench-b",
+        MeasurementKind::OwnMeasurement,
+        review.clone(),
+    );
+    b.node
+        .store
+        .benchmark_put(&report, &Visibility::Public, now_unix())
+        .unwrap();
+    // The search reads b's offer and report; by then the scope's view has
+    // moved, and the offer is stale when the task arrives.
+    let req = SearchRequest {
+        benchmark: Some(Wanted {
+            profile: "service.task".to_owned(),
+            profile_version: "1".to_owned(),
+            config: review,
+            model_revision: None,
+            route: None,
+            peer_pair: None,
+        }),
+        ..plain_request()
+    };
+    let chosen = a
+        .node
+        .searcher()
+        .choose_and_ask(req, "review".to_owned(), WAIT)
+        .await
+        .unwrap();
+    assert_eq!(chosen.candidate.peer, "bob");
+    assert_eq!(chosen.outcome.state, "TASK_STATE_COMPLETED", "{chosen:#?}");
+    assert!(chosen.tried.is_empty(), "{:?}", chosen.tried);
+    // The search's query and the renewal: three requests to b's
+    // discovery in all, and one run.
+    assert_eq!(queries.load(Ordering::SeqCst), 2);
+    assert_eq!(reports.load(Ordering::SeqCst), 1);
+    assert_eq!(exec.runs(), 1);
+    // The first question was refused as stale, the second ran.
+    let rows = a.node.store.outbox_all().unwrap();
+    let states: Vec<&str> = rows.iter().map(|row| row.state.as_str()).collect();
+    assert_eq!(states, ["refused", "TASK_STATE_COMPLETED"]);
+}
+
+#[tokio::test]
+async fn unreachable_provider_stops_the_choice() {
+    let a = requester().await;
+    // b offers, and then takes no task: its binding answers 503.
+    let key = AgentKey::generate();
+    let mut card = stub_card(&key, &public_service((1, 1)));
+    card.tasks_unavailable = true;
+    let kept = Arc::new(Mutex::new(Vec::new()));
+    let answer = offering(Arc::clone(&kept), card.announce_hash.clone());
+    let _b =
+        stub_discovery_peer_with_card(&a, "bob", key, StubMode::Answer(answer), card, true).await;
+    // c is busy, so after b, and would take it.
+    let carol = CountingExecutor::new(Duration::ZERO);
+    let _c = provider_for(
+        &a,
+        "carol",
+        &public_service((1, 1)),
+        carol.clone(),
+        full(),
+        |_| {},
+        true,
+    )
+    .await;
+    let req = SearchRequest {
+        capability: CAPABILITY.to_owned(),
+        project: Some("demo".to_owned()),
+        ..SearchRequest::default()
+    };
+    let outcome = a.node.searcher().search(req.clone()).await.unwrap();
+    assert_eq!(ranked(&outcome), ["bob", "carol"], "{outcome:#?}");
+    let err = a
+        .node
+        .searcher()
+        .choose_and_ask(req, "hello".to_owned(), WAIT)
+        .await
+        .unwrap_err();
+    let SearchError::Ask { peer, error, .. } = &err else {
+        panic!("the ask stops, not {err}");
+    };
+    assert_eq!(peer, "bob");
+    assert!(matches!(error, AskError::Unreachable { .. }), "{error}");
+    // The question waits for b, kept; c runs nothing.
+    assert_eq!(carol.runs(), 0);
+    let rows = a.node.store.outbox_all().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, "pending");
+}
+
+/// `issuer`'s grant to `subject` of every task operation on `skill:ask` of
+/// `project`, against `audience`, issued at `issued_at` for an hour.
+fn project_grant(
+    issuer: &AgentKey,
+    subject: AgentId,
+    audience: AgentId,
+    project: &str,
+    issued_at: i64,
+) -> SignedGrant {
+    let grant = Grant {
+        schema: GRANT_SCHEMA.to_owned(),
+        grant_id: format!("g-{project}-{issued_at}"),
+        issuer: issuer.id(),
+        subject,
+        audience,
+        project: project.to_owned(),
+        resources: vec!["skill:ask".to_owned()],
+        operations: TASK_OPS.to_vec(),
+        issued_at: ts(issued_at),
+        expires_at: ts(issued_at + 3600),
+    };
+    SignedGrant::issue(issuer, grant).unwrap()
+}
+
+#[tokio::test]
+async fn offer_runs_only_under_a_grant_of_its_scope() {
+    let a = requester().await;
+    let exec = CountingExecutor::new(Duration::ZERO);
+    let b = provider_for(
+        &a,
+        "bob",
+        &public_service((1, 1)),
+        exec.clone(),
+        NodeOptions::default(),
+        |_| {},
+        false,
+    )
+    .await;
+    let key = key_in(b.dir.path());
+    let now = now_unix();
+    // Two grants of b's: demo's, and a newer one of another project, the
+    // one the gateway would present by itself.
+    let demo = issue_grant(&key, a.id(), b.id(), &TASK_OPS, now - 60, now + 3600);
+    let other = project_grant(&key, a.id(), b.id(), "other", now);
+    for held in [&demo, &other] {
+        b.node.store.grant_issued_put(held).unwrap();
+        a.hold(held);
+    }
+    let offer = offer_from(&a, &b, "q-1", Some(&demo)).await;
+    assert_eq!(offer.scope, "task:demo");
+    // Under a grant of another scope, the offer is stale, and nothing runs.
+    let res = send_naming(
+        &a,
+        &b,
+        Some(&other),
+        naming("m-1", "x", &OfferRef::of(&offer)),
+    )
+    .await;
+    assert_eq!(rpc_error(&res), (INVALID_PARAMS, "offer_stale".to_owned()));
+    // An offer made without a grant is the public scope's.
+    let public = offer_from(&a, &b, "q-2", None).await;
+    assert_eq!(public.scope, "public");
+    let res = send_naming(
+        &a,
+        &b,
+        Some(&demo),
+        naming("m-2", "x", &OfferRef::of(&public)),
+    )
+    .await;
+    assert_eq!(rpc_error(&res), (INVALID_PARAMS, "offer_stale".to_owned()));
+    assert_eq!(exec.runs(), 0);
+    // Asked with the offer, the outbox presents the grant of its scope,
+    // not the newest.
+    let asked = a
+        .node
+        .outbox()
+        .ask(AskRequest {
+            peer: "bob".to_owned(),
+            question: "under demo".to_owned(),
+            attachments: Vec::new(),
+            wait: WAIT,
+            offer: Some(OfferRef::of(&offer)),
+        })
+        .await
+        .unwrap();
+    assert_eq!(asked.state, "TASK_STATE_COMPLETED");
+    assert_eq!(exec.runs(), 1);
+    // Without an offer, as in milestone 1: the gateway's grant, the newest.
+    let plain = a
+        .node
+        .outbox()
+        .ask(AskRequest {
+            peer: "bob".to_owned(),
+            question: "under any".to_owned(),
+            attachments: Vec::new(),
+            wait: WAIT,
+            offer: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(plain.state, "TASK_STATE_COMPLETED");
+    assert_eq!(exec.runs(), 2);
 }

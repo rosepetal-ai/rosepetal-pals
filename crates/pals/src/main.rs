@@ -39,6 +39,7 @@ use pals_core::benchmark::{BenchmarkReport, MAX_REPORT_BYTES};
 use pals_core::card_jws::{CardSigner, verify_card};
 use pals_core::discovery::query::{
     MAX_QUERY_BYTES, MAX_REPLY_TIMEOUT_MS, QUERY_SCHEMA, Requirements, ServiceQuery, accept_offer,
+    new_query_id,
 };
 use pals_core::discovery::selection::{Coverage, SearchOutcome, SearchRequest, Stage};
 use pals_core::grant::{
@@ -1120,19 +1121,10 @@ fn print_tried(tried: &Value) {
     }
 }
 
-/// `text`, which may come from a peer, as printable ASCII.
+/// `text`, which may come from a peer, as printable ASCII, whole: a line
+/// of output bounds nothing.
 fn shown(text: &str) -> String {
-    text.chars()
-        .filter(|c| c.is_ascii_graphic() || *c == ' ')
-        .collect()
-}
-
-/// A new query id: `q-` and 16 random hex characters.
-fn new_query_id() -> String {
-    let mut random = [0u8; 8];
-    getrandom::fill(&mut random).expect("the OS random number generator failed");
-    let hex: String = random.iter().map(|b| format!("{b:02x}")).collect();
-    format!("q-{hex}")
+    pals::printable_ascii(text, usize::MAX)
 }
 
 /// Prints `card`, then `verified: <signer> <hash>`.

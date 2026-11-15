@@ -20,8 +20,9 @@
 //! A question asked with the offer its peer was chosen by
 //! ([`AskRequest::offer`]) names it in its message, under the inventory
 //! extension's URI in `metadata` ([`OfferRef`]), and every attempt
-//! activates that extension too: being in the request kept, the reference
-//! goes again with every retry. The provider checks the offer again, and
+//! activates that extension too, and presents the grant this agent holds
+//! for the scope the offer was made in: being in the request kept, the
+//! reference goes again with every retry. The provider checks the offer again, and
 //! refuses a message whose offer is unknown, expired or stale before it
 //! runs anything; the grant is checked first all the same.
 //!
@@ -77,8 +78,10 @@ use a2a_client::transport::ServiceParams;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use http::header::AUTHORIZATION;
 use pals_core::discovery::query::OfferRef;
-use pals_core::inventory::INVENTORY_EXTENSION;
+use pals_core::grant::SignedGrant;
+use pals_core::inventory::{INVENTORY_EXTENSION, Scope};
 use pals_core::store::{OUTBOX_PENDING, OUTBOX_REFUSED, OutboxRow, PeerRef, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -87,6 +90,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::a2a::{IDEMPOTENCY_EXTENSION, is_safe_task_id};
 use crate::gateway::plain::path_segment;
+use crate::gateway::serves_tasks;
 use crate::path_policy::open_attachment;
 
 /// How many times an ask retries an attempt that failed on the way, after
@@ -103,7 +107,7 @@ const CANCEL_TIMEOUT: Duration = Duration::from_secs(30);
 /// The media type of an attachment whose extension says nothing.
 const OCTET_STREAM: &str = "application/octet-stream";
 /// Why a peer's answer naming an unsafe or another task is refused.
-const INVALID_TASK_ID: &str = "the peer returned an invalid task id";
+pub(crate) const INVALID_TASK_ID: &str = "the peer returned an invalid task id";
 
 type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 type Client = A2AClient<RestTransport>;
@@ -365,7 +369,8 @@ impl Outbox {
             )));
         };
         let peer = self.peer_of(&row).await?;
-        let client = self.client(&peer, false);
+        let asked = decode_request(&row.request_json)?;
+        let client = self.client(&peer, &asked).await?;
         let request = CancelTaskRequest {
             id: task_id,
             metadata: None,
@@ -408,7 +413,7 @@ impl Outbox {
     /// retries or of time.
     async fn drive(&self, mut ask: Ask) -> Result<AskOutcome, AskError> {
         let deadline = ask.deadline;
-        let client = self.client(&ask.peer, names_an_offer(&ask.request));
+        let client = self.client(&ask.peer, &ask.request).await?;
         let mut failures: u32 = 0;
         // The state last seen, by this call.
         let mut seen: Option<TaskState> = None;
@@ -647,15 +652,63 @@ impl Outbox {
             .with_media_type(media_type(path)))
     }
 
-    /// The A2A client for `peer`, through the gateway. Every request it
-    /// sends activates the [idempotency extension](IDEMPOTENCY_EXTENSION),
-    /// which the resends of an ask rely on, and, with `inventory`, the
-    /// [inventory extension](INVENTORY_EXTENSION) too, which a message that
-    /// names an offer activates; a plain A2A agent may ignore them.
-    fn client(&self, peer: &PeerRef, inventory: bool) -> Client {
+    /// The A2A client for `peer`, through the gateway, for the question
+    /// `request`. Every request it sends activates the [idempotency
+    /// extension](IDEMPOTENCY_EXTENSION), which the resends of an ask rely
+    /// on; a plain A2A agent may ignore it. For a question that names an
+    /// offer, it activates the [inventory extension](INVENTORY_EXTENSION)
+    /// too, and presents the grant of the offer's scope
+    /// ([`Outbox::offer_grant`]) when this agent holds one, so that the
+    /// task runs under the scope it was offered for; any other question
+    /// goes with the grant the gateway chooses, as in milestone 1.
+    async fn client(
+        &self,
+        peer: &PeerRef,
+        request: &SendMessageRequest,
+    ) -> Result<Client, AskError> {
+        let inventory = names_an_offer(request);
+        let bearer = if inventory {
+            self.offer_grant(peer, request)
+                .await?
+                .map(|grant| format!("Bearer {}", grant.to_token()))
+        } else {
+            None
+        };
         let base_url = format!("{}/peers/{}/rest", self.gateway_url, path_segment(peer));
-        A2AClient::new(RestTransport::new(self.http.clone(), base_url))
-            .with_interceptors(vec![Arc::new(Extensions { inventory })])
+        Ok(
+            A2AClient::new(RestTransport::new(self.http.clone(), base_url))
+                .with_interceptors(vec![Arc::new(Extensions { inventory, bearer })]),
+        )
+    }
+
+    /// The grant this agent holds of `peer`'s, a PALS peer, that serves
+    /// tasks in the scope of the offer `request` names, as the offer this
+    /// agent keeps says it ([`Store::offer_received`]); none when it keeps
+    /// no such offer any more (expired and purged: a retry of a request
+    /// that ran attaches whatever grant it presents) or holds no such grant
+    /// (the provider then refuses the offer as `offer_stale`).
+    async fn offer_grant(
+        &self,
+        peer: &PeerRef,
+        request: &SendMessageRequest,
+    ) -> Result<Option<SignedGrant>, AskError> {
+        let (PeerRef::Pals(provider), Some(Some(reference))) = (
+            peer,
+            OfferRef::in_metadata(request.message.metadata.as_ref()),
+        ) else {
+            return Ok(None);
+        };
+        let provider = *provider;
+        self.with_store(move |store| {
+            let Some(offer) = store.offer_received(&provider, &reference.offer_id)? else {
+                return Ok(None);
+            };
+            let held = store.grants_held_for(&provider, now_unix())?;
+            Ok(held.into_iter().find(|g| {
+                serves_tasks(&g.grant) && Scope::for_grant(Some(&g.grant)).key() == offer.doc.scope
+            }))
+        })
+        .await
     }
 
     /// The row of `message_id`.
@@ -956,9 +1009,11 @@ fn new_message_id() -> String {
 
 /// Activates the [`IDEMPOTENCY_EXTENSION`] on every request, with the
 /// `A2A-Extensions` service parameter, and the [`INVENTORY_EXTENSION`]
-/// after it with `inventory`.
+/// after it with `inventory`; presents `bearer`, when given, as the
+/// request's own `Authorization`, which the gateway passes intact.
 struct Extensions {
     inventory: bool,
+    bearer: Option<String>,
 }
 
 #[async_trait]
@@ -970,6 +1025,9 @@ impl CallInterceptor for Extensions {
             extensions.push_str(INVENTORY_EXTENSION);
         }
         params.insert(SVC_PARAM_EXTENSIONS.to_owned(), vec![extensions]);
+        if let Some(bearer) = &self.bearer {
+            params.insert(AUTHORIZATION.to_string(), vec![bearer.clone()]);
+        }
         Ok(())
     }
 }

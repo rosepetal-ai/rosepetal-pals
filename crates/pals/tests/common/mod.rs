@@ -993,6 +993,10 @@ pub struct StubCard {
     pub json: Value,
     /// The `agent_card_hash` of the stub's announce record.
     pub announce_hash: pals_core::card_jws::CardHash,
+    /// Every other request on the A2A binding, a task included, is
+    /// answered `503`, as by an agent that cannot take any: the gateway
+    /// passes it on, and an ask counts it as a peer out of reach.
+    pub tasks_unavailable: bool,
 }
 
 /// The public card of an agent with `key`'s identity and the inventory
@@ -1008,6 +1012,7 @@ pub fn stub_card(key: &AgentKey, inventory_toml: &str) -> StubCard {
     StubCard {
         json: cards.public().json.clone(),
         announce_hash: cards.public().hash.clone(),
+        tasks_unavailable: false,
     }
 }
 
@@ -1127,6 +1132,16 @@ async fn spawn_stub(
             let app = axum::Router::new()
                 .route("/.well-known/agent-card.json", get(served.clone()))
                 .route("/rest/extendedAgentCard", get(served));
+            let app = if card.tasks_unavailable {
+                app.fallback(|| async {
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error": "unavailable"})),
+                    )
+                })
+            } else {
+                app
+            };
             router.accept(
                 ALPN_A2A_HTTP,
                 TunnelServer::new(app, TunnelLimits::default()),

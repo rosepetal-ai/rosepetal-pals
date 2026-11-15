@@ -86,9 +86,10 @@ pub struct SearchRequest {
 impl SearchRequest {
     /// The query a candidate is asked, as `query_id`, waiting
     /// `reply_timeout_ms`: the request's capability, media types, summary,
-    /// project and requirements, with every inventory id, required and
-    /// preferred, only `with_ids` (§7.1, §9.9: integrations and sources go
-    /// only to authorized candidates).
+    /// project and requirements, with the project and every inventory id,
+    /// required and preferred, only `with_ids` (§7.1, §9.9: integrations
+    /// and sources go only to authorized candidates, and a candidate without
+    /// a grant for the project is not told which project it is).
     pub fn query(&self, query_id: &str, reply_timeout_ms: u32, with_ids: bool) -> ServiceQuery {
         let mut requirements = self.requirements.clone();
         if !with_ids {
@@ -110,7 +111,7 @@ impl SearchRequest {
             summary: self.summary.clone(),
             reply_timeout_ms: Some(reply_timeout_ms),
             requested_inventory_sections: Vec::new(),
-            project: self.project.clone(),
+            project: self.project.clone().filter(|_| with_ids),
             execution_authorized: false,
         }
     }
@@ -838,6 +839,9 @@ mod tests {
         with.validate().unwrap();
         let without = req.query("q-2", 1000, false);
         without.validate().unwrap();
+        // Nor the project: a candidate without a grant for it is not told.
+        assert_eq!(with.project.as_deref(), Some("demo"));
+        assert_eq!(without.project, None);
         let json = String::from_utf8(without.to_jcs()).unwrap();
         assert!(!json.contains("example:repo-reader"), "{json}");
         assert!(!json.contains("project:repo-controller"), "{json}");

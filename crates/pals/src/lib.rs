@@ -27,6 +27,17 @@ pub mod outbox;
 mod path_policy;
 pub mod worker;
 
+/// `text`, which may come from a peer, as printable ASCII, spaces kept and
+/// everything else dropped, cut to its first `max_chars`: the one way a
+/// peer's words are shown, in an error, a log or a command's output, so
+/// that they never carry a control sequence or a line of their own.
+pub fn printable_ascii(text: &str, max_chars: usize) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(max_chars)
+        .collect()
+}
+
 /// Installs `ring` as the process's rustls crypto provider, unless one is
 /// installed already.
 ///

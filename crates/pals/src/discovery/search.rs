@@ -29,17 +29,17 @@
 //!    left, and says so in `reply_timeout_ms`, at most 3000 ms
 //!    ([`ServiceQuery::reply_timeout`](pals_core::discovery::query::ServiceQuery::reply_timeout)):
 //!    with the default 3 s per candidate, the two are the same; never the
-//!    gateway's own times. It presents the
-//!    grant this agent holds of the peer's for the project, else its newest
-//!    that serves tasks, if any. The inventory ids of the requirements,
-//!    required and preferred, go only to a peer of which this agent holds a
-//!    grant for the project: the others get none, and a required one counts
-//!    as unknown, which discards them (§7.1, §9.9). Whatever the client
-//!    refuses (an offer of another agent, for another requester or query,
-//!    expired, badly signed; a record that goes back) is a discard with its
-//!    reason. The announce record of the reply must name the public card
-//!    read, and the offer one of the cards read: else the card is
-//!    discarded. Plain agents are never queried.
+//!    gateway's own times. It presents the grant this agent holds of the
+//!    peer's for the project (its newest that serves tasks when the request
+//!    names no project), and then carries the project and the inventory ids
+//!    of the requirements, required and preferred. A peer of which this
+//!    agent holds no such grant gets neither grant, project nor ids, and a
+//!    required id counts as unknown, which discards it (§7.1, §9.9).
+//!    Whatever the client refuses (an offer of another agent, for another
+//!    requester or query, expired, badly signed; a record that goes back)
+//!    is a discard with its reason. The announce record of the reply must
+//!    name the public card read, and the offer one of the cards read: else
+//!    the card is discarded. Plain agents are never queried.
 //! 3. **Its benchmark reports**, when the request wants some and the offer
 //!    is compatible: those the offer refers to of the profile wanted, still
 //!    in force, at most [`MAX_REPORTS_PER_CANDIDATE`], read with
@@ -63,11 +63,13 @@
 //! renewed once if the budget allows, and the question goes with the
 //! offer it has ([`OfferRef`]). A refusal for `offer_expired` or
 //! `offer_stale` renews it once, if the budget allows and it was not
-//! renewed already, and asks again; `offer_unknown`, another refusal, or a
-//! task `REJECTED` as `busy` goes on to the next. Any other end of the
-//! task is the outcome. An ask that cannot reach the peer stops: its
-//! question is kept for `pals task resume`, and asking another could run it
-//! twice.
+//! renewed already, and asks again; `offer_unknown`, another refusal of the
+//! first request, before the peer named any task, or a task `REJECTED` as
+//! `busy` goes on to the next. Any other end of the task is the outcome.
+//! An ask that cannot reach the peer, or that is refused once the peer has
+//! a task for it (a follow-up call refused, a task id this agent does not
+//! take), stops: its question may still run there, it is kept for `pals
+//! task resume`, and asking another could run it twice.
 //!
 //! **Quotas**, for the whole daemon: at most [`DiscoveryLimits::max_searches`]
 //! searches at once, the next refused at once, `too many searches`, and
@@ -86,7 +88,8 @@ use pals_core::benchmark::{Comparability, MeasurementKind, Wanted, comparable};
 use pals_core::card_jws::{CardHash, SignatureStatus, card_hash};
 use pals_core::clock::Clock;
 use pals_core::discovery::query::{
-    MAX_QUERY_BYTES, MAX_REPLY_TIMEOUT_MS, Met, OFFER_EXPIRED, OFFER_STALE, OfferRef, ServiceOffer,
+    MAX_QUERY_BYTES, MAX_REPLY_TIMEOUT_MS, Met, OFFER_EXPIRED, OFFER_STALE, OFFER_UNKNOWN,
+    OfferRef, ServiceOffer, new_query_id,
 };
 use pals_core::discovery::selection::{
     Candidate, Coverage, Discarded, SearchMetrics, SearchOutcome, SearchRequest, Stage, stage_one,
@@ -98,6 +101,7 @@ use pals_core::store::{A2aContact, PLAIN_PEER_PREFIX, PeerRef, Store};
 use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use super::cards::{PeerCards, signed_card_json};
 use super::client::{DiscoveryClient, DiscoveryError};
@@ -105,7 +109,7 @@ use crate::config::DiscoveryCfg;
 use crate::gateway::plain::{fetch_plain_card, keep_plain_card};
 use crate::gateway::serves_tasks;
 use crate::net::peer_addr;
-use crate::outbox::{AskError, AskOutcome, AskRequest, Outbox};
+use crate::outbox::{AskError, AskOutcome, AskRequest, INVALID_TASK_ID, Outbox};
 
 /// The most candidates [`Searcher::choose_and_ask`] asks.
 pub const MAX_ASKED: usize = 3;
@@ -835,8 +839,28 @@ impl Searcher {
                     left,
                 )
                 .await;
-            let Ok((report, reply)) = fetched else {
-                continue;
+            // A report not had is none; why is logged, the peer's words
+            // escaped.
+            let (report, reply) = match fetched {
+                Ok(fetched) => fetched,
+                Err(DiscoveryError::Report(why)) => {
+                    tracing::warn!(
+                        peer = %target.id,
+                        benchmark_id = ?reference.benchmark_id,
+                        why,
+                        "a peer's benchmark report is refused"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        peer = %target.id,
+                        benchmark_id = ?reference.benchmark_id,
+                        ?error,
+                        "a peer's benchmark report was not had"
+                    );
+                    continue;
+                }
             };
             tally.bytes_sent += reply.bytes_sent;
             tally.bytes_received += reply.bytes_received;
@@ -950,7 +974,16 @@ impl Searcher {
                 wait,
                 offer: candidate.offer.as_ref().map(OfferRef::of),
             };
-            match self.inner.parts.outbox.ask(ask).await {
+            let mut kept = None;
+            let asked = self
+                .inner
+                .parts
+                .outbox
+                .ask_kept(ask, &CancellationToken::new(), |id| {
+                    kept = Some(id.to_owned());
+                })
+                .await;
+            let reason = match asked {
                 Ok(outcome)
                     if outcome.state == "TASK_STATE_REJECTED"
                         && outcome.answer.as_deref() == Some(BUSY) =>
@@ -958,24 +991,63 @@ impl Searcher {
                     return Attempt::Next(BUSY.to_owned());
                 }
                 Ok(outcome) => return Attempt::Took(Box::new(candidate), outcome),
-                Err(AskError::Rejected(reason))
-                    if (reason.contains(OFFER_EXPIRED) || reason.contains(OFFER_STALE))
-                        && !renewed
-                        && Instant::now() < budget_end =>
-                {
-                    let Some(target) = target else {
-                        return Attempt::Next(quoted(&reason));
-                    };
-                    match self.renew(req, target, &candidate, budget_end).await {
-                        Ok(fresh) => candidate = fresh,
-                        Err(why) => return Attempt::Next(why),
-                    }
-                    renewed = true;
-                }
-                Err(AskError::Rejected(reason)) => return Attempt::Next(quoted(&reason)),
+                Err(AskError::Rejected(reason)) => reason,
+                Err(error) => return Attempt::Failed(error),
+            };
+            // Another may be asked only if no task of this one's exists:
+            // else the question could run twice.
+            let offer_refused = [OFFER_UNKNOWN, OFFER_EXPIRED, OFFER_STALE]
+                .iter()
+                .any(|refusal| reason.contains(refusal));
+            match self
+                .before_any_task(kept.as_deref(), &reason, offer_refused)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => return Attempt::Failed(AskError::Rejected(reason)),
                 Err(error) => return Attempt::Failed(error),
             }
+            let renewable = (reason.contains(OFFER_EXPIRED) || reason.contains(OFFER_STALE))
+                && !renewed
+                && Instant::now() < budget_end;
+            let Some(target) = target.filter(|_| renewable) else {
+                return Attempt::Next(quoted(&reason));
+            };
+            match self.renew(req, target, &candidate, budget_end).await {
+                Ok(fresh) => candidate = fresh,
+                Err(why) => return Attempt::Next(why),
+            }
+            renewed = true;
         }
+    }
+
+    /// Whether the question kept as `message_id`, refused for `reason`, was
+    /// refused before any task of the peer's existed, so that another
+    /// candidate may be asked without running it twice: nothing was kept,
+    /// or the outbox knows no task of it and either the peer refused the
+    /// offer it names (`offer_refused`: a provider checks the offer only
+    /// for a request that is new, so none of its copies runs) or the very
+    /// first exchange was refused. A peer that named a task id this agent
+    /// does not take ([`INVALID_TASK_ID`]) had a task.
+    async fn before_any_task(
+        &self,
+        message_id: Option<&str>,
+        reason: &str,
+        offer_refused: bool,
+    ) -> Result<bool, AskError> {
+        let Some(message_id) = message_id else {
+            return Ok(true);
+        };
+        if reason == INVALID_TASK_ID {
+            return Ok(false);
+        }
+        let (store, id) = (Arc::clone(&self.inner.parts.store), message_id.to_owned());
+        let row = match tokio::task::spawn_blocking(move || store.outbox_get(&id)).await {
+            Ok(Ok(row)) => row,
+            Ok(Err(err)) => return Err(AskError::Local(format!("the outbox failed: {err:#}"))),
+            Err(err) => return Err(AskError::Local(format!("the outbox failed: {err}"))),
+        };
+        Ok(row.is_some_and(|row| row.task_id.is_none() && (offer_refused || row.attempts == 1)))
     }
 
     /// `candidate` with a new offer of `target`'s, asked within its time and
@@ -1023,8 +1095,10 @@ impl Searcher {
 }
 
 /// The PALS contact `name`, `id` dialed with `ticket`, with the grant this
-/// agent holds for it: the one of `project` if any, else the newest that
-/// serves tasks.
+/// agent holds of it that serves tasks in `project`, or its newest that
+/// serves tasks when `project` names none. A grant of another project is
+/// never presented: the query would be answered in that project's scope,
+/// which says nothing of this one.
 fn pals_entry(
     store: &Store,
     name: String,
@@ -1045,10 +1119,11 @@ fn pals_entry(
         Some(_) => for_project.is_some(),
         None => !grants.is_empty(),
     };
-    let grant = for_project
-        .and_then(|at| grants.get(at))
-        .or_else(|| grants.first())
-        .cloned();
+    let grant = match project {
+        Some(_) => for_project.and_then(|at| grants.get(at)),
+        None => grants.first(),
+    }
+    .cloned();
     Ok(Entry {
         name,
         kind: EntryKind::Pals(Box::new(PalsPeer {
@@ -1104,11 +1179,7 @@ fn failure(err: &DiscoveryError, cut: &str) -> String {
 
 /// `reason`, a refusal that may quote a peer, as printable ASCII and short.
 fn quoted(reason: &str) -> String {
-    reason
-        .chars()
-        .filter(|c| c.is_ascii_graphic() || *c == ' ')
-        .take(MAX_REASON_CHARS)
-        .collect()
+    crate::printable_ascii(reason, MAX_REASON_CHARS)
 }
 
 /// The preferences `offer` says are met.
@@ -1130,12 +1201,4 @@ fn discard(peer: &str, stage: Stage, reason: &str) -> Discarded {
 
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
-/// A new query id: `q-` and 16 random hex characters.
-fn new_query_id() -> String {
-    let mut random = [0u8; 8];
-    getrandom::fill(&mut random).expect("the OS random number generator failed");
-    let hex: String = random.iter().map(|b| format!("{b:02x}")).collect();
-    format!("q-{hex}")
 }
