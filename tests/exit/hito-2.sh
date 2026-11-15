@@ -222,14 +222,27 @@ timer_ticks() {
     echo "$n"
 }
 # tools_calls: "<x> <n>" for every provider and H: the tools/call its MCP
-# server received, by the copy of its stdin.
+# server received, by the copy of its stdin; `ilegible` instead of <n> when
+# that copy is missing or cannot be read, or the count is not a number.
 tools_calls() {
     local x n out=
     for x in b c d e g h; do
-        n=$(en "$x" <<< 'grep -c "\"tools/call\"" "$H2/$AGENTE-mcp-entrada.log" 2> /dev/null || true')
-        out="$out$x ${n:-0} "
+        n=$(en "$x" <<< 'f=$H2/$AGENTE-mcp-entrada.log; [ -r "$f" ] && { grep -c "\"tools/call\"" "$f" || true; }') || n=
+        case $n in '' | *[!0-9]*) n=ilegible ;; esac
+        out="$out$x $n "
     done
     echo "${out% }"
+}
+# no_tools_calls CALLS: whether CALLS, as tools_calls prints them, says 0 for
+# every provider and H. A count missing or not a number fails it.
+no_tools_calls() {
+    local -a pairs
+    read -r -a pairs <<< "$1"
+    [ "${#pairs[@]}" -eq 12 ] || return 1
+    local i
+    for (( i = 1; i < 12; i += 2 )); do
+        [ "${pairs[$i]}" = 0 ] || return 1
+    done
 }
 
 # A host-side Python check over files of the log: the script on stdin, the
@@ -636,7 +649,7 @@ PY
     done
     calls=$(tools_calls)
     note "tools/call recibidos hasta ahora por cada servidor MCP: $calls"
-    check "ningún tools/call en ningún servidor MCP" test -z "$(tr ' ' '\n' <<< "$calls" | grep -E '^[0-9]+$' | grep -vx 0)"
+    check "ningún tools/call en ningún servidor MCP" no_tools_calls "$calls"
     note "arranques del servidor MCP de B (uno por comprobación del adaptador: al arrancar, pals inventory refresh y el temporizador de 60 s); el caso 4 fue de $(date -u -d "@$t0" +%T) a $(date -u -d "@$t1" +%T):"
     en b <<< 'cat "$H2/b-mcp-arranques.log"'
     [ "$FAILS" = 0 ] || ok=fail
@@ -877,7 +890,7 @@ desmontar() {
     if [ "$(label_of "$P-b")" = "$WORK" ]; then
         local calls
         calls=$(tools_calls)
-        if [ -z "$(tr ' ' '\n' <<< "$calls" | grep -E '^[0-9]+$' | grep -vx 0)" ]; then
+        if no_tools_calls "$calls"; then
             result "sin tools/call en toda la prueba" ok "$calls"
         else
             result "sin tools/call en toda la prueba" fail "$calls"
