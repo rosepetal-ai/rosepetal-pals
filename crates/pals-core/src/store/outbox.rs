@@ -10,7 +10,6 @@ use anyhow::ensure;
 use rusqlite::{OptionalExtension, Row, params};
 
 use super::Store;
-use crate::identity::AgentId;
 
 /// The state of a row whose outcome is not known yet.
 pub const OUTBOX_PENDING: &str = "pending";
@@ -22,8 +21,9 @@ pub const OUTBOX_REFUSED: &str = "refused";
 pub struct OutboxRow {
     /// The A2A `messageId`, unique among rows.
     pub message_id: String,
-    /// The peer asked.
-    pub peer: AgentId,
+    /// The peer asked, as its [`PeerRef::key`](super::PeerRef::key): its
+    /// agent id in hex, or `a2a:<name>` for a plain A2A contact.
+    pub peer: String,
     /// The A2A `SendMessageRequest` as JSON, sent unchanged on every attempt.
     pub request_json: String,
     /// The task the peer runs it as, once known.
@@ -169,7 +169,7 @@ mod tests {
     fn row(message_id: &str, created_at: i64) -> OutboxRow {
         OutboxRow {
             message_id: message_id.to_owned(),
-            peer: AgentKey::generate().id(),
+            peer: AgentKey::generate().id().to_string(),
             request_json: "{}".to_owned(),
             task_id: None,
             state: OUTBOX_PENDING.to_owned(),

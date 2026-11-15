@@ -5,11 +5,16 @@
 //! | Tool | Parameters | Result |
 //! |-|-|-|
 //! | `pals_whoami` | — | `{agent_id, name, ticket}` |
-//! | `pals_contacts` | — | `[{name, agent_id, has_grant}]` |
+//! | `pals_contacts` | — | `[{name, kind, agent_id, has_grant, url}]` |
 //! | `pals_ask` | `peer`, `question`, `attachments?` (absolute paths), `wait_s?` (50 by default, at most 3600) | [`AskOutcome`] |
 //! | `pals_task` | `message_id`, `wait_s?` | [`AskOutcome`] |
 //! | `pals_cancel` | `message_id` | [`AskOutcome`] |
 //! | `pals_fetch` | `url`, `dest` (a new file in the download directory) | `{path, bytes}` |
+//!
+//! `pals_contacts` lists PALS peers (`kind` `pals`, with their agent id,
+//! whether this agent holds a grant to ask them, and no `url`) and plain A2A
+//! agents (`kind` `a2a`, with the URL of their card, and neither agent id
+//! nor grant), by name.
 //!
 //! `pals_ask`, `pals_task` and `pals_cancel` are the [`Outbox`]'s `ask`,
 //! `resume` and `cancel`. An MCP client gives up on a tool call after its
@@ -193,23 +198,43 @@ impl PalsMcp {
     }
 
     #[tool(
-        description = "The peers this agent knows, by name, with their agent id and whether \
-                       this agent holds a grant to ask them."
+        description = "The peers this agent knows, by name. A PALS peer (kind pals) comes \
+                       with its agent id and whether this agent holds a grant to ask it; a \
+                       plain A2A agent (kind a2a), with the URL of its card, needs no grant \
+                       and takes no attachments. pals_ask asks either by its name."
     )]
     async fn pals_contacts(&self) -> Result<CallToolResult, ErrorData> {
-        let Ok(contacts) = self.gateway.contacts().await else {
+        let (Ok(contacts), Ok(plain)) = (
+            self.gateway.contacts().await,
+            self.gateway.a2a_contacts().await,
+        ) else {
             return Ok(refused("the contacts cannot be read"));
         };
-        let contacts: Vec<Value> = contacts
+        let mut contacts: Vec<(String, Value)> = contacts
             .into_iter()
             .map(|(contact, has_grant)| {
-                json!({
+                let listed = json!({
                     "name": contact.name,
+                    "kind": "pals",
                     "agent_id": contact.agent_id.to_string(),
                     "has_grant": has_grant,
-                })
+                    "url": null,
+                });
+                (contact.name, listed)
             })
+            .chain(plain.into_iter().map(|contact| {
+                let listed = json!({
+                    "name": contact.name,
+                    "kind": "a2a",
+                    "agent_id": null,
+                    "has_grant": null,
+                    "url": contact.card_url,
+                });
+                (contact.name, listed)
+            }))
             .collect();
+        contacts.sort_by(|a, b| a.0.cmp(&b.0));
+        let contacts: Vec<Value> = contacts.into_iter().map(|(_, listed)| listed).collect();
         Ok(CallToolResult::success(vec![ContentBlock::text(
             Value::Array(contacts).to_string(),
         )]))

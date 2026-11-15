@@ -379,16 +379,23 @@ fn named_scopes(inventory: &Inventory) -> BTreeSet<Scope> {
 /// credential: no security schemes, no security requirements, on the card or
 /// on its skills, and no signatures, which covered the original.
 pub fn gateway_view(card: &AgentCard, base_url: &str, peer: &AgentId) -> AgentCard {
+    gateway_view_for(card, base_url, &peer.to_string())
+}
+
+/// [`gateway_view`] for the peer the gateway reaches at
+/// `<base_url>/peers/<segment>`: a PALS peer's agent id in hex, or a plain
+/// A2A contact's name.
+pub fn gateway_view_for(card: &AgentCard, base_url: &str, segment: &str) -> AgentCard {
     let base = base_url.trim_end_matches('/');
     let mut view = card.clone();
     // `new` sets the protocol version this SDK implements, 1.0.
     view.supported_interfaces = vec![
         AgentInterface::new(
-            format!("{base}/peers/{peer}/jsonrpc"),
+            format!("{base}/peers/{segment}/jsonrpc"),
             TRANSPORT_PROTOCOL_JSONRPC,
         ),
         AgentInterface::new(
-            format!("{base}/peers/{peer}/rest"),
+            format!("{base}/peers/{segment}/rest"),
             TRANSPORT_PROTOCOL_HTTP_JSON,
         ),
     ];

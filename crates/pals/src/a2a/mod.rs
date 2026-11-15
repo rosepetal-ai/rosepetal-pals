@@ -18,7 +18,7 @@ pub(crate) use binding::BindingExecutor;
 pub use card::{
     BINDING_URI_HTTP_JSON, BINDING_URI_JSONRPC, CardSet, DEFAULT_DESCRIPTION,
     IDEMPOTENCY_EXTENSION, SECURITY_SCHEME, SignedCard, canonical_card, extended_card,
-    gateway_view,
+    gateway_view, gateway_view_for,
 };
 pub use guard::GuardedHandler;
 pub(crate) use shims::{echo_extensions, jsonrpc_shim, rest_shim};

@@ -17,6 +17,7 @@ use rusqlite::{Connection, ToSql, TransactionBehavior};
 
 use crate::identity::AgentId;
 
+mod a2a_contacts;
 mod benchmarks;
 mod cards;
 mod contacts;
@@ -29,6 +30,9 @@ mod records;
 mod tasks;
 mod views;
 
+pub use a2a_contacts::{
+    A2aContact, MAX_PLAIN_CONTACT_NAME, PLAIN_PEER_PREFIX, PeerRef, is_plain_contact_name,
+};
 pub use benchmarks::KeptBenchmark;
 pub use cards::MAX_CARD_CONTEXTS_PER_PEER;
 pub use contacts::Contact;

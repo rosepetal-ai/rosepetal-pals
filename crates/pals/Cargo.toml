@@ -14,10 +14,14 @@ a2a-server.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
+# JWS headers and JWK keys of plain A2A agents' cards.
+base64.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 clap.workspace = true
+# The Ed25519 keys plain A2A agents sign their cards with.
+ed25519-dalek.workspace = true
 futures.workspace = true
 getrandom.workspace = true
 http.workspace = true

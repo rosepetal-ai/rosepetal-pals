@@ -202,10 +202,52 @@ async fn pals_ask_returns_the_peer_answer() {
     assert_eq!(
         contacts,
         json!([
-            {"name": "bob", "agent_id": b.id().to_string(), "has_grant": true},
-            {"name": "stranger", "agent_id": stranger.id().to_string(), "has_grant": false},
+            {"name": "bob", "kind": "pals", "agent_id": b.id().to_string(), "has_grant": true,
+             "url": null},
+            {"name": "stranger", "kind": "pals", "agent_id": stranger.id().to_string(),
+             "has_grant": false, "url": null},
         ])
     );
+    client.cancel().await.expect("close the session");
+}
+
+#[tokio::test]
+async fn pals_contacts_lists_plain_a2a_agents_and_pals_ask_reaches_them_by_name() {
+    let (a, b) = pair().await;
+    let (origin, _agent) = common::echo_app_at().await;
+    let card_url = format!("{origin}/.well-known/agent-card.json");
+    a.node
+        .store
+        .a2a_contact_put(&pals_core::store::A2aContact {
+            name: "plain".to_owned(),
+            card_url: card_url.clone(),
+            origin,
+            bearer_env: None,
+            added_at: common::now_unix(),
+        })
+        .unwrap();
+    let client = mcp_client(&a).await;
+
+    let contacts = ok_json(&call(&client, "pals_contacts", json!({})).await);
+    assert_eq!(
+        contacts,
+        json!([
+            {"name": "bob", "kind": "pals", "agent_id": b.id().to_string(), "has_grant": true,
+             "url": null},
+            {"name": "plain", "kind": "a2a", "agent_id": null, "has_grant": null,
+             "url": card_url},
+        ])
+    );
+    let out = ok_json(
+        &call(
+            &client,
+            "pals_ask",
+            json!({"peer": "plain", "question": "hola"}),
+        )
+        .await,
+    );
+    assert_eq!(out["answer"], "echo: hola");
+    assert_eq!(out["state"], "TASK_STATE_COMPLETED");
     client.cancel().await.expect("close the session");
 }
 

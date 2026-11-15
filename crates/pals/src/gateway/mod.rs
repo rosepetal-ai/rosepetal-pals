@@ -2,7 +2,9 @@
 //!
 //! It listens on loopback only. A stock A2A client reaches any PALS peer at
 //! `<gateway>/peers/<peer>`, where `<peer>` is a contact name or an agent id,
-//! with the standard bindings:
+//! with the standard bindings; and a plain A2A contact, an agent with no
+//! PALS behind it, at `<gateway>/peers/<name>` ([`plain`]). `<peer>` is an
+//! agent id first, then a PALS contact's name, then a plain contact's:
 //!
 //! | Route | Behavior |
 //! |-|-|
@@ -110,7 +112,9 @@
 //! `404` when this agent is the holder and has no such blob.
 //!
 //! A `<peer>` that is neither a contact nor an agent id gets
-//! `404 {"error":"unknown peer"}`; a peer that cannot be reached, within the
+//! `404 {"error":"unknown peer"}`, and a plain contact on the routes only
+//! PALS peers serve (the signed card, `/discovery/...`) `404 {"error":"not
+//! a PALS peer"}`; a peer that cannot be reached, within the
 //! 10 s that [`PeerHttp`] allows for dialing, `502 {"error":"peer
 //! unreachable"}`; and a broken exchange `502 {"error":"peer protocol
 //! error"}`.
@@ -127,6 +131,7 @@
 //! origin, and its requests carry `Origin: null`.
 
 mod checks;
+pub mod plain;
 pub mod rewrite;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -154,7 +159,6 @@ use http_body_util::{BodyExt, LengthLimitError, Limited};
 use iroh::{Endpoint, EndpointAddr};
 use iroh_blobs::Hash;
 use iroh_blobs::api::TempTag;
-use pals_core::card_jws::VerifiedCard;
 use pals_core::clock::Clock;
 use pals_core::discovery::DISCOVERY_VERSION;
 use pals_core::discovery::query::{MAX_QUERY_BYTES, ServiceQuery};
@@ -163,12 +167,12 @@ use pals_core::grant::{Grant, Operation, SignedGrant, parse_timestamp};
 use pals_core::identity::AgentId;
 use pals_core::inventory::Section;
 use pals_core::inventory::view::{INVENTORY_SECTIONS, verify_page};
-use pals_core::store::{Contact, Store};
+use pals_core::store::{A2aContact, Contact, Store};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
-use self::checks::{Binding, Call, EventFramer};
+use self::checks::{Binding, Call, CardOwner, EventFramer};
 use crate::a2a::auth::ASK_RESOURCE;
 use crate::a2a::gateway_view;
 #[cfg(doc)]
@@ -261,6 +265,8 @@ struct Inner {
     cards: PeerCards,
     /// Discovery requests to peers.
     discovery: DiscoveryClient,
+    /// The HTTP client for plain A2A contacts ([`plain::http_client`]).
+    plain_http: reqwest::Client,
     /// The node's clock, which pages of peers' views are judged by.
     clock: Arc<dyn Clock>,
     /// The only directory `pals_fetch` writes to, when configured.
@@ -322,6 +328,7 @@ impl GatewayState {
                 outbox,
                 cards,
                 discovery,
+                plain_http: plain::http_client(),
                 clock,
                 download_dir,
                 stopping: CancellationToken::new(),
@@ -394,6 +401,12 @@ impl GatewayState {
         .await
     }
 
+    /// Every plain A2A contact, by name.
+    pub(crate) async fn a2a_contacts(&self) -> Result<Vec<A2aContact>, StoreUnavailable> {
+        let store = Arc::clone(&self.inner.store);
+        blocking(move || store.a2a_contacts()).await
+    }
+
     /// The holder and hash of `url` when it is a blob URL of this gateway,
     /// spelled as the gateway writes them: `<base_url>/blobs/<holder>/<hash>`.
     pub(crate) fn blob_of_url(&self, url: &str) -> Option<(AgentId, Hash)> {
@@ -460,23 +473,40 @@ impl GatewayState {
         }
     }
 
-    /// The agent `peer` names, a contact name or an agent id, and where to
-    /// dial it; `None` when it names no one.
-    async fn resolve(&self, peer: String) -> Result<Option<Target>, StoreUnavailable> {
+    /// The agent `peer` names, an agent id, a contact's name or a plain
+    /// contact's name, in that order, and where to dial a PALS peer; `None`
+    /// when it names no one.
+    async fn resolve(&self, peer: String) -> Result<Option<Resolved>, StoreUnavailable> {
         let store = Arc::clone(&self.inner.store);
         blocking(move || {
             let (id, contact) = match peer.parse::<AgentId>() {
                 Ok(id) => (id, store.contact_by_id(&id)?),
                 Err(_) => match store.contact_by_name(&peer)? {
                     Some(contact) => (contact.agent_id, Some(contact)),
-                    None => return Ok(None),
+                    None => return Ok(store.a2a_contact_by_name(&peer)?.map(Resolved::Plain)),
                 },
             };
             let ticket = contact.and_then(|contact| contact.ticket);
             let addr = peer_addr(&id, ticket.as_deref());
-            Ok(Some(Target { id, addr }))
+            Ok(Some(Resolved::Peer(Target { id, addr })))
         })
         .await
+    }
+
+    /// The PALS peer `peer` names; else the answer: `404` for no one, or for
+    /// a plain contact, which serves no PALS route.
+    async fn resolve_pals(&self, peer: String) -> Result<Target, Refusal> {
+        match self.resolve(peer).await {
+            Ok(Some(Resolved::Peer(target))) => Ok(target),
+            Ok(Some(Resolved::Plain(_))) => {
+                Err(Refusal::new(StatusCode::NOT_FOUND, "not a PALS peer"))
+            }
+            Ok(None) => Err(Refusal::new(StatusCode::NOT_FOUND, "unknown peer")),
+            Err(StoreUnavailable) => Err(Refusal::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            )),
+        }
     }
 
     /// The newest unexpired grant held for `peer` that [serves
@@ -547,10 +577,16 @@ fn serves_tasks(grant: &Grant) -> bool {
     task_op && grant.covers_resource(ASK_RESOURCE)
 }
 
-/// A peer, resolved.
+/// A PALS peer, resolved.
 struct Target {
     id: AgentId,
     addr: EndpointAddr,
+}
+
+/// What a `{peer}` names.
+enum Resolved {
+    Peer(Target),
+    Plain(A2aContact),
 }
 
 /// The gateway's routes, behind the local guard.
@@ -643,8 +679,9 @@ async fn healthz(State(state): State<GatewayState>) -> Response {
     Json(state.identity()).into_response()
 }
 
-/// The peer's card as [`gateway_view`], read from the peer and verified
-/// ([`GatewayState::peer_public_card`]).
+/// The peer's card as [`gateway_view`], read from the peer and verified as
+/// its own ([`PeerCards::public`]), and kept; a plain contact's as
+/// [`plain::plain_view`], read and checked ([`plain::fetch_plain_card`]).
 ///
 /// The response may be cached for [`CARD_MAX_AGE`] and carries a strong
 /// `ETag`, the BLAKE3 of its body; a request whose `If-None-Match` names it
@@ -654,12 +691,22 @@ async fn peer_card(
     Path(peer): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let (target, verified) = match state.peer_public_card(peer).await {
-        Ok(found) => found,
-        Err(none) => return none.into_response(),
+    let view = match state.resolve(peer).await {
+        Ok(Some(Resolved::Peer(target))) => {
+            match state.inner.cards.public(&target.id, target.addr).await {
+                // From what the signature covers, never from the JSON
+                // received.
+                Ok(verified) => gateway_view(&verified.card, &state.base_url(), &target.id),
+                Err(failure) => return card_failure(&target.id, &failure),
+            }
+        }
+        Ok(Some(Resolved::Plain(contact))) => match state.plain_card(&contact).await {
+            Ok(plain) => plain::plain_view(&plain, &state.base_url(), &contact.name),
+            Err(failure) => return plain::plain_failure(&contact.name, &failure),
+        },
+        Ok(None) => return unknown_peer(),
+        Err(failure) => return failure.into_response(),
     };
-    // From what the signature covers, never from the JSON received.
-    let view = gateway_view(&verified.card, &state.base_url(), &target.id);
     let body = checks::ascii_json(&serde_json::to_value(&view).expect("an Agent Card serializes"));
     let etag = format!("\"{}\"", blake3::hash(&body).to_hex());
     let etag = HeaderValue::from_str(&etag).expect("hex digits in quotes are a valid header");
@@ -683,55 +730,22 @@ async fn peer_card(
 }
 
 /// The peer's card as the peer signed it ([`signed_card_json`]), read from
-/// the peer and verified ([`GatewayState::peer_public_card`]): only what
-/// its valid signature covers, and the signatures that verify, re-encoded
-/// in ASCII. For tools that check a card's signature themselves.
+/// the peer and verified as its own ([`PeerCards::public`]), and kept: only
+/// what its valid signature covers, and the signatures that verify,
+/// re-encoded in ASCII. For tools that check a card's signature themselves;
+/// PALS peers only.
 async fn signed_peer_card(State(state): State<GatewayState>, Path(peer): Path<String>) -> Response {
-    match state.peer_public_card(peer).await {
-        Ok((_, verified)) => (
+    let target = match state.resolve_pals(peer).await {
+        Ok(target) => target,
+        Err(refusal) => return refusal.into_response(),
+    };
+    match state.inner.cards.public(&target.id, target.addr).await {
+        Ok(verified) => (
             [(CONTENT_TYPE, HeaderValue::from_static(JSON))],
             checks::ascii_json(&signed_card_json(&verified)),
         )
             .into_response(),
-        Err(none) => none.into_response(),
-    }
-}
-
-/// Why the gateway has no card of a peer to serve.
-enum NoCard {
-    UnknownPeer,
-    Store(StoreUnavailable),
-    Fetch(AgentId, CardFetchError),
-}
-
-impl IntoResponse for NoCard {
-    fn into_response(self) -> Response {
-        match self {
-            Self::UnknownPeer => unknown_peer(),
-            Self::Store(failure) => failure.into_response(),
-            Self::Fetch(peer, failure) => card_failure(&peer, &failure),
-        }
-    }
-}
-
-impl GatewayState {
-    /// The peer `peer` names and its public card, read and verified as its
-    /// own, and kept ([`PeerCards::public`]); else why there is none.
-    async fn peer_public_card(&self, peer: String) -> Result<(Target, VerifiedCard), NoCard> {
-        let target = match self.resolve(peer).await {
-            Ok(Some(target)) => target,
-            Ok(None) => return Err(NoCard::UnknownPeer),
-            Err(failure) => return Err(NoCard::Store(failure)),
-        };
-        match self
-            .inner
-            .cards
-            .public(&target.id, target.addr.clone())
-            .await
-        {
-            Ok(verified) => Ok((target, verified)),
-            Err(failure) => Err(NoCard::Fetch(target.id, failure)),
-        }
+        Err(failure) => card_failure(&target.id, &failure),
     }
 }
 
@@ -758,10 +772,9 @@ async fn peer_inventory(
     };
     let names: Vec<String> = sections.iter().map(|s| section_name(*s)).collect();
     let cursor = query.cursor.unwrap_or_default();
-    let target = match state.resolve(peer).await {
-        Ok(Some(target)) => target,
-        Ok(None) => return unknown_peer(),
-        Err(failure) => return failure.into_response(),
+    let target = match state.resolve_pals(peer).await {
+        Ok(target) => target,
+        Err(refusal) => return refusal.into_response(),
     };
     let grant = match state.held_grant(target.id).await {
         Ok(grant) => grant,
@@ -848,10 +861,9 @@ async fn peer_query(
     if let Err(why) = query.validate() {
         return error(StatusCode::BAD_REQUEST, format!("invalid query: {why}"));
     }
-    let target = match state.resolve(peer).await {
-        Ok(Some(target)) => target,
-        Ok(None) => return unknown_peer(),
-        Err(failure) => return failure.into_response(),
+    let target = match state.resolve_pals(peer).await {
+        Ok(target) => target,
+        Err(refusal) => return refusal.into_response(),
     };
     let grant = match state.held_grant_for(target.id, query.project.clone()).await {
         Ok(grant) => grant,
@@ -1014,7 +1026,8 @@ async fn forward_rest(
     forward(state, peer, request, Binding::Rest).await
 }
 
-/// Forwards `request`, for `/peers/<peer>/<rest>`, to `/<rest>` of `peer`.
+/// Forwards `request`, for `/peers/<peer>/<rest>`, to `/<rest>` of `peer`;
+/// to a plain contact as [`plain::forward`] says.
 async fn forward(
     state: GatewayState,
     peer: String,
@@ -1025,7 +1038,10 @@ async fn forward(
         return error(StatusCode::BAD_REQUEST, "invalid request target");
     };
     let target = match state.resolve(peer).await {
-        Ok(Some(target)) => target,
+        Ok(Some(Resolved::Peer(target))) => target,
+        Ok(Some(Resolved::Plain(contact))) => {
+            return plain::forward(&state, contact, target_uri, request, binding).await;
+        }
         Ok(None) => return unknown_peer(),
         Err(failure) => return failure.into_response(),
     };
@@ -1077,7 +1093,7 @@ async fn forward(
             parts.headers = incoming_headers(&parts.headers);
             match state
                 .incoming_body(
-                    &target.id,
+                    CardOwner::Peer(&target.id),
                     binding,
                     call,
                     parts.status,
@@ -1179,13 +1195,13 @@ impl GatewayState {
         Ok(!declared.is_empty())
     }
 
-    /// The body of `peer`'s response, of `status`, to `call` on `binding`,
-    /// as it goes to the client: checked and re-encoded, as [`checks`] says.
-    /// `headers` get the type and length of what goes, and, for the extended
-    /// card, [`CARD_HASH_HEADER`].
+    /// The body of the response of `owner`, a peer or a plain contact, of
+    /// `status`, to `call` on `binding`, as it goes to the client: checked
+    /// and re-encoded, as [`checks`] says. `headers` get the type and length
+    /// of what goes, and, for a peer's extended card, [`CARD_HASH_HEADER`].
     async fn incoming_body(
         &self,
-        peer: &AgentId,
+        owner: CardOwner<'_>,
         binding: Binding,
         call: Call,
         status: StatusCode,
@@ -1234,7 +1250,7 @@ impl GatewayState {
             Err(_) => return Ok(Body::from(bytes)),
         };
         let card_hash = if card && status.is_success() {
-            checks::extended_card_view(&mut value, binding, peer, &self.base_url())
+            checks::extended_card_view(&mut value, binding, owner, &self.base_url())
                 .map_err(TunnelError::Protocol)?
         } else {
             None

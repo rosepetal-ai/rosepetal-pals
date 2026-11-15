@@ -1,6 +1,8 @@
-//! Saved peers, by a local name.
+//! Saved peers, by a local name: a name that no plain A2A contact has
+//! (`a2a_contacts.rs`), so that one name is one contact.
 
-use rusqlite::{OptionalExtension, Row, params};
+use anyhow::ensure;
+use rusqlite::{OptionalExtension, Row, TransactionBehavior, params};
 
 use super::Store;
 use crate::identity::AgentId;
@@ -31,9 +33,22 @@ impl Contact {
 }
 
 impl Store {
-    /// Saves `c`, replacing the contact with the same name.
+    /// Saves `c`, replacing the contact with the same name. Fails when its
+    /// name is a plain A2A contact's.
     pub fn contact_put(&self, c: &Contact) -> anyhow::Result<()> {
-        self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let taken: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM a2a_contacts WHERE name = ?1)",
+            [&c.name],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            !taken,
+            "{} is the name of a plain A2A contact already: one name, one contact",
+            c.name
+        );
+        tx.execute(
             "INSERT INTO contacts (name, agent_id, ticket, added_at) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (name) DO UPDATE SET
                  agent_id = excluded.agent_id,
@@ -41,6 +56,7 @@ impl Store {
                  added_at = excluded.added_at",
             params![c.name, c.agent_id, c.ticket, c.added_at],
         )?;
+        tx.commit()?;
         Ok(())
     }
 

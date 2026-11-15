@@ -4,8 +4,10 @@
 //! with the grants that let them talk to each other, an executor that counts
 //! its runs ([`CountingExecutor`]), nodes whose worker reports a fixed load
 //! ([`spawn_node_with_load`]), peers that speak only the discovery protocol,
-//! as the tests script them ([`stub_discovery_peer`]), and a plain HTTP
-//! client for a node's loopback gateway ([`gateway_request`]).
+//! as the tests script them ([`stub_discovery_peer`]), stock A2A agents with
+//! no PALS behind them, served over plain HTTP on loopback ([`echo_app_at`],
+//! [`serve_at`]), and a plain HTTP client for a node's loopback gateway
+//! ([`gateway_request`]).
 
 // Each test binary uses a different subset of these helpers.
 #![allow(dead_code)]
@@ -30,7 +32,7 @@ use a2a_server::{
 use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Request, Response, header};
-use axum::routing::post;
+use axum::routing::{get, post};
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use http_body_util::BodyExt;
@@ -113,6 +115,145 @@ pub fn echo_app(agent_name: &str) -> axum::Router {
         .merge(agent_card_router(Arc::new(StaticAgentCard::new(card))))
         .nest("/jsonrpc", jsonrpc_router(Arc::clone(&handler)))
         .nest("/rest", rest_router(handler))
+}
+
+/// The echo agent's card, its JSON-RPC and HTTP+JSON interfaces at `origin`
+/// (`http://127.0.0.1:<port>`), as a stock A2A agent reached over HTTP
+/// declares them.
+pub fn echo_card_at(origin: &str) -> AgentCard {
+    AgentCard {
+        name: "plain echo".to_owned(),
+        description: "Replies with the text it receives".to_owned(),
+        version: "0.1.0".to_owned(),
+        supported_interfaces: vec![
+            AgentInterface::new(format!("{origin}/jsonrpc"), TRANSPORT_PROTOCOL_JSONRPC),
+            AgentInterface::new(format!("{origin}/rest"), TRANSPORT_PROTOCOL_HTTP_JSON),
+        ],
+        capabilities: AgentCapabilities {
+            streaming: Some(true),
+            push_notifications: Some(false),
+            ..AgentCapabilities::default()
+        },
+        default_input_modes: vec!["text/plain".to_owned()],
+        default_output_modes: vec!["text/plain".to_owned()],
+        skills: vec![AgentSkill {
+            id: "echo".to_owned(),
+            name: "Echo".to_owned(),
+            description: "Replies with `echo: <text>`".to_owned(),
+            tags: vec!["echo".to_owned()],
+            examples: None,
+            input_modes: None,
+            output_modes: None,
+            security_requirements: None,
+        }],
+        provider: None,
+        documentation_url: None,
+        icon_url: None,
+        security_schemes: None,
+        security_requirements: None,
+        signatures: None,
+    }
+}
+
+/// The echo agent as a stock A2A v1.0 server that serves `card`, exactly as
+/// given, at `/.well-known/agent-card.json`, and its JSON-RPC binding at
+/// `/jsonrpc` and its HTTP+JSON binding at `/rest`, whatever the card says.
+pub fn echo_app_with_card(card: Value) -> axum::Router {
+    let capabilities = AgentCapabilities {
+        streaming: Some(true),
+        push_notifications: Some(false),
+        ..AgentCapabilities::default()
+    };
+    let handler = Arc::new(
+        DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
+            .with_capabilities(capabilities),
+    );
+    axum::Router::new()
+        .route(
+            "/.well-known/agent-card.json",
+            get(move || {
+                let card = card.clone();
+                async move { Json(card) }
+            }),
+        )
+        .nest("/jsonrpc", jsonrpc_router(Arc::clone(&handler)))
+        .nest("/rest", rest_router(handler))
+}
+
+/// A stock A2A agent with no PALS behind it, the echo agent, served over
+/// HTTP on a new port of 127.0.0.1, whose card declares the origin it
+/// listens at, `http://127.0.0.1:<port>` ([`echo_app`] declares
+/// `agent.invalid`, for the tunnel): that origin, and the server.
+pub async fn echo_app_at() -> (String, ServerHandle) {
+    serve_at(|origin| {
+        echo_app_with_card(serde_json::to_value(echo_card_at(origin)).expect("a card serializes"))
+    })
+    .await
+}
+
+/// A request a [`ServerHandle`] received.
+#[derive(Debug, Clone)]
+pub struct SeenRequest {
+    pub method: String,
+    /// The path and the query, as sent.
+    pub uri: String,
+    pub headers: HeaderMap,
+}
+
+/// An HTTP server on 127.0.0.1 ([`serve_at`]) that records every request it
+/// receives, and stops when dropped.
+pub struct ServerHandle {
+    origin: String,
+    seen: Arc<Mutex<Vec<SeenRequest>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ServerHandle {
+    /// `http://127.0.0.1:<port>`.
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    /// Every request received so far, in order.
+    pub fn requests(&self) -> Vec<SeenRequest> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Serves over HTTP, on a new port of 127.0.0.1, the app `build` makes for
+/// the origin it listens at: the listener is bound first, so that the app,
+/// its card, can name the origin it is reached at. That origin,
+/// `http://127.0.0.1:<port>`, and the server.
+pub async fn serve_at(build: impl FnOnce(&str) -> axum::Router) -> (String, ServerHandle) {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind a loopback port");
+    let origin = format!("http://{}", listener.local_addr().expect("a local address"));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    let app = build(&origin).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                recorder.lock().unwrap().push(SeenRequest {
+                    method: request.method().to_string(),
+                    uri: request.uri().to_string(),
+                    headers: request.headers().clone(),
+                });
+                next.run(request).await
+            }
+        },
+    ));
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (origin.clone(), ServerHandle { origin, seen, task })
 }
 
 /// An app that answers `POST /peer` with every `x-agentnet-peer` value the

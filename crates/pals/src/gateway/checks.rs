@@ -34,7 +34,9 @@
 //! HTTP+JSON, the `result` of a JSON-RPC response), which is replaced by its
 //! [`gateway_view`], built from what the signature covers
 //! ([`extended_card_view`]). A JSON-RPC error goes on as any other. A card
-//! that does not verify is refused, as a body that is not JSON is.
+//! that does not verify is refused, as a body that is not JSON is. A plain
+//! A2A contact's extended card ([`CardOwner::Plain`]) needs no signature: it
+//! must be a valid card ([`validate_card`]), and goes on as its view.
 //!
 //! **A whole body** is read up to the gateway's bound; a `2xx` one must be
 //! empty or JSON (RFC 8259, UTF-8). JSON, of any status, is checked
@@ -87,13 +89,13 @@ use std::io;
 
 use bytes::{Bytes, BytesMut};
 use http::Method;
-use pals_core::card_jws::{CardHash, MAX_CARD_BYTES, card_hash, verify_card};
+use pals_core::card_jws::{CardHash, MAX_CARD_BYTES, card_hash, validate_card, verify_card};
 use pals_core::identity::AgentId;
 use serde::Serialize;
 use serde_json::Value;
 
 use super::rewrite;
-use crate::a2a::{gateway_view, is_safe_task_id};
+use crate::a2a::{gateway_view, gateway_view_for, is_safe_task_id};
 use crate::discovery::signed_card_json;
 
 /// The A2A binding a call speaks.
@@ -110,6 +112,15 @@ pub(crate) enum Call {
     Unary,
     Streaming,
     ExtendedCard,
+}
+
+/// Whose answer the gateway checks: whose extended card it must be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CardOwner<'a> {
+    /// A PALS peer: its card must be signed with its agent id as `kid`.
+    Peer(&'a AgentId),
+    /// A plain A2A contact, by name: its card need not be signed.
+    Plain(&'a str),
 }
 
 /// The JSON-RPC methods the pinned SDK answers with an event stream.
@@ -181,18 +192,20 @@ impl Call {
 }
 
 /// `answer`, a peer's successful answer to an extended card call on
-/// `binding`, with its card verified as `peer`'s and replaced by its
+/// `binding`, with its card verified as `owner`'s and replaced by its
 /// [`gateway_view`] at `base_url`; the [hash](card_hash) of the card as
-/// `peer` signed it ([`signed_card_json`]).
+/// the peer signed it ([`signed_card_json`]). A plain contact's card is
+/// validated instead, and replaced by its view with no hash.
 ///
 /// On HTTP+JSON the answer is the card. On JSON-RPC it is a response
 /// envelope, with the card as its `result`, or with an `error`, which is
 /// left as it is (`None`). Refused, saying why, when the card does not
-/// verify as `peer`'s, or when the answer is not one of those.
+/// verify as the peer's (is not a valid card, for a plain contact), or when
+/// the answer is not one of those.
 pub(crate) fn extended_card_view(
     answer: &mut Value,
     binding: Binding,
-    peer: &AgentId,
+    owner: CardOwner<'_>,
     base_url: &str,
 ) -> Result<Option<CardHash>, String> {
     let card = match binding {
@@ -206,6 +219,16 @@ pub(crate) fn extended_card_view(
                 Some(result) => result,
                 None => return Ok(None),
             }
+        }
+    };
+    let peer = match owner {
+        CardOwner::Peer(peer) => peer,
+        CardOwner::Plain(name) => {
+            let valid = validate_card(card)
+                .map_err(|err| format!("an extended card that is not valid: {err}"))?;
+            let view = gateway_view_for(&valid, base_url, name);
+            *card = serde_json::to_value(view).expect("an AgentCard always serializes");
+            return Ok(None);
         }
     };
     let verified = verify_card(card, peer)
@@ -573,11 +596,13 @@ mod tests {
         let view = serde_json::to_value(gateway_view(&signed.card, base, &peer)).unwrap();
 
         let mut rest = signed.json.clone();
-        let hash = extended_card_view(&mut rest, Binding::Rest, &peer, base).unwrap();
+        let hash =
+            extended_card_view(&mut rest, Binding::Rest, CardOwner::Peer(&peer), base).unwrap();
         assert_eq!(hash, Some(signed.hash.clone()));
         assert_eq!(rest, view);
         let mut rpc = json!({"jsonrpc": "2.0", "id": "x", "result": signed.json});
-        let hash = extended_card_view(&mut rpc, Binding::JsonRpc, &peer, base).unwrap();
+        let hash =
+            extended_card_view(&mut rpc, Binding::JsonRpc, CardOwner::Peer(&peer), base).unwrap();
         assert_eq!(hash, Some(signed.hash.clone()));
         assert_eq!(rpc, json!({"jsonrpc": "2.0", "id": "x", "result": view}));
 
@@ -585,7 +610,7 @@ mod tests {
         let error = json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32004}});
         let mut answer = error.clone();
         assert_eq!(
-            extended_card_view(&mut answer, Binding::JsonRpc, &peer, base),
+            extended_card_view(&mut answer, Binding::JsonRpc, CardOwner::Peer(&peer), base),
             Ok(None)
         );
         assert_eq!(answer, error);
@@ -614,7 +639,43 @@ mod tests {
             (json!({}), Binding::Rest, peer),
         ] {
             assert!(
-                extended_card_view(&mut answer, binding, &signer, base).is_err(),
+                extended_card_view(&mut answer, binding, CardOwner::Peer(&signer), base).is_err(),
+                "{answer}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_contact_s_extended_card_needs_no_signature_but_must_be_valid() {
+        let base = "http://127.0.0.1:7420";
+        let card = json!({
+            "name": "plain", "description": "d", "version": "1",
+            "supportedInterfaces": [{"url": "https://agent.example/rpc",
+                "protocolBinding": "JSONRPC", "protocolVersion": "1.0"}],
+            "capabilities": {}, "defaultInputModes": ["text/plain"],
+            "defaultOutputModes": ["text/plain"], "skills": [],
+            "securitySchemes": {"bearer": {"httpAuthSecurityScheme": {"scheme": "Bearer"}}}
+        });
+        let valid = validate_card(&card).unwrap();
+        let view = serde_json::to_value(gateway_view_for(&valid, base, "echo")).unwrap();
+        assert!(view.get("securitySchemes").is_none(), "{view}");
+
+        let mut rest = card.clone();
+        let owner = CardOwner::Plain("echo");
+        assert_eq!(
+            extended_card_view(&mut rest, Binding::Rest, owner, base),
+            Ok(None)
+        );
+        assert_eq!(rest, view);
+        let mut rpc = json!({"jsonrpc": "2.0", "id": 1, "result": card});
+        assert_eq!(
+            extended_card_view(&mut rpc, Binding::JsonRpc, owner, base),
+            Ok(None)
+        );
+        assert_eq!(rpc["result"], view);
+        for mut answer in [json!({"name": "no card"}), json!("text")] {
+            assert!(
+                extended_card_view(&mut answer, Binding::Rest, owner, base).is_err(),
                 "{answer}"
             );
         }

@@ -4,10 +4,13 @@
 //!
 //! An ask gets a new `messageId`, a UUID v4, and its whole
 //! `SendMessageRequest` is written to the outbox before the first attempt
-//! to send it. Every attempt goes through the gateway
-//! (`<gateway>/peers/<agent id>/rest`) with the stock A2A client, on the
-//! HTTP+JSON binding, whose errors keep the gateway's HTTP status, and with
-//! `A2A-Version: 1.0`:
+//! to send it, with the peer it goes to as its [`PeerRef::key`]: an agent id,
+//! or `a2a:<name>` for a plain A2A contact (`crate::gateway::plain`), which
+//! is asked, kept and taken up again just the same. Every attempt goes
+//! through the gateway (`<gateway>/peers/<agent id>/rest`, or
+//! `/peers/<name>/rest` for a plain contact) with the stock A2A client, on
+//! the HTTP+JSON binding, whose errors keep the gateway's HTTP status, and
+//! with `A2A-Version: 1.0`:
 //!
 //! - while the peer's task is not known, the same request, byte for byte,
 //!   with `SendStreamingMessage`: the peer runs the first copy that reaches
@@ -40,7 +43,9 @@
 //! that names an unsafe one never gets through it, so the attempt breaks
 //! as on a cut connection, and is retried.
 //!
-//! An attachment is read only as the path policy's reading rule allows
+//! Files go to PALS peers only: an ask to a plain contact with attachments
+//! is refused before anything is read or sent. An attachment is read only
+//! as the path policy's reading rule allows
 //! (`crate::path_policy`): resolved first, symbolic links and `..`
 //! included, it must be a regular file outside the agent's data directory
 //! ([`Outbox::with_data_dir`]), which holds its key and its grants, and
@@ -63,14 +68,14 @@ use a2a_client::transport::ServiceParams;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use pals_core::identity::AgentId;
-use pals_core::store::{OUTBOX_PENDING, OUTBOX_REFUSED, OutboxRow, Store};
+use pals_core::store::{OUTBOX_PENDING, OUTBOX_REFUSED, OutboxRow, PeerRef, Store};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::a2a::{IDEMPOTENCY_EXTENSION, is_safe_task_id};
+use crate::gateway::plain::path_segment;
 use crate::path_policy::open_attachment;
 
 /// How many times an ask retries an attempt that failed on the way, after
@@ -95,7 +100,7 @@ type Client = A2AClient<RestTransport>;
 /// A question for a peer.
 #[derive(Debug, Clone)]
 pub struct AskRequest {
-    /// A contact name or an agent id.
+    /// A contact name, a plain A2A contact's name or an agent id.
     pub peer: String,
     pub question: String,
     /// Files sent with the question.
@@ -199,9 +204,10 @@ impl Outbox {
     /// `req.wait` for the answer.
     ///
     /// Fails with [`AskError::Local`], having sent nothing, when the peer is
-    /// neither a contact nor an agent id, or an attachment cannot be read
-    /// or uploaded: one that is not a regular file, is inside the data
-    /// directory or is a system file is refused.
+    /// neither a contact nor an agent id, is a plain A2A contact and there
+    /// are attachments, or an attachment cannot be read or uploaded: one
+    /// that is not a regular file, is inside the data directory or is a
+    /// system file is refused.
     pub async fn ask(&self, req: AskRequest) -> Result<AskOutcome, AskError> {
         self.ask_kept(req, &CancellationToken::new(), |_| {}).await
     }
@@ -229,6 +235,9 @@ impl Outbox {
         let deadline = Instant::now() + wait;
         let prepared = async {
             let peer = self.resolve(peer).await?;
+            if matches!(peer, PeerRef::Plain(_)) && !attachments.is_empty() {
+                return Err(AskError::Local("attachments need a PALS peer".to_owned()));
+            }
             let mut parts = vec![Part::text(question)];
             for path in &attachments {
                 parts.push(self.upload(path).await?);
@@ -264,7 +273,7 @@ impl Outbox {
         let now = now_unix();
         let row = OutboxRow {
             message_id: message_id.clone(),
-            peer,
+            peer: peer.key(),
             request_json,
             task_id: None,
             state: OUTBOX_PENDING.to_owned(),
@@ -296,6 +305,7 @@ impl Outbox {
         let row = self.row(message_id).await?;
         check_stored_task(&row)?;
         let request = decode_request(&row.request_json)?;
+        let peer = self.peer_of(&row).await?;
         if row.state == OUTBOX_REFUSED {
             let id = row.message_id.clone();
             self.with_store(move |store| store.outbox_set_state(&id, OUTBOX_PENDING, now_unix()))
@@ -303,7 +313,7 @@ impl Outbox {
         }
         self.drive(Ask {
             message_id: row.message_id,
-            peer: row.peer,
+            peer,
             request,
             task_id: row.task_id,
             deadline: Instant::now() + wait,
@@ -321,13 +331,14 @@ impl Outbox {
     pub async fn cancel(&self, message_id: &str) -> Result<AskOutcome, AskError> {
         let row = self.row(message_id).await?;
         check_stored_task(&row)?;
-        let Some(task_id) = row.task_id else {
+        let Some(task_id) = row.task_id.clone() else {
             return Err(AskError::Local(format!(
                 "no task of the peer is known for message {message_id} yet: there is nothing \
                  to cancel"
             )));
         };
-        let client = self.client(&row.peer);
+        let peer = self.peer_of(&row).await?;
+        let client = self.client(&peer);
         let request = CancelTaskRequest {
             id: task_id,
             metadata: None,
@@ -538,18 +549,28 @@ impl Outbox {
         Ok(task_outcome(message_id, task, attempts))
     }
 
-    /// The agent `peer` names: an agent id, or a contact's name.
-    async fn resolve(&self, peer: String) -> Result<AgentId, AskError> {
-        if let Ok(id) = peer.parse::<AgentId>() {
-            return Ok(id);
-        }
+    /// The agent `peer` names: an agent id, a contact's name, or a plain A2A
+    /// contact's name, in that order.
+    async fn resolve(&self, peer: String) -> Result<PeerRef, AskError> {
         let name = peer.clone();
-        let contact = self
-            .with_store(move |store| store.contact_by_name(&name))
+        let resolved = self
+            .with_store(move |store| store.resolve_peer(&name))
             .await?;
-        contact.map(|contact| contact.agent_id).ok_or_else(|| {
+        resolved.ok_or_else(|| {
             AskError::Local(format!(
                 "unknown peer {peer}: neither a contact nor an agent id"
+            ))
+        })
+    }
+
+    /// The peer `row` was asked of, from the reference it keeps.
+    async fn peer_of(&self, row: &OutboxRow) -> Result<PeerRef, AskError> {
+        let key = row.peer.clone();
+        let peer = self.with_store(move |store| store.peer_ref(&key)).await?;
+        peer.ok_or_else(|| {
+            AskError::Local(format!(
+                "the peer of message {} is not known any more: {}",
+                row.message_id, row.peer
             ))
         })
     }
@@ -601,9 +622,9 @@ impl Outbox {
 
     /// The A2A client for `peer`, through the gateway. Every request it
     /// sends activates the [idempotency extension](IDEMPOTENCY_EXTENSION),
-    /// which the resends of an ask rely on.
-    fn client(&self, peer: &AgentId) -> Client {
-        let base_url = format!("{}/peers/{peer}/rest", self.gateway_url);
+    /// which the resends of an ask rely on; a plain A2A agent may ignore it.
+    fn client(&self, peer: &PeerRef) -> Client {
+        let base_url = format!("{}/peers/{}/rest", self.gateway_url, path_segment(peer));
         A2AClient::new(RestTransport::new(self.http.clone(), base_url))
             .with_interceptors(vec![Arc::new(Idempotent)])
     }
@@ -642,7 +663,7 @@ impl Outbox {
 /// A question being attempted.
 struct Ask {
     message_id: String,
-    peer: AgentId,
+    peer: PeerRef,
     /// What every attempt that sends it sends.
     request: SendMessageRequest,
     task_id: Option<String>,

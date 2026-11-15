@@ -1,10 +1,11 @@
 //! The `pals` command line.
 //!
 //! Only `pals daemon` takes the data directory's lock; every other command,
-//! `pals benchmark import|ls` included, opens the store directly, which a
-//! running daemon shares. `pals ask`, `pals task resume|cancel`, `pals card
-//! show <peer>`, `pals inventory get` and `pals query` reach peers through
-//! the running daemon's gateway.
+//! `pals benchmark import|ls` and `pals contact add-a2a` included, opens the
+//! store directly, which a running daemon shares; `pals contact add-a2a`
+//! reads the plain agent's card itself. `pals ask`, `pals task
+//! resume|cancel`, `pals card show <peer>`, `pals inventory get` and `pals
+//! query` reach peers through the running daemon's gateway.
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -23,7 +24,9 @@ use hyper_util::rt::TokioIo;
 use iroh_tickets::endpoint::EndpointTicket;
 use pals::a2a::CardSet;
 use pals::config::{self, CONFIG_FILE, Config, INIT_TEMPLATE, INVENTORY_TEMPLATE, is_header_safe};
+use pals::discovery::cards::PUBLIC_CONTEXT;
 use pals::gateway::CARD_HASH_HEADER;
+use pals::gateway::plain::{self, fetch_plain_card};
 use pals::inventory::InventoryState;
 use pals::net::agent_id_of;
 use pals::node::{Node, STORE_FILE};
@@ -41,7 +44,7 @@ use pals_core::identity::{AgentId, AgentKey};
 use pals_core::inventory::view::{INVENTORY_SECTIONS, render, verify_page};
 use pals_core::inventory::{Scope, Section, Visibility};
 use pals_core::signed::{Signed, SignedError};
-use pals_core::store::{Contact, KeptBenchmark, Store};
+use pals_core::store::{Contact, KeptBenchmark, PLAIN_PEER_PREFIX, Store};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -240,7 +243,26 @@ enum ContactCommand {
         #[arg(long)]
         name: String,
     },
-    /// List the saved peers
+    /// Save a plain A2A agent, one with no PALS daemon, which this agent
+    /// asks and never answers: its card is read and checked now, and at
+    /// every use. Only interfaces of the URL's origin are ever called; no
+    /// proxy, no redirect, no files
+    #[command(name = "add-a2a")]
+    AddA2a {
+        /// The agent's base URL, https://<host>[/<path>], whose card is at
+        /// <url>/.well-known/agent-card.json, or its card's URL (ending in
+        /// .json); http:// only to 127.0.0.1, [::1] or localhost
+        url: String,
+        /// The name to reach the agent by: letters, digits, '-', '_' and '.'
+        #[arg(long)]
+        name: String,
+        /// The environment variable that holds the agent's bearer token,
+        /// read when a request is sent; the token itself is never saved
+        #[arg(long, value_name = "VAR")]
+        bearer_env: Option<String>,
+    },
+    /// List the saved peers: name and agent id, or name and card URL for a
+    /// plain A2A agent
     Ls,
 }
 
@@ -310,6 +332,11 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Id { ticket: true } => id_ticket(&home),
         Command::Daemon => daemon(&home),
         Command::Contact(ContactCommand::Add { ticket, name }) => contact_add(&home, &ticket, name),
+        Command::Contact(ContactCommand::AddA2a {
+            url,
+            name,
+            bearer_env,
+        }) => contact_add_a2a(&home, &url, &name, bearer_env.as_deref()),
         Command::Contact(ContactCommand::Ls) => contact_ls(&home),
         Command::Grant(GrantCommand::Issue {
             to,
@@ -1029,16 +1056,16 @@ fn ask(
 fn task_ls(home: &Path) -> anyhow::Result<()> {
     let (cfg, key) = load_agent(home)?;
     let store = open_store(&cfg, &key)?;
-    let names: HashMap<AgentId, String> = store
+    let names: HashMap<String, String> = store
         .contacts()?
         .into_iter()
-        .map(|contact| (contact.agent_id, contact.name))
+        .map(|contact| (contact.agent_id.to_string(), contact.name))
         .collect();
     for row in store.outbox_all()? {
-        let peer = names
-            .get(&row.peer)
-            .cloned()
-            .unwrap_or_else(|| row.peer.to_string());
+        let peer = match row.peer.strip_prefix(PLAIN_PEER_PREFIX) {
+            Some(plain_name) => plain_name.to_owned(),
+            None => names.get(&row.peer).cloned().unwrap_or(row.peer),
+        };
         println!(
             "{}\t{}\t{}\t{}\t{}",
             row.message_id,
@@ -1192,10 +1219,46 @@ fn contact_add(home: &Path, ticket: &str, name: String) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn contact_add_a2a(
+    home: &Path,
+    url: &str,
+    name: &str,
+    bearer_env: Option<&str>,
+) -> anyhow::Result<()> {
+    let contact = plain::new_contact(name, url, bearer_env, now_unix())?;
+    let (cfg, key) = load_agent(home)?;
+    let store = open_store(&cfg, &key)?;
+    if store.contact_by_name(name)?.is_some() {
+        bail!("{name} is the name of a PALS contact already: one name, one contact");
+    }
+    let card = runtime(false)?
+        .block_on(fetch_plain_card(&plain::http_client(), &contact))
+        .with_context(|| format!("cannot use the card at {}", contact.card_url))?;
+    store.a2a_contact_put(&contact)?;
+    let peer = format!("{PLAIN_PEER_PREFIX}{name}");
+    store.peer_card_put(
+        &peer,
+        PUBLIC_CONTEXT,
+        &card.json,
+        &card.hash,
+        None,
+        now_unix(),
+    )?;
+    println!(
+        "saved contact {name}: {} ({}), card signature {}",
+        contact.origin, card.card.name, card.signature
+    );
+    Ok(())
+}
+
 fn contact_ls(home: &Path) -> anyhow::Result<()> {
     let (cfg, key) = load_agent(home)?;
-    for contact in open_store(&cfg, &key)?.contacts()? {
+    let store = open_store(&cfg, &key)?;
+    for contact in store.contacts()? {
         println!("{}\t{}", contact.name, contact.agent_id);
+    }
+    for contact in store.a2a_contacts()? {
+        println!("{}\t{}", contact.name, contact.card_url);
     }
     Ok(())
 }

@@ -165,7 +165,7 @@ fn version_1_database_upgrades_to_2_keeping_its_data() {
     };
     let outbox = OutboxRow {
         message_id: "m-1".to_owned(),
-        peer: peer.id(),
+        peer: peer.id().to_string(),
         request_json: r#"{"message":{"messageId":"m-1"}}"#.to_owned(),
         task_id: None,
         state: OUTBOX_PENDING.to_owned(),

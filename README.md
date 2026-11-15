@@ -129,6 +129,12 @@ The gateway never forwards a peer's answer as is. Whether the client expects a J
 
 `ListTasks` returns tasks from the most recently updated to the oldest, paginates with an opaque cursor and omits artifacts unless `includeArtifacts: true` is set (A2A §3.1.4); the pinned Rust SDK does not, and PALS corrects it in its store.
 
+### Plain A2A agents as contacts (milestone 2, in progress)
+
+An agent with no PALS daemon, reached over HTTPS, can be saved as a contact and asked, outbound only: `pals contact add-a2a https://agent.example --name helper [--bearer-env HELPER_TOKEN]` reads and checks its card (`<url>/.well-known/agent-card.json`, or the card's own URL), and `pals ask helper ...`, `pals_ask` and `http://127.0.0.1:7420/peers/helper/...` reach it as they reach a peer. `http://` is accepted only for `127.0.0.1`, `[::1]` and `localhost`. Only the card's interfaces on the origin of the URL given are ever called, with no proxy and no redirects; the card is read again at every use (at most 32 KiB), and its JWS signature is reported (`verified <kid>` with an Ed25519 key of a JWK Set on the same origin, `unverifiable` or `unsigned`), not required. The only credential is a bearer token read from the named environment variable when a request is sent; the token is never saved, and no grant is ever sent. Its answers go through the same checks as a peer's.
+
+Limitations: files cannot be sent to a plain agent (`attachments need a PALS peer`); the PALS client activates `idempotency/v1` as with a peer, but a plain agent may ignore it, and then a resend after a network cut can run the work twice.
+
 ## A2A compatibility
 
 What is backed, as established by the [conformance report](docs/conformance/hito-1/README.md):
