@@ -365,7 +365,7 @@ impl PalsMcp {
              card's hash and signature, whether this agent holds a grant of it, and its offer, \
              whose offer_id pals_ask takes, with the candidate's peer, to delegate to it; those \
              discarded, with the stage and the reason; the coverage, partial when limits left \
-             some out; and what the search took. `requirements` are mandatory, but those under \
+             some out or a candidate ran out of its time; and what the search took. `requirements` are mandatory, but those under \
              inventory.preferred; inventory requirements need `project`, since their ids go \
              only to candidates with a grant for it: without one, a required id counts as not \
              met. `peers` restricts the search to those contacts. The query sent, the \

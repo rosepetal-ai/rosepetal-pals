@@ -1449,7 +1449,42 @@ async fn slow_candidate_is_cut_and_the_budget_ends_the_search() {
     let Coverage::Partial { reasons } = &outcome.coverage else {
         panic!("partial coverage, not {:?}", outcome.coverage);
     };
-    assert_eq!(reasons, &["time budget".to_owned()]);
+    assert_eq!(reasons, &["time budget".to_owned(), "timeout".to_owned()]);
+}
+
+#[tokio::test]
+async fn candidates_cut_by_their_own_time_make_the_coverage_partial() {
+    // A second per candidate, and the whole budget of a minute: none is
+    // cut by the budget, every one by its own time.
+    let a = spawn_node_in_configured(
+        tempfile::tempdir().unwrap(),
+        CountingExecutor::new(Duration::ZERO),
+        NodeOptions::default(),
+        |cfg| {
+            cfg.discovery.per_candidate_timeout_ms = 1000;
+            cfg.discovery.total_budget_ms = 60_000;
+        },
+    )
+    .await;
+    let mut stubs = Vec::new();
+    for n in 0..2 {
+        stubs.push(card_stub(&a, &format!("q{n}"), StubMode::Silent, true).await);
+    }
+    let outcome = a.node.searcher().search(plain_request()).await.unwrap();
+    assert!(outcome.ranked.is_empty());
+    let reasons: Vec<&str> = outcome
+        .discarded
+        .iter()
+        .map(|d| d.reason.as_str())
+        .collect();
+    assert_eq!(reasons, ["timeout", "timeout"], "{outcome:#?}");
+    // Not `complete`: no one said there is no provider.
+    assert_eq!(
+        outcome.coverage,
+        Coverage::Partial {
+            reasons: vec!["timeout".to_owned()]
+        }
+    );
 }
 
 /// A JWS protected header for `kid` with its JWK Set at `jku`.

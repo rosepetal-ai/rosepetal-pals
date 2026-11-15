@@ -270,7 +270,9 @@ pub struct Discarded {
 #[serde(rename_all = "snake_case")]
 pub enum Coverage {
     Complete,
-    /// Some were left out by the limits: `candidate limit`, `time budget`.
+    /// Some were left out by the limits, or cut by them: `candidate limit`,
+    /// `time budget`, `timeout` (a candidate that had its whole time and did
+    /// not finish).
     Partial {
         reasons: Vec<String>,
     },

@@ -61,7 +61,9 @@
 //!
 //! When the budget ends nothing more starts, and what had not finished is
 //! discarded `time budget`, the coverage partial; a candidate that had its
-//! whole time and did not finish is discarded `timeout`. Every request,
+//! whole time and did not finish is discarded `timeout`, and the coverage
+//! is partial too, `timeout`: such a search does not say that no provider
+//! exists. Every request,
 //! byte, and the time the stages took is counted ([`SearchMetrics`]).
 //!
 //! **Ranking**: stage 2 ([`stage_two`]), at this agent's clock.
@@ -463,6 +465,10 @@ impl Searcher {
         }
         if discarded.iter().any(|d| d.reason == TIME_BUDGET) {
             reasons.push(TIME_BUDGET.to_owned());
+        }
+        // A candidate cut by its own time may have answered with more.
+        if discarded.iter().any(|d| d.reason == TIMEOUT) {
+            reasons.push(TIMEOUT.to_owned());
         }
         let coverage = if reasons.is_empty() {
             Coverage::Complete
