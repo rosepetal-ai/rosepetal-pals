@@ -112,7 +112,7 @@ Los daemons usan `net.relay = true`, los relays públicos de n0: con `relay = fa
   ```
 
 - Espacio: la imagen ocupa unos 700 MB; los registros, unos pocos MB.
-- Tiempo: unos 5 min con la imagen ya construida, más la primera construcción.
+- Tiempo: unos 2 min con la imagen ya construida; la primera vez, unos 3 más para construirla.
 
 ## Uso
 
