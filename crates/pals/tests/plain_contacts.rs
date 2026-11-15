@@ -2281,3 +2281,43 @@ async fn contact_add_a2a_shows_the_card_s_words_as_printable_ascii() {
     assert!(!out.contains('\u{1b}') && !out.contains('\u{7}'), "{out:?}");
     assert_eq!(out.lines().count(), 1, "{out:?}");
 }
+
+#[tokio::test]
+async fn a_json_rpc_batch_that_asks_for_the_extended_card_is_refused() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let b = spawn_node(WorkerCfg::Echo).await;
+    a.add_contact("bob", &b);
+    a.hold(&grant(&b, &a, &[TaskSend, TaskRead], 3600));
+    let (origin, agent) = echo_app_at().await;
+    add_plain(&a, "echo", &origin);
+    let gw = a.gateway_url();
+    let batch = json!([
+        rpc_request("GetTask", json!({"id": "t-1"})),
+        {"jsonrpc": "2.0", "id": 2, "method": "GetExtendedAgentCard", "params": {}},
+    ]);
+    let before = agent.requests().len();
+    for peer in ["bob", "echo"] {
+        let res = gateway_request(
+            &gw,
+            "POST",
+            &format!("/peers/{peer}/jsonrpc"),
+            &VERSION,
+            Some(&batch),
+        )
+        .await;
+        assert_eq!(res.status, 200, "{peer}: {}", res.json);
+        assert_eq!(
+            res.json,
+            json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600,
+                "message": "a JSON-RPC batch cannot ask for the extended card: ask for it alone"}}),
+            "{peer}"
+        );
+    }
+    // Nothing was sent: the plain agent was not even asked for its card.
+    assert_eq!(agent.requests().len(), before);
+    // Alone, it is served.
+    let alone = json!({"jsonrpc": "2.0", "id": 3, "method": "GetExtendedAgentCard", "params": {}});
+    let res = gateway_request(&gw, "POST", "/peers/bob/jsonrpc", &VERSION, Some(&alone)).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert!(res.json["result"]["name"].is_string(), "{}", res.json);
+}

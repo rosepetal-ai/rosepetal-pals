@@ -15,8 +15,9 @@
 //! from its own call, never from the peer's `Content-Type` ([`Call`]): on
 //! the JSON-RPC binding, the `method` of a request object,
 //! `SendStreamingMessage` or `SubscribeToTask` (the pinned SDK's
-//! `methods::is_streaming`), and a batch (unless it asks for the extended
-//! card, below) or a body that is not JSON is unary; on the HTTP+JSON
+//! `methods::is_streaming`), and a batch or a body that is not JSON is
+//! unary (a batch that asks for the extended card is refused before it is
+//! sent, below); on the HTTP+JSON
 //! binding, the routes the pinned SDK's `rest_router` answers with a
 //! stream: `POST /message:stream` and `/message/stream`, and `GET` or
 //! `POST` on `/tasks/{id}` whose decoded `{id}` ends with `:subscribe` or
@@ -28,7 +29,9 @@
 //!
 //! **The extended card** ([`Call::ExtendedCard`]): `GetExtendedAgentCard`
 //! on JSON-RPC, `GET /extendedAgentCard` or `GET /agent-card/extended` on
-//! HTTP+JSON. Its answer is read up to [`MAX_CARD_ANSWER_BYTES`]; a `2xx`
+//! HTTP+JSON. A JSON-RPC batch with an item that asks for it is refused,
+//! never sent: `200` with a JSON-RPC `InvalidRequest` (`-32600`) error,
+//! [`EXTENDED_CARD_BATCH`], `id` null. Its answer is read up to [`MAX_CARD_ANSWER_BYTES`]; a `2xx`
 //! one must hold a card the peer signed, verified with `kid` equal to the
 //! peer's agent id, the one Iroh's handshake proved (the card itself on
 //! HTTP+JSON, the `result` of a JSON-RPC response), which is replaced by its
@@ -137,24 +140,35 @@ const EXTENDED_CARD_METHOD: &str = "GetExtendedAgentCard";
 /// client's.
 pub(crate) const MAX_CARD_ANSWER_BYTES: usize = 2 * MAX_CARD_BYTES;
 
+/// The method of `request`, a JSON-RPC request object.
+fn method_of(request: &Value) -> Option<&str> {
+    request
+        .as_object()
+        .and_then(|request| request.get("method"))
+        .and_then(Value::as_str)
+}
+
+/// Whether `request`, a JSON-RPC body, is a batch with an item that asks
+/// for the extended card: the gateway refuses it, before anything is sent
+/// ([`EXTENDED_CARD_BATCH`]), since it checks a card as one response's
+/// `result`.
+pub(crate) fn is_extended_card_batch(request: &Value) -> bool {
+    matches!(request, Value::Array(batch)
+        if batch.iter().any(|item| method_of(item) == Some(EXTENDED_CARD_METHOD)))
+}
+
+/// The message of the gateway's JSON-RPC `InvalidRequest` for a batch that
+/// asks for the extended card.
+pub(crate) const EXTENDED_CARD_BATCH: &str =
+    "a JSON-RPC batch cannot ask for the extended card: ask for it alone";
+
 impl Call {
     /// A call to the JSON-RPC binding whose body, when it is JSON, is
-    /// `request`. A batch is unary, unless it asks for the extended card.
+    /// `request`. A batch is unary: one that asks for the extended card is
+    /// refused first ([`is_extended_card_batch`]).
     pub(crate) fn jsonrpc(request: Option<&Value>) -> Self {
-        fn method_of(request: &Value) -> Option<&str> {
-            request
-                .as_object()
-                .and_then(|request| request.get("method"))
-                .and_then(Value::as_str)
-        }
         match request {
-            Some(Value::Array(batch))
-                if batch
-                    .iter()
-                    .any(|item| method_of(item) == Some(EXTENDED_CARD_METHOD)) =>
-            {
-                Self::ExtendedCard
-            }
+            Some(Value::Array(_)) => Self::Unary,
             Some(request) => match method_of(request) {
                 Some(method) if STREAMING_METHODS.contains(&method) => Self::Streaming,
                 Some(EXTENDED_CARD_METHOD) => Self::ExtendedCard,
@@ -584,8 +598,12 @@ mod tests {
         }
         let call = json!({"jsonrpc": "2.0", "id": 1, "method": "GetExtendedAgentCard"});
         assert_eq!(Call::jsonrpc(Some(&call)), Call::ExtendedCard);
+        // A batch that asks for it is refused, never read as a card.
         let batch = json!([{"method": "GetTask"}, call]);
-        assert_eq!(Call::jsonrpc(Some(&batch)), Call::ExtendedCard);
+        assert_eq!(Call::jsonrpc(Some(&batch)), Call::Unary);
+        assert!(is_extended_card_batch(&batch));
+        assert!(!is_extended_card_batch(&call));
+        assert!(!is_extended_card_batch(&json!([{"method": "GetTask"}])));
         let other = json!({"jsonrpc": "2.0", "id": 1, "method": "getExtendedAgentCard"});
         assert_eq!(Call::jsonrpc(Some(&other)), Call::Unary);
     }

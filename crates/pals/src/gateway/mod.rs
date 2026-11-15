@@ -1246,12 +1246,37 @@ fn if_none_match(headers: &HeaderMap, etag: &HeaderValue) -> bool {
 }
 
 /// `POST /peers/{peer}/jsonrpc`, or `/jsonrpc/`: both go to the peer's
-/// `/jsonrpc`, where its JSON-RPC binding is served.
+/// `/jsonrpc`, where its JSON-RPC binding is served. A batch that asks for
+/// the extended card is refused here, before anything is sent
+/// ([`checks::is_extended_card_batch`]).
 async fn forward_jsonrpc(
     State(state): State<GatewayState>,
     Path(peer): Path<String>,
-    mut request: Request,
+    request: Request,
 ) -> Response {
+    let (parts, body) = request.into_parts();
+    let limit = state.inner.limits.max_body_bytes;
+    let bytes = match Limited::new(body, limit).collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(err) if err.downcast_ref::<LengthLimitError>().is_some() => {
+            return error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("request body larger than {limit} bytes"),
+            );
+        }
+        Err(_) => return error(StatusCode::BAD_REQUEST, "cannot read the request body"),
+    };
+    if serde_json::from_slice::<Value>(&bytes)
+        .is_ok_and(|body| checks::is_extended_card_batch(&body))
+    {
+        let refusal = json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": {"code": a2a::error_code::INVALID_REQUEST, "message": checks::EXTENDED_CARD_BATCH},
+        });
+        return json_response(&refusal);
+    }
+    let mut request = Request::from_parts(parts, Body::from(bytes));
     let uri = request.uri();
     if let Some(path) = uri.path().strip_suffix('/') {
         let target = match uri.query() {
