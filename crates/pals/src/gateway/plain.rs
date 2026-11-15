@@ -56,8 +56,9 @@
 //! - the gateway's own answers name their reason: on HTTP+JSON as
 //!   `{"error": <reason>}`, as for a peer; on JSON-RPC, whose pinned client
 //!   reads no HTTP status, as a JSON-RPC error of the same HTTP status, of
-//!   code [`REFUSED_CODE`] for a refusal (a `4xx`) and `InternalError`
-//!   otherwise (`plain_answer`);
+//!   code [`REFUSED_CODE`] for a refusal (a `4xx` but `408` and `429`, as
+//!   the outbox reads HTTP+JSON) and `InternalError` otherwise
+//!   (`plain_answer`);
 //! - the body is read whole up to `limits.max_body_bytes` (beyond, `413`),
 //!   and one with a part that names a blob, of this gateway or between
 //!   peers, gets `400 files go only to PALS peers`;
@@ -65,25 +66,34 @@
 //!   gateway refuses an encoded answer;
 //! - the client's `Authorization` passes intact; without one, the contact's
 //!   bearer token, read from its variable then (`401 bearer env var not
-//!   set` when the variable is not set); no grant is ever sent;
+//!   set` when the variable is not set); no grant is ever sent; no
+//!   `x-agentnet-*` header of the client's goes on, as to a peer;
 //! - the card is read and checked before the call, which is sent only to
 //!   the contact's origin; when the card cannot be read for want of the
 //!   agent (no connection, no card in time), or the connection for the
 //!   call cannot be made, nothing of the call was sent, and the answer is
-//!   the `502` [`PLAIN_NOT_SENT`]: exactly [`NOT_SENT_BODY`] on HTTP+JSON,
-//!   the JSON-RPC error [`NOT_SENT_CODE`] on JSON-RPC. The outbox may send
-//!   a question again on it, and on nothing else;
+//!   the `502` [`PLAIN_NOT_SENT`] ([`not_sent_message`]): `{"error": …}` on
+//!   HTTP+JSON, the JSON-RPC error [`NOT_SENT_CODE`] on JSON-RPC. When the
+//!   request carried a nonce ([`NOT_SENT_NONCE_HEADER`]), the refusal says
+//!   it back, and it is the only answer that ever does: the agent never
+//!   sees the nonce, so no answer of its own can hold it. To an agent that
+//!   may run every copy, the outbox sends a question again on that nonce
+//!   (or when it could not reach the gateway), never on the refusal's
+//!   text;
 //! - the answer goes through the same checks as a PALS peer's (`checks.rs`):
 //!   unary or streaming from the client's request, bounded, task ids safe,
 //!   re-encoded in ASCII, a redirect a `502`, cookies and `x-agentnet-*`
 //!   headers dropped. And none of its bytes reach the client unchecked: an
 //!   error body that is no JSON (invalid UTF-8 included) is replaced by the
 //!   gateway's own (`replaced_body`), which names the status only, and so
-//!   is any error whose strings say the text of [`PLAIN_NOT_SENT`] or that
-//!   carries [`NOT_SENT_CODE`] (`forges_not_sent`); such a `2xx` answer is
-//!   a protocol error, and such an event ends the stream. So no agent can
-//!   say what only the gateway says. Its `iroh-blob://` URLs stay as sent:
-//!   a plain agent holds no PALS blob, and no blob is fetched on its word.
+//!   is any error with a string that says the text of [`PLAIN_NOT_SENT`] or
+//!   that carries [`NOT_SENT_CODE`] (`forges_not_sent`); such a `2xx`
+//!   answer is a protocol error, and such an event ends the stream. That
+//!   keeps the agent from saying the gateway's words in one string, or its
+//!   code; a client may still join several of the agent's strings into
+//!   that text, which is why nothing is decided on it. Its `iroh-blob://`
+//!   URLs stay as sent: a plain agent holds no PALS blob, and no blob is
+//!   fetched on its word.
 //!   An extended card answered is validated and served as its view,
 //!   unsigned.
 
@@ -134,20 +144,26 @@ const URL_RULE: &str = "a plain A2A agent's URL is https://<host>[/<path>]";
 pub const ONLY_LOOPBACK: &str = "http:// is only for 127.0.0.1, [::1] and localhost";
 /// The gateway's `502` when it could not reach a plain agent and sent it
 /// nothing of the call: its card could not be read, or the connection to
-/// its origin could not be made. On HTTP+JSON it is exactly
-/// [`NOT_SENT_BODY`]; on JSON-RPC, a JSON-RPC error of the code
-/// [`NOT_SENT_CODE`] with this message. No answer of an agent's carries
-/// either (`forges_not_sent`): the outbox sends a question again on them.
+/// its origin could not be made. On HTTP+JSON, `{"error": …}`; on
+/// JSON-RPC, a JSON-RPC error of the code [`NOT_SENT_CODE`]; in both, with
+/// the request's nonce, if any ([`not_sent_message`]).
 pub const PLAIN_NOT_SENT: &str = "plain agent unreachable: nothing was sent to it";
-/// The exact body of [`PLAIN_NOT_SENT`] on HTTP+JSON.
-pub const NOT_SENT_BODY: &str = r#"{"error":"plain agent unreachable: nothing was sent to it"}"#;
+/// The request header in which the outbox gives the gateway the nonce of a
+/// question it sends: [`NONCE_HEX_LEN`] lowercase hex digits, 128 random
+/// bits, new for every send. Like every `x-agentnet-*` header, it never
+/// reaches an agent; the gateway says it back in its [`PLAIN_NOT_SENT`],
+/// and nowhere else.
+pub const NOT_SENT_NONCE_HEADER: &str = "x-agentnet-not-sent-nonce";
+/// How many lowercase hex digits a nonce has: 128 bits.
+pub const NONCE_HEX_LEN: usize = 32;
 /// The JSON-RPC error code of [`PLAIN_NOT_SENT`] on a plain contact's
-/// JSON-RPC route, which no agent's answer carries.
+/// JSON-RPC route, which no agent's answer carries through the gateway
+/// (`forges_not_sent`).
 pub const NOT_SENT_CODE: i32 = -32090;
-/// The JSON-RPC error code of a refusal (a `4xx`) on a plain contact's
-/// JSON-RPC route, the gateway's own or an agent's answer it replaced:
-/// whose client reads no HTTP status, so that it knows a refusal from a
-/// failure on the way, which is `InternalError`.
+/// The JSON-RPC error code of a refusal (a `4xx` but `408` and `429`) on a
+/// plain contact's JSON-RPC route, the gateway's own or an agent's answer
+/// it replaced: whose client reads no HTTP status, so that it knows a
+/// refusal from a failure on the way, which is `InternalError`.
 pub const REFUSED_CODE: i32 = -32091;
 /// Why a contact whose origin is this agent's own gateway is refused.
 pub const OWN_GATEWAY: &str =
@@ -632,28 +648,52 @@ pub(super) fn plain_answer(
 ) -> Response {
     match binding {
         Binding::Rest => error(status, message),
-        Binding::JsonRpc => {
-            let code = if status.is_client_error() {
-                REFUSED_CODE
-            } else {
-                a2a::error_code::INTERNAL_ERROR
-            };
-            jsonrpc_error(status, id, code, &message.into())
-        }
+        Binding::JsonRpc => jsonrpc_error(status, id, jsonrpc_code(status), &message.into()),
     }
 }
 
-/// [`PLAIN_NOT_SENT`] on `binding`, for a request with the JSON-RPC `id`:
-/// `502` with exactly [`NOT_SENT_BODY`], or the JSON-RPC error
-/// [`NOT_SENT_CODE`].
-fn not_sent(binding: Binding, id: Option<&Value>) -> Response {
+/// The JSON-RPC error code that says, to a client that reads no HTTP
+/// status, what `status` says: [`REFUSED_CODE`] for a refusal, a `4xx`
+/// but `408` and `429`; `InternalError`, a failure on the way, for those
+/// two and for the rest, as the outbox reads them on HTTP+JSON.
+fn jsonrpc_code(status: StatusCode) -> i32 {
+    let on_the_way = [StatusCode::REQUEST_TIMEOUT, StatusCode::TOO_MANY_REQUESTS];
+    if status.is_client_error() && !on_the_way.contains(&status) {
+        REFUSED_CODE
+    } else {
+        a2a::error_code::INTERNAL_ERROR
+    }
+}
+
+/// The message of [`PLAIN_NOT_SENT`] for a request that carried `nonce`
+/// ([`NOT_SENT_NONCE_HEADER`]): `<PLAIN_NOT_SENT> (nonce <nonce>)`, or the
+/// text alone.
+pub fn not_sent_message(nonce: Option<&str>) -> String {
+    match nonce {
+        Some(nonce) => format!("{PLAIN_NOT_SENT} (nonce {nonce})"),
+        None => PLAIN_NOT_SENT.to_owned(),
+    }
+}
+
+/// The nonce `headers`, a client's request's, carry
+/// ([`NOT_SENT_NONCE_HEADER`]), when it is one: [`NONCE_HEX_LEN`]
+/// lowercase hex digits, and nothing else, which the gateway may say back.
+fn nonce_of(headers: &http::HeaderMap) -> Option<String> {
+    let nonce = headers.get(NOT_SENT_NONCE_HEADER)?.to_str().ok()?;
+    let hex = nonce
+        .bytes()
+        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+    (nonce.len() == NONCE_HEX_LEN && hex).then(|| nonce.to_owned())
+}
+
+/// [`PLAIN_NOT_SENT`] on `binding`, for a request with the JSON-RPC `id`
+/// and `nonce`: `502` with `{"error": …}`, or the JSON-RPC error
+/// [`NOT_SENT_CODE`], of [`not_sent_message`].
+fn not_sent(binding: Binding, id: Option<&Value>, nonce: Option<&str>) -> Response {
+    let message = not_sent_message(nonce);
     match binding {
-        Binding::Rest => {
-            json_bytes_response(StatusCode::BAD_GATEWAY, NOT_SENT_BODY.as_bytes().to_vec())
-        }
-        Binding::JsonRpc => {
-            jsonrpc_error(StatusCode::BAD_GATEWAY, id, NOT_SENT_CODE, PLAIN_NOT_SENT)
-        }
+        Binding::Rest => error(StatusCode::BAD_GATEWAY, message),
+        Binding::JsonRpc => jsonrpc_error(StatusCode::BAD_GATEWAY, id, NOT_SENT_CODE, &message),
     }
 }
 
@@ -666,12 +706,7 @@ pub(super) fn replaced_body(binding: Binding, status: StatusCode) -> Vec<u8> {
     match binding {
         Binding::Rest => serde_json::to_vec(&serde_json::json!({ "error": message })),
         Binding::JsonRpc => {
-            let code = if status.is_client_error() {
-                REFUSED_CODE
-            } else {
-                a2a::error_code::INTERNAL_ERROR
-            };
-            serde_json::to_vec(&jsonrpc_envelope(None, code, &message))
+            serde_json::to_vec(&jsonrpc_envelope(None, jsonrpc_code(status), &message))
         }
     }
     .expect("a JSON value serializes")
@@ -711,7 +746,8 @@ fn json_bytes_response(status: StatusCode, body: Vec<u8>) -> Response {
 /// Whether `value`, a plain agent's answer, says what only the gateway may
 /// say: a string or a key holding [`PLAIN_NOT_SENT`], once decoded, or a
 /// `code` of [`NOT_SENT_CODE`], anywhere in it. The gateway never passes
-/// such an answer on.
+/// such an answer on. What it decides is what a client reads; whether a
+/// question goes again is never decided on it, but on the nonce.
 pub(super) fn forges_not_sent(value: &Value) -> bool {
     match value {
         Value::String(text) => text.contains(PLAIN_NOT_SENT),
@@ -736,6 +772,8 @@ pub(super) async fn forward(
     binding: Binding,
 ) -> Response {
     let (parts, body) = request.into_parts();
+    // Said back only if nothing is sent; never sent on (`outgoing_headers`).
+    let nonce = nonce_of(&parts.headers);
     let mut headers = outgoing_headers(&parts.headers);
     // The body goes as read, and reqwest declares its length.
     headers.remove(CONTENT_LENGTH);
@@ -797,7 +835,7 @@ pub(super) async fn forward(
         // Nothing of the call was sent.
         Err(failure @ (PlainError::Unreachable(_) | PlainError::Timeout)) => {
             tracing::debug!(contact = %contact.name, error = %failure, "a plain contact cannot be reached");
-            return not_sent(binding, id);
+            return not_sent(binding, id, nonce.as_deref());
         }
         Err(failure) => {
             tracing::debug!(contact = %contact.name, error = %failure, "no usable card from a plain contact");
@@ -838,7 +876,7 @@ pub(super) async fn forward(
         // No connection, so nothing of the call left.
         Err(err) if err.is_connect() => {
             tracing::debug!(contact = %contact.name, error = %err, "a plain contact cannot be reached");
-            return not_sent(binding, id);
+            return not_sent(binding, id, nonce.as_deref());
         }
         Err(err) if err.is_timeout() => {
             tracing::debug!(contact = %contact.name, error = %err, "a plain contact did not answer");

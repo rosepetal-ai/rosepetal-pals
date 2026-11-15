@@ -37,10 +37,10 @@ use futures::StreamExt;
 use http_body_util::BodyExt;
 use pals::a2a::gateway_view_for;
 use pals::config::WorkerCfg;
-use pals::gateway::plain::PLAIN_NOT_SENT;
 use pals::gateway::plain::{
     MAX_JWKS_BYTES, PlainCard, PlainError, SignatureStatus, fetch_plain_card, http_client,
 };
+use pals::gateway::plain::{NOT_SENT_NONCE_HEADER, PLAIN_NOT_SENT, not_sent_message};
 use pals::outbox::{AskError, AskRequest, Outbox, PLAIN_NEEDS_STREAMING};
 use pals_core::card_jws::{CanonicalForm, CardError, MAX_CARD_BYTES, canonical_payload, card_hash};
 use pals_core::discovery::selection::{SearchRequest, Stage};
@@ -1974,6 +1974,9 @@ async fn fake_gateway(card: Value, cut: bool) -> String {
         let Ok((mut stream, _)) = listener.accept().await else {
             return;
         };
+        // Not `cut`, it listens no more before the card is answered, so
+        // that no later connection is ever made.
+        let listener = cut.then_some(listener);
         read_head(&mut stream).await;
         let body = card.to_string();
         let answer = format!(
@@ -1983,9 +1986,9 @@ async fn fake_gateway(card: Value, cut: bool) -> String {
         );
         let _ = stream.write_all(answer.as_bytes()).await;
         drop(stream);
-        if !cut {
+        let Some(listener) = listener else {
             return;
-        }
+        };
         let Ok((mut stream, _)) = listener.accept().await else {
             return;
         };
@@ -2374,6 +2377,8 @@ fn raw_answer(status: u16, content_type: &str, body: Vec<u8>) -> axum::response:
 /// The gateway's JSON-RPC code for its own not-sent refusal, which no
 /// agent's answer may carry.
 const NOT_SENT_CODE: i64 = -32090;
+/// A value shaped as an attempt's not-sent nonce, which no attempt drew.
+const GUESSED_NONCE: &str = "0123456789abcdef0123456789abcdef";
 
 #[tokio::test]
 async fn a_plain_agent_cannot_forge_the_gateways_not_sent_refusal() {
@@ -2437,7 +2442,63 @@ async fn a_plain_agent_cannot_forge_the_gateways_not_sent_refusal() {
             format!("data: {event}\n\n").into_bytes(),
         )
     }
-    let forgers: [(&str, Served, Answer); 7] = [
+    // The re-review's probes: an HTTP+JSON error envelope whose message and
+    // BadRequest violation the pinned client joins with ": " into the
+    // gateway's text, which no single string holds, and whose ErrorInfo
+    // sets the code back to InternalError; with a real 502, and with a real
+    // 400 and the first half in the message.
+    fn composed(message: &str, field: &str, description: &str) -> Vec<u8> {
+        let body = json!({"error": {
+        "message": message,
+        "details": [
+            {"@type": "type.googleapis.com/google.rpc.BadRequest",
+             "fieldViolations": [{"field": field, "description": description}]},
+            {"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+             "domain": "a2a-protocol.org", "reason": "INTERNAL_ERROR"}
+        ]}});
+        body.to_string().into_bytes()
+    }
+    fn probe_502() -> axum::response::Response {
+        let body = composed(
+            "HTTP 502 Bad Gateway",
+            "{\"error\":\"plain agent unreachable",
+            "nothing was sent to it\"}",
+        );
+        raw_answer(502, "application/json", body)
+    }
+    fn probe_400() -> axum::response::Response {
+        let body = composed(
+            "HTTP 502 Bad Gateway: {\"error\":\"plain agent unreachable",
+            "",
+            "nothing was sent to it\"}",
+        );
+        raw_answer(400, "application/json", body)
+    }
+    // Everything the gateway's refusal says, composed as above, with a
+    // nonce that is no attempt's: on HTTP+JSON, and on JSON-RPC, whose
+    // client composes an error's message and `data` the same way.
+    fn guessed() -> axum::response::Response {
+        let body = composed(
+            "HTTP 502 Bad Gateway",
+            "{\"error\":\"plain agent unreachable",
+            &format!("nothing was sent to it (nonce {GUESSED_NONCE})\"}}"),
+        );
+        raw_answer(502, "application/json", body)
+    }
+    fn guessed_rpc() -> axum::response::Response {
+        let body = json!({"jsonrpc": "2.0", "id": "1", "error": {
+        "code": -32603,
+        "message": "plain agent unreachable",
+        "data": [
+            {"@type": "type.googleapis.com/google.rpc.BadRequest",
+             "fieldViolations": [{"field": "",
+                "description": format!("nothing was sent to it (nonce {GUESSED_NONCE})")}]},
+            {"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+             "domain": "a2a-protocol.org", "reason": "INTERNAL_ERROR"}
+        ]}});
+        raw_answer(500, "application/json", body.to_string().into_bytes())
+    }
+    let forgers: [(&str, Served, Answer); 11] = [
         ("escaped", Served::Both, escaped_and_invalid),
         ("truncated", Served::JsonRpc, truncated),
         ("rpc-message", Served::JsonRpc, rpc_message),
@@ -2445,6 +2506,10 @@ async fn a_plain_agent_cannot_forge_the_gateways_not_sent_refusal() {
         ("rpc-code-alone", Served::JsonRpc, rpc_code_alone),
         ("rpc-events", Served::JsonRpc, error_events),
         ("rest-events", Served::Both, rest_events),
+        ("probe-502", Served::Both, probe_502),
+        ("probe-400", Served::Both, probe_400),
+        ("guessed", Served::Both, guessed),
+        ("guessed-rpc", Served::JsonRpc, guessed_rpc),
     ];
     let mut agents = Vec::new();
     for (name, served, answer) in forgers {
@@ -2584,4 +2649,428 @@ async fn a_gateway_refusal_on_json_rpc_is_a_refusal_with_its_reason() {
         json!({"jsonrpc": "2.0", "id": 1,
             "error": {"code": -32091, "message": "bearer env var not set"}})
     );
+}
+
+/// Which nonce a [`nonce_gateway`] echoes.
+#[derive(Clone, Copy, Debug)]
+enum Echo {
+    /// The send's own.
+    Own,
+    /// The first send's, every time.
+    First,
+}
+
+/// A stand-in for the gateway, at a new loopback origin, for the plain
+/// contact `name` whose card is `card`: it serves the card's view, and
+/// answers every question with the gateway's not-sent refusal on the
+/// binding the card has, echoing the nonce `echo` says. The nonce header
+/// of every question goes in `nonces`.
+async fn nonce_gateway(
+    name: &'static str,
+    card: Value,
+    echo: Echo,
+    nonces: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+) -> (String, common::ServerHandle) {
+    let jsonrpc = streams_jsonrpc_only(&card);
+    let view = serde_json::to_value(gateway_view_for(
+        &serde_json::from_value(card).unwrap(),
+        "http://127.0.0.1:1",
+        name,
+    ))
+    .unwrap();
+    let answer = move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+        let nonces = Arc::clone(&nonces);
+        async move {
+            let nonce = headers
+                .get(NOT_SENT_NONCE_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let echoed = {
+                let mut seen = nonces.lock().unwrap();
+                seen.push(nonce.clone());
+                match echo {
+                    Echo::Own => nonce,
+                    Echo::First => seen[0].clone(),
+                }
+            };
+            let message = not_sent_message(echoed.as_deref());
+            let body = if jsonrpc {
+                let id = serde_json::from_slice::<Value>(&body)
+                    .ok()
+                    .and_then(|request| request.get("id").cloned())
+                    .unwrap_or(Value::Null);
+                json!({"jsonrpc": "2.0", "id": id,
+                    "error": {"code": NOT_SENT_CODE, "message": message}})
+            } else {
+                json!({"error": message})
+            };
+            raw_answer(502, "application/json", body.to_string().into_bytes())
+        }
+    };
+    serve_at(move |_| {
+        axum::Router::new()
+            .route(
+                &format!("/peers/{name}/.well-known/agent-card.json"),
+                get(move || {
+                    let view = view.clone();
+                    async move { axum::Json(view) }
+                }),
+            )
+            .route(
+                &format!("/peers/{name}/rest/message:stream"),
+                post(answer.clone()),
+            )
+            .route(&format!("/peers/{name}/jsonrpc"), post(answer))
+    })
+    .await
+}
+
+/// Whether `card` has a JSON-RPC interface and no HTTP+JSON one.
+fn streams_jsonrpc_only(card: &Value) -> bool {
+    let bindings: Vec<&str> = card["supportedInterfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|iface| iface["protocolBinding"].as_str())
+        .collect();
+    !bindings.contains(&"HTTP+JSON") && bindings.contains(&"JSONRPC")
+}
+
+#[tokio::test]
+async fn a_question_goes_again_only_on_its_own_sends_nonce() {
+    let store = Arc::new(Store::open_in_memory(AgentKey::generate().id()).unwrap());
+    let cases = [
+        ("own", Served::Both, Echo::Own),
+        ("own-rpc", Served::JsonRpc, Echo::Own),
+        ("first", Served::Both, Echo::First),
+        ("first-rpc", Served::JsonRpc, Echo::First),
+    ];
+    let mut gateways = Vec::new();
+    for (name, served, echo) in cases {
+        store
+            .a2a_contact_put(&plain_contact(name, "http://127.0.0.1:9"))
+            .unwrap();
+        // A plain agent that streams, with no idempotency extension.
+        let card = streaming_card("http://127.0.0.1:9", served, false);
+        let nonces = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (gateway, server) = nonce_gateway(name, card, echo, Arc::clone(&nonces)).await;
+        gateways.push((name, echo, gateway, nonces, server));
+    }
+    let asks = gateways.iter().map(|(name, _, gateway, ..)| {
+        let outbox = Outbox::new(Arc::clone(&store), gateway.clone());
+        async move { outbox.ask(hola(name)).await }
+    });
+    let outcomes = futures::future::join_all(asks).await;
+    for ((name, echo, _, nonces, _), outcome) in gateways.iter().zip(&outcomes) {
+        let nonces = nonces.lock().unwrap().clone();
+        // Every send carried a nonce of its own: 128 bits, in lowercase hex.
+        for nonce in &nonces {
+            let nonce = nonce
+                .as_deref()
+                .unwrap_or_else(|| panic!("{name}: a send with no nonce: {nonces:?}"));
+            assert_eq!(nonce.len(), 32, "{name}: {nonce}");
+            assert!(
+                nonce
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                "{name}: {nonce}"
+            );
+        }
+        let mut distinct = nonces.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), nonces.len(), "{name}: {nonces:?}");
+        let (message_id, sends) = match (echo, outcome) {
+            // Its own nonce each time: never sent, so sent again, then kept.
+            (Echo::Own, Err(AskError::Unreachable { message_id })) => (message_id, 4),
+            // The first send's nonce on the second: that may have reached
+            // the agent, so it is not sent again.
+            (Echo::First, Err(AskError::NotResent { message_id })) => (message_id, 2),
+            other => panic!("{name}: {other:?}, nonces {nonces:?}"),
+        };
+        assert_eq!(nonces.len(), sends, "{name}");
+        let row = store.outbox_get(message_id).unwrap().unwrap();
+        assert_eq!(
+            (row.state.as_str(), row.attempts),
+            (OUTBOX_PENDING, sends as u32),
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_not_sent_nonce_never_reaches_the_agent() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    // Agents that declare no idempotency extension, so that every send
+    // carries a nonce to the gateway: on HTTP+JSON and on JSON-RPC.
+    let (rest_origin, rest_agent) = echo_app_at().await;
+    add_plain(&a, "echo", &rest_origin);
+    let exec = CountingExecutor::new(Duration::ZERO);
+    let worker = exec.clone();
+    let (rpc_origin, rpc_agent) = serve_at(move |origin| {
+        counting_app(
+            streaming_card(origin, Served::JsonRpc, false),
+            worker,
+            Served::JsonRpc,
+        )
+    })
+    .await;
+    add_plain(&a, "rpc", &rpc_origin);
+    for (name, agent) in [("echo", &rest_agent), ("rpc", &rpc_agent)] {
+        let outcome = a.node.outbox().ask(hola(name)).await.expect(name);
+        assert_eq!(outcome.state, "TASK_STATE_COMPLETED", "{name}");
+        let requests = agent.requests();
+        assert!(requests.iter().any(|r| r.method == "POST"), "{name}");
+        // No header of PALS's own, the nonce's among them.
+        for request in &requests {
+            assert!(
+                request
+                    .headers
+                    .keys()
+                    .all(|header| !header.as_str().starts_with("x-agentnet-")),
+                "{name}: {request:?}"
+            );
+        }
+    }
+    assert_eq!(exec.runs(), 1);
+}
+
+#[tokio::test]
+async fn a_plain_agent_out_of_reach_at_first_is_asked_once_it_is_up() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let exec = CountingExecutor::new(Duration::ZERO);
+    let mut agents = Vec::new();
+    for (name, served) in [("late", Served::Both), ("late-rpc", Served::JsonRpc)] {
+        // It answers the card the outbox reads first through the gateway,
+        // and then is gone, so the gateway sends nothing.
+        let origin =
+            serve_one_connection(move |origin| card_app(streaming_card(origin, served, false)))
+                .await;
+        add_plain(&a, name, &origin);
+        agents.push((name, served, origin));
+    }
+    let asks: Vec<_> = agents
+        .iter()
+        .map(|(name, ..)| {
+            let outbox = a.node.outbox().clone();
+            let name = (*name).to_owned();
+            tokio::spawn(async move { outbox.ask(hola(&name)).await })
+        })
+        .collect();
+    // Once each has been sent again, the agent comes up at its origin.
+    let mut servers = Vec::new();
+    for (name, served, origin) in &agents {
+        let peer = format!("a2a:{name}");
+        let started = Instant::now();
+        while !a
+            .node
+            .store
+            .outbox_all()
+            .unwrap()
+            .iter()
+            .any(|row| row.peer == peer && row.attempts >= 2)
+        {
+            assert!(started.elapsed() < WAIT, "{name}: never sent again");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let addr: std::net::SocketAddr = origin.strip_prefix("http://").unwrap().parse().unwrap();
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let app = counting_app(
+            streaming_card(origin, *served, false),
+            exec.clone(),
+            *served,
+        );
+        servers.push(tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        }));
+    }
+    for ((name, ..), ask) in agents.iter().zip(asks) {
+        let outcome = ask
+            .await
+            .unwrap()
+            .unwrap_or_else(|err| panic!("{name}: {err:?}"));
+        assert_eq!(outcome.state, "TASK_STATE_COMPLETED", "{name}");
+        assert_eq!(outcome.answer.as_deref(), Some("echo: hola"), "{name}");
+        assert!(outcome.attempts >= 2, "{name}: {}", outcome.attempts);
+    }
+    // Each agent ran the question once.
+    assert_eq!(exec.runs(), 2);
+    for server in servers {
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn a_429_or_408_on_json_rpc_is_a_failure_on_the_way() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    fn too_many() -> axum::response::Response {
+        raw_answer(429, "text/plain", b"slow down".to_vec())
+    }
+    fn too_slow() -> axum::response::Response {
+        raw_answer(408, "text/plain", b"too slow".to_vec())
+    }
+    // JSON-RPC-only agents: two that declare idempotency, one that does not.
+    let cases: [(&str, bool, Answer); 3] = [
+        ("busy", true, too_many),
+        ("slow", true, too_slow),
+        ("busy-once", false, too_many),
+    ];
+    let mut agents = Vec::new();
+    for (name, idempotent, answer) in cases {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
+        let (origin, server) = serve_at(move |origin| {
+            counted_answer_app(
+                streaming_card(origin, Served::JsonRpc, idempotent),
+                counter,
+                answer,
+            )
+        })
+        .await;
+        add_plain(&a, name, &origin);
+        agents.push((name, idempotent, asked, server));
+    }
+    let outbox = a.node.outbox().clone();
+    let asks = agents.iter().map(|(name, ..)| {
+        let outbox = outbox.clone();
+        async move { outbox.ask(hola(name)).await }
+    });
+    let outcomes = futures::future::join_all(asks).await;
+    for ((name, idempotent, asked, _), outcome) in agents.iter().zip(&outcomes) {
+        let asked = asked.load(Ordering::SeqCst);
+        if *idempotent {
+            // Asked again, as a peer is, as on HTTP+JSON.
+            assert!(
+                matches!(outcome, Err(AskError::Unreachable { .. })),
+                "{name}: {outcome:?}"
+            );
+            assert_eq!(asked, 4, "{name}");
+        } else {
+            // It may have run it: kept, and not sent again.
+            assert!(
+                matches!(outcome, Err(AskError::NotResent { .. })),
+                "{name}: {outcome:?}"
+            );
+            assert_eq!(asked, 1, "{name}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_pals_peers_error_with_the_not_sent_code_is_as_in_milestone_1() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    // A PALS peer whose A2A server answers every question, successfully,
+    // with a JSON-RPC error of the gateway's not-sent code and text, which
+    // the pinned client would read from the stream's end.
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&asked);
+    let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+        if request.method() == axum::http::Method::POST {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+        async move {
+            let body = json!({"jsonrpc": "2.0", "id": 1,
+                "error": {"code": NOT_SENT_CODE, "message": PLAIN_NOT_SENT}});
+            raw_answer(200, "application/json", body.to_string().into_bytes())
+        }
+    });
+    let key = AgentKey::generate();
+    let _router = common::stub_peer(&a, "peer", &key, app).await;
+    // As in milestone 1: no event in it, so the gateway refuses it, and the
+    // outbox asks again, as on any failure on the way, the peer's own
+    // deduplication keeping it to one run. Never a not-sent match: no
+    // nonce goes to a PALS peer, and its errors keep milestone 1's reading
+    // (the outbox's unit tests: `the_not_sent_code_is_on_the_way_only_on_a_plain_json_rpc_route`).
+    let outcome = a.node.outbox().ask(hola("peer")).await;
+    assert!(
+        matches!(outcome, Err(AskError::Unreachable { .. })),
+        "{outcome:?}"
+    );
+    assert_eq!(asked.load(Ordering::SeqCst), 4);
+    let res = gateway_request(
+        &a.gateway_url(),
+        "POST",
+        &format!("/peers/{}/rest/message:stream", key.id()),
+        &VERSION,
+        Some(&message_params("hola", None)),
+    )
+    .await;
+    assert_eq!(res.status, 502);
+    assert_eq!(res.json, json!({"error": "peer protocol error"}));
+}
+
+#[tokio::test]
+async fn the_gateway_says_back_a_nonce_only_in_its_not_sent_refusal() {
+    let a = spawn_node(WorkerCfg::Echo).await;
+    let gw = a.gateway_url();
+    // An agent out of reach: its port is closed.
+    let closed = {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    add_plain(&a, "gone", &closed);
+    // And one that answers every question with an error of its own.
+    fn failing() -> axum::response::Response {
+        raw_answer(500, "application/json", br#"{"error":"internal"}"#.to_vec())
+    }
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&asked);
+    let (origin, _agent) = serve_at(move |origin| {
+        counted_answer_app(
+            streaming_card(origin, Served::Both, false),
+            counter,
+            failing,
+        )
+    })
+    .await;
+    add_plain(&a, "failing", &origin);
+
+    let nonce = "00112233445566778899aabbccddeeff";
+    let rest_call = message_params("hola", None);
+    let rpc_call = rpc_request("SendStreamingMessage", message_params("hola", None));
+    for (path, body) in [
+        ("/peers/gone/rest/message:stream", &rest_call),
+        ("/peers/gone/jsonrpc", &rpc_call),
+    ] {
+        // Said back in the refusal that nothing was sent, on each binding.
+        let headers = [("a2a-version", "1.0"), (NOT_SENT_NONCE_HEADER, nonce)];
+        let res = gateway_request(&gw, "POST", path, &headers, Some(body)).await;
+        assert_eq!(res.status, 502, "{path}");
+        let said = not_sent_message(Some(nonce));
+        if path.ends_with("/jsonrpc") {
+            assert_eq!(
+                res.json,
+                json!({"jsonrpc": "2.0", "id": 1,
+                    "error": {"code": NOT_SENT_CODE, "message": said}}),
+                "{path}"
+            );
+        } else {
+            assert_eq!(res.json, json!({"error": said}), "{path}");
+        }
+        // Only a nonce is said back: anything else in the header is not.
+        for odd in [
+            "00112233445566778899AABBCCDDEEFF",
+            "00112233445566778899aabbccddeef",
+            "00112233445566778899aabbccddeeff0",
+            "<b>00112233445566778899aabbccdd</b>",
+        ] {
+            let headers = [("a2a-version", "1.0"), (NOT_SENT_NONCE_HEADER, odd)];
+            let res = gateway_request(&gw, "POST", path, &headers, Some(body)).await;
+            assert_eq!(res.status, 502, "{path} {odd}");
+            assert_eq!(refusal_message(&res), PLAIN_NOT_SENT, "{path} {odd}");
+        }
+    }
+    // An agent's answer never carries it.
+    let headers = [("a2a-version", "1.0"), (NOT_SENT_NONCE_HEADER, nonce)];
+    let res = gateway_request(
+        &gw,
+        "POST",
+        "/peers/failing/rest/message:stream",
+        &headers,
+        Some(&rest_call),
+    )
+    .await;
+    assert_eq!(res.status, 500);
+    assert!(!String::from_utf8_lossy(&res.body).contains(nonce));
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
 }
