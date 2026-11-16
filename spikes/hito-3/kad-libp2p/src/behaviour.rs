@@ -37,8 +37,8 @@
 //! for `spike_common::verify` to check again. It never dials the providers
 //! it finds (`Task::on_providers` says why). A candidate's `found_ms` is
 //! when the search first had a valid link and a valid announce of the same
-//! agent; `requests` sums `QueryStats::num_requests` of every query of the
-//! search.
+//! agent; `requests` sums `QueryStats::num_requests` of its queries, minus
+//! the dials `NoDial` denied.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;

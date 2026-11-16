@@ -195,8 +195,9 @@ async fn a_closed_connection_ends_on_both_sides() {
     let read = timeout(PROMPTLY, open.read_to_end(&mut rest))
         .await
         .expect("reading hangs");
-    // It ends: the connection lost, or the stream's end.
-    assert!(read.is_err() || rest.is_empty(), "{read:?} {rest:?}");
+    // It ends with the connection lost: B never accepted that substream, so
+    // it never wrote on it, let alone finished it.
+    assert!(read.is_err(), "{read:?} {rest:?}");
     // Closing A's side completes too. Whether it reports B's close or its
     // own (noq reports its own) does not matter: the connection is gone.
     let _closed = timeout(PROMPTLY, poll_fn(|cx| at_a.poll_close_unpin(cx)))

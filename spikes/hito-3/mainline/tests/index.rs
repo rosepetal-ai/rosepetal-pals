@@ -523,5 +523,9 @@ async fn a_router_refuses_what_the_index_does_not_use() {
     }
     let stats = router.stats();
     assert_eq!(stats.records_rejected, refused.len() as u64);
+    // Read right after the puts, most likely before a probe round has run
+    // (one every `PROBE_INTERVAL`): it holds by timing, and would hold even
+    // if the library had stored them, so it does not prove the hook kept
+    // them out. That needs a test that can see the router's probe rounds.
     assert_eq!(stats.records_stored, 0);
 }

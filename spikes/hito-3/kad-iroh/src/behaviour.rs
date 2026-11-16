@@ -3,10 +3,10 @@
 //! that the backend talks to through a [`Handle`].
 //!
 //! Copied from kad-libp2p's `behaviour.rs`; the Kademlia configuration,
-//! the validation of what arrives, the search, the announce, the sweep, the
-//! counters and the workarounds of its decision record (`NoDial`, the
-//! external addresses, `identify` without loopback or cache, the server
-//! addresses given back) are the same. What changed:
+//! the validation of what arrives, the search, the sweep, the counters and
+//! the workarounds of its decision record (`NoDial`, the external
+//! addresses, `identify` without loopback or cache, the server addresses
+//! given back) are the same. What changed:
 //! - [`spawn`] binds the node's one Iroh endpoint at `--listen` with the
 //!   agent's key, serves [`ALPN_KAD`] on it through an Iroh router, and
 //!   builds the swarm over [`IrohTransport`] with `Swarm::new` and the
@@ -64,8 +64,8 @@
 //! `spike_common::verify` to check again. It never dials the providers it
 //! finds (`Task::on_providers` says why). A candidate's `found_ms` is when
 //! the search first had a valid contact and a valid announce of the same
-//! agent; `requests` sums `QueryStats::num_requests` of every query of the
-//! search.
+//! agent; `requests` sums `QueryStats::num_requests` of its queries, minus
+//! the dials `NoDial` denied.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
