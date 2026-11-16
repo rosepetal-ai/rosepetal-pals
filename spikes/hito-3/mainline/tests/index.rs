@@ -6,9 +6,9 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use n0_mainline::SigningKey;
+use n0_mainline::{MutableItem, SigningKey};
 use pals_core::identity::AgentKey;
-use spike_common::records::{BAD_ANNOUNCE, BAD_CONTACT};
+use spike_common::records::{BAD_ANNOUNCE, BAD_CONTACT, EXPIRED};
 use spike_common::{
     Backend, BackendStats, NodeConfig, Role, issue_announce, issue_contact, tamper_signature,
     verify,
@@ -23,6 +23,9 @@ const RUST: &str = "agentnet:capability:v1:code.rust.review";
 /// What the routers may take to store what a put sent them, and their
 /// probes to see it.
 const STORE_DEADLINE: Duration = Duration::from_secs(20);
+/// How long a test watches for something that must not happen: three of the
+/// routers' probe rounds.
+const ABSENCE: Duration = Duration::from_secs(3);
 
 fn now() -> i64 {
     SystemTime::now()
@@ -158,6 +161,25 @@ fn a_router_takes_only_an_agents_own_records() {
         check(&k, Kind::Contact.salt(), &contact_json, 8).unwrap_err(),
         index::SEQ_MISMATCH
     );
+    // A record past its validity window, issued two days ago for one.
+    let old = issue_contact(&agent, &[contact_addr(1)], 7, now() - 2 * 86_400).unwrap();
+    assert_eq!(
+        check(&k, Kind::Contact.salt(), &old.to_json(), 7).unwrap_err(),
+        EXPIRED
+    );
+    // A key that is not an Ed25519 point is no agent's.
+    let not_a_point = (0..=u8::MAX)
+        .map(|b| [b; 32])
+        .find(|k| index::agent_of(k).is_err())
+        .expect("some byte repeated is no curve point");
+    assert_eq!(
+        check(&not_a_point, Kind::Contact.salt(), &contact_json, 7).unwrap_err(),
+        index::BAD_KEY
+    );
+    assert_eq!(
+        index::check_provider(&not_a_point, &index::capability_hash(OCR), None).unwrap_err(),
+        index::BAD_KEY
+    );
 
     // A signed peer of a capability the stored announce does not list.
     let ocr = index::capability_hash(OCR);
@@ -182,7 +204,10 @@ fn an_item_holds_at_most_bep_44s_1000_bytes() {
     assert_eq!(item.key(), agent.id().as_bytes());
     assert_eq!(item.seq(), 7);
     assert_eq!(item.salt(), Some(Kind::Contact.salt()));
-    assert_eq!(*item.target(), index::target(&agent.id(), Kind::Contact));
+    assert_eq!(
+        *item.target(),
+        MutableItem::target_from_key(agent.id().as_bytes(), Some(Kind::Contact.salt()))
+    );
     // A contact always fits: eight IPv6 addresses, as many as pals-core
     // allows, are under 800 bytes.
     let wide: Vec<SocketAddr> = (0..8u16)
@@ -246,6 +271,27 @@ async fn found_entries_lead_to_a_verified_contact() {
     .await;
     let rejected: u64 = routers.iter().map(|r| r.stats().records_rejected).sum();
     assert!(rejected > 0, "no router counted the rogue's contact");
+    // The routers probe the refused contact's target too: what they report
+    // there is what the library holds, and it must stay nothing, with every
+    // stored record attributed.
+    let watched = Instant::now();
+    while watched.elapsed() < ABSENCE {
+        for stats in routers.iter().map(Backend::stats) {
+            let rogue_held = stats.stored_by_agent.get(&rogue_id).copied();
+            assert_eq!(
+                rogue_held.unwrap_or_default().contact_records,
+                0,
+                "{stats:#?}"
+            );
+            let attributed: u64 = stats
+                .stored_by_agent
+                .values()
+                .map(|r| r.contact_records + r.announce_records + r.other_records)
+                .sum();
+            assert_eq!(stats.records_stored, attributed, "{stats:#?}");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 
     let mut client = node("c1", Role::Client, 0x31, boot).await;
     let found = client.search(OCR, 8).await.unwrap();
@@ -273,8 +319,14 @@ async fn a_node_without_bootstrap_finds_nothing() {
     // A client that joined, beside it, does know the routers once its stats
     // are read again, every second.
     let joined = node("c1", Role::Client, 0x31, std::slice::from_ref(&bootstrap)).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert!(joined.stats().routing_peers > 0);
+    let deadline = Instant::now() + STORE_DEADLINE;
+    while joined.stats().routing_peers == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the joined client never knew a router"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     assert!(lone.search(OCR, 8).await.unwrap().candidates.is_empty());
     let stats = lone.stats();
@@ -363,4 +415,113 @@ async fn providers_and_clients_stay_in_client_mode() {
     };
     assert_eq!(provider.mode().await.unwrap(), client_mode);
     assert_eq!(client.mode().await.unwrap(), client_mode);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_router_refuses_what_the_index_does_not_use() {
+    use serde_bencode::value::Value;
+    use spike_mainline::krpc::Dict;
+
+    let router = node("r1", Role::Router, 0x11, &[]).await;
+    let at = router.stats().bootstrap_addr.unwrap();
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let bytes = |n: usize, b: u8| Value::Bytes(vec![b; n]);
+    let query = |method: &str, args: Vec<(&str, Value)>| {
+        let args: Dict = args
+            .into_iter()
+            .map(|(k, v)| (k.as_bytes().to_vec(), v))
+            .collect();
+        let message: Dict = [
+            (b"t".to_vec(), Value::Bytes(b"aa".to_vec())),
+            (b"y".to_vec(), Value::Bytes(b"q".to_vec())),
+            (b"q".to_vec(), Value::Bytes(method.as_bytes().to_vec())),
+            (b"a".to_vec(), Value::Dict(args)),
+        ]
+        .into();
+        serde_bencode::to_bytes(&Value::Dict(message)).unwrap()
+    };
+    // Each query, and the reason the router's KRPC error must give.
+    let refused = [
+        // An immutable item: the index has none.
+        (
+            query(
+                "put",
+                vec![
+                    ("id", bytes(20, 1)),
+                    ("target", bytes(20, 2)),
+                    ("token", bytes(4, 3)),
+                    ("v", bytes(5, 4)),
+                ],
+            ),
+            index::UNKNOWN_KEY,
+        ),
+        // A BEP 5 peer: the index is of signed peers.
+        (
+            query(
+                "announce_peer",
+                vec![
+                    ("id", bytes(20, 1)),
+                    ("info_hash", bytes(20, 2)),
+                    ("port", Value::Int(4433)),
+                    ("token", bytes(4, 3)),
+                ],
+            ),
+            index::UNKNOWN_KEY,
+        ),
+        // A mutable put whose key is not 32 bytes: it cannot be read, so it
+        // is refused rather than let through.
+        (
+            query(
+                "put",
+                vec![
+                    ("id", bytes(20, 1)),
+                    ("target", bytes(20, 2)),
+                    ("token", bytes(4, 3)),
+                    ("k", bytes(5, 4)),
+                    ("v", bytes(5, 5)),
+                    ("seq", Value::Int(1)),
+                    ("sig", bytes(64, 6)),
+                ],
+            ),
+            index::MALFORMED,
+        ),
+        // A signed peer whose infohash is not 20 bytes.
+        (
+            query(
+                "announce_signed_peer",
+                vec![
+                    ("id", bytes(20, 1)),
+                    ("info_hash", bytes(3, 2)),
+                    ("token", bytes(4, 3)),
+                    ("k", bytes(32, 4)),
+                    ("t", Value::Int(1)),
+                    ("sig", bytes(64, 6)),
+                ],
+            ),
+            index::MALFORMED,
+        ),
+    ];
+    for (query, reason) in &refused {
+        socket.send_to(query, &at).unwrap();
+        let mut answer = [0u8; 1500];
+        let (n, _) = socket.recv_from(&mut answer).expect("the router answers");
+        let Value::Dict(answer) = serde_bencode::from_bytes::<Value>(&answer[..n]).unwrap() else {
+            panic!("not a dictionary");
+        };
+        assert_eq!(
+            answer.get(b"y".as_slice()),
+            Some(&Value::Bytes(b"e".to_vec()))
+        );
+        let expected = Value::List(vec![
+            Value::Int(203),
+            Value::Bytes(format!("agentnet: {reason}").into_bytes()),
+        ]);
+        assert_eq!(answer.get(b"e".as_slice()), Some(&expected));
+    }
+    let stats = router.stats();
+    assert_eq!(stats.records_rejected, refused.len() as u64);
+    assert_eq!(stats.records_stored, 0);
 }

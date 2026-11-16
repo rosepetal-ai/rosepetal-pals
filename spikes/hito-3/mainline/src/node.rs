@@ -36,14 +36,16 @@ use std::future::poll_fn;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail, ensure};
 use futures_core::Stream;
 use iroh::endpoint::{PortmapperConfig, presets};
 use iroh::{Endpoint, RelayMode, SecretKey};
-use n0_mainline::{Dht, Id, MutableItem, SigningKey};
+use n0_mainline::{
+    Dht, Id, MutableItem, RequestFilter, RequestSpecific, ServerSettings, SigningKey,
+};
 use pals_core::identity::AgentKey;
 use pals_core::records::{AnnounceRecord, ContactRecord};
 use pals_core::signed::Signed;
@@ -100,6 +102,18 @@ struct Published {
 
 /// A task that ends with its handle.
 struct Task(JoinHandle<()>);
+
+/// A router's server filter until its hook is in place: the builder takes
+/// no hook, so the router refuses every request until it has one, and
+/// nothing reaches the store unchecked in between.
+#[derive(Debug, Clone)]
+struct UntilHooked(Arc<AtomicBool>);
+
+impl RequestFilter for UntilHooked {
+    fn allow_request(&self, _request: &RequestSpecific, _from: SocketAddrV4) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
 
 impl Drop for Task {
     fn drop(&mut self) {
@@ -327,8 +341,12 @@ impl Net {
         let mut builder = Dht::builder();
         // The whole list: the library's default nodes are never used.
         builder.bootstrap(bootstrap).port(port);
+        let hooked = Arc::new(AtomicBool::new(false));
         if role == Role::Router {
-            builder.server_mode();
+            builder.server_mode().server_settings(ServerSettings {
+                filter: Box::new(UntilHooked(Arc::clone(&hooked))),
+                ..ServerSettings::default()
+            });
         }
         let dht = bind(|| builder.build()).await?;
         let port = dht.info().await?.local_addr().port();
@@ -345,6 +363,10 @@ impl Net {
             })));
             let hook = router.hook(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), replies);
             dht.set_datagram_hook(Some(hook)).await?;
+            // The actor takes its messages in order: once it answers this
+            // one, the hook is in place.
+            dht.info().await?;
+            hooked.store(true, Ordering::Release);
         }
         let (watcher, router, routing_peers) =
             (dht.clone(), router.clone(), Arc::clone(routing_peers));

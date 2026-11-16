@@ -10,7 +10,7 @@ Mainline, la DHT de BitTorrent (BEP 5 y BEP 44), guarda pares por *infohash* e i
 
 **Sirve para buscar, pero no como backend de PALS tal cual: la DHT no caduca nada, y un router en dos redes solo sirve a una de ellas. Definir el índice cuesta poco código, pero obliga a los routers a leer el protocolo por su cuenta.**
 
-- **Integración.** `n0-mainline` 0.7.2 compila junto a Iroh 1.4.1, también con la MSRV 1.91, y solo añade seis crates a la línea base. Con *signed peers* como índice y los registros en items BEP 44, cada búsqueda de S1 devuelve los dos proveedores verificados. En la ejecución del arnés, S0, S1, S4, S5 y S7 quedan en `pass` y S6 en `measured`, sin ningún `error`.
+- **Integración.** `n0-mainline` 0.7.2 compila junto a Iroh 1.4.1, también con la MSRV 1.91, y solo añade seis crates a la línea base (un recuento de `cargo tree`, no una cifra del JSON; ver [Código](#código)). Con *signed peers* como índice y los registros en items BEP 44, cada búsqueda de S1 devuelve los dos proveedores verificados. En la ejecución del arnés, S0, S1, S4, S5 y S7 quedan en `pass` y S6 en `measured`, sin ningún `error`.
 - **Lo que Mainline no da.** S3 queda en `fail`: la biblioteca no caduca nada, y los routers seguían guardando lo del proveedor parado, y las búsquedas devolviéndolo, al acabar la observación ([Caducidad](#caducidad-y-republicación)). S2 queda en `fail`: Mainline nombra a cada nodo con una sola dirección, así que con `r1` parado nadie llega a lo que solo guardaba él, los registros de los proveedores de la red A ([Routers en dos redes](#routers-en-dos-redes)).
 - **Ajustes.** La biblioteca no da cuatro cosas que hubo que hacer en el candidato: leer cada `put` en el gancho de datagramas para validarlo, preguntarse a sí mismo para ver lo que guarda, repetir tras una búsqueda un `put` fallido, porque un router que vuelve a arrancar rechaza los *tokens* viejos, y arrancar un cliente de la DHT nuevo al cambiar de red. Sin el tercero, una ejecución de prueba dejó S3 sin nada que medir ([Un router que vuelve a arrancar](#un-router-que-vuelve-a-arrancar)).
 - **Coste, frente a la línea base y a los dos candidatos de Kademlia.** Las cifras son las de `results/mainline.json`, `results/baseline.json`, `results/kad-libp2p.json` y `results/kad-iroh.json`, salvo las dependencias:
@@ -72,7 +72,7 @@ Cada nodo lleva:
 
 **Anuncio.** El nodo pone a la vez el contacto y el anuncio (`put_mutable`). Cuando terminan, pone a la vez un *signed peer* por capacidad (`announce_signed_peer`). Así, un router ya tiene el anuncio cuando le llegan los *signed peers*. Un `put` termina cuando han contestado los nodos más cercanos o ha vencido el plazo. Uno que no llega a ningún nodo se repite una vez, tras buscar de nuevo su objetivo ([Un router que vuelve a arrancar](#un-router-que-vuelve-a-arrancar)). El anuncio falla, nombrándolos, si alguno sigue sin llegar. Antes de cambiar nada, comprueba que cada registro cabe en un item ([Límites](#límites-por-nodo)). Cada `REPUBLISH_S` lo pone todo otra vez: los mismos items, y *signed peers* firmados de nuevo, porque un router solo acepta una marca de tiempo con 45 s de diferencia como mucho. `unannounce` deja de republicar. Mainline no borra nada, así que lo guardado se queda mientras la biblioteca lo guarde ([Caducidad](#caducidad-y-republicación)).
 
-**Cambio de red.** Cuando un proveedor anuncia un contacto con otras direcciones (S7), primero arranca un cliente de la DHT nuevo, en el mismo puerto y con la misma lista de arranque. La tabla de rutas de la biblioteca guarda cada nodo con la dirección por la que lo vio, de la red que el proveedor acaba de dejar. Solo saca un nodo tras 15 minutos sin verlo (`STALE_TIME`), y no ofrece forma de vaciarla. Sale de leer el código de `n0-mainline`: no se probó S7 sin el cliente nuevo.
+**Cambio de red.** Cuando un proveedor anuncia un contacto con otras direcciones (S7), primero arranca un cliente de la DHT nuevo, en el mismo puerto y con la misma lista de arranque. La tabla de rutas de la biblioteca guarda cada nodo con la dirección por la que lo vio, de la red que el proveedor acaba de dejar, y no ofrece forma de vaciarla. Solo saca un nodo tras 15 minutos sin verlo (`STALE_TIME`, `common/node.rs`, línea 13). Y una búsqueda solo añade los nodos de arranque cuando la tabla le da menos candidatos que entradas tiene la lista de arranque (`core.rs`, líneas 346 a 351). Tras el cambio, `p3` tiene en su tabla los cuatro routers con sus direcciones de la red B, más que sus dos entradas de arranque. Sin el cliente nuevo, sus búsquedas y sus `put` irían solo a direcciones que no alcanza, durante hasta 15 minutos. Sale de ese código: no se probó S7 sin el cliente nuevo.
 
 ### Routers en dos redes
 
@@ -80,7 +80,7 @@ Mainline nombra a cada nodo con una sola dirección. En las respuestas, un nodo 
 
 Se vio en la primera ejecución de prueba del arnés, la misma del apartado siguiente, según sus ficheros `raw/`, que git ignora. Tras el arranque, `r1` guardaba los registros de los cuatro proveedores, y `r2`, `r3` y `r4` solo los de `p3` y `p4`, los de la red B. Toda la DHT conocía a esos tres routers por su dirección de la B. Los proveedores de la A, `p1` y `p2`, solo llegaban a `r1`, del que tienen las dos direcciones por `--bootstrap`. Los clientes llegan además a `r3`, su contacto guardado.
 
-Con esta biblioteca no hay ajuste posible. El protocolo no lleva varias direcciones por nodo, y `n0-mainline` liga su socket a `0.0.0.0`, así que un router tampoco puede ser dos nodos, uno por red. Lo que mide el arnés con `r1` parado (S2) sale de aquí ([Resultados](#resultados)).
+Con esta biblioteca no hay ajuste sencillo. El protocolo no lleva varias direcciones por nodo. En un puerto, `n0-mainline` liga su socket a `0.0.0.0:<puerto>` (`actor/socket.rs`, línea 187), y `Config` solo tiene el puerto, sin dirección. Un router sí podría ser dos nodos en dos puertos, uno por red. Pero cada uno solo guardaría lo que le llega de su red, y partirían la DHT en dos, salvo que el router copiara lo guardado de uno al otro, que ya es reimplementar parte de la DHT. Lo que mide el arnés con `r1` parado (S2) sale de aquí ([Resultados](#resultados)).
 
 ### Un router que vuelve a arrancar
 
@@ -112,6 +112,9 @@ Un router comprueba cada `put` antes de que la biblioteca lo guarde. Como `Reque
 - **Item mutable** (`put` con clave): su *salt* tiene que ser una de las dos del índice (`unknown_key`) y su clave, la de un agente (`bad_key`). Su valor tiene que verificar como el registro de esa clase de `pals-core`, con su firma, su forma canónica y sus reglas (`bad_contact` o `bad_announce`). Además, el registro tiene que ser del agente cuya clave firma el item (`wrong_key`), tener el mismo `seq` que el item (`seq_mismatch`) y estar en plazo (`expired`). Lo de `rogue` en S5, un contacto de firma alterada, es `bad_contact`.
 - ***Signed peer*** (`announce_signed_peer`): su clave tiene que ser la de un agente. Si el router aceptó un anuncio de ese agente, el anuncio más nuevo tiene que listar una capacidad con ese *infohash* (`capability_not_announced`). Sin anuncio aceptado, no sabe qué capacidad es ni si el agente la ofrece, y lo acepta.
 - **Item inmutable** (`put` sin clave) y **BEP 5** (`announce_peer`): se rechazan (`unknown_key`). El índice no usa ninguno.
+- **Lo que no se puede leer:** un `put` o un `announce_signed_peer` cuyos argumentos el gancho no puede leer (una clave que no tiene 32 bytes, un *infohash* que no tiene 20, un item sin valor o sin `seq`…) se rechaza (`malformed`), en vez de dejarlo pasar. Los bytes que no se pueden descodificar en absoluto tampoco los descodifica la biblioteca, porque las dos usan `serde_bencode::from_bytes`, y los descarta. La prueba `a_router_refuses_what_the_index_does_not_use` manda a un router un item inmutable, un `announce_peer` y dos peticiones ilegibles, y comprueba cada error y cada rechazo contado.
+
+**El arranque.** El constructor de la DHT no admite el gancho: se pone con un mensaje al actor justo después de crearla. Para que nada llegue a la tienda sin comprobar en ese intervalo, el router arranca con un `RequestFilter` en `ServerSettings` que rechaza toda petición hasta que el gancho está puesto. El router lo sabe cuando el actor contesta a un mensaje posterior, porque los atiende en orden. Hasta entonces no contesta a nadie. No hay prueba que lo provoque.
 
 Lo rechazado nunca llega a la biblioteca. El gancho se queda el datagrama, contesta a quien lo envió con un error KRPC 203 («agentnet: \<motivo>»), lo suma a `records_rejected` y lo registra con su motivo. Lo aceptado sigue hasta la biblioteca, que aplica sus propias comprobaciones y aún puede rechazarlo.
 
@@ -140,7 +143,9 @@ Lo que un router no puede hacer, con esta biblioteca:
 
 ### Lo que guarda un router: `stored_by_agent`
 
-`n0-mainline` no deja leer lo que guarda su servidor. Por eso, cada segundo, el router se pregunta a sí mismo, por la dirección de bucle, por cada objetivo que conoce: un `get` de cada item y un `get_signed_peers` de cada *infohash* que nombró un `put` aceptado. Son las mismas consultas que manda quien busca. El gancho se queda las respuestas antes de que las vea la biblioteca, y dicen lo que la biblioteca serviría en ese momento. Es lo que cuentan las estadísticas del router. El router no quita nada por su cuenta: una entrada sale de las cuentas solo cuando la biblioteca deja de servirla. Las preguntas van por `lo`, que el arnés no cuenta en los bytes de la interfaz.
+`n0-mainline` no deja leer lo que guarda su servidor. Por eso, cada segundo, el router se pregunta a sí mismo, por la dirección de bucle, por cada objetivo que nombró un `put`, aceptado o rechazado: un `get` de cada item y un `get_signed_peers` de cada *infohash*. Son las mismas consultas que manda quien busca. El gancho se queda las respuestas antes de que las vea la biblioteca, y dicen lo que la biblioteca serviría en ese momento, con la clave que lleva cada respuesta. Es lo que cuentan las estadísticas del router. El router no quita nada por su cuenta: una entrada sale de las cuentas solo cuando la biblioteca deja de servirla. Las preguntas van por `lo`, que el arnés no cuenta en los bytes de la interfaz.
+
+También se pregunta por lo rechazado. Así, si la biblioteca guardara un `put` que el gancho rechazó, las cuentas lo mostrarían: el contacto de `rogue` saldría en su `contact_records`, y S5 lo vería. La prueba `found_entries_lead_to_a_verified_contact` lo comprueba: vigila 3 s que ningún router muestre un contacto de `rogue` ni un registro sin atribuir. Con un gancho que dejara pasar lo que rechaza, la prueba falla, con 4 registros guardados y el contacto de `rogue` en cada router. Sin preguntar por lo rechazado, como en la primera versión del candidato, ese mismo fallo pasaba inadvertido. Los *peers* de BEP 5 rechazados no se preguntan: su respuesta lleva direcciones, que no nombran a ningún agente.
 
 | Lo que guarda la biblioteca | Campo de `StoredRecords` | De qué agente |
 |-|-|-|
@@ -148,15 +153,17 @@ Lo que un router no puede hacer, con esta biblioteca:
 | Item con *salt* `agentnet:announce:v1` | `announce_records` | El de la clave del item |
 | *Signed peer* | `provider_records` | El de su clave |
 
-`records_stored` son los items que guarda y `provider_records_stored`, los *signed peers*. `other_records` queda a 0, porque el router solo pregunta por objetivos de items que aceptó. Todo lo que cuenta `records_stored` está atribuido.
+`records_stored` son los items que guarda y `provider_records_stored`, los *signed peers*. Un item bajo una *salt* que no es del índice contaría en `other_records` de su agente. Un item sin clave de agente, como uno inmutable, contaría en `records_stored` y en ningún agente, y S5 lo vería como crecimiento sin explicar. En la ejecución, todo lo que cuenta `records_stored` está atribuido.
 
 Una respuesta de `get_signed_peers` lleva como mucho 10 *signed peers*, elegidos al azar si hay más (`SignedPeersStore::get_random_peers`). Con más de 10 proveedores de una capacidad en un router, las cuentas serían de una muestra. En la topología hay como mucho 3: dos proveedores y `rogue`.
+
+Preguntar también cambia lo que se observa: el `get` del servidor usa `LruCache::get`, que pone la entrada la primera de la caché (`core/server.rs`, línea 476, y `get_random_peers` en `peers.rs` y `signed_peers.rs`). Con la caché llena, lo que el router pregunta cada segundo sería lo último en salir, así que la observación protegería justo lo que observa. Con los tamaños de la ejecución, muy por debajo de los límites, no importa.
 
 **Las demás estadísticas.** `connections` es siempre 0: Mainline va en datagramas UDP sueltos, sin conexiones, y nadie marca el endpoint de Iroh, así que no hay nada más cercano que contar. `routing_peers` es el tamaño de la tabla de rutas principal de la biblioteca (`Info::routing_table_size`), sin la de los nodos que contestan *signed peers*, que se solapa con ella. Solo los routers dan `bootstrap_addr`: un nodo en modo cliente no contesta, así que no sirve de arranque.
 
 ### Caducidad y republicación
 
-**`n0-mainline` 0.7.2 no caduca nada por tiempo.** Lo guarda todo en cachés LRU acotadas por número de entradas: 1000 items mutables, 1000 inmutables, 2000 *infohashes* y 500 pares por *infohash* (`MAX_VALUES`, `MAX_INFO_HASHES` y `MAX_PEERS` en `core/server.rs`, y `core/server/peers.rs` y `signed_peers.rs`). Una entrada solo sale cuando la desplaza otra, con la caché llena. `ServerSettings` solo deja cambiar esos números y el filtro. `mainline 8.0.1` hace lo mismo. Así que no hay nada que ajustar a `TTL_S`:
+**`n0-mainline` 0.7.2 no caduca nada por tiempo.** Lo guarda todo en cachés LRU acotadas por número de entradas: 1000 items mutables, 1000 inmutables, 2000 *infohashes* y 500 pares por *infohash* (`MAX_VALUES`, `MAX_INFO_HASHES` y `MAX_PEERS` en `core/server.rs`, y `core/server/peers.rs` y `signed_peers.rs`). Una entrada solo sale cuando la desplaza otra, con la caché llena (y las preguntas del router a sí mismo retrasan ese momento, ver [Lo que guarda un router](#lo-que-guarda-un-router-stored_by_agent)). `ServerSettings` solo deja cambiar esos números y el filtro. `mainline 8.0.1` hace lo mismo. Así que no hay nada que ajustar a `TTL_S`:
 
 - el nodo republica cada `REPUBLISH_S`, 40 s;
 - S3 se mide en el plazo normal del arnés, y la biblioteca no lo puede cumplir: los routers no olvidan nunca al proveedor parado, y las búsquedas lo siguen devolviendo como válido, porque los registros de `pals-core` valen 24 h;
@@ -219,20 +226,20 @@ Las líneas de `src/`, sin pruebas, con `wc -l` (todas) y sin las vacías ni los
 
 | Fichero | Líneas | Sin comentarios ni vacías | Qué es |
 |-|-|-|-|
-| `index.rs` | 191 | 119 | El índice: *salts*, *infohash*, items y lo que acepta un router, sin red |
-| `krpc.rs` | 206 | 146 | Los mensajes KRPC que lee el gancho del router y los que escribe |
-| `router.rs` | 259 | 189 | El gancho del router: sus comprobaciones, sus errores y lo que guarda la biblioteca |
-| `node.rs` | 514 | 409 | El `Backend`: Iroh y la DHT, el anuncio y su republicación, la búsqueda y las estadísticas |
+| `index.rs` | 189 | 117 | El índice: *salts*, *infohash*, items y lo que acepta un router, sin red |
+| `krpc.rs` | 217 | 148 | Los mensajes KRPC que lee el gancho del router y los que escribe |
+| `router.rs` | 286 | 203 | El gancho del router: sus comprobaciones, sus errores y lo que guarda la biblioteca |
+| `node.rs` | 536 | 424 | El `Backend`: Iroh y la DHT, el anuncio y su republicación, la búsqueda y las estadísticas |
 | `lib.rs` | 20 | 5 | Los módulos |
 | `main.rs` | 7 | 4 | `run_node` sobre el `Backend` |
-| **Total** | **1197** | **872** | |
+| **Total** | **1255** | **901** | |
 
-`index.rs`, `krpc.rs` y `router.rs` son lo que costó definir el índice y validarlo en los routers: 656 líneas, 454 sin comentarios ni vacías. `lib.rs` existe para que las pruebas lleguen al nodo y al índice.
+`index.rs`, `krpc.rs` y `router.rs` son lo que costó definir el índice y validarlo en los routers: 692 líneas, 468 sin comentarios ni vacías. `lib.rs` existe para que las pruebas lleguen al nodo y al índice.
 
 Las pruebas son de dos clases:
 
-- sin red: tres en `tests/index.rs` (el *infohash* de una capacidad, contra un SHA-1 calculado aparte; lo que acepta y rechaza un router, motivo por motivo; el límite de 1000 bytes) y tres en `krpc.rs` (leer una consulta, un `put` mutable frente a uno inmutable y un error);
-- cinco con nodos reales sobre la dirección de bucle, en `tests/index.rs`, con tres routers del candidato, el primero sin arranque y los otros dos desde él. No se usa el `Testnet` de la biblioteca, porque sus routers no llevan el gancho del candidato. `announced_capability_is_found` busca lo que anunció un proveedor. `found_entries_lead_to_a_verified_contact` añade un proveedor con el contacto alterado: comprueba que los routers lo rechazan y lo cuentan, lo que guarda cada router de cada agente y que el cliente recibe al honrado con su contacto verificado y al otro como `bad_contact`. `a_node_without_bootstrap_finds_nothing` comprueba que un cliente sin lista de arranque no conoce a nadie ni encuentra nada, mientras otro, a su lado, conoce a los routers. Las dos últimas son las de [Un router que vuelve a arrancar](#un-router-que-vuelve-a-arrancar) y [Modo servidor y modo cliente](#modo-servidor-y-modo-cliente).
+- sin red: tres en `tests/index.rs` (el *infohash* de una capacidad, contra un SHA-1 calculado aparte; lo que acepta y rechaza `index.rs`, motivo por motivo; el límite de 1000 bytes) y tres en `krpc.rs` (leer una consulta, un `put` mutable frente a uno inmutable y un error);
+- seis con nodos reales sobre la dirección de bucle, en `tests/index.rs`. Cuatro montan tres routers del candidato, el primero sin arranque y los otros dos desde él, y las otras dos, uno solo. No se usa el `Testnet` de la biblioteca, porque sus routers no llevan el gancho del candidato. `announced_capability_is_found` busca lo que anunció un proveedor. `found_entries_lead_to_a_verified_contact` añade un proveedor con el contacto alterado: comprueba que los routers lo rechazan y lo cuentan, lo que guarda cada router de cada agente, que en 3 s de vigilancia ninguno muestra el contacto rechazado ni un registro sin atribuir, y que el cliente recibe al honrado con su contacto verificado y al otro como `bad_contact`. `a_router_refuses_what_the_index_does_not_use` manda a un router, por UDP, lo que el índice no usa y lo que no se puede leer, y comprueba cada error KRPC. `a_node_without_bootstrap_finds_nothing` comprueba que un cliente sin lista de arranque no conoce a nadie ni encuentra nada, mientras otro, a su lado, conoce a los routers. Otras dos son las de [Un router que vuelve a arrancar](#un-router-que-vuelve-a-arrancar) y [Modo servidor y modo cliente](#modo-servidor-y-modo-cliente).
 
 `CARGO_TARGET_DIR=target/msrv cargo +1.91 check --locked -p spike-mainline --all-targets` pasa: el candidato compila con la MSRV.
 
@@ -278,7 +285,6 @@ Lo que explica las cifras, sin que el JSON lo desglose. Lo que viene de los fich
 - **El contacto en uso.** Nadie marca el endpoint de Iroh que nombra el contacto: S7 comprueba que el cliente recibe la dirección nueva, no que conecte con ella.
 - **Peticiones por búsqueda.** La biblioteca no las cuenta.
 - **Lo que la biblioteca rechaza tras el gancho** (un *token* caducado, un `seq` viejo). El router no lo cuenta en `records_rejected`, y no se ve aparte.
-- **El hueco del arranque.** El gancho se pone con un mensaje al actor de la DHT justo después de crearla, porque el constructor no lo admite. Un `put` que llegara antes de ese mensaje lo guardaría la biblioteca sin comprobar. No se midió.
 
 ## Metadatos que ve un nodo intermedio
 

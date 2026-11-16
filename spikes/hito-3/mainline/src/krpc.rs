@@ -7,9 +7,13 @@
 //! value, and `DatagramHook` gets each datagram as bytes, before the
 //! library decodes it. This module reads those bytes, with
 //! `serde_bencode`, which n0-mainline uses itself, as far as the hooks need,
-//! and writes the few messages they send. It reads nothing the library
-//! does not read again: whatever a hook lets through, the library decodes
-//! and checks on its own.
+//! and writes the few messages they send.
+//!
+//! The router's hook fails closed: a `put` or an `announce_signed_peer`
+//! whose arguments it cannot read is refused, never let through. Bytes this
+//! module cannot decode at all the library cannot decode either, since
+//! both go through `serde_bencode::from_bytes`, and drops them. What the
+//! hook lets through, the library decodes and checks again on its own.
 
 use std::collections::HashMap;
 
@@ -55,7 +59,8 @@ pub struct SignedPeer {
 }
 
 /// The message in `bytes`; `None` when they are not a bencoded dictionary
-/// with a transaction id.
+/// with a transaction id. A query with no method, or no arguments, has them
+/// empty.
 pub fn parse(bytes: &[u8]) -> Option<Message> {
     let Ok(Value::Dict(mut message)) = serde_bencode::from_bytes::<Value>(bytes) else {
         return None;
@@ -64,8 +69,8 @@ pub fn parse(bytes: &[u8]) -> Option<Message> {
     Some(match take_bytes(&mut message, b"y").as_deref() {
         Some(b"q") => Message::Query {
             tid,
-            method: take_bytes(&mut message, b"q")?,
-            args: take_dict(&mut message, b"a")?,
+            method: take_bytes(&mut message, b"q").unwrap_or_default(),
+            args: take_dict(&mut message, b"a").unwrap_or_default(),
         },
         Some(b"r") => Message::Response {
             tid,
@@ -89,6 +94,11 @@ pub fn mutable_put(args: &Dict) -> Option<MutablePut> {
 /// Whether a `put`'s arguments carry an immutable item: a value and no key.
 pub fn is_immutable_put(args: &Dict) -> bool {
     !args.contains_key(b"k".as_slice()) && args.contains_key(b"v".as_slice())
+}
+
+/// The target a `put`'s arguments name, if it is 20 bytes.
+pub fn put_target(args: &Dict) -> Option<Id> {
+    fixed::<20>(args, b"target").map(Id::from)
 }
 
 /// The signed peer an `announce_signed_peer`'s arguments carry; `None`
@@ -126,11 +136,12 @@ pub fn get_signed_peers(tid: &[u8], id: &Id, info_hash: &Id) -> Vec<u8> {
     query(tid, b"get_signed_peers", id, (b"info_hash", info_hash))
 }
 
-/// The key of the item a `get` answer carries; `None` when it carries none.
-pub fn item_key(body: &Dict) -> Option<[u8; 32]> {
+/// The item a `get` answer carries: `None` when it carries none, and
+/// otherwise its key, `None` for an immutable item (or a key that is not
+/// 32 bytes).
+pub fn item_in(body: &Dict) -> Option<Option<[u8; 32]>> {
     body.contains_key(b"v".as_slice())
         .then(|| fixed(body, b"k"))
-        .flatten()
 }
 
 /// The keys of the signed peers a `get_signed_peers` answer carries.

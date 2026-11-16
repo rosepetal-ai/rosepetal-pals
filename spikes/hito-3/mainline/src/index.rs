@@ -46,6 +46,9 @@ pub const SEQ_MISMATCH: &str = "seq_mismatch";
 /// A signed peer for a capability that the agent's stored announce does
 /// not list.
 pub const CAPABILITY_NOT_ANNOUNCED: &str = "capability_not_announced";
+/// A `put` or `announce_signed_peer` whose arguments a router cannot read:
+/// it refuses what it cannot check.
+pub const MALFORMED: &str = "malformed";
 
 /// The two items an agent publishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -90,11 +93,6 @@ pub fn capability_hash(capability: &str) -> Id {
             .digest()
             .bytes(),
     )
-}
-
-/// Where an agent's item of `kind` lives: BEP 44's `SHA-1(key + salt)`.
-pub fn target(agent: &AgentId, kind: Kind) -> Id {
-    MutableItem::target_from_key(agent.as_bytes(), Some(kind.salt()))
 }
 
 /// The item of `kind` that carries `json`, signed with the agent's key,

@@ -9,20 +9,25 @@
 //!   [`index::check_item`], an `announce_signed_peer` through
 //!   [`index::check_provider`], against the newest announce of that agent
 //!   the router accepted. BEP 5's `announce_peer` and immutable puts are
-//!   refused: the index uses neither. A refused query never reaches the
+//!   refused: the index uses neither. So is a `put` or an
+//!   `announce_signed_peer` whose arguments the hook cannot read
+//!   ([`MALFORMED`]): it fails closed. A refused query never reaches the
 //!   library: the hook consumes it, answers the sender with a KRPC error
 //!   203 naming the reason and counts it in `records_rejected`. An accepted
 //!   one goes on to the library, which applies its own checks (BEP 44's
 //!   token, signature, target and `seq`, a signed peer's signature and
-//!   timestamp) and may still refuse it; the router only learns its target.
+//!   timestamp) and may still refuse it.
 //! - **What is stored.** n0-mainline gives no read of its store. So, every
 //!   [`PROBE_INTERVAL`], the router asks itself, over loopback, for each
-//!   target it has learned: a `get` for each item and a `get_signed_peers`
-//!   for each infohash, the queries a searcher sends. Their answers, which
-//!   the hook takes before the library sees them, say what the library
-//!   would serve now, and are what the router's stats count. The router
-//!   removes nothing itself: an entry leaves the counts only when the
-//!   library stops serving it.
+//!   target a put named, accepted or refused: a `get` for each item and a
+//!   `get_signed_peers` for each infohash, the queries a searcher sends.
+//!   Their answers, which the hook takes before the library sees them, say
+//!   what the library would serve now, attributed by the key they carry,
+//!   and are what the router's stats count. A refused put is probed too, so
+//!   that the counts would show it if the library held it anyway. The
+//!   router removes nothing itself: an entry leaves the counts only when the
+//!   library stops serving it. BEP 5 peers are not probed: their answers
+//!   carry addresses, which name no agent.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddrV4;
@@ -34,7 +39,7 @@ use pals_core::identity::AgentId;
 use spike_common::{BackendStats, StoredRecords};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::index::{self, Kind, UNKNOWN_KEY};
+use crate::index::{self, Kind, MALFORMED, UNKNOWN_KEY};
 use crate::krpc::{self, Message};
 
 /// How often a router asks itself what its store holds.
@@ -61,14 +66,18 @@ pub struct Router {
 #[derive(Debug, Default)]
 struct State {
     rejected: u64,
-    /// The target of every item an accepted put named, and its kind.
-    targets: HashMap<Id, Kind>,
-    /// Every infohash an accepted signed peer named.
+    /// The target of every item a put named, accepted or refused, and its
+    /// kind: `None` under a salt the index does not define, or for an
+    /// immutable item.
+    targets: HashMap<Id, Option<Kind>>,
+    /// Every infohash a signed peer named, accepted or refused.
     info_hashes: BTreeSet<Id>,
     /// The `seq` and capabilities of each agent's newest accepted announce.
     announced: HashMap<AgentId, (i64, Vec<Id>)>,
-    /// From the probes: the agent of each item the library holds.
-    held_items: HashMap<Id, AgentId>,
+    /// From the probes: each item the library holds, with the agent whose
+    /// key it carries; `None` for an item with no key, or a key that is no
+    /// agent's.
+    held_items: HashMap<Id, Option<AgentId>>,
     /// From the probes: the agents of each infohash's signed peers.
     held_peers: HashMap<Id, BTreeSet<AgentId>>,
     /// The probes of this round still unanswered.
@@ -151,16 +160,20 @@ impl Router {
     }
 
     /// The router's part of the stats: what the library holds, as the last
-    /// probes saw it, and what the hook refused.
+    /// probes saw it, and what the hook refused. An item with no agent's
+    /// key counts in `records_stored` and nowhere in `stored_by_agent`.
     pub fn fill(&self, stats: &mut BackendStats) {
         let state = lock(&self.state);
         let mut by_agent: BTreeMap<AgentId, StoredRecords> = BTreeMap::new();
         for (target, agent) in &state.held_items {
+            let Some(agent) = agent else {
+                continue;
+            };
             let entry = by_agent.entry(*agent).or_default();
             match state.targets.get(target) {
-                Some(Kind::Contact) => entry.contact_records += 1,
-                Some(Kind::Announce) => entry.announce_records += 1,
-                None => entry.other_records += 1,
+                Some(Some(Kind::Contact)) => entry.contact_records += 1,
+                Some(Some(Kind::Announce)) => entry.announce_records += 1,
+                _ => entry.other_records += 1,
             }
         }
         for agents in state.held_peers.values() {
@@ -176,14 +189,27 @@ impl Router {
 }
 
 impl State {
-    /// The verdict on a query of `method`: `None` when it stores nothing
-    /// (a get, a ping…) or is malformed, which the library refuses; `Ok`
-    /// with what was learned, or `Err` with the reason to refuse it.
+    /// The verdict on a query of `method`: `None` when it stores nothing (a
+    /// get, a ping…), `Ok` when the router lets it through, or `Err` with
+    /// the reason to refuse it. Either way, the router learns the target of
+    /// a put it can read, to probe it.
     fn check(&mut self, method: &[u8], args: &krpc::Dict) -> Option<Result<(), &'static str>> {
         match method {
-            b"put" if krpc::is_immutable_put(args) => Some(Err(UNKNOWN_KEY)),
+            b"put" if krpc::is_immutable_put(args) => {
+                if let Some(target) = krpc::put_target(args) {
+                    self.targets.insert(target, None);
+                }
+                Some(Err(UNKNOWN_KEY))
+            }
             b"put" => {
-                let put = krpc::mutable_put(args)?;
+                let Some(put) = krpc::mutable_put(args) else {
+                    return Some(Err(MALFORMED));
+                };
+                // Where the library would keep it: the key and the salt name
+                // the target, and the library refuses any other.
+                let target = MutableItem::target_from_key(&put.key, put.salt.as_deref());
+                self.targets
+                    .insert(target, Kind::of_salt(put.salt.as_deref()));
                 let verdict = index::check_item(
                     &put.key,
                     put.salt.as_deref(),
@@ -192,8 +218,6 @@ impl State {
                     now_unix(),
                 );
                 Some(verdict.map(|accepted| {
-                    let target = MutableItem::target_from_key(&put.key, put.salt.as_deref());
-                    self.targets.insert(target, accepted.kind);
                     if accepted.kind == Kind::Announce {
                         let newest = self.announced.get(&accepted.agent);
                         if newest.is_none_or(|(seq, _)| put.seq >= *seq) {
@@ -204,15 +228,15 @@ impl State {
                 }))
             }
             b"announce_signed_peer" => {
-                let peer = krpc::signed_peer(args)?;
+                let Some(peer) = krpc::signed_peer(args) else {
+                    return Some(Err(MALFORMED));
+                };
+                self.info_hashes.insert(peer.info_hash);
                 let announced = index::agent_of(&peer.key)
                     .ok()
                     .and_then(|agent| self.announced.get(&agent))
                     .map(|(_, capabilities)| capabilities.as_slice());
-                let verdict = index::check_provider(&peer.key, &peer.info_hash, announced);
-                Some(verdict.map(|_| {
-                    self.info_hashes.insert(peer.info_hash);
-                }))
+                Some(index::check_provider(&peer.key, &peer.info_hash, announced).map(drop))
             }
             b"announce_peer" => Some(Err(UNKNOWN_KEY)),
             _ => None,
@@ -227,8 +251,11 @@ impl State {
         };
         match probe {
             Probe::Item(target) => {
-                match krpc::item_key(body).and_then(|k| index::agent_of(&k).ok()) {
-                    Some(agent) => self.held_items.insert(target, agent),
+                match krpc::item_in(body) {
+                    Some(key) => {
+                        let agent = key.and_then(|k| index::agent_of(&k).ok());
+                        self.held_items.insert(target, agent)
+                    }
                     None => self.held_items.remove(&target),
                 };
             }
