@@ -325,15 +325,33 @@ Un nodo publica en vueltas:
 
 Una vuelta nueva cierra las consultas que quedaban de la anterior. Cada vuelta:
 
-1. Deja de anunciar las capacidades que el anuncio ya no lista. Después guarda en la tienda del nodo el provider record propio de cada una de las demás, en el orden del inventario. Una capacidad que no cabe falla sola, por ejemplo en un router que también anuncia y tiene llenas sus 1024 claves de proveedores: va a `failed_capabilities` y se intenta en la vuelta siguiente. Las demás siguen, y no se deshace nada.
-2. Pone el contacto y el anuncio en los routers más cercanos a sus claves, con quórum de todos ellos. Un registro llegó cuando al menos un router contestó que lo guardó.
-3. Cuando ha terminado el `put` del anuncio, para cada capacidad busca los routers más cercanos a su clave y les pone el anuncio, con quórum de todos ellos: el `put` espera a cada uno. Si llegó al menos a uno, les envía después el provider record. Si no llegó a ninguno, esa vuelta no anuncia la capacidad, y la siguiente lo intenta otra vez. Así el anuncio viaja con cada provider record: cada router que guarda uno tiene ya el anuncio que pide la sección 6, aunque con muchos routers los más cercanos a la clave del anuncio y a la de la capacidad no sean los mismos.
+1. Deja de anunciar las capacidades que el anuncio ya no lista. Después guarda en la tienda del nodo el provider record propio de cada una de las demás, en el orden del inventario. Una capacidad que no cabe falla sola, por ejemplo en un router que también anuncia y tiene llenas sus 1024 claves de proveedores.
+2. Pone el contacto y el anuncio en los routers más cercanos a sus claves, con quórum de todos ellos. Un registro llegó cuando al menos un router contestó.
+3. Cuando ha terminado el `put` del anuncio, lleva cada capacidad a los routers, como mucho 4 a la vez y en el orden del inventario: cuando termina una, empieza la siguiente. Así una vuelta de muchas capacidades no hace cola tras sí misma por los 4 streams propios que el nodo abre con cada router (sección 5), y esa espera no gasta el plazo de sus peticiones. Para cada capacidad:
+   - busca los routers más cercanos a su clave;
+   - les pone el anuncio, con quórum de todos ellos: el `put` espera a cada uno;
+   - si llegó al menos a uno, les envía después el provider record.
 
-Una vuelta en la que ningún router contestó que guardaba algo termina con `last_error`, y la siguiente llega a los 30 s. Con `libp2p-kad` 0.49, un router contesta así también a lo que rechaza (sección 6): si lo guardó o no, lo dicen el estado del router y sus rechazos.
+   Así el anuncio viaja con cada provider record: cada router que guarda uno tiene ya el anuncio que pide la sección 6, aunque con muchos routers los más cercanos a la clave del anuncio y a la de la capacidad no sean los mismos.
+
+Una capacidad falla sola, y las demás siguen sin que se deshaga nada, cuando:
+- no cabe en la tienda del nodo (paso 1);
+- ningún router de los más cercanos a su clave contestó al anuncio;
+- su provider record no llegó a salir: su consulta terminó antes.
+
+Una capacidad que falla va a `failed_capabilities`, en el orden del inventario, y la vuelta siguiente la intenta otra vez.
+
+Una vuelta en la que ningún router contestó termina con `last_error`, y la siguiente llega a los 30 s. Con `libp2p-kad` 0.49, un router contesta también a lo que rechaza (sección 6): si lo guardó o no, lo dicen el estado del router y sus rechazos.
 
 ### Caducidad
 
-Un router guarda un valor o un provider record `[dht] record_ttl_s` desde que lo recibe: 3600 s por defecto. Esa vida es la de `libp2p-kad`, que la mide con su propio reloj, no con el `Clock` del nodo. La replicación entre routers no la alarga: una copia replicada lleva la caducidad del original. Un registro firmado deja además de valer a las 24 h de emitirse (`RECORD_TTL_S`), y un router no lo sirve caducado por cualquiera de las dos.
+Un router guarda un valor o un provider record `[dht] record_ttl_s` desde que lo recibe: 3600 s por defecto. Esa vida es la de `libp2p-kad`, que la mide con su propio reloj, no con el `Clock` del nodo. La replicación entre routers no la alarga: una copia replicada lleva la caducidad del original.
+
+Un registro firmado deja además de valer a las 24 h de emitirse (`RECORD_TTL_S`). Por eso, quien publica da a cada copia de su contacto y de su anuncio la vida que le quede, la menor de dos:
+- `record_ttl_s`;
+- lo que le falta a su firma para caducar, por el `Clock` del nodo.
+
+Un `put` de `libp2p-kad` lleva esa vida, y el router se queda con la menor entre ella y su propio `record_ttl_s`. Así un router no sirve un contacto ni un anuncio después de que caduque su firma, salvo por el desajuste entre los relojes de los dos nodos. Un provider record no lleva firma: vive el `record_ttl_s` del router.
 
 No hay barridos propios. `libp2p-kad` borra un valor caducado cuando se lee o en la vuelta de replicación, y un provider record caducado cuando se leen los proveedores de su clave. Hasta entonces ocupa su sitio en la tienda, así que un router con la tienda llena borra lo caducado antes de rechazar un registro con `store_full`, y lo intenta otra vez.
 
@@ -370,11 +388,11 @@ El estado de cada vuelta y de cada búsqueda va por consulta: el nodo hace a la 
 
 ### El estado de la publicación
 
-Con `[dht] announce`, `pals dht status --json` y `GET /dht` llevan `publication`:
+Con `[dht] announce`, `GET /dht` y `pals dht status --json` llevan `publication`, y `pals dht status` sin `--json` lo escribe en unas pocas líneas:
 
 | Campo | Qué es |
 |-|-|
 | `capabilities` | las capacidades públicas de la última vuelta; antes de que termine la primera, las del anuncio en vigor |
 | `last_round_unix` | cuándo terminó la última vuelta, por el reloj del nodo |
-| `last_error` | por qué se quedó corta la última vuelta: no contestó ningún router, o la tienda del propio nodo no tenía sitio para sus registros |
-| `failed_capabilities` | las capacidades que la última vuelta no pudo anunciar por falta de sitio en la tienda del nodo |
+| `last_error` | por qué se quedó corta la última vuelta. Si hay más de un motivo, el más grave: la tienda del propio nodo no tenía sitio para sus registros; no contestó ningún router; o cuántas capacidades no se anunciaron, por ejemplo `2 capabilities not provided` |
+| `failed_capabilities` | las capacidades que la última vuelta no pudo anunciar, en el orden del inventario: no cabían en la tienda del nodo, ningún router de su clave contestó al anuncio, o su provider record no llegó a salir |

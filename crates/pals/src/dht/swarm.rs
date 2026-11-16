@@ -119,7 +119,9 @@ use pals_core::store::Store;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use super::keys::{Slot, agent_of, announce_key, peer_id, provider_key, public_key, slot};
+use super::keys::{
+    Slot, agent_of, announce_key, contact_key, peer_id, provider_key, public_key, slot,
+};
 use super::publish::{Lookups, Publication};
 use super::transport::{
     AddressBook, IrohListener, IrohTransport, Refusals, dial_target, located_nowhere, multiaddr_of,
@@ -162,6 +164,8 @@ const COMMANDS_QUEUED: usize = 16;
 /// Routers to enter the network through: each one's agent and direct
 /// addresses.
 type Routers = Vec<(AgentId, Vec<SocketAddr>)>;
+/// An agent's contact and announce a router holds, as it stored them.
+type HeldRecords = (Option<Vec<u8>>, Option<Vec<u8>>);
 /// The protocol family `identify` says the node speaks.
 const IDENTIFY_VERSION: &str = "agentnet/0";
 
@@ -411,6 +415,8 @@ impl NetworkBehaviour for Kademlia {
 pub(crate) enum Command {
     Status(oneshot::Sender<DhtStatus>),
     HeldProviders(RecordKey, oneshot::Sender<Vec<(AgentId, Vec<Multiaddr>)>>),
+    /// The contact and the announce of an agent the node holds.
+    HeldRecords(AgentId, oneshot::Sender<HeldRecords>),
     /// A lookup of the providers of the capability whose key it is.
     Providers {
         key: RecordKey,
@@ -681,6 +687,14 @@ impl Task {
             }
             Command::HeldProviders(key, reply) => {
                 let _ = reply.send(self.held_providers(&key));
+            }
+            Command::HeldRecords(agent, reply) => {
+                let store = self.kad().store_mut();
+                let held = (
+                    held_value(store, &contact_key(&agent)),
+                    held_value(store, &announce_key(&agent)),
+                );
+                let _ = reply.send(held);
             }
             Command::Providers {
                 key,
@@ -1309,7 +1323,7 @@ fn key_text(key: &RecordKey) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::net::Ipv4Addr;
     use std::time::Duration;
 
@@ -1364,12 +1378,12 @@ mod tests {
 
     /// An endpoint with `key` on a free port of 127.0.0.1, as the daemon
     /// binds it without relay.
-    async fn endpoint(key: &AgentKey) -> Endpoint {
+    pub(in crate::dht) async fn endpoint(key: &AgentKey) -> Endpoint {
         endpoint_on(key, Ipv4Addr::LOCALHOST).await
     }
 
     /// A task for `key` on `endpoint` with `cfg`, publishing `published`.
-    fn task_with(
+    pub(in crate::dht) fn task_with(
         key: AgentKey,
         endpoint: Endpoint,
         cfg: DhtCfg,
@@ -1419,16 +1433,30 @@ mod tests {
 
     /// `key`'s records, valid now, its announce listing `capabilities`,
     /// which never change.
-    struct Fixed {
+    pub(in crate::dht) struct Fixed {
         current: (Vec<u8>, Vec<u8>),
         capabilities: Vec<String>,
         changes: watch::Sender<u64>,
     }
 
     impl Fixed {
-        fn of(key: &AgentKey, capabilities: &[&str]) -> Arc<dyn PublishedRecords> {
-            let issued_at = format_timestamp(SystemClock.now_unix() - 60).unwrap();
-            let expires_at = format_timestamp(SystemClock.now_unix() - 60 + RECORD_TTL_S).unwrap();
+        /// Issued a minute ago, for the whole life of a signed record.
+        pub(in crate::dht) fn of(
+            key: &AgentKey,
+            capabilities: &[&str],
+        ) -> Arc<dyn PublishedRecords> {
+            Self::expiring(key, capabilities, RECORD_TTL_S - 60)
+        }
+
+        /// Issued a minute ago, expiring `expires_in` seconds from now.
+        pub(in crate::dht) fn expiring(
+            key: &AgentKey,
+            capabilities: &[&str],
+            expires_in: i64,
+        ) -> Arc<dyn PublishedRecords> {
+            let now = SystemClock.now_unix();
+            let issued_at = format_timestamp(now - 60).unwrap();
+            let expires_at = format_timestamp(now + expires_in).unwrap();
             let contact = ContactRecord {
                 schema: CONTACT_SCHEMA.to_owned(),
                 agent_id: key.id(),

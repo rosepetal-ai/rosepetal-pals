@@ -668,6 +668,27 @@ async fn an_address_change_republishes_the_contact_at_once() {
     .await;
     let candidate = &found.found[0];
     assert_eq!(candidate.contact.doc.iroh.direct_addrs, [moved.to_string()]);
+    // Each router holds it, not only one that a lookup reached.
+    for router in [&r1, &r2] {
+        wait_for_held_contact(router, key.id(), 2).await;
+    }
+}
+
+/// Waits until `router` holds `agent`'s contact of `seq`; fails after
+/// [`CONVERGES`].
+async fn wait_for_held_contact(router: &TestNode, agent: AgentId, seq: u64) {
+    let deadline = Instant::now() + CONVERGES;
+    loop {
+        let (contact, _) = dht(router).held_records(&agent).await.unwrap();
+        let held = contact
+            .and_then(|json| Signed::<ContactRecord>::from_json(&json).ok())
+            .map(|contact| contact.doc.seq);
+        if held == Some(seq) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the router holds {held:?}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 #[tokio::test]

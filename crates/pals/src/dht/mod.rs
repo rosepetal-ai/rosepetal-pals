@@ -247,6 +247,16 @@ impl Dht {
         self.ask(|reply| Command::HeldProviders(key, reply)).await
     }
 
+    /// What the node holds as a router of `agent`'s contact and announce,
+    /// each as the signed JSON it stored, unexpired.
+    pub async fn held_records(
+        &self,
+        agent: &AgentId,
+    ) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), DhtError> {
+        let agent = *agent;
+        self.ask(|reply| Command::HeldRecords(agent, reply)).await
+    }
+
     /// Looks for `capability`'s providers, up to `limit` of them, as
     /// [`publish`] says: what it has at `deadline`, with
     /// [`DhtLookup::cut`], if its queries did not end before.

@@ -8,7 +8,11 @@
 //! capabilities of its public services, which that announce lists (H3-D4).
 //! Without it, nothing, not even the contact. A node that stops sends
 //! nothing: the routers' copies expire on their own, `record_ttl` after the
-//! last round that reached them, with `libp2p-kad`'s own expiry.
+//! last round that reached them, with `libp2p-kad`'s own expiry. A copy of
+//! the contact or the announce never outlives its signature: it goes with
+//! the smaller of `record_ttl` and what its signature has left by the
+//! node's clock, which `libp2p-kad` sends as the record's TTL, and a router
+//! keeps the smaller of that and its own `record_ttl`.
 //!
 //! **A round of publication.** There is one when the node enters the
 //! network, one every `republish`, one each time a record is issued again
@@ -22,25 +26,30 @@
 //! arrives. A round:
 //! 1. stops providing the capabilities the records no longer list, and
 //!    holds the node's own provider record of each of the others, in the
-//!    records' order, with the addresses the node declares. A capability
-//!    the store has no room for fails alone and goes to
-//!    `failed_capabilities`, for the next round to try again; the others go
-//!    on, and nothing is undone;
-//! 2. puts the contact and the announce with `Quorum::All`. A put is done
-//!    once a router stored it: `QuorumFailed` with some `success`;
-//! 3. once the announce's put ended, for each capability, finds the routers
-//!    closest to its key (`get_closest_peers`) and puts the announce at
-//!    them with `Quorum::All` (`put_record_to`): the put waits for every
-//!    one of them. When it reached at least one (`Ok`, or `QuorumFailed` or
-//!    `Timeout` with some `success`), the node provides the capability
-//!    (`start_providing`); when it reached none, it does not, and the next
-//!    round tries again. The announce travels with every provider record:
+//!    records' order, with the addresses the node declares;
+//! 2. puts the contact and the announce with `Quorum::All`. A put reached
+//!    a router once one answered: `Ok`, or `QuorumFailed` or `Timeout` with
+//!    some `success`. `libp2p-kad` 0.49 answers a put the router refused
+//!    too, so the router's status says whether it stored it;
+//! 3. once the announce's put ended, takes the capabilities to the
+//!    routers, [`CAPABILITIES_AT_ONCE`] at a time in the records' order,
+//!    the next starting as one ends. For each, it finds the routers closest
+//!    to its key (`get_closest_peers`) and puts the announce at them with
+//!    `Quorum::All` (`put_record_to`): the put waits for every one of them.
+//!    When it reached at least one, the node provides the capability
+//!    (`start_providing`). The announce travels with every provider record:
 //!    each router that stores one already holds the announce that
 //!    [`validate::check_provider`] asks for, even when the routers closest
 //!    to the announce's key are not those closest to the capability's.
 //!
-//! A round in which no router answered that it stored anything ends with
-//! `last_error`, and the next comes `retry_after` later.
+//! A capability fails alone, and the others go on with nothing undone,
+//! when the store has no room for it, when no router closest to its key
+//! answered the announce, or when its provider record never went (its
+//! query ended first). It goes to `failed_capabilities`, in the records'
+//! order, for the next round to try again, and `last_error` says how many
+//! failed, unless something worse went wrong. A round in which no router
+//! answered ends with `last_error` too, and the next comes `retry_after`
+//! later.
 //!
 //! **A lookup** ([`super::Dht::providers`]) asks for the providers of a
 //! capability's key and, for each provider as it arrives, up to its limit,
@@ -48,8 +57,8 @@
 //! [`validate::contact_for`] and [`validate::announce_for`] at the node's
 //! clock, and the valid one of highest `seq` stays. A provider with a valid
 //! contact and a valid announce that lists the capability is a candidate;
-//! the others are discarded, with the name of the last refusal of one of
-//! their copies or what they lack. The node never finds itself. At its
+//! the others are discarded, with why: the refusal of the record they lack
+//! (the announce's when they lack both), or that none came. The node never finds itself. At its
 //! deadline, a lookup answers with what it has and finishes its queries.
 //! Its requests are those of its queries, the dials [`NoDial`] refused
 //! them left out, each counted by its query
@@ -57,8 +66,9 @@
 //!
 //! [`NoDial`]: super::swarm::NoDial
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use libp2p::PeerId;
 use libp2p::kad::{
@@ -66,9 +76,10 @@ use libp2p::kad::{
     GetProvidersOk, GetRecordError, GetRecordOk, PutRecordError, PutRecordOk, QueryId, QueryStats,
     Quorum, Record, RecordKey,
 };
+use pals_core::grant::parse_timestamp;
 use pals_core::identity::AgentId;
 use pals_core::records::{AnnounceRecord, ContactRecord};
-use pals_core::signed::Signed;
+use pals_core::signed::{Signed, SignedDoc};
 use serde::Serialize;
 use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
@@ -98,12 +109,14 @@ pub struct PublicationStatus {
     pub capabilities: Vec<String>,
     /// When the last round ended, by the node's clock.
     pub last_round_unix: Option<i64>,
-    /// Why the last round fell short, if it did: no router answered that
-    /// it stored any of its records, or the node's own store had no room
-    /// for them.
+    /// Why the last round fell short, if it did; the worst reason: the
+    /// node's own store had no room for its records, no router answered
+    /// any of its puts, or how many capabilities it did not provide.
     pub last_error: Option<String>,
-    /// The capabilities the last round could not provide, for want of room
-    /// in the node's own store; the next round tries them again.
+    /// The capabilities the last round could not provide, in the records'
+    /// order: no room in the node's own store, no router closest to their
+    /// key answered their announce, or their provider record never went.
+    /// The next round tries them again.
     pub failed_capabilities: Vec<String>,
 }
 
@@ -151,15 +164,29 @@ struct Round {
     capabilities: Vec<String>,
     /// The announce, which goes with every provider record.
     announce: Record,
-    /// The capabilities waiting for the announce's put to end.
-    waiting: Vec<(String, RecordKey)>,
+    /// The capabilities waiting for their turn: the announce's put to end,
+    /// and a place among [`CAPABILITIES_AT_ONCE`], in the records' order.
+    waiting: VecDeque<(String, RecordKey)>,
+    /// The capabilities on their way, at most [`CAPABILITIES_AT_ONCE`].
+    on_their_way: usize,
     /// What each of its queries running is for.
     queries: HashMap<QueryId, Step>,
-    /// Whether a router stored any of its records.
+    /// Whether a router answered any of its puts.
     reached: bool,
+    /// The capabilities not provided: no room in the node's store, no
+    /// router that answered their announce, or a provider record that
+    /// never went.
     failed: Vec<String>,
     error: Option<String>,
 }
+
+/// The capabilities a round takes to the routers at a time: finding their
+/// routers, putting the announce at them and sending the provider record.
+/// So a round of many capabilities never queues behind itself for the
+/// node's own streams to a router
+/// ([`OUTBOUND_STREAMS_PER_PEER`](super::muxer::OUTBOUND_STREAMS_PER_PEER)),
+/// which count in each request's time.
+const CAPABILITIES_AT_ONCE: usize = 4;
 
 /// What a query of a round is for.
 enum Step {
@@ -172,7 +199,7 @@ enum Step {
     /// The announce, put at those routers.
     AnnounceAt(String, RecordKey),
     /// The provider record of a capability, sent.
-    Providing,
+    Providing(String),
 }
 
 /// The lookups running.
@@ -207,8 +234,10 @@ struct Provider {
     agent: AgentId,
     contact: Option<(Signed<ContactRecord>, Vec<u8>)>,
     announce: Option<(Signed<AnnounceRecord>, Vec<u8>)>,
-    /// Why the last copy refused was.
-    refused: Option<Rejection>,
+    /// Why the last copy of its contact refused was.
+    contact_refused: Option<Rejection>,
+    /// Why the last copy of its announce refused was.
+    announce_refused: Option<Rejection>,
 }
 
 impl Provider {
@@ -217,7 +246,8 @@ impl Provider {
             agent,
             contact: None,
             announce: None,
-            refused: None,
+            contact_refused: None,
+            announce_refused: None,
         }
     }
 
@@ -235,7 +265,7 @@ impl Provider {
                         self.contact = Some((contact, value));
                     }
                 }
-                Err(why) => self.refused = Some(why),
+                Err(why) => self.contact_refused = Some(why),
             },
             Slot::Announce(agent) => match validate::announce_for(&agent, &value, now_unix) {
                 Ok(announce) => {
@@ -247,13 +277,15 @@ impl Provider {
                         self.announce = Some((announce, value));
                     }
                 }
-                Err(why) => self.refused = Some(why),
+                Err(why) => self.announce_refused = Some(why),
             },
         }
     }
 
     /// A candidate, when it has a valid contact and a valid announce that
-    /// lists the capability of `key`; why not, otherwise.
+    /// lists the capability of `key`; why not, otherwise: why the record
+    /// it lacks was refused, or the announce's when it lacks both, or that
+    /// none came.
     fn verdict(self, key: &RecordKey) -> Result<DhtCandidate, (AgentId, String)> {
         let agent = self.agent;
         let why = match (self.contact, self.announce) {
@@ -274,11 +306,16 @@ impl Provider {
                 }
                 Rejection::CapabilityNotAnnounced.as_str()
             }
-            (contact, _) => match self.refused {
-                Some(why) => why.as_str(),
-                None if contact.is_none() => "no valid contact",
-                None => "no valid announce",
-            },
+            (None, Some(_)) => self
+                .contact_refused
+                .map_or("no valid contact", Rejection::as_str),
+            (Some(_), None) => self
+                .announce_refused
+                .map_or("no valid announce", Rejection::as_str),
+            (None, None) => self
+                .announce_refused
+                .or(self.contact_refused)
+                .map_or("no valid contact", Rejection::as_str),
         };
         Err((agent, why.to_owned()))
     }
@@ -384,24 +421,28 @@ impl Task {
             publication.provided = waiting.iter().map(|(_, key)| key.clone()).collect();
         }
 
-        let mut announce = Record::new(announce_key(&self.own), announce);
-        announce.publisher = Some(self.local);
+        let mut contact_record = Record::new(contact_key(&self.own), contact.clone());
+        contact_record.expires = Some(self.expiry(signed_expiry::<ContactRecord>(&contact)));
+        let mut announce_record = Record::new(announce_key(&self.own), announce.clone());
+        announce_record.expires = Some(self.expiry(signed_expiry::<AnnounceRecord>(&announce)));
+        announce_record.publisher = Some(self.local);
         let mut round = Round {
             capabilities,
-            announce: announce.clone(),
-            waiting,
+            announce: announce_record.clone(),
+            waiting: waiting.into(),
+            on_their_way: 0,
             queries: HashMap::new(),
             reached: false,
             failed,
             error: None,
         };
-        match self.put_own(Record::new(contact_key(&self.own), contact)) {
+        match self.put_own(contact_record) {
             Ok(id) => {
                 round.queries.insert(id, Step::Contact);
             }
             Err(error) => round.error = Some(error),
         }
-        match self.put_own(announce) {
+        match self.put_own(announce_record) {
             Ok(id) => {
                 round.queries.insert(id, Step::Announce);
             }
@@ -413,6 +454,20 @@ impl Task {
         self.keep_round(round);
     }
 
+    /// When a copy of one of the node's own records stops living at the
+    /// routers: `record_ttl` from now, or sooner, when its signature
+    /// expires first at `signed_expires_unix`, by the node's clock. The
+    /// routers keep the smaller of this and their own `record_ttl`.
+    fn expiry(&self, signed_expires_unix: Option<i64>) -> std::time::Instant {
+        let now = std::time::Instant::now();
+        let ttl_end = now + self.timing.record_ttl;
+        let Some(expires) = signed_expires_unix else {
+            return ttl_end;
+        };
+        let left = u64::try_from(expires - self.clock.now_unix()).unwrap_or(0);
+        ttl_end.min(now + Duration::from_secs(left))
+    }
+
     /// Puts one of the node's own records at the routers closest to its
     /// key, and holds it in its own store.
     fn put_own(&mut self, record: Record) -> Result<QueryId, String> {
@@ -420,12 +475,31 @@ impl Task {
             .map_err(|error| format!("the node's own DHT store: {error}"))
     }
 
-    /// Step 3 of the module for each capability waiting.
+    /// Step 3 of the module for the capabilities waiting, as many as there
+    /// is room for among [`CAPABILITIES_AT_ONCE`], in the records' order.
     fn start_capabilities(&mut self, round: &mut Round) {
-        for (capability, key) in std::mem::take(&mut round.waiting) {
+        while round.on_their_way < CAPABILITIES_AT_ONCE {
+            let Some((capability, key)) = round.waiting.pop_front() else {
+                return;
+            };
+            round.on_their_way += 1;
             let id = self.kad().get_closest_peers(key.to_vec());
             round.queries.insert(id, Step::Closest(capability, key));
         }
+    }
+
+    /// A capability's way to the routers ended, whether it was provided or
+    /// not: the next one waiting starts.
+    fn capability_done(&mut self, round: &mut Round) {
+        round.on_their_way = round.on_their_way.saturating_sub(1);
+        self.start_capabilities(round);
+    }
+
+    /// `capability` was not provided in this round, for `why`.
+    fn capability_failed(&mut self, round: &mut Round, capability: String, why: &str) {
+        tracing::debug!(%capability, why, "a capability not provided in the DHT");
+        round.failed.push(capability);
+        self.capability_done(round);
     }
 
     /// Provides `capability` at the routers closest to its `key`.
@@ -436,12 +510,9 @@ impl Task {
                 // `libp2p-kad` fills with its listen addresses: in place,
                 // the declared ones go back.
                 let _ = self.own_provider_record(&key);
-                round.queries.insert(id, Step::Providing);
+                round.queries.insert(id, Step::Providing(capability));
             }
-            Err(error) => {
-                tracing::debug!(%capability, %error, "no room to provide a capability");
-                round.failed.push(capability);
-            }
+            Err(_) => self.capability_failed(round, capability, "no room in the store"),
         }
     }
 
@@ -484,12 +555,12 @@ impl Task {
             Step::AnnounceAt(capability, key) if reached => {
                 self.provide(&mut round, capability, key);
             }
-            Step::AnnounceAt(capability, _) => tracing::debug!(
-                %capability,
-                "the announce reached none of the routers closest to a capability: not provided \
-                 this round"
+            Step::AnnounceAt(capability, _) => self.capability_failed(
+                &mut round,
+                capability,
+                "no router closest to it answered the announce",
             ),
-            Step::Contact | Step::Closest(..) | Step::Providing => {}
+            Step::Contact | Step::Closest(..) | Step::Providing(_) => {}
         }
         self.keep_round(round);
     }
@@ -522,17 +593,27 @@ impl Task {
         self.keep_round(round);
     }
 
-    /// A provider record of a round, sent.
+    /// A provider record of a round, sent; or not, when its query ended
+    /// first.
     pub(super) fn on_round_provided(
         &mut self,
         id: QueryId,
         result: Result<AddProviderOk, AddProviderError>,
     ) {
-        let Some((round, _)) = self.round_step(id) else {
+        let Some((mut round, step)) = self.round_step(id) else {
             return;
         };
-        if let Err(error) = result {
-            tracing::debug!(%error, "providing a capability");
+        if let Step::Providing(capability) = step {
+            match result {
+                Ok(_) => self.capability_done(&mut round),
+                Err(_) => {
+                    self.capability_failed(
+                        &mut round,
+                        capability,
+                        "its provider record never went",
+                    );
+                }
+            }
         }
         self.keep_round(round);
     }
@@ -553,22 +634,25 @@ impl Task {
             ..
         } = round;
         failed.sort_by_key(|failed| capabilities.iter().position(|c| c == failed));
-        let error = error.or_else(|| (!reached).then(|| DhtError::NoRouters.to_string()));
+        // The worst first: the node's own store, then no router at all.
+        let error = error
+            .or_else(|| (!reached).then(|| DhtError::NoRouters.to_string()))
+            .or_else(|| (!failed.is_empty()).then(|| not_provided(failed.len())));
         if !reached {
             publication.next_at = Some(publication.next_at.map_or(retry, |at| at.min(retry)));
         }
-        if error != publication.status.last_error {
+        if !failed.is_empty() {
+            if failed != publication.status.failed_capabilities {
+                tracing::warn!(
+                    ?failed,
+                    "capabilities not provided in the DHT: the next round tries them again"
+                );
+            }
+        } else if error != publication.status.last_error {
             match &error {
                 Some(error) => tracing::info!(%error, "a round of DHT publication fell short"),
                 None => tracing::info!("this agent's records are in the DHT"),
             }
-        }
-        if !failed.is_empty() && failed != publication.status.failed_capabilities {
-            tracing::warn!(
-                ?failed,
-                "no room in the DHT store to provide these capabilities: the next round tries \
-                 them again"
-            );
         }
         tracing::debug!(
             capabilities = capabilities.len(),
@@ -773,5 +857,294 @@ impl Task {
             })
         };
         let _ = reply.send(answer);
+    }
+}
+
+/// A signed record that expires.
+trait Expiring: SignedDoc {
+    fn expires_at(&self) -> &str;
+}
+
+impl Expiring for ContactRecord {
+    fn expires_at(&self) -> &str {
+        &self.expires_at
+    }
+}
+
+impl Expiring for AnnounceRecord {
+    fn expires_at(&self) -> &str {
+        &self.expires_at
+    }
+}
+
+/// When the signed record `json` of kind `T` expires, as its `expires_at`
+/// says; none for one that does not read.
+fn signed_expiry<T: Expiring>(json: &[u8]) -> Option<i64> {
+    let signed = Signed::<T>::from_json(json).ok()?;
+    parse_timestamp(signed.doc.expires_at())
+}
+
+/// The last error of a round that left `count` capabilities not provided.
+fn not_provided(count: usize) -> String {
+    match count {
+        1 => "1 capability not provided".to_owned(),
+        n => format!("{n} capabilities not provided"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+    use std::time::Duration;
+
+    use libp2p::kad::store::RecordStore;
+    use libp2p::kad::{PeerInfo, QueryInfo};
+    use pals_core::clock::{Clock, SystemClock};
+    use pals_core::identity::AgentKey;
+
+    use super::*;
+    use crate::config::{DhtCfg, DhtMode};
+    use crate::dht::swarm::tests::{Fixed, endpoint, task_with};
+
+    /// A client of `key` that publishes `published` and knows no router:
+    /// its rounds' queries never leave, and the test gives their results.
+    async fn publisher(key: &AgentKey, published: Arc<dyn PublishedRecords>) -> Task {
+        let cfg = DhtCfg {
+            enabled: true,
+            mode: DhtMode::Client,
+            announce: true,
+            ..DhtCfg::default()
+        };
+        let endpoint = endpoint(key).await;
+        let key = AgentKey::from_bytes(&key.to_bytes());
+        task_with(key, endpoint, cfg, Some(published)).0
+    }
+
+    /// The query of the round running whose step `which` wants: exactly
+    /// one.
+    fn query(task: &Task, which: impl Fn(&Step) -> bool) -> QueryId {
+        let round = task
+            .publication
+            .as_ref()
+            .and_then(|p| p.round.as_ref())
+            .expect("a round runs");
+        let found: Vec<QueryId> = round
+            .queries
+            .iter()
+            .filter(|(_, step)| which(step))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(found.len(), 1, "{} such steps", found.len());
+        found[0]
+    }
+
+    /// The capabilities whose routers the round is looking for, in the
+    /// records' order.
+    fn looking_for(task: &Task, capabilities: &[String]) -> Vec<String> {
+        let round = task
+            .publication
+            .as_ref()
+            .and_then(|p| p.round.as_ref())
+            .expect("a round runs");
+        capabilities
+            .iter()
+            .filter(|capability| {
+                round
+                    .queries
+                    .values()
+                    .any(|step| matches!(step, Step::Closest(c, _) if c == *capability))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// A put a router answered.
+    fn answered() -> Result<PutRecordOk, PutRecordError> {
+        Err(PutRecordError::QuorumFailed {
+            key: RecordKey::new(b"k"),
+            success: vec![PeerId::random()],
+            quorum: NonZeroUsize::new(20).unwrap(),
+        })
+    }
+
+    /// A put no router answered.
+    fn unanswered() -> Result<PutRecordOk, PutRecordError> {
+        Err(PutRecordError::QuorumFailed {
+            key: RecordKey::new(b"k"),
+            success: Vec::new(),
+            quorum: NonZeroUsize::new(1).unwrap(),
+        })
+    }
+
+    /// The routers closest to a key: `peers`.
+    fn closest(peers: &[PeerId]) -> Result<GetClosestPeersOk, GetClosestPeersError> {
+        Ok(GetClosestPeersOk {
+            key: Vec::new(),
+            peers: peers
+                .iter()
+                .map(|peer| PeerInfo {
+                    peer_id: *peer,
+                    addrs: Vec::new(),
+                })
+                .collect(),
+        })
+    }
+
+    /// The contact's and the announce's puts, answered.
+    fn records_answered(task: &mut Task) {
+        let contact = query(task, |s| matches!(s, Step::Contact));
+        let announce = query(task, |s| matches!(s, Step::Announce));
+        task.on_round_put(contact, &answered());
+        task.on_round_put(announce, &answered());
+    }
+
+    #[tokio::test]
+    async fn capabilities_the_network_did_not_take_are_reported() {
+        let key = AgentKey::generate();
+        let capabilities = ["vision.ocr", "knowledge.documentation", "code.rust.review"];
+        let mut task = publisher(&key, Fixed::of(&key, &capabilities)).await;
+        task.start_round();
+        records_answered(&mut task);
+        let router = PeerId::random();
+        for capability in capabilities {
+            let id = query(
+                &task,
+                |s| matches!(s, Step::Closest(c, _) if c == capability),
+            );
+            task.on_round_closest(id, closest(&[router]));
+        }
+        let announce_at = |task: &Task, capability: &str| {
+            query(
+                task,
+                |s| matches!(s, Step::AnnounceAt(c, _) if c == capability),
+            )
+        };
+        let ocr = provider_key("vision.ocr").unwrap();
+
+        // vision.ocr: its routers answered the announce, and its provider
+        // record was never sent.
+        task.on_round_put(announce_at(&task, "vision.ocr"), &answered());
+        let providing = query(&task, |s| matches!(s, Step::Providing { .. }));
+        task.on_round_provided(
+            providing,
+            Err(AddProviderError::Timeout { key: ocr.clone() }),
+        );
+        // knowledge.documentation: all of it went.
+        task.on_round_put(announce_at(&task, "knowledge.documentation"), &answered());
+        let providing = query(&task, |s| matches!(s, Step::Providing { .. }));
+        task.on_round_provided(providing, Ok(AddProviderOk { key: ocr }));
+        // code.rust.review: none of its routers answered the announce.
+        task.on_round_put(announce_at(&task, "code.rust.review"), &unanswered());
+
+        let publication = task.publication.as_ref().unwrap();
+        assert!(publication.round.is_none(), "the round ended");
+        let status = publication.status();
+        assert_eq!(
+            status.failed_capabilities,
+            ["vision.ocr", "code.rust.review"]
+        );
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("2 capabilities not provided")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_round_runs_four_capabilities_at_a_time() {
+        let key = AgentKey::generate();
+        let capabilities: Vec<String> = (0..6).map(|n| format!("test.capability-{n}")).collect();
+        let listed: Vec<&str> = capabilities.iter().map(String::as_str).collect();
+        let mut task = publisher(&key, Fixed::of(&key, &listed)).await;
+        task.start_round();
+        records_answered(&mut task);
+        assert_eq!(looking_for(&task, &capabilities), capabilities[..4]);
+
+        // The first has no router to go to: it is provided here, and once
+        // its provider record is done, the fifth starts.
+        let first = query(
+            &task,
+            |s| matches!(s, Step::Closest(c, _) if *c == capabilities[0]),
+        );
+        task.on_round_closest(first, closest(&[]));
+        assert_eq!(looking_for(&task, &capabilities), capabilities[1..4]);
+        let providing = query(&task, |s| matches!(s, Step::Providing { .. }));
+        let key0 = provider_key(&capabilities[0]).unwrap();
+        task.on_round_provided(providing, Ok(AddProviderOk { key: key0 }));
+        assert_eq!(looking_for(&task, &capabilities), capabilities[1..5]);
+    }
+
+    #[tokio::test]
+    async fn own_records_last_no_longer_than_their_signature() {
+        // Records whose signature has 600 s left, against the DHT's 3600 s.
+        let key = AgentKey::generate();
+        let mut task = publisher(&key, Fixed::expiring(&key, &["vision.ocr"], 600)).await;
+        assert_eq!(task.timing.record_ttl, Duration::from_secs(3600));
+        let before = std::time::Instant::now();
+        task.start_round();
+        records_answered(&mut task);
+        let id = query(&task, |s| matches!(s, Step::Closest(..)));
+        task.on_round_closest(id, closest(&[PeerId::random()]));
+        let after = std::time::Instant::now();
+        let at = query(&task, |s| matches!(s, Step::AnnounceAt(..)));
+        let own = task.own;
+        let store = task.kad().store_mut();
+        let contact = store.get(&contact_key(&own)).unwrap().expires;
+        let announce = store.get(&announce_key(&own)).unwrap().expires;
+        let announce_at = match task.kad().query(&at).unwrap().info() {
+            QueryInfo::PutRecord { record, .. } => record.expires,
+            other => panic!("not a put: {other:?}"),
+        };
+        for expires in [contact, announce, announce_at] {
+            let expires = expires.expect("an expiry");
+            assert!(expires >= before + Duration::from_secs(598), "{expires:?}");
+            assert!(expires <= after + Duration::from_secs(601), "{expires:?}");
+        }
+
+        // Records with a whole day left go for the DHT's 3600 s.
+        let key = AgentKey::generate();
+        let mut task = publisher(&key, Fixed::of(&key, &["vision.ocr"])).await;
+        let before = std::time::Instant::now();
+        task.start_round();
+        let after = std::time::Instant::now();
+        let own = task.own;
+        let expires = task
+            .kad()
+            .store_mut()
+            .get(&contact_key(&own))
+            .unwrap()
+            .expires
+            .expect("an expiry");
+        assert!(expires >= before + Duration::from_secs(3600), "{expires:?}");
+        assert!(expires <= after + Duration::from_secs(3600), "{expires:?}");
+    }
+
+    #[test]
+    fn a_discard_names_the_record_that_is_missing() {
+        let key = AgentKey::generate();
+        let agent = key.id();
+        let (contact, announce) = Fixed::of(&key, &["vision.ocr"]).current();
+        let ocr = provider_key("vision.ocr").unwrap();
+        let now = SystemClock.now_unix();
+        let (c, a) = (Slot::Contact(agent), Slot::Announce(agent));
+        let verdict = |copies: &[(Slot, &[u8])]| {
+            let mut provider = Provider::new(agent);
+            for (slot, value) in copies {
+                provider.take(*slot, value.to_vec(), now);
+            }
+            match provider.verdict(&ocr) {
+                Ok(_) => "a candidate".to_owned(),
+                Err((_, why)) => why,
+            }
+        };
+        let forged: &[u8] = b"forged";
+        // A valid contact, a forged copy of it, and no announce: what is
+        // missing is the announce.
+        assert_eq!(verdict(&[(c, &contact), (c, forged)]), "no valid announce");
+        assert_eq!(verdict(&[(c, forged), (a, &announce)]), "bad_contact");
+        assert_eq!(verdict(&[(a, &announce)]), "no valid contact");
+        // Both missing: the announce's refusal, if it had one.
+        assert_eq!(verdict(&[(c, forged), (a, forged)]), "bad_announce");
+        assert_eq!(verdict(&[(c, forged)]), "bad_contact");
+        assert_eq!(verdict(&[(c, &contact), (a, &announce)]), "a candidate");
     }
 }
