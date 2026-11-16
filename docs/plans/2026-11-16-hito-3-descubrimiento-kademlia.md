@@ -141,6 +141,7 @@ pub struct NodeConfig {
 pub struct RawCandidate {
     pub contact: Option<Vec<u8>>,     // JSON de un Signed<ContactRecord>
     pub announce: Option<Vec<u8>>,    // JSON de un Signed<AnnounceRecord>
+    pub found_ms: Option<u64>,        // ms desde el inicio de la búsqueda hasta que el backend obtuvo sus registros
 }
 pub struct RawSearch { pub candidates: Vec<RawCandidate>, pub requests: Option<u64> }
 pub struct Candidate {
@@ -149,7 +150,7 @@ pub struct Candidate {
     pub reason: Option<&'static str>,  // None si es válido
 }
 pub fn verify(capability: &str, raw: RawCandidate, now_unix: i64) -> Candidate;
-pub fn dedupe(candidates: Vec<Candidate>) -> Vec<Candidate>;   // por agent_id, conservando el primero válido
+pub fn dedupe(candidates: Vec<Candidate>) -> Vec<Candidate>;   // por agent_id, conservando la copia válida de mayor `seq` del contacto
 pub struct BackendStats {
     pub connections: u64, pub routing_peers: u64,
     pub records_stored: u64, pub provider_records_stored: u64, pub records_rejected: u64,
