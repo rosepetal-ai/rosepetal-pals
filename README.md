@@ -255,10 +255,11 @@ Four milestones, in the order of the [design](docs/plans/initial.md) (§14). In 
 - **Status:** the 13 tasks of the plan implemented, reviewed and merged into `dev` ([PR #2](https://github.com/rosepetal-ai/rosepetal-pals/pull/2)). The exit test passed 8 of 8 cases with one Docker container per agent, on a single host, and case 9, the conformance rerun, with no regression; it did not cover several physical machines or networks. That run closes the milestone ([decision record](docs/decisions/2026-11-16-cierre-hitos-1-y-2.md)).
 - **Links:** [plan](docs/plans/2026-11-14-hito-2-consulta-de-servicios.md), [conformance report](docs/conformance/hito-2/README.md), [exit test](docs/conformance/hito-2/exit-test.md), [runbook](docs/runbooks/hito-2-consulta-de-servicios.md), [Docker harness](tests/exit/README.md#prueba-de-salida-del-hito-2-con-docker), [independent verification of the card signature](docs/conformance/hito-2/card-signatures.md).
 
-**3. Discovery with Kademlia: planned.** Find providers without prior contact, over a backend chosen after a bounded comparison.
+**3. Discovery with Kademlia: backend comparison done.** Find providers without prior contact, over a backend chosen after a bounded comparison.
 - **Deliverable:** a bounded comparison of the backend, a capability registry and contact resolution.
 - **Exit criterion:** justify the chosen implementation; find a provider without prior contact; work without the original bootstrap node, and expire announcements.
-- **Status:** no plan yet. It is written now that milestone 2 is built, and the backend comparison decides the rest.
+- **Status:** phase 1, the bounded backend comparison, is done: three backends measured against a baseline with a Docker harness, and a fourth assessed on paper. It recommends `libp2p-kad` over the daemon's own Iroh connections, pending ratification (H3-D1). The phase 2 plan, on the chosen backend, is pending.
+- **Links:** [phase 1 plan](docs/plans/2026-11-16-hito-3-descubrimiento-kademlia.md), [backend decision record](docs/decisions/2026-11-16-hito-3-backend-dht.md), [comparison harness](spikes/hito-3/README.md).
 
 **4. Private collaboration with P2panda: only if a real case appears.** Several authorized nodes keep a project's private catalog in sync without publishing it, even when they are not online at the same time.
 - **Deliverable:** a bounded trial of P2panda, if there is a need for replication.
