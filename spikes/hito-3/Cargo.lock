@@ -4672,9 +4672,17 @@ dependencies = [
 name = "spike-kad-libp2p"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "base64 0.23.1",
  "iroh",
  "libp2p",
+ "pals-core",
+ "serde",
+ "serde_json",
+ "sha2",
  "spike-common",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

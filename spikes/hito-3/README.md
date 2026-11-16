@@ -16,7 +16,7 @@ No es código del producto. El daemon no usa nada de aquí, y esta fase no toca 
 | `spike-kad-iroh` | `kad-iroh/` | `libp2p-kad` sobre un transporte de libp2p hecho con conexiones Iroh (tarea 4) |
 | `spike-mainline` | `mainline/` | Iroh más una DHT Mainline privada, con el contacto resuelto por pkarr (tarea 5) |
 
-`spike-common` y `spike-baseline` están escritos (tarea 2). Los otros tres binarios todavía solo nombran un elemento de cada dependencia para enlazarlas; las tareas 3 a 5 escriben sus nodos sobre el contrato de [más abajo](#el-contrato-de-nodo).
+`spike-common` y `spike-baseline` están escritos (tarea 2), y `spike-kad-libp2p` también (tarea 3). Los otros dos binarios todavía solo nombran un elemento de cada dependencia para enlazarlas; las tareas 4 y 5 escriben sus nodos sobre el contrato de [más abajo](#el-contrato-de-nodo).
 
 ## Dependencias
 
@@ -25,12 +25,12 @@ Todas van fijadas con `=` en [`Cargo.toml`](Cargo.toml):
 | Crate | Versión | Quién la usa |
 |-|-|-|
 | `iroh` | `=1.4.1`, la del daemon | Todos los binarios |
-| `libp2p` | `=0.57.1`, que trae `libp2p-kad 0.49.0` | `kad-libp2p`, con `kad`, `quic`, `tokio`, `macros` e `identify`; `kad-iroh`, sin transportes propios: `kad`, `tokio` y `macros` |
+| `libp2p` | `=0.57.1`, que trae `libp2p-kad 0.49.0` | `kad-libp2p`, con `kad`, `quic`, `tokio`, `macros`, `identify` y `ed25519`; `kad-iroh`, sin transportes propios: `kad`, `tokio` y `macros` |
 | `mainline` | `=8.0.1` | `mainline` |
 | `pkarr` | `=9.0.0`, con sus features por defecto (`full-client`: `dht` y `relays`) | `mainline` |
 | `iroh-mainline-address-lookup` | `=0.6.1` | `mainline` |
 
-El contrato de nodo usa además, con las versiones que ya fija el `Cargo.lock` de la raíz: `axum =0.8.9` y `tokio =1.54.1` (la API de control, como la pasarela del daemon), `clap =4.6.7` (la línea de órdenes), `serde =1.0.229`, `serde_json =1.0.154`, `anyhow =1.0.104`, `base64 =0.23.1` (la firma que altera `--rogue`), `tracing =0.1.44` y `tracing-subscriber =0.3.23` (el registro de cada nodo).
+El contrato de nodo usa además, con las versiones que ya fija el `Cargo.lock` de la raíz: `axum =0.8.9` y `tokio =1.54.1` (la API de control, como la pasarela del daemon), `clap =4.6.7` (la línea de órdenes), `serde =1.0.229`, `serde_json =1.0.154`, `anyhow =1.0.104`, `base64 =0.23.1` (la firma que altera `--rogue`), `tracing =0.1.44` y `tracing-subscriber =0.3.23` (el registro de cada nodo). `kad-libp2p` usa también `sha2 =0.11.0`, para la clave de los provider records y la clave libp2p que deriva de la semilla del agente.
 
 El `Cargo.lock` de aquí partió de una copia del de la raíz. Así, los crates que el daemon ya usa conservan sus versiones, y solo se resolvieron los nuevos.
 
@@ -162,6 +162,10 @@ python3 spikes/hito-3/harness/summarize.py --compat docs/decisions/hito-3-backen
 
 Resultado esperado: S0 `pass`, S1 `by-design` sin candidatos, S2 a S5 y S7 `not-applicable` con su motivo, y S6 `measured`.
 
+### `kad-libp2p`
+
+Iroh, como en la línea base, más `libp2p-kad` sobre QUIC de libp2p en el puerto siguiente, con un vínculo de identidades `agentnet.spike-kadlink/0` que lleva el contacto. Su `bootstrap_addr` son las multiaddrs de libp2p del router, terminadas en `/p2p/<PeerId>` y separadas por comas. Cómo está hecho, qué valida cada router y sus resultados están en [`docs/decisions/hito-3-backend/kad-libp2p.md`](../../docs/decisions/hito-3-backend/kad-libp2p.md).
+
 ## Comprobaciones
 
 Dentro de `spikes/hito-3/`:
@@ -170,7 +174,7 @@ Dentro de `spikes/hito-3/`:
 cargo build --release --locked
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked -p spike-common -p spike-baseline
+cargo test --locked -p spike-common -p spike-baseline -p spike-kad-libp2p
 (cd harness && python3 -m unittest -v)    # evaluate.py, con observaciones sintéticas
 ```
 
