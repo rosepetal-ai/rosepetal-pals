@@ -8,7 +8,17 @@ No es código del producto. El registro `agentnet.spike-kadlink/0` es provisiona
 
 El spec (§6.1) deja como candidato inicial un módulo de `rust-libp2p` para Kademlia dentro del daemon, junto a Iroh, «pendiente de una prueba acotada de integración y coste». La duda es si las dos pilas conviven en un mismo nodo, con dos identidades vinculadas como pide el §6.2, y qué cuesta: dependencias, memoria, conexiones, tráfico en reposo y tiempos de búsqueda, frente a la línea base, que solo tiene Iroh.
 
-La respuesta, con las cifras de la ejecución del arnés, está en [Resultados](#resultados).
+**Sí: las dos pilas conviven y la DHT cumple los escenarios comunes, pero hubo que ajustar la integración y cuesta.**
+
+- **Integración.** Iroh 1.4.1 y libp2p 0.57.1 compilan juntos, también con la MSRV 1.91, cada pila en su puerto UDP. El vínculo firmado por las dos claves deja resolver el endpoint Iroh de un proveedor sin conectar antes con él por libp2p (§6.2). En la ejecución del arnés, S0 a S5 y S7 quedan en `pass` y S6 en `measured`, sin ningún `error`.
+- **Ajustes.** Hubo que sortear cinco comportamientos de `libp2p-kad` y de libp2p para que funcionara en una red privada con dos subredes ([API de `libp2p` usadas](#api-de-libp2p-usadas)). Sin dos de ellos, la red se degradaba después del primer router parado.
+- **Coste, frente a la línea base:**
+  - dependencias: 370 crates frente a 300, por el recuento de `compat.sh` sobre `cargo tree`; la tarea 6 lo vuelve a medir, con el tiempo de compilación y el tamaño del binario;
+  - memoria en reposo: unos 22 a 23 MiB por nodo frente a 14 a 15 MiB;
+  - tráfico en reposo, con la republicación de la prueba cada 40 s: un router mueve unos 250 KB por minuto (127 KB enviados), un proveedor 181 KB y un cliente 19 KB, frente a menos de 0,5 KB;
+  - por búsqueda: 22 peticiones y unos 31,6 KB, porque cada `get_record` pide el valor a los cuatro routers.
+
+El detalle está en [Resultados](#resultados).
 
 ## Cómo está hecho
 
@@ -157,13 +167,36 @@ Las líneas de `src/`, sin pruebas, con `wc -l` (todas) y sin las vacías ni los
 Las pruebas (`tests/link.rs`) son de dos clases:
 
 - del vínculo y de los validadores, sin red;
-- dos de integración con nodos reales sobre loopback: dos routers, un proveedor honrado, uno con el contacto alterado y un cliente, y un nodo sin lista de arranque.
+- dos de integración con nodos reales sobre loopback. Una monta dos routers, un proveedor honrado, uno con el contacto alterado y un cliente, y comprueba lo que guardan los routers, lo que encuentra el cliente y que no ha marcado a los proveedores. La otra comprueba que un nodo sin lista de arranque no encuentra a nadie.
 
 `cargo +1.91 check --locked -p spike-kad-libp2p --all-targets` pasa: el candidato compila con la MSRV.
 
 ## Resultados
 
-Las cifras de la ejecución del arnés están en [`results/kad-libp2p.json`](results/kad-libp2p.json).
+Ejecución del arnés del 2026-11-16, sobre el commit `331d85c`, con los parámetros comunes de `params.env`: `TTL_S` = 120 s, `REPUBLISH_S` = 40 s, `IDLE_S` = 300 s, 10 búsquedas por cliente y capacidad y `SEARCH_LIMIT` = 8. Duró 12 minutos, con el anfitrión de 32 CPU a una carga media de 16 a 22. Las cifras completas están en [`results/kad-libp2p.json`](results/kad-libp2p.json).
+
+| Escenario | Estado | Cifras |
+|-|-|-|
+| S0 | `pass` | 4 búsquedas, ningún candidato. `c0` acaba con 0 pares en la tabla de rutas y 0 conexiones |
+| S1 | `pass` | 160 búsquedas, todas con los dos proveedores verificados. Primer candidato válido a los 2 ms (p50) y 3 ms (p95), y búsqueda entera en 7 ms (p50 y p95). 22 peticiones por búsqueda. 31 617 bytes netos por búsqueda (p50), 32 130 (p95) |
+| S2 | `pass` | Con `r1` parado, todas las búsquedas de los clientes están completas, con el primer candidato a los 2 ms (p50), aunque cada una dura unos 5 s esperando a `r1`. `c5` tiene su primer candidato válido 15,2 s después de arrancar su contenedor, y encuentra a todos los proveedores |
+| S3 | `pass` | Los routers dejan de guardar lo de `p1` a los 114,2 s de pararlo, y ninguna búsqueda lo devuelve desde los 110,8 s. El límite es 160 s |
+| S4 | `pass` | Cobertura inmediata 1,0, porque `r1` y `r3` lo guardan todo. Cada búsqueda dura unos 5 s por los dos routers caídos, con el primer candidato a los 2 a 5 ms |
+| S5 | `pass` | Los cuatro routers rechazan el vínculo de `rogue` (4 rechazos), ninguno guarda su contacto y `records_stored` no crece sin explicación. Los clientes lo reciben las 4 veces como `bad_contact`, nunca como válido |
+| S6 | `measured` | Ver la tabla siguiente |
+| S7 | `pass` | Los cuatro clientes reciben el contacto nuevo de `p3`, con su IP en la red A, a los 0,7 s (p50) y 0,9 s (máximo) de la desconexión. El límite es 80 s |
+
+En S2, los 15,2 s de `c5` suman el arranque del contenedor, su primer bootstrap, que espera 5 s la conexión imposible a `r1`, y su primera búsqueda, que espera lo mismo.
+
+En reposo (S6), por papel, con la cifra de la línea base entre paréntesis. Todas son p50, salvo las conexiones, que van como p50 / máximo:
+
+| Papel | RSS (KiB) | Conexiones | Tabla de rutas | Bytes por minuto | Enviados por minuto |
+|-|-|-|-|-|-|
+| Router | 23 200 (14 396) | 0 / 5 (0 / 0) | 3 (1) | 250 894 (444) | 126 775 (0) |
+| Proveedor | 22 372 (14 612) | 0 / 0 (0 / 0) | 4 (1) | 181 426 (222) | 88 697 (0) |
+| Cliente | 22 828 (14 824) | 0 / 4 (0 / 0) | 4 (2) | 18 661 (222) | 9 068 (0) |
+
+Las conexiones están casi siempre cerradas: `libp2p-swarm` cierra una conexión a los 10 s sin uso. Por eso cada republicación, cada 40 s, abre conexiones QUIC nuevas con su apretón de manos TLS, y eso, con las consultas iterativas de cada `put` y de cada `start_providing`, es casi todo el tráfico de proveedores y routers. Los clientes solo hacen el arranque periódico de Kademlia, cada 5 minutos. Con los intervalos de producción, de horas, el tráfico en reposo bajaría en proporción. Pero aquí se mide con los de la prueba, los mismos para todos los candidatos.
 
 ## Lo que no se pudo medir
 
@@ -177,7 +210,7 @@ Las cifras de la ejecución del arnés están en [`results/kad-libp2p.json`](res
 
 ## Metadatos que ve un router
 
-- **Quién busca.** Cada búsqueda llega por una conexión QUIC autenticada, así que el router ve el `PeerId` de quien busca y su IP y puerto. `identify` le da además sus direcciones de escucha, su clave pública, sus protocolos y la versión de `rust-libp2p` (`agent_version` por defecto). El `PeerId` es estable entre búsquedas y reinicios, así que un router puede juntar las búsquedas de un mismo nodo. Quien solo busca no publica vínculo, y su `PeerId` no lleva a su agente por la DHT. Pero la IP sí lo identifica en una red pequeña.
+- **Quién busca.** Cada búsqueda llega por una conexión QUIC autenticada, así que el router ve el `PeerId` de quien busca y su IP y puerto. `identify` le da además sus direcciones externas (en la prueba, todas sus direcciones locales menos el bucle), su clave pública, sus protocolos y la versión de `rust-libp2p` (`agent_version` por defecto). El `PeerId` es estable entre búsquedas y reinicios, así que un router puede juntar las búsquedas de un mismo nodo. Quien solo busca no publica vínculo, y su `PeerId` no lleva a su agente por la DHT. Pero la IP sí lo identifica en una red pequeña.
 - **Qué busca.** La clave de `GET_PROVIDERS` es el SHA-256 de la cadena de la capacidad. Con un vocabulario común y público, el router la recupera con un diccionario. Después ve los `GET_VALUE` de `/agentnet/link/<P>` y `/agentnet/announce/<P>`: qué proveedores mira quien busca. Las consultas iterativas (`FIND_NODE`) muestran además las claves a los routers por los que pasan.
 - **Quién ofrece.** Cada 40 s, cada proveedor le envía su vínculo, con su agente y las IP de su contacto, su anuncio, con sus capacidades, y un provider record por capacidad, con sus direcciones de libp2p. El router sabe quién ofrece qué, dónde está y si sigue vivo.
 
