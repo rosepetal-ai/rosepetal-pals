@@ -1,0 +1,74 @@
+[workspace]
+resolver = "3"
+members = ["crates/pals-core", "crates/pals"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+repository = "https://github.com/rosepetal-ai/rosepetal-pals"
+
+[workspace.dependencies]
+# Pinned with `=`: bumping any of these is an explicit change that repeats the
+# A2A conformance run (TCK).
+iroh = "=1.4.1"
+# The file store only: blobs travel between peers on its own ALPN, not over
+# irpc.
+iroh-blobs = { version = "=0.105.0", default-features = false, features = ["fs-store"] }
+iroh-tickets = "=1.0.0"
+a2a = { package = "a2a-lf", version = "=0.4.2" }
+a2a-server = { package = "a2a-server-lf", version = "=0.5.3", default-features = false }
+a2a-client = { package = "a2a-client-lf", version = "=0.2.9", default-features = false }
+rmcp = "=3.10.0"
+
+pals-core = { path = "crates/pals-core" }
+
+anyhow = "=1.0.104"
+# `TaskStore` is an `async_trait`: unpinned, to be the SDK's.
+async-trait = "0.1"
+axum = "0.8"
+base64 = "=0.23.1"
+blake3 = "=1.8.7"
+# `Bytes`: unpinned, to be axum's and iroh-blobs'.
+bytes = "1"
+# A2A timestamps are `chrono` types: unpinned, to be the SDK's.
+chrono = "0.4"
+clap = { version = "=4.6.7", features = ["derive"] }
+ed25519-dalek = "=3.0.0"
+futures = "0.3"
+getrandom = "=0.4.3"
+http = "1"
+http-body-util = "0.1"
+hyper = "1"
+hyper-util = "0.1"
+# Signals a worker's process group: unpinned, to be tokio's.
+libc = "0.2"
+# Decodes path parameters as axum does: unpinned, to be axum's.
+percent-encoding = "2"
+rusqlite = { version = "=0.42.0", features = ["bundled"] }
+# The HTTP client the A2A client is built on, to give it a client that never
+# goes through a proxy: unpinned, to be `a2a-client-lf`'s.
+reqwest = { version = "0.13", default-features = false, features = ["stream"] }
+# The crypto provider reqwest needs: iroh builds reqwest with
+# `rustls-no-provider` and rustls with `ring`. Pinned to the version iroh
+# resolves.
+rustls = { version = "=0.23.46", default-features = false, features = ["ring"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "1"
+serde_json_canonicalizer = "=0.4.1"
+thiserror = "2"
+time = { version = "=0.3.55", features = ["formatting", "macros", "parsing"] }
+tokio = "1"
+# `CancellationToken`: unpinned, to be iroh's.
+tokio-util = "0.7"
+toml = "=1.2.1"
+tower = "0.5"
+tracing = "0.1"
+# The daemon's log on stderr, filtered by RUST_LOG. Pinned to the version
+# Cargo.lock already had.
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+
+# Test-only.
+assert_cmd = "=2.2.2"
+tempfile = "=3.27.0"

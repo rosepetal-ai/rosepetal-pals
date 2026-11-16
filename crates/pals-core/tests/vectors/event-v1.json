@@ -1,0 +1,21 @@
+{
+  "description": "agentnet.event/1 test vector. The author's Ed25519 secret key is 32 bytes of 0x01 (signing_key_hex); the event is the author's first (seq 0, prev_hash 64 zeros), appended at now_unix. payload_canonical_hex is JCS (RFC 8785) of payload, and header.payload_hash is the BLAKE3 hash of those bytes in lowercase hex. header_canonical_hex is JCS of header; signature is Ed25519 over \"agentnet.event/1\\n\" followed by those bytes, base64url without padding; header_hash is the BLAKE3 hash of those bytes in lowercase hex, which is the prev_hash of the author's next event.",
+  "header": {
+    "author": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "created_at": "2026-11-14T00:00:00Z",
+    "kind": "grant.issued",
+    "payload_hash": "038c8233c192a02f40a28c3e0e0a8d1505641cead68e922bb11b9a19461e1976",
+    "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+    "seq": 0
+  },
+  "header_canonical_hex": "7b22617574686f72223a2238613838653364643734303966313935666435326462326433636261356437326361363730396266316439343132316266333734383830316234306636663563222c22637265617465645f6174223a22323032362d31312d31345430303a30303a30305a222c226b696e64223a226772616e742e697373756564222c227061796c6f61645f68617368223a2230333863383233336331393261303266343061323863336530653061386431353035363431636561643638653932326262313162396131393436316531393736222c22707265765f68617368223a2230303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030222c22736571223a307d",
+  "header_hash": "faa325bbbcf1894f667c0bc17458cbf48cb979f1da5219f02aa5858717bdbd63",
+  "kind": "grant.issued",
+  "now_unix": 1794614400,
+  "payload": {
+    "grant_id": "g-vector-1"
+  },
+  "payload_canonical_hex": "7b226772616e745f6964223a22672d766563746f722d31227d",
+  "signature": "NQuqfaJVfYyFfsYfd47WN4Or6bVtREDd6UJydxkmDdqHMkTCQjzzFGaLQg3JBErFnjanOYgQFUAxynp7QYQ4AA",
+  "signing_key_hex": "0101010101010101010101010101010101010101010101010101010101010101"
+}

@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+
+# The jobs only read the repository.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The toolchain the branch is developed and tested with, pinned so that
+      # a new stable release cannot change the lints or the build under it.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+
+  msrv:
+    # The oldest Rust the README promises (rust-version in Cargo.toml).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91"
+      - uses: Swatinem/rust-cache@v2
+      - name: Check on the MSRV
+        run: cargo +1.91 check --workspace --all-targets --locked
