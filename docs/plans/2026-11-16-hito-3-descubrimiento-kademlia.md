@@ -185,7 +185,7 @@ pub async fn run_node<B: Backend>() -> anyhow::Result<()>;   // el `main` de cad
   - `GET /stats`, con los campos de `BackendStats` más `rss_kib`, leído de `/proc/self/status`;
   - `GET /healthz`.
 - **`rogue`:** con `--role provider --rogue`, `run_node` emite un contacto con la firma alterada en un byte, para S5.
-- **Resultados:** `results/<id>.json` = `{"backend", "commit", "date", "params": {…params.env…}, "compat": {…su entrada de compat.json…}, "scenarios": {"S0".."S7": {"status": "pass|fail|by-design|not-applicable|error|measured", "metrics": {…}, "notes": "…"}}}`.
+- **Resultados:** `results/<id>.json` = `{"backend", "commit", "date", "params": {…params.env…}, "scenarios": {"S0".."S7": {"status": "pass|fail|by-design|not-applicable|error|measured", "metrics": {…}, "notes": "…"}}}`.
 
 - [ ] **Step 1: Write the failing test** `contract.rs`:
   - `verify_accepts_a_matching_pair`: un contacto y un anuncio de la misma clave, en plazo y con la capacidad dan `valid` sin motivo;
@@ -200,7 +200,7 @@ pub async fn run_node<B: Backend>() -> anyhow::Result<()>;   // el `main` de cad
 - [ ] **Step 6:** Escribir el arnés, siguiendo las protecciones de `tests/exit/hito-2.sh`: prefijo y etiqueta, negarse a seguir si hay recursos `pals-spike-*` de otra ejecución, y desmontar con `trap` en `EXIT` e `INT`.
   - `harness.sh <id>` construye la imagen `pals-spike:latest` (Debian trixie-slim fijado por digest, como `tests/exit/Dockerfile`, con `curl` y `iproute2`). Copia el binario `--release` del candidato y crea las dos redes con `--internal`, comprobando `docker network inspect -f '{{.Internal}}'`. Arranca los nodos de la topología y ejecuta S0 a S7 en orden, con `docker exec <c> curl -s 127.0.0.1:7600/...`. Lee los bytes de la interfaz en `/sys/class/net/*/statistics`, dentro de cada contenedor. Escribe `docs/decisions/hito-3-backend/results/<id>.json` y los registros de cada nodo en `spikes/hito-3/harness/logs/<id>/`, que van en `.gitignore`.
   - `check_results.py <json>…` valida el esquema, rechaza parámetros distintos entre ficheros y sale con 1 si algún escenario está en `error`.
-  - `summarize.py <json>…` imprime la tabla Markdown que irá en el registro de decisión: una fila por métrica, una columna por candidato, y en cada celda la cifra con su `status`.
+  - `summarize.py --compat <compat.json> <json>…` imprime la tabla Markdown que irá en el registro de decisión: una fila por métrica, una columna por candidato, y en cada celda la cifra con su `status`. Las filas de compatibilidad (MSRV, crates, duplicados, compilación, tamaño) salen de `compat.json`, que los resultados no copian, porque se vuelve a medir en la tarea 6.
 - [ ] **Step 7:** Ejecutar `bash spikes/hito-3/harness/harness.sh baseline`. Esperado:
   - S0 `pass`;
   - S1 `by-design`, sin candidatos;
@@ -333,7 +333,7 @@ pub async fn run_node<B: Backend>() -> anyhow::Result<()>;   // el `main` de cad
   - si hace falta vínculo de identidades (tarea 3 de la hoja de ruta);
   - el modo por defecto, router o cliente (H3-D3).
 
-- [ ] **Step 1:** Ejecutar `python3 spikes/hito-3/harness/check_results.py docs/decisions/hito-3-backend/results/*.json`. Esperado: salida 0, con los cuatro ficheros y los mismos parámetros.
+- [ ] **Step 1:** Volver a medir la compatibilidad con los binarios reales: commit de todo lo anterior, `bash spikes/hito-3/compat.sh --repeat 3` sobre ese árbol limpio (sin `provisional`, con `commit` igual a ese hash) y commit de `compat.json` solo. Después, `python3 spikes/hito-3/harness/check_results.py docs/decisions/hito-3-backend/results/*.json`. Esperado: `compat.json` sin `provisional` y con tamaños de binario reales, y `check_results.py` con salida 0, con los cuatro ficheros y los mismos parámetros.
 - [ ] **Step 2:** Escribir el registro con los apartados que pide la hoja de ruta:
   - candidatos y versiones;
   - las pruebas y la duda de cada una;
