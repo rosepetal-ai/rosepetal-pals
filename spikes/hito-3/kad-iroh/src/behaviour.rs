@@ -70,6 +70,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroU8;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::{Duration, Instant};
@@ -133,6 +134,10 @@ const RETRY_AFTER: Duration = Duration::from_secs(1);
 const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the task sweeps expired records and refreshes its stats.
 const SWEEP_EVERY: Duration = Duration::from_secs(1);
+/// The variable that sets the swarm's dial concurrency factor, for the
+/// repeated measurements of task 7 of phase 2 of the hito 3 plan: the idle
+/// traffic of kad-iroh dialing each peer once (H3-D1, condition 1).
+const DIAL_CONCURRENCY_VAR: &str = "SPIKE_DIAL_CONCURRENCY";
 
 /// Kademlia and `identify`, and the peers a search does not dial.
 #[derive(NetworkBehaviour)]
@@ -389,13 +394,22 @@ pub async fn spawn(settings: Settings, key: &AgentKey) -> anyhow::Result<Handle>
         undialed: NoDial::default(),
     };
     // `SwarmBuilder` wants the secret key; the swarm itself needs only the
-    // `PeerId`, and its default configuration is the builder's.
-    let mut swarm = Swarm::new(
-        Transport::boxed(transport),
-        behaviour,
-        local,
-        swarm::Config::with_tokio_executor(),
-    );
+    // `PeerId`, and its default configuration is the builder's. Without
+    // SPIKE_DIAL_CONCURRENCY it stays so, as in phase 1: libp2p's default
+    // dial concurrency factor, 8, which dials both addresses of a router at
+    // once. With it, at most that many at once: 1 dials them one after
+    // another, so a router gets one dial of each peer at a time.
+    let raw_dial_concurrency = match std::env::var(DIAL_CONCURRENCY_VAR) {
+        Ok(text) => Some(text),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => bail!("{DIAL_CONCURRENCY_VAR}: {error}"),
+    };
+    let dial_concurrency = dial_concurrency(raw_dial_concurrency.as_deref())?;
+    let mut swarm_config = swarm::Config::with_tokio_executor();
+    if let Some(factor) = dial_concurrency {
+        swarm_config = swarm_config.with_dial_concurrency_factor(factor);
+    }
+    let mut swarm = Swarm::new(Transport::boxed(transport), behaviour, local, swarm_config);
     let mode = match settings.role {
         Role::Router => Mode::Server,
         Role::Provider | Role::Client => Mode::Client,
@@ -414,7 +428,7 @@ pub async fn spawn(settings: Settings, key: &AgentKey) -> anyhow::Result<Handle>
     } else {
         swarm.behaviour_mut().kad.bootstrap().ok()
     };
-    tracing::info!(peer_id = %local, ?mode, listen = %settings.listen, bootstrap = bootstrap.len(), "libp2p over Iroh started");
+    tracing::info!(peer_id = %local, ?mode, listen = %settings.listen, bootstrap = bootstrap.len(), ?dial_concurrency, "libp2p over Iroh started");
 
     let stats = Arc::new(Mutex::new(BackendStats::default()));
     let (commands, queue) = mpsc::channel(4);
@@ -1426,4 +1440,29 @@ fn key_text(key: &RecordKey) -> String {
 
 fn millis(since: Instant) -> u64 {
     u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The dial concurrency factor that `SPIKE_DIAL_CONCURRENCY`'s value asks
+/// for, 1 to 255; `None` when the variable is not set, which keeps
+/// libp2p's default.
+fn dial_concurrency(value: Option<&str>) -> anyhow::Result<Option<NonZeroU8>> {
+    value
+        .map(|text| {
+            text.parse::<NonZeroU8>()
+                .with_context(|| format!("{DIAL_CONCURRENCY_VAR} must be 1 to 255, not {text:?}"))
+        })
+        .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_dial_concurrency_is_libp2ps_unless_set() {
+        assert_eq!(dial_concurrency(None).unwrap(), None);
+        assert_eq!(dial_concurrency(Some("1")).unwrap(), NonZeroU8::new(1));
+        assert!(dial_concurrency(Some("0")).is_err());
+        assert!(dial_concurrency(Some("eight")).is_err());
+    }
 }

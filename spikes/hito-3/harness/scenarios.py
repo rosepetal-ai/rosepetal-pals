@@ -150,8 +150,10 @@ def overlaps(subnets, taken):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--raw", required=True, help="the run's directory of observations")
-    parser.add_argument("--params", required=True, help="params.env")
+    parser.add_argument("--params", required=True, action="append",
+                        help="params.env; once more for each file of harness.sh --params, read after it")
     parser.add_argument("--prefix", default="pals-spike", help="the containers' name prefix")
+    parser.add_argument("--node-env", default="", help="the run's NODE_ENV, noted in the results")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("search", help="searches from each node for each capability, in that order")
     p.add_argument("file"), p.add_argument("tag")
@@ -180,7 +182,7 @@ def main():
     p.add_argument("--backend", required=True), p.add_argument("--commit", required=True)
     p.add_argument("--date", required=True), p.add_argument("--out", required=True)
     args = parser.parse_args()
-    ctx = Ctx(args.raw, read_params(args.params))
+    ctx = Ctx(args.raw, read_params(*args.params), args.node_env)
     ctx.prefix = args.prefix
 
     if args.command == "search":

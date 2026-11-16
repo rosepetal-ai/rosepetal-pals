@@ -10,7 +10,10 @@ error, an answer with no candidates; anything else (no answer, 400, 422,
 503) is the harness's failure and puts the scenario in `error`. The
 scenarios a backend declares on /healthz take the status it declares:
 `not-applicable` ones are not run, and a `by-design` S1 runs and must find
-no valid candidate. Percentiles are nearest-rank.
+no valid candidate. A scenario that `harness.sh --only` left out is
+`not-applicable` too, by the `not-run` event the harness writes for it;
+one with no observations at all is still `error`. Percentiles are
+nearest-rank.
 """
 
 import json
@@ -22,19 +25,24 @@ ROLES = ("router", "provider", "client")
 ATTRIBUTED = ("contact_records", "announce_records", "other_records")
 
 
-def read_params(path):
-    """params.env as a dict: integers where the value is all digits."""
+def read_params(path, *overrides):
+    """params.env as a dict: integers where the value is all digits. Each
+    file of `overrides` (harness.sh --params) is read after it, in the same
+    form, and may only change parameters that params.env has."""
     params = {}
-    for number, raw in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        key, sep, value = line.partition("=")
-        if not sep or not key.isidentifier() or "$" in value or "`" in value:
-            raise SystemExit(f"{path}:{number}: not a plain NAME=value line")
-        if len(value) >= 2 and value[0] == value[-1] == '"':
-            value = value[1:-1]
-        params[key] = int(value) if value.isdigit() else value
+    for index, source in enumerate((path, *overrides)):
+        for number, raw in enumerate(Path(source).read_text(encoding="utf-8").splitlines(), 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, sep, value = line.partition("=")
+            if not sep or not key.isidentifier() or "$" in value or "`" in value:
+                raise SystemExit(f"{source}:{number}: not a plain NAME=value line")
+            if index and key not in params:
+                raise SystemExit(f"{source}:{number}: {key} is not a parameter of {Path(path).name}")
+            if len(value) >= 2 and value[0] == value[-1] == '"':
+                value = value[1:-1]
+            params[key] = int(value) if value.isdigit() else value
     return params
 
 
@@ -52,11 +60,13 @@ def rnd(value, digits=1):
 
 
 class Ctx:
-    """A run's observations and parameters."""
+    """A run's observations and parameters, and the environment its nodes
+    ran with (harness.sh's NODE_ENV, "" when none)."""
 
-    def __init__(self, raw, params):
+    def __init__(self, raw, params, node_env=""):
         self.raw = Path(raw)
         self.p = params
+        self.node_env = node_env
 
     def words(self, key):
         return str(self.p.get(key, "")).split()
@@ -573,6 +583,11 @@ def evaluate(ctx, scenario):
     if declared and declared["status"] == "not-applicable":
         return {"status": "not-applicable", "metrics": {}, "notes": declared["notes"]}
     lines = ctx.lines(scenario)
+    # Left out of a run by harness.sh --only, which says so in an event.
+    left_out = event(lines, "not-run")
+    if left_out is not None:
+        return {"status": "not-applicable", "metrics": {},
+                "notes": f"No ejecutado en esta ejecución: el arnés solo ejecutó {left_out.get('only')} (--only)."}
     if not lines:
         return {"status": "error", "metrics": {}, "notes": "El arnés no ejecutó el escenario."}
     if scenario == "S1" and declared and declared["status"] == "by-design":
@@ -589,6 +604,8 @@ def evaluate(ctx, scenario):
     if errors:
         result["status"] = "error"
         result["notes"] = "Error del arnés: " + "; ".join(errors) + ". " + result["notes"]
+    if ctx.node_env:
+        result["notes"] = f"Los nodos corrieron con {ctx.node_env} (NODE_ENV del arnés). " + result["notes"]
     return result
 
 

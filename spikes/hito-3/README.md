@@ -155,8 +155,25 @@ python3 spikes/hito-3/harness/check_results.py docs/decisions/hito-3-backend/res
 python3 spikes/hito-3/harness/summarize.py --compat docs/decisions/hito-3-backend/compat.json docs/decisions/hito-3-backend/results/*.json
 ```
 
-- `check_results.py` valida el esquema, rechaza ficheros con `params` distintos entre sí o con el mismo `backend`, y rutas del anfitrión. Sale con 1 si algún escenario está en `error`.
+- `check_results.py` valida el esquema, rechaza ficheros con `params` distintos entre sí o con el mismo `backend`, y rutas del anfitrión. Sale con 1 si algún escenario está en `error`. Con `--repeated` admite el mismo `backend` en varios ficheros: las ejecuciones repetidas de abajo.
 - `summarize.py` imprime la tabla Markdown del registro de decisión: una columna por candidato y una fila por métrica, con el `status` del escenario en cada celda. Las filas de compatibilidad salen de `compat.json`, que los resultados no copian. Mientras `compat.json` es provisional, las celdas de tamaño dicen `provisional`.
+
+### Ejecuciones repetidas
+
+La [tarea 7 de la fase 2 del plan](../../docs/plans/2026-11-16-hito-3-descubrimiento-kademlia.md) repite las medidas de la fase 1, que son las condiciones de la ratificación de H3-D1 ([registro del backend](../../docs/decisions/2026-11-16-hito-3-backend-dht.md#decisión)). Para eso, el arnés tiene tres opciones y una variable. Sin ninguna de ellas, una ejecución es la de la fase 1.
+
+```bash
+bash spikes/hito-3/harness/harness.sh --tag 2 kad-iroh    # results/runs/kad-iroh-2.json y logs/kad-iroh-2/
+NODE_ENV=SPIKE_DIAL_CONCURRENCY=1 bash spikes/hito-3/harness/harness.sh --tag production-dial-once \
+    --params spikes/hito-3/harness/params-production.env --only S6 kad-iroh
+python3 spikes/hito-3/harness/repeat.py --runs <json>… --production <kad-iroh.json> <kad-libp2p.json>
+```
+
+- `--tag <t>`: la ejecución es `<id>-<t>`. Su JSON va a `docs/decisions/hito-3-backend/results/runs/<id>-<t>.json` y sus registros, a `harness/logs/<id>-<t>/`. `--teardown` también la acepta.
+- `--params <fichero>`: se lee después de `params.env`, con su misma forma, y solo puede cambiar lo que `params.env` tiene. Lo que cambia va al `params` del JSON. [`harness/params-production.env`](harness/params-production.env) lleva los intervalos de producción del plan: `TTL_S` = 3600, `REPUBLISH_S` = 1200 e `IDLE_S` = 2400, dos vueltas de republicación.
+- `--only <S…>`: solo esos escenarios (`S6`, o `S3,S6`). Los demás quedan `not-applicable`, con la nota «No ejecutado en esta ejecución».
+- `NODE_ENV`: palabras `SPIKE_*=valor`, que van al entorno de cada contenedor (`docker create -e`) y a las notas de cada escenario ejecutado. Ninguna otra variable llega a los contenedores. `kad-iroh` lee `SPIKE_DIAL_CONCURRENCY`, cuántas direcciones de un par marca libp2p a la vez. Sin ella, las 8 de libp2p, como en la fase 1, así que marca a la vez las dos de un router.
+- [`harness/repeat.py`](harness/repeat.py) imprime las tablas de [`repeticion.md`](../../docs/decisions/hito-3-backend/repeticion.md) y el veredicto, condición por condición. Sale con 0 si no se da ninguna condición de cambio, con 3 si se da alguna y con 1 si algún JSON no vale o tiene un escenario en `error`. Esa ejecución se repite con la misma etiqueta.
 
 ### Línea base
 
@@ -185,7 +202,7 @@ cargo build --release --locked
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked -p spike-common -p spike-baseline -p spike-kad-libp2p -p spike-kad-iroh -p spike-mainline
-(cd harness && python3 -m unittest -v)    # evaluate.py, con observaciones sintéticas
+(cd harness && python3 -m unittest -v)    # evaluate.py y repeat.py, con observaciones y resultados sintéticos
 ```
 
 Las comprobaciones de la raíz (`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` y `cargo test --workspace --locked`) no ven este directorio.

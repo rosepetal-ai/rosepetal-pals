@@ -10,6 +10,20 @@
 #   spikes/hito-3/harness/harness.sh --teardown <id>   # what an interrupted
 #                                                      # run of <id> left
 #
+# Options for the repeated runs of task 7 of phase 2 of the hito 3 plan;
+# without them, and without NODE_ENV, a run is as in phase 1:
+#   --tag <t>         the run is <id>-<t>: its results go to
+#                     docs/decisions/hito-3-backend/results/runs/<id>-<t>.json
+#                     and its logs to logs/<id>-<t>/ (with --teardown too)
+#   --params <file>   read after params.env, in its form; it may only change
+#                     what params.env has, and the results' `params` carry
+#                     the change (params-production.env)
+#   --only <S…>       run only these scenarios ("S6", or "S3,S6"); the rest
+#                     are `not-applicable`, "no ejecutado en esta ejecución"
+#   NODE_ENV          SPIKE_*=value words, passed to every node's container
+#                     (`docker create -e`) and noted in the results, e.g.
+#                     NODE_ENV=SPIKE_DIAL_CONCURRENCY=1 for kad-iroh
+#
 # A run builds spike-<id> (`cargo build --release --locked` in spikes/hito-3/)
 # and the image pals-spike:latest (Dockerfile), creates the two networks
 # with --internal on the subnets of params.env, once it has checked that no
@@ -50,28 +64,81 @@ SPIKES=$(dirname "$HARNESS")
 REPO=$(cd "$SPIKES/../.." && pwd)
 PARAMS=$HARNESS/params.env
 
-usage() { echo "usage: $0 [--teardown] <id>" >&2; exit 2; }
+usage() { echo "usage: $0 [--teardown] [--tag <t>] [--params <file>] [--only <S…>] <id>" >&2; exit 2; }
 ONLY_TEARDOWN=0
-if [ "${1:-}" = --teardown ]; then
-    ONLY_TEARDOWN=1
-    shift
-fi
+TAG=
+EXTRA_PARAMS=
+ONLY=
+while [ $# -gt 0 ]; do
+    case $1 in
+        --teardown) ONLY_TEARDOWN=1; shift ;;
+        --tag | --params | --only)
+            [ $# -ge 2 ] || usage
+            case $1 in
+                --tag) TAG=$2 ;;
+                --params) EXTRA_PARAMS=$2 ;;
+                --only) ONLY=${2//,/ } ;;
+            esac
+            shift 2
+            ;;
+        -*) usage ;;
+        *) break ;;
+    esac
+done
 [ $# -eq 1 ] || usage
 ID=$1
 if ! [[ $ID =~ ^[a-z0-9][a-z0-9-]*$ ]] || [ ! -f "$SPIKES/$ID/Cargo.toml" ]; then
     echo "harness.sh: no candidate $ID in spikes/hito-3/" >&2
     exit 2
 fi
+if [ -n "$TAG" ] && ! [[ $TAG =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+    echo "harness.sh: --tag takes lowercase letters, digits and dashes, not '$TAG'" >&2
+    exit 2
+fi
+read -r -a ONLY_LIST <<< "$ONLY"
+ONLY=${ONLY_LIST[*]}
+for s in "${ONLY_LIST[@]}"; do
+    [[ $s =~ ^S[0-7]$ ]] || { echo "harness.sh: --only takes scenarios S0 to S7, not '$s'" >&2; exit 2; }
+done
+# NODE_ENV: only SPIKE_* variables reach the containers, never a credential.
+NODE_ENV=${NODE_ENV:-}
+read -r -a NODE_ENV_LIST <<< "$NODE_ENV"
+NODE_ENV=${NODE_ENV_LIST[*]}
+ENV_ARGS=()
+for kv in "${NODE_ENV_LIST[@]}"; do
+    if ! [[ $kv =~ ^SPIKE_[A-Z0-9_]+=[A-Za-z0-9._:,-]*$ ]]; then
+        echo "harness.sh: NODE_ENV takes SPIKE_*=value words, not '$kv'" >&2
+        exit 2
+    fi
+    ENV_ARGS+=(-e "$kv")
+done
 
 # shellcheck source-path=SCRIPTDIR source=params.env
 . "$PARAMS"
+PARAM_ARGS=(--params "$PARAMS")
+if [ -n "$EXTRA_PARAMS" ]; then
+    [ -f "$EXTRA_PARAMS" ] || { echo "harness.sh: no file $EXTRA_PARAMS for --params" >&2; exit 2; }
+    EXTRA_PARAMS=$(cd "$(dirname "$EXTRA_PARAMS")" && pwd)/$(basename "$EXTRA_PARAMS")
+    # The same form as params.env, and nothing params.env does not have
+    # (evaluate.read_params), before the shell reads it.
+    python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from evaluate import read_params; read_params(*sys.argv[2:])' \
+        "$HARNESS" "$PARAMS" "$EXTRA_PARAMS" || exit 2
+    # shellcheck disable=SC1090 # a file of the same form as params.env
+    . "$EXTRA_PARAMS"
+    PARAM_ARGS+=(--params "$EXTRA_PARAMS")
+fi
 
 P=pals-spike
 IMAGE=$P:latest
 LABEL=pals-spike.dir
-WORK=$HARNESS/logs/$ID
+RUN=$ID${TAG:+-$TAG}
+WORK=$HARNESS/logs/$RUN
 RAW=$WORK/raw
-RESULTS_REL=docs/decisions/hito-3-backend/results/$ID.json
+if [ -n "$TAG" ]; then
+    RESULTS_REL=docs/decisions/hito-3-backend/results/runs/$RUN.json
+else
+    RESULTS_REL=docs/decisions/hito-3-backend/results/$ID.json
+fi
 BIN=$SPIKES/target/release/spike-$ID
 read -r -a ROUTER_LIST <<< "$ROUTERS"
 CLIENTS="$CLIENTS_A $CLIENTS_B"
@@ -86,7 +153,7 @@ die() { note "ERROR: $*"; exit 1; }
 # A wait that a trapped signal interrupts at once.
 pause() { sleep "$1" & wait $!; }
 # The JSON side: observations, waits and results (scenarios.py, evaluate.py).
-sc() { python3 "$HARNESS/scenarios.py" --raw "$RAW" --params "$PARAMS" --prefix "$P" "$@"; }
+sc() { python3 "$HARNESS/scenarios.py" --raw "$RAW" "${PARAM_ARGS[@]}" --prefix "$P" --node-env "$NODE_ENV" "$@"; }
 ctr() { echo "$P-$1"; }
 net_name() { case $1 in a) echo "$NET_A" ;; b) echo "$NET_B" ;; *) return 1 ;; esac; }
 caps_of() { local v="CAPS_$1"; echo "${!v}"; }
@@ -162,8 +229,8 @@ teardown() {
 
 # create NODE ROLE [ARG...]: NODE's container, with the binary in it, not
 # started, on its networks (nets_of) at its pinned addresses (IP_<node>);
-# the ARGs go to the binary. The key derives from the node's name, so that
-# it is the same on every run.
+# the ARGs go to the binary, and NODE_ENV to its environment. The key
+# derives from the node's name, so that it is the same on every run.
 create() {
     local node=$1 role=$2 nets ips seed i
     shift 2
@@ -174,7 +241,7 @@ create() {
         return 1
     fi
     seed=$(printf 'pals-spike/%s' "$node" | sha256sum | cut -c1-64)
-    docker create --init --name "$(ctr "$node")" --hostname "$node" --label "$LABEL=$WORK" \
+    docker create --init --name "$(ctr "$node")" --hostname "$node" --label "$LABEL=$WORK" "${ENV_ARGS[@]}" \
         --cpus "$CPUS" --memory "$MEMORY" --network "$(net_name "${nets[0]}")" --ip "${ips[0]}" "$IMAGE" \
         /usr/local/bin/spike-node --name "$node" --role "$role" --listen "0.0.0.0:$LISTEN_PORT" \
         --ttl-s "$TTL_S" --republish-s "$REPUBLISH_S" --key-seed "$seed" "$@" > /dev/null || return 1
@@ -247,9 +314,15 @@ unsettled() {
     UNSETTLED=
 }
 
-# begin S: whether to run S, and its first line.
+# begin S: whether to run S, and its first line. A scenario that --only
+# leaves out is not run, and says so in an event (evaluate.py).
 begin() {
     say "$1"
+    if [ -n "$ONLY" ] && [[ " $ONLY " != *" $1 "* ]]; then
+        note "$1: not in --only $ONLY, not run"
+        sc event "$1" not-run only="$ONLY"
+        return 1
+    fi
     if [ -n "$BROKEN" ]; then
         sc error "$1" "the topology is broken: $BROKEN"
         return 1
@@ -265,7 +338,10 @@ begin() {
 # --- the run ---------------------------------------------------------------
 
 preflight() {
-    say "Run of $ID"
+    say "Run of $ID${TAG:+, tag $TAG}"
+    [ -z "$EXTRA_PARAMS" ] || note "params: params.env, then ${EXTRA_PARAMS#"$REPO/"}"
+    [ -z "$ONLY" ] || note "only: $ONLY"
+    [ -z "$NODE_ENV" ] || note "node environment: $NODE_ENV"
     local tool
     for tool in docker python3 cargo git; do
         command -v "$tool" > /dev/null || die "$tool is required"

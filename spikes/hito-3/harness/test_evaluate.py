@@ -350,5 +350,58 @@ class ByDesignSettle(Case):
         self.assertTrue(evaluate.settled(self.ctx, "initial"))
 
 
+class Only(Case):
+    """Runs of task 7 of phase 2: --only, --params and NODE_ENV."""
+
+    def test_a_scenario_left_out_by_only_is_not_applicable(self):
+        result = self.judge("S3", [event("not-run", 0, only="S6")])
+        self.assertEqual(result["status"], "not-applicable")
+        self.assertEqual(result["metrics"], {})
+        self.assertIn("no ejecutado en esta ejecución", result["notes"].lower())
+
+    def test_a_scenario_the_harness_did_not_run_is_still_an_error(self):
+        # Without --only, as in phase 1: no lines at all is the harness's failure.
+        self.assertEqual(evaluate.evaluate(self.ctx, "S3")["status"], "error")
+
+    def test_the_nodes_environment_is_noted_where_a_scenario_ran(self):
+        self.ctx.node_env = "SPIKE_DIAL_CONCURRENCY=1"
+        lines = [event("begin", 0)] + [search("c0", c, "grace", 1 + i) for i, c in enumerate(CAPS)]
+        self.assertIn("SPIKE_DIAL_CONCURRENCY=1", self.judge("S0", lines)["notes"])
+        self.assertNotIn("SPIKE_DIAL_CONCURRENCY", self.judge("S3", [event("not-run", 0, only="S0")])["notes"])
+
+    def test_without_a_nodes_environment_the_notes_are_as_before(self):
+        lines = [event("begin", 0)] + [search("c0", c, "grace", 1 + i) for i, c in enumerate(CAPS)]
+        self.assertTrue(self.judge("S0", lines)["notes"].startswith("c0, sin lista de arranque"))
+
+
+class Overrides(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.base = Path(__file__).resolve().parent / "params.env"
+
+    def override(self, text):
+        path = Path(self.dir.name) / "override.env"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_an_override_changes_what_it_names_and_keeps_the_rest(self):
+        params = read_params(self.base, self.override("# producción\nTTL_S=3600\nREPUBLISH_S=1200\n"))
+        self.assertEqual((params["TTL_S"], params["REPUBLISH_S"]), (3600, 1200))
+        self.assertEqual({k: v for k, v in params.items() if k not in ("TTL_S", "REPUBLISH_S")},
+                         {k: v for k, v in PARAMS.items() if k not in ("TTL_S", "REPUBLISH_S")})
+        self.assertEqual(list(params), list(PARAMS))
+
+    def test_an_override_cannot_add_a_parameter(self):
+        with self.assertRaises(SystemExit):
+            read_params(self.base, self.override("TTL_s=3600\n"))
+
+    def test_the_production_parameters(self):
+        production = Path(__file__).resolve().parent / "params-production.env"
+        params = read_params(self.base, production)
+        self.assertEqual((params["TTL_S"], params["REPUBLISH_S"], params["IDLE_S"]), (3600, 1200, 2400))
+        self.assertEqual({k for k in params if params[k] != PARAMS[k]}, {"TTL_S", "REPUBLISH_S", "IDLE_S"})
+
+
 if __name__ == "__main__":
     unittest.main()

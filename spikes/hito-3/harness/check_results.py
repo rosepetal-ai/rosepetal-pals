@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Checks results JSONs of the hito 3 backend comparison.
 
-    check_results.py <results.json>...
+    check_results.py [--repeated] <results.json>...
 
 Each file must follow the schema harness.sh writes:
 
@@ -12,8 +12,10 @@ with a status of pass, fail, by-design, not-applicable, error or measured,
 metrics whose values are numbers, booleans or null, and no host path. All
 the files must have the same `params`, and no two the same backend: results
 measured with another topology, other times or other limits are not
-comparable. Exits 1 if any file breaks this or has a scenario in `error`,
-and 0 otherwise.
+comparable. With --repeated, the files may repeat a backend: repeated runs
+of the same candidates (task 7 of phase 2 of the hito 3 plan, repeat.py),
+each checked as any other. Exits 1 if any file breaks this or has a
+scenario in `error`, and 0 otherwise.
 """
 
 import json
@@ -70,6 +72,9 @@ def schema_problems(doc):
 
 
 def main(paths):
+    repeated = bool(paths) and paths[0] == "--repeated"
+    if repeated:
+        paths = paths[1:]
     if not paths:
         print(__doc__.strip().splitlines()[2].strip(), file=sys.stderr)
         return 2
@@ -96,7 +101,7 @@ def main(paths):
 
     backends = {}
     for path, doc in docs.items():
-        if doc["backend"] in backends:
+        if doc["backend"] in backends and not repeated:
             print(f"{path}: backend {doc['backend']} again, as in {backends[doc['backend']]}")
             failed = True
         backends.setdefault(doc["backend"], path)
