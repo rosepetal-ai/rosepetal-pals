@@ -258,8 +258,8 @@ Four milestones, in the order of the [design](docs/plans/initial.md) (§14). In 
 **3. Discovery with Kademlia: backend comparison done.** Find providers without prior contact, over a backend chosen after a bounded comparison.
 - **Deliverable:** a bounded comparison of the backend, a capability registry and contact resolution.
 - **Exit criterion:** justify the chosen implementation; find a provider without prior contact; work without the original bootstrap node, and expire announcements.
-- **Status:** phase 1, the bounded backend comparison, is done: three backends measured against a baseline with a Docker harness, and a fourth assessed on paper. It recommends `libp2p-kad` over the daemon's own Iroh connections, pending ratification (H3-D1). The phase 2 plan, on the chosen backend, is pending.
-- **Links:** [phase 1 plan](docs/plans/2026-11-16-hito-3-descubrimiento-kademlia.md), [backend decision record](docs/decisions/2026-11-16-hito-3-backend-dht.md), [comparison harness](spikes/hito-3/README.md).
+- **Status:** phase 1, the bounded backend comparison, is done: three backends measured against a baseline with a Docker harness, and a fourth assessed on paper. The chosen backend (H3-D1, ratified with conditions) is `libp2p-kad` over the daemon's own Iroh connections: one network stack and one identity, with the agent key as the Kademlia peer id. The other milestone decisions (H3-D2 to H3-D5) are recorded too. The phase 2 plan, on that backend, is pending.
+- **Links:** [phase 1 plan](docs/plans/2026-11-16-hito-3-descubrimiento-kademlia.md), [backend decision record](docs/decisions/2026-11-16-hito-3-backend-dht.md), [H3-D2 to H3-D5](docs/decisions/2026-11-16-hito-3-decisiones.md), [comparison harness](spikes/hito-3/README.md).
 
 **4. Private collaboration with P2panda: only if a real case appears.** Several authorized nodes keep a project's private catalog in sync without publishing it, even when they are not online at the same time.
 - **Deliverable:** a bounded trial of P2panda, if there is a need for replication.

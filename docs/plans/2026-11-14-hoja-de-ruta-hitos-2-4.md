@@ -12,7 +12,7 @@ Aquí queda fijado lo que ya se puede decidir: qué implica para cada hito el re
 |-|-|-|-|-|
 | 1. Flujo básico | Cerrado y unido con `dev`. Prueba de salida: 8 de 8 casos con un contenedor Docker en el papel de la segunda máquina, que cierra el hito; `AUTH-TLS-001` aceptado ([registro de decisión](../decisions/2026-11-16-cierre-hitos-1-y-2.md)) | [Hito 1](2026-11-14-hito-1-flujo-basico-a2a.md) | [#1](https://github.com/rosepetal-ai/rosepetal-pals/pull/1), unida con `dev` | [Conformidad](../conformance/hito-1/README.md), [prueba de salida](../conformance/hito-1/exit-test.md), arnés [`tests/exit/`](../../tests/exit/README.md) |
 | 2. Consulta de servicios e inventario | Cerrado y unido con `dev`: las 13 tareas del plan. Prueba de salida: 8 de 8 casos con un contenedor Docker por agente, en una sola máquina, que cierra el hito, y el caso 9, la conformidad repetida, sin regresión ([registro de decisión](../decisions/2026-11-16-cierre-hitos-1-y-2.md)) | [Hito 2](2026-11-14-hito-2-consulta-de-servicios.md) | [#2](https://github.com/rosepetal-ai/rosepetal-pals/pull/2), unida con `dev` | [Conformidad](../conformance/hito-2/README.md), [prueba de salida](../conformance/hito-2/exit-test.md), [firmas de la card](../conformance/hito-2/card-signatures.md), arnés [`tests/exit/hito-2.sh`](../../tests/exit/README.md#prueba-de-salida-del-hito-2-con-docker) |
-| 3. Descubrimiento con Kademlia | Comparación hecha; plan de la fase 2 pendiente. La fase 1 midió tres backends frente a una línea base y evaluó un cuarto sobre el papel, y recomienda `libp2p-kad` sobre las conexiones Iroh del daemon, pendiente de ratificar (H3-D1) ([registro de decisión](../decisions/2026-11-16-hito-3-backend-dht.md)) | [Hito 3, fase 1](2026-11-16-hito-3-descubrimiento-kademlia.md) | — | — |
+| 3. Descubrimiento con Kademlia | Comparación hecha; plan de la fase 2 pendiente. La fase 1 midió tres backends frente a una línea base y evaluó un cuarto sobre el papel, y eligió `libp2p-kad` sobre las conexiones Iroh del daemon, ratificado con condiciones (H3-D1, [registro de decisión](../decisions/2026-11-16-hito-3-backend-dht.md)); H3-D2 a H3-D5, [decididas](../decisions/2026-11-16-hito-3-decisiones.md) | [Hito 3, fase 1](2026-11-16-hito-3-descubrimiento-kademlia.md) | — | — |
 | 4. Colaboración privada con P2panda | Solo si aparece un caso real; sin plan | — | — | — |
 
 ## Regla común a los tres hitos
@@ -108,7 +108,7 @@ Como se cerró el hito 1, en la última tarea de cada plan:
 - **Pesan en contra:** tener que definir el índice de capacidades y sus mecanismos de anuncio, identificación y abuso, como con Mainline; cambiar el transporte de tareas o de ficheros, que además exige una decisión explícita (§6.1).
 - **No basta para ganar:** reducir dependencias (§6.1). Entre los que pasan, deciden las medidas.
 
-**Registro de decisión** en `docs/decisions/`: candidatos y versiones, pruebas y la duda de cada una, montaje, métricas y lo no medido, resultado justificado frente al criterio de salida y qué lo haría cambiar. Está en [`2026-11-16-hito-3-backend-dht.md`](../decisions/2026-11-16-hito-3-backend-dht.md), con la recomendación pendiente de ratificar (H3-D1).
+**Registro de decisión** en `docs/decisions/`: candidatos y versiones, pruebas y la duda de cada una, montaje, métricas y lo no medido, resultado justificado frente al criterio de salida y qué lo haría cambiar. Está en [`2026-11-16-hito-3-backend-dht.md`](../decisions/2026-11-16-hito-3-backend-dht.md), con la recomendación ratificada con condiciones (H3-D1).
 
 **Gate:** si la comparación no favorece a `libp2p-kad`, el cambio de backend es una decisión explícita del responsable (spec §6.1); no se sustituye solo por reducir dependencias.
 
@@ -141,7 +141,7 @@ La tarea 8 cubre los escenarios del §14 de este hito: card sin vínculo válido
 
 ### Decisiones para el responsable
 
-El responsable las delegó el 2026-11-16 ([registro de decisión](../decisions/2026-11-16-cierre-hitos-1-y-2.md#decisiones-del-hito-3)): se toman con los datos de cada tarea y se registran en `docs/decisions/`.
+El responsable las delegó el 2026-11-16 ([registro de decisión](../decisions/2026-11-16-cierre-hitos-1-y-2.md#decisiones-del-hito-3)): se toman con los datos de cada tarea y se registran en `docs/decisions/`. H3-D1 está en el [registro del backend](../decisions/2026-11-16-hito-3-backend-dht.md#decisión), y H3-D2 a H3-D5, en el [de las decisiones del hito 3](../decisions/2026-11-16-hito-3-decisiones.md).
 
 | Id | Decisión | Recomendación |
 |-|-|-|
