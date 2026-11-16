@@ -45,32 +45,37 @@ El plan pide añadir, si existe, un crate de Iroh 1.x que haga la búsqueda de d
 ## Compatibilidad de dependencias: `compat.sh`
 
 ```bash
-bash spikes/hito-3/compat.sh    # desde cualquier directorio
+bash spikes/hito-3/compat.sh [--repeat N] [--provisional "<motivo>"]    # desde cualquier directorio
 ```
 
-Necesita la toolchain de la MSRV (`rustup toolchain install 1.91`) y `python3`. Tarda varios minutos: compila cada binario en release desde cero. Para cada candidato mide:
+Los scripts de este directorio necesitan Linux con las coreutils de GNU. `compat.sh` necesita además la toolchain de la MSRV (`rustup toolchain install 1.91`) y `python3`. Tarda varios minutos, porque compila cada binario en release desde cero. Para cada candidato mide:
 
-- si `cargo +1.91 check --locked -p <paquete>` pasa y, si falla, la primera línea de error;
+- si `cargo +1.91 check --locked -p <paquete>` pasa. Si falla, guarda la primera línea de error y la que nombra el crate culpable: la primera que dice `requires rustc` o, si no hay ninguna, la siguiente línea no vacía;
 - cuántos crates trae: las líneas distintas de `cargo tree -p <paquete> -e normal --prefix none`, quitada la marca ` (*)` de los repetidos para que cada nombre y versión cuente una vez;
 - qué crates trae en más de una versión, según `cargo tree -p <paquete> -d -e normal`. Una misma versión compilada dos veces, para el anfitrión y para el destino, no cuenta como duplicado;
 - cuánto tarda `cargo build --release --locked -p <paquete>` desde cero, con su propio `CARGO_TARGET_DIR` en `target/compat/build/<id>/`;
 - cuánto ocupa el binario, y cuánto más que el de `baseline`.
 
+Las opciones:
+
+- `--repeat N` compila cada candidato `N` veces desde cero (1 por defecto). En cada vuelta el orden empieza un candidato más tarde, para que ninguno vaya siempre primero. `release_build_s` es el mínimo, y `release_build_samples_s` guarda todas las muestras.
+- `--provisional "<motivo>"` es para cuando los binarios todavía no son los reales. El JSON lleva el motivo en `provisional`, y `binary_bytes` y `binary_bytes_over_baseline` salen como `null`. El resto de las medidas sí vale. Sin la opción, el JSON lleva los tamaños reales y no tiene `provisional`.
+
 Escribe [`docs/decisions/hito-3-backend/compat.json`](../../docs/decisions/hito-3-backend/compat.json) con este esquema:
 
 ```json
-{"date": "...", "rustc": "...", "rustc_msrv": "...", "commit": "...", "host_cpus": n,
+{"date": "...", "rustc": "...", "rustc_msrv": "...", "commit": "...", "host_cpus": n, "provisional": "...",
  "candidates": {"<id>": {"msrv_1_91": "pass|fail", "msrv_error": "...", "crates": n,
-   "duplicates": ["name vA, vB", ...], "release_build_s": n, "release_build_load_1m": [inicio, fin],
-   "binary_bytes": n, "binary_bytes_over_baseline": n}}}
+   "duplicates": ["name vA, vB", ...], "release_build_s": n, "release_build_samples_s": [n, ...],
+   "release_build_load_1m": [[inicio, fin], ...], "binary_bytes": n, "binary_bytes_over_baseline": n}}}
 ```
 
 Notas sobre los campos:
 
-- `msrv_error` es `null` cuando la comprobación pasa.
+- `msrv_error` es `null` cuando la comprobación pasa. Las rutas del anfitrión que pueda llevar salen como `.` (el repositorio), `$CARGO_HOME`, `$RUSTUP_HOME` o `~`.
 - `commit` es el `HEAD` del repositorio al medir. Lleva `-dirty` si lo medido (`Cargo.toml`, `Cargo.lock`, `crates/` o `spikes/hito-3/`) tenía cambios sin commit.
-- `rustc_msrv`, `host_cpus` y `release_build_load_1m` no están en el esquema del plan. Los tiempos de compilación dependen de la carga del anfitrión, que suele estar muy cargado. Por eso cada tiempo va con la carga media de un minuto al empezar y al acabar, y con el número de CPU. Los tiempos solo se comparan dentro de una misma ejecución.
-- Mientras los binarios solo enlazan sus dependencias, el tamaño mide poco, porque el enlazador quita el código que nadie usa. Hay que volver a ejecutar `compat.sh` cuando cada candidato tenga su nodo.
+- `rustc_msrv`, `host_cpus`, `provisional`, `release_build_samples_s` y `release_build_load_1m` no están en el esquema del plan. Los tiempos de compilación dependen de la carga del anfitrión, que suele estar muy cargado. Por eso cada muestra de `release_build_samples_s` va con la carga media de un minuto al empezar y al acabar, en el mismo orden en `release_build_load_1m`, y con el número de CPU. Los tiempos solo se comparan dentro de una misma ejecución.
+- Mientras los binarios solo enlazan sus dependencias, el enlazador quita el código que nadie usa, y el tamaño no mide nada. Por eso la medida de la tarea 1 lleva `--provisional`. La medida que vale es la de la tarea 6, que ejecuta `compat.sh --repeat 3` sobre un árbol limpio, con los nodos ya escritos.
 
 `compat.sh` deja sus compilaciones en `target/compat/`, que git ignora.
 
