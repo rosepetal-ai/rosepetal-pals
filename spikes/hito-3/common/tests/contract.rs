@@ -21,8 +21,12 @@ fn key(seed: u8) -> AgentKey {
 }
 
 fn contact(key: &AgentKey) -> Signed<ContactRecord> {
-    let addr: SocketAddr = "192.0.2.10:4433".parse().unwrap();
-    issue_contact(key, &[addr], 1, ISSUED).unwrap()
+    contact_at(key, "192.0.2.10:4433", 1)
+}
+
+fn contact_at(key: &AgentKey, addr: &str, seq: u64) -> Signed<ContactRecord> {
+    let addr: SocketAddr = addr.parse().unwrap();
+    issue_contact(key, &[addr], seq, ISSUED).unwrap()
 }
 
 fn announce(key: &AgentKey, capabilities: &[&str]) -> Signed<AnnounceRecord> {
@@ -34,6 +38,7 @@ fn raw(contact: &Signed<ContactRecord>, announce: &Signed<AnnounceRecord>) -> Ra
     RawCandidate {
         contact: Some(contact.to_json()),
         announce: Some(announce.to_json()),
+        found_ms: None,
     }
 }
 
@@ -45,6 +50,7 @@ fn verify_accepts_a_matching_pair() {
     assert_eq!(candidate.reason, None);
     assert_eq!(candidate.agent_id, Some(a.id()));
     assert_eq!(candidate.direct_addrs, ["192.0.2.10:4433"]);
+    assert_eq!(candidate.contact_seq, Some(1));
 }
 
 #[test]
@@ -67,11 +73,13 @@ fn verify_rejects_a_missing_record() {
     let no_contact = RawCandidate {
         contact: None,
         announce: Some(announce(&a, &[OCR]).to_json()),
+        found_ms: None,
     };
     assert_eq!(verify(OCR, no_contact, NOW).reason, Some("bad_contact"));
     let no_announce = RawCandidate {
         contact: Some(contact(&a).to_json()),
         announce: None,
+        found_ms: None,
     };
     assert_eq!(verify(OCR, no_announce, NOW).reason, Some("bad_announce"));
 }
@@ -138,4 +146,31 @@ fn dedupe_keeps_an_agent_with_no_valid_copy_once() {
     let candidates = dedupe(vec![rogue(), rogue()]);
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].reason, Some("bad_contact"));
+}
+
+#[test]
+fn dedupe_keeps_the_newest_valid_contact() {
+    let a = key(1);
+    let ocr = announce(&a, &[OCR]);
+    let check = |addr, seq| verify(OCR, raw(&contact_at(&a, addr, seq), &ocr), NOW);
+    // The second copy has the higher seq: it wins, though it came later.
+    let newest = dedupe(vec![
+        check("192.0.2.10:4433", 1),
+        check("192.0.2.11:4433", 2),
+    ]);
+    assert_eq!(newest.len(), 1);
+    assert_eq!(newest[0].contact_seq, Some(2));
+    assert_eq!(newest[0].direct_addrs, ["192.0.2.11:4433"]);
+    // On a tie, the first stays.
+    let tie = dedupe(vec![
+        check("192.0.2.10:4433", 3),
+        check("192.0.2.11:4433", 3),
+    ]);
+    assert_eq!(tie[0].direct_addrs, ["192.0.2.10:4433"]);
+    // An older valid copy after a newer one does not replace it.
+    let older = dedupe(vec![
+        check("192.0.2.11:4433", 5),
+        check("192.0.2.10:4433", 4),
+    ]);
+    assert_eq!(older[0].contact_seq, Some(5));
 }

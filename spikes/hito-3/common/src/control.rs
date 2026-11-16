@@ -8,12 +8,14 @@
 //! routes, all JSON:
 //!
 //! - `POST /search {"capability", "limit"}`: the backend's search, each
-//!   candidate verified, one per agent, at most `limit`:
-//!   `{"elapsed_ms", "first_valid_ms", "candidates": [{"agent_id", "valid",
-//!   "reason", "direct_addrs"}], "requests"}`. `first_valid_ms` is when the
-//!   first candidate that verifies was checked, the search included, `null`
-//!   when none does; `requests` is `null` when the backend does not count
-//!   them;
+//!   candidate verified, one per agent, the valid ones first, at most
+//!   `limit`: `{"elapsed_ms", "first_valid_ms", "first_valid_source",
+//!   "candidates": [{"agent_id", "valid", "reason", "direct_addrs",
+//!   "contact_seq"}], "requests"}`. `first_valid_ms` is the earliest
+//!   `found_ms` of a valid candidate (`first_valid_source: "backend"`) or,
+//!   when no valid candidate has one, `elapsed_ms`, when the search
+//!   returned (`"completion"`); both are `null` when none is valid.
+//!   `requests` is `null` when the backend does not count them;
 //! - `POST /announce {"capabilities"}`: issues the records again, with the
 //!   node's addresses now and the next `seq`, and announces them:
 //!   `{"seq", "direct_addrs"}`;
@@ -22,13 +24,15 @@
 //! - `GET /healthz`: `{"name", "role", "agent_id", "announced",
 //!   "announce_error", "declared"}`, served only once the backend started
 //!   and the announcement of `--announce` was attempted: a node that
-//!   answers is ready.
+//!   answers is ready. `announced` is what the last announce that worked
+//!   listed, empty after `/unannounce`; `announce_error` is why the last
+//!   announce failed, `null` once one works or after `/unannounce`.
 //!
 //! A backend error is `500 {"error"}`; a request the API cannot take, `400`
 //! or `422`.
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -48,7 +52,7 @@ use crate::records::{
     dedupe, issue_announce, issue_contact, local_addrs, tamper_signature, verify,
 };
 use crate::stats::{BackendStats, rss_kib};
-use crate::{Backend, Candidate, Declared, NodeConfig, Role};
+use crate::{Backend, Candidate, Declared, NodeConfig, RawSearch, Role};
 
 /// Where the control API listens, inside the node's container.
 pub const CONTROL_ADDR: SocketAddr =
@@ -73,10 +77,11 @@ struct SearchRequest {
     limit: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
 struct SearchAnswer {
     elapsed_ms: u64,
     first_valid_ms: Option<u64>,
+    first_valid_source: Option<&'static str>,
     candidates: Vec<Candidate>,
     requests: Option<u64>,
 }
@@ -115,6 +120,7 @@ struct Health {
 }
 
 type Reply<T> = oneshot::Sender<Result<T, String>>;
+type SharedHealth = Arc<RwLock<Health>>;
 
 enum Command {
     Search(SearchRequest, Reply<SearchAnswer>),
@@ -126,32 +132,29 @@ enum Command {
 #[derive(Clone)]
 struct App {
     commands: mpsc::Sender<Command>,
-    health: Arc<Health>,
+    health: SharedHealth,
 }
 
 impl<B: Backend> Node<B> {
     /// Announces `announce` if there is any, then serves the control API
     /// until the process ends.
     pub(crate) async fn serve(mut self, announce: Vec<String>) -> anyhow::Result<()> {
-        let mut announce_error = None;
-        if !announce.is_empty()
-            && let Err(error) = self.announce(&announce).await
-        {
-            tracing::error!("the announcement at start failed: {error:#}");
-            announce_error = Some(format!("{error:#}"));
-        }
-        let health = Health {
+        let health = Arc::new(RwLock::new(Health {
             name: self.cfg.name.clone(),
             role: self.cfg.role,
             agent_id: self.key.id(),
-            announced: announce,
-            announce_error,
+            announced: Vec::new(),
+            announce_error: None,
             declared: B::DECLARED,
-        };
+        }));
+        if !announce.is_empty() {
+            let result = self.announce(&announce).await;
+            note_announce(&health, &announce, &result);
+        }
         let (commands, mut queue) = mpsc::channel(16);
         let app = App {
             commands,
-            health: Arc::new(health),
+            health: Arc::clone(&health),
         };
         let router = Router::new()
             .route("/search", post(search))
@@ -172,12 +175,18 @@ impl<B: Backend> Node<B> {
                     let _ = reply.send(self.search(request).await.map_err(|e| format!("{e:#}")));
                 }
                 Command::Announce(request, reply) => {
-                    let answer = self.announce(&request.capabilities).await;
-                    let _ = reply.send(answer.map_err(|e| format!("{e:#}")));
+                    let result = self.announce(&request.capabilities).await;
+                    note_announce(&health, &request.capabilities, &result);
+                    let _ = reply.send(result.map_err(|e| format!("{e:#}")));
                 }
                 Command::Unannounce(reply) => {
-                    let answer = self.backend.unannounce().await.map(|()| Done {});
-                    let _ = reply.send(answer.map_err(|e| format!("{e:#}")));
+                    let result = self.backend.unannounce().await.map(|()| Done {});
+                    if result.is_ok() {
+                        let mut health = health.write().unwrap_or_else(|e| e.into_inner());
+                        health.announced.clear();
+                        health.announce_error = None;
+                    }
+                    let _ = reply.send(result.map_err(|e| format!("{e:#}")));
                 }
                 Command::Stats(reply) => {
                     let _ = reply.send(Ok(StatsAnswer {
@@ -196,24 +205,14 @@ impl<B: Backend> Node<B> {
             .backend
             .search(&request.capability, request.limit)
             .await?;
-        let now = now_unix();
-        let mut first_valid_ms = None;
-        let mut checked = Vec::with_capacity(found.candidates.len());
-        for raw in found.candidates {
-            let candidate = verify(&request.capability, raw, now);
-            if candidate.valid && first_valid_ms.is_none() {
-                first_valid_ms = Some(millis(started));
-            }
-            checked.push(candidate);
-        }
-        let mut candidates = dedupe(checked);
-        candidates.truncate(request.limit);
-        Ok(SearchAnswer {
-            elapsed_ms: millis(started),
-            first_valid_ms,
-            candidates,
-            requests: found.requests,
-        })
+        let elapsed_ms = millis(started);
+        Ok(checked(
+            &request.capability,
+            request.limit,
+            found,
+            now_unix(),
+            elapsed_ms,
+        ))
     }
 
     /// Issues both records with the addresses now and announces them; with
@@ -259,6 +258,69 @@ impl<B: Backend> Node<B> {
     }
 }
 
+/// What `/healthz` says after an announce of `capabilities`.
+fn note_announce(
+    health: &SharedHealth,
+    capabilities: &[String],
+    result: &anyhow::Result<Announced>,
+) {
+    let mut health = health.write().unwrap_or_else(|e| e.into_inner());
+    match result {
+        Ok(_) => {
+            health.announced = capabilities.to_vec();
+            health.announce_error = None;
+        }
+        Err(error) => {
+            tracing::error!("the announcement failed: {error:#}");
+            health.announce_error = Some(format!("{error:#}"));
+        }
+    }
+}
+
+/// The answer to a search that returned `found` after `elapsed_ms`: every
+/// candidate verified at `now_unix`, one per agent, the valid ones first
+/// (so that invalid ones never push a valid one past `limit`), at most
+/// `limit`.
+fn checked(
+    capability: &str,
+    limit: usize,
+    found: RawSearch,
+    now_unix: i64,
+    elapsed_ms: u64,
+) -> SearchAnswer {
+    let mut any_valid = false;
+    let mut first_found: Option<u64> = None;
+    let mut verified = Vec::with_capacity(found.candidates.len());
+    for raw in found.candidates {
+        let found_ms = raw.found_ms;
+        let candidate = verify(capability, raw, now_unix);
+        if candidate.valid {
+            any_valid = true;
+            first_found = match (first_found, found_ms) {
+                (Some(first), Some(ms)) => Some(first.min(ms)),
+                (first, ms) => first.or(ms),
+            };
+        }
+        verified.push(candidate);
+    }
+    let mut candidates = dedupe(verified);
+    // Stable: the order among valid ones, and among invalid ones, stays.
+    candidates.sort_by_key(|c| !c.valid);
+    candidates.truncate(limit);
+    let (first_valid_ms, first_valid_source) = match (any_valid, first_found) {
+        (false, _) => (None, None),
+        (true, Some(ms)) => (Some(ms), Some("backend")),
+        (true, None) => (Some(elapsed_ms), Some("completion")),
+    };
+    SearchAnswer {
+        elapsed_ms,
+        first_valid_ms,
+        first_valid_source,
+        candidates,
+        requests: found.requests,
+    }
+}
+
 async fn search(State(app): State<App>, Json(request): Json<SearchRequest>) -> Response {
     if request.limit == 0 || request.limit > MAX_LIMIT {
         return (
@@ -283,7 +345,7 @@ async fn stats(State(app): State<App>) -> Response {
 }
 
 async fn healthz(State(app): State<App>) -> Json<Health> {
-    Json((*app.health).clone())
+    Json(app.health.read().unwrap_or_else(|e| e.into_inner()).clone())
 }
 
 /// Passes a command to the node's loop and answers with what it replies.
@@ -311,4 +373,84 @@ fn now_unix() -> i64 {
 
 fn millis(since: Instant) -> u64 {
     u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{RawCandidate, issue_announce, issue_contact, tamper_signature};
+
+    const OCR: &str = "agentnet:capability:v1:vision.ocr";
+    const ISSUED: i64 = 1_800_000_000;
+
+    fn raw(seed: u8, rogue: bool, found_ms: Option<u64>) -> RawCandidate {
+        let key = AgentKey::from_bytes(&[seed; 32]);
+        let addr: SocketAddr = "192.0.2.10:4433".parse().unwrap();
+        let contact = issue_contact(&key, &[addr], 1, ISSUED).unwrap();
+        let contact = if rogue {
+            tamper_signature(&contact)
+        } else {
+            contact
+        };
+        let announce = issue_announce(&key, &[OCR.to_owned()], 1, ISSUED).unwrap();
+        RawCandidate {
+            contact: Some(contact.to_json()),
+            announce: Some(announce.to_json()),
+            found_ms,
+        }
+    }
+
+    fn search(candidates: Vec<RawCandidate>, limit: usize) -> SearchAnswer {
+        let found = RawSearch {
+            candidates,
+            requests: Some(3),
+        };
+        checked(OCR, limit, found, ISSUED + 60, 900)
+    }
+
+    #[test]
+    fn the_first_valid_is_the_earliest_found_valid_one() {
+        // The invalid one was found first, and does not count.
+        let answer = search(
+            vec![
+                raw(1, true, Some(5)),
+                raw(2, false, Some(40)),
+                raw(3, false, Some(20)),
+            ],
+            8,
+        );
+        assert_eq!(answer.first_valid_ms, Some(20));
+        assert_eq!(answer.first_valid_source, Some("backend"));
+        assert_eq!(answer.elapsed_ms, 900);
+        assert_eq!(answer.requests, Some(3));
+    }
+
+    #[test]
+    fn with_no_time_from_the_backend_the_first_valid_is_at_completion() {
+        let answer = search(vec![raw(1, false, None)], 8);
+        assert_eq!(answer.first_valid_ms, Some(900));
+        assert_eq!(answer.first_valid_source, Some("completion"));
+        let none = search(vec![raw(1, true, Some(5))], 8);
+        assert_eq!((none.first_valid_ms, none.first_valid_source), (None, None));
+    }
+
+    #[test]
+    fn invalid_candidates_never_crowd_out_valid_ones() {
+        let answer = search(
+            vec![
+                raw(1, true, None),
+                raw(2, true, None),
+                raw(3, false, None),
+                raw(4, false, None),
+            ],
+            2,
+        );
+        assert_eq!(answer.candidates.len(), 2);
+        assert!(answer.candidates.iter().all(|c| c.valid));
+        let ids: Vec<_> = answer.candidates.iter().map(|c| c.agent_id).collect();
+        let expected: Vec<_> = [3, 4]
+            .map(|seed| Some(AgentKey::from_bytes(&[seed; 32]).id()))
+            .to_vec();
+        assert_eq!(ids, expected);
+    }
 }

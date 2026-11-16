@@ -28,7 +28,8 @@ pub struct BackendStats {
     /// What this node stores about each agent, the agents it stores nothing
     /// about left out: the router-side checks of scenarios S3 (a stopped
     /// provider's records go away) and S5 (an invalid contact is never
-    /// stored).
+    /// stored). A node that stores records must fill it, or S5 ends in
+    /// `error`: it cannot tell whose the records are.
     pub stored_by_agent: BTreeMap<AgentId, StoredRecords>,
 }
 
@@ -39,6 +40,10 @@ pub struct StoredRecords {
     pub contact_records: u64,
     /// Its announce records, counted in [`BackendStats::records_stored`].
     pub announce_records: u64,
+    /// Any other record about it counted in [`BackendStats::records_stored`]
+    /// (an identity binding, say): S5 counts as the rogue's contact any
+    /// growth of `records_stored` that `stored_by_agent` does not explain.
+    pub other_records: u64,
     /// Provider records that point to it, counted in
     /// [`BackendStats::provider_records_stored`].
     pub provider_records: u64,

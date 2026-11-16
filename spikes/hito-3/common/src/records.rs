@@ -48,6 +48,10 @@ const NO_CARD: &str = "blake3:00000000000000000000000000000000000000000000000000
 pub struct RawCandidate {
     pub contact: Option<Vec<u8>>,
     pub announce: Option<Vec<u8>>,
+    /// Milliseconds from the start of the search until the backend had
+    /// both records of this candidate, when it knows: the time to the first
+    /// valid candidate (scenario S1) comes from here.
+    pub found_ms: Option<u64>,
 }
 
 /// What a backend's search returns: every candidate it found, unverified,
@@ -71,6 +75,9 @@ pub struct Candidate {
     /// The verified contact's direct addresses, empty unless `valid`: what
     /// tells a searcher that a provider moved (scenario S7).
     pub direct_addrs: Vec<String>,
+    /// The verified contact's `seq`, `None` unless `valid`: [`dedupe`]
+    /// keeps the newest.
+    pub contact_seq: Option<u64>,
 }
 
 /// Checks one candidate found for `capability` at `now_unix`: its contact
@@ -96,6 +103,7 @@ pub fn verify(capability: &str, raw: RawCandidate, now_unix: i64) -> Candidate {
         valid: false,
         reason: Some(reason),
         direct_addrs: Vec::new(),
+        contact_seq: None,
     };
 
     let Some(contact) = contact else {
@@ -120,12 +128,14 @@ pub fn verify(capability: &str, raw: RawCandidate, now_unix: i64) -> Candidate {
         agent_id,
         valid: true,
         reason: None,
+        contact_seq: Some(contact.doc.seq),
         direct_addrs: contact.doc.iroh.direct_addrs,
     }
 }
 
-/// One candidate per agent, in the order each agent first appears: its
-/// first valid copy, or its first copy when none is valid. Candidates with
+/// One candidate per agent, in the order each agent first appears: of its
+/// valid copies, the one whose contact has the highest `seq` (the first of
+/// those on a tie), or its first copy when none is valid. Candidates with
 /// no agent are all kept.
 pub fn dedupe(candidates: Vec<Candidate>) -> Vec<Candidate> {
     let mut kept: Vec<Candidate> = Vec::with_capacity(candidates.len());
@@ -134,7 +144,12 @@ pub fn dedupe(candidates: Vec<Candidate>) -> Vec<Candidate> {
             .agent_id
             .and_then(|id| kept.iter().position(|k| k.agent_id == Some(id)));
         match seen {
-            Some(i) if candidate.valid && !kept[i].valid => kept[i] = candidate,
+            Some(i)
+                if candidate.valid
+                    && (!kept[i].valid || candidate.contact_seq > kept[i].contact_seq) =>
+            {
+                kept[i] = candidate
+            }
             Some(_) => {}
             None => kept.push(candidate),
         }
@@ -197,7 +212,12 @@ pub fn issue_announce(
 pub fn tamper_signature<T: Clone>(signed: &Signed<T>) -> Signed<T> {
     let mut signature = URL_SAFE_NO_PAD
         .decode(&signed.signature)
-        .unwrap_or_else(|_| vec![0; 64]);
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                "the signature to tamper with is not base64url ({error}): zeros instead"
+            );
+            vec![0; 64]
+        });
     if let Some(first) = signature.first_mut() {
         *first ^= 0x01;
     }
@@ -220,6 +240,7 @@ pub fn local_addrs(listen: SocketAddr) -> Vec<SocketAddr> {
     let table = std::fs::read_to_string("/proc/net/fib_trie").unwrap_or_default();
     let mut ips = local_ipv4s(&table);
     if ips.is_empty() {
+        tracing::warn!("no local IPv4 address in /proc/net/fib_trie: the contact lists loopback");
         ips.push(Ipv4Addr::LOCALHOST);
     }
     ips.into_iter()

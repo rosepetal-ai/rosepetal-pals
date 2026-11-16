@@ -24,7 +24,7 @@
 
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail, ensure};
 use axum::extract::State;
@@ -189,6 +189,7 @@ impl Backend for Baseline {
         let body = serde_json::to_vec(&Lookup {
             capability: capability.to_owned(),
         })?;
+        let started = Instant::now();
         let mut found = RawSearch {
             candidates: Vec::new(),
             requests: Some(0),
@@ -196,7 +197,11 @@ impl Backend for Baseline {
         for addrs in &self.contacts {
             let (requests, candidate) = ask(addrs, &body).await;
             found.requests = found.requests.map(|n| n + requests);
-            found.candidates.extend(candidate);
+            // When this contact's answer, with both records, was in.
+            let found_ms = u64::try_from(started.elapsed().as_millis()).ok();
+            found
+                .candidates
+                .extend(candidate.map(|c| RawCandidate { found_ms, ..c }));
         }
         Ok(found)
     }
@@ -272,6 +277,7 @@ async fn exchange(
             Ok(Some(RawCandidate {
                 contact: Some(records.contact.into_bytes()),
                 announce: Some(records.announce.into_bytes()),
+                found_ms: None,
             }))
         }
         404 => Ok(None),

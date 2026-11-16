@@ -12,10 +12,13 @@
 #
 # A run builds spike-<id> (`cargo build --release --locked` in spikes/hito-3/)
 # and the image pals-spike:latest (Dockerfile), creates the two networks
-# with --internal and checks that Docker made them so, starts the nodes of
-# the topology and runs S0 to S7. It drives every node through its control
-# API, `docker exec <container> curl` on 127.0.0.1:7600; scenarios.py reads
-# and writes all the JSON. It writes
+# with --internal on the subnets of params.env, once it has checked that no
+# Docker network on the host overlaps them, and checks that Docker made them
+# internal; it starts the nodes of the topology at their pinned addresses,
+# checks them after every start, and runs S0 to S7. It drives every node
+# through its control API, `docker exec <container> curl` on
+# 127.0.0.1:7600; scenarios.py makes the observations and evaluate.py judges
+# them, so the shell never parses JSON. It writes
 # docs/decisions/hito-3-backend/results/<id>.json and checks it with
 # check_results.py, whose exit code is the run's: 1 when a scenario ended in
 # `error`. Logs go to spikes/hito-3/harness/logs/<id>/, which git ignores:
@@ -82,11 +85,47 @@ note() { printf '[%s] %s\n' "$(ts)" "$*"; }
 die() { note "ERROR: $*"; exit 1; }
 # A wait that a trapped signal interrupts at once.
 pause() { sleep "$1" & wait $!; }
-# The JSON side: observations, waits and results (scenarios.py).
+# The JSON side: observations, waits and results (scenarios.py, evaluate.py).
 sc() { python3 "$HARNESS/scenarios.py" --raw "$RAW" --params "$PARAMS" --prefix "$P" "$@"; }
 ctr() { echo "$P-$1"; }
 net_name() { case $1 in a) echo "$NET_A" ;; b) echo "$NET_B" ;; *) return 1 ;; esac; }
 caps_of() { local v="CAPS_$1"; echo "${!v}"; }
+ips_of() { local v="IP_$1"; echo "${!v}"; }
+# nets_of NODE: the networks NODE starts on, "a", "b" or "a b", in the order
+# of its IP_ addresses.
+nets_of() {
+    case " $ROUTERS " in *" $1 "*) echo "a b"; return ;; esac
+    case " $PROVIDERS_A $CLIENTS_A " in *" $1 "*) echo a; return ;; esac
+    case " $PROVIDERS_B $CLIENTS_B " in *" $1 "*) echo b; return ;; esac
+    case $1 in
+        "$S0_NODE") echo "$S0_NET" ;;
+        "$S2_NODE") echo "$S2_NET" ;;
+        "$S5_NODE") echo "$S5_NET" ;;
+        *) return 1 ;;
+    esac
+}
+# where NODE: "<network>=<ip> …" as Docker has NODE now, sorted.
+where() {
+    docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}={{$v.IPAddress}} {{end}}' \
+        "$(ctr "$1")" 2> /dev/null | tr ' ' '\n' | grep . | sort | tr '\n' ' '
+}
+# planned NODE: the same, as params.env pins it.
+planned() {
+    local nets ips i
+    read -r -a nets <<< "$(nets_of "$1")"
+    read -r -a ips <<< "$(ips_of "$1")"
+    for i in "${!nets[@]}"; do echo "$(net_name "${nets[$i]}")=${ips[$i]}"; done | sort | tr '\n' ' '
+}
+# placed NODE...: whether every NODE is at its pinned addresses.
+placed() {
+    local node
+    for node in "$@"; do
+        if [ "$(where "$node")" != "$(planned "$node")" ]; then
+            note "$node is at '$(where "$node")', not at its pinned '$(planned "$node")'"
+            return 1
+        fi
+    done
+}
 # announces NODE: ANN, the --announce flags of NODE's capabilities.
 announces() {
     local c
@@ -121,20 +160,26 @@ teardown() {
     [ -z "$left" ] || note "WARNING: $P-* resources of another run remain, untouched: ${left//$'\n'/ }"
 }
 
-# create NODE ROLE NETS [ARG...]: NODE's container, with the binary in it,
-# not started; NETS is "a", "b" or "a b"; the ARGs go to the binary. The key
-# derives from the node's name, so that it is the same on every run.
+# create NODE ROLE [ARG...]: NODE's container, with the binary in it, not
+# started, on its networks (nets_of) at its pinned addresses (IP_<node>);
+# the ARGs go to the binary. The key derives from the node's name, so that
+# it is the same on every run.
 create() {
-    local node=$1 role=$2 nets=$3 first seed n
-    shift 3
-    first=${nets%% *}
+    local node=$1 role=$2 nets ips seed i
+    shift 2
+    read -r -a nets <<< "$(nets_of "$node")"
+    read -r -a ips <<< "$(ips_of "$node")"
+    if [ "${#nets[@]}" -eq 0 ] || [ "${#nets[@]}" -ne "${#ips[@]}" ]; then
+        note "params.env gives $node ${#ips[@]} addresses for ${#nets[@]} networks"
+        return 1
+    fi
     seed=$(printf 'pals-spike/%s' "$node" | sha256sum | cut -c1-64)
     docker create --init --name "$(ctr "$node")" --hostname "$node" --label "$LABEL=$WORK" \
-        --cpus "$CPUS" --memory "$MEMORY" --network "$(net_name "$first")" "$IMAGE" \
+        --cpus "$CPUS" --memory "$MEMORY" --network "$(net_name "${nets[0]}")" --ip "${ips[0]}" "$IMAGE" \
         /usr/local/bin/spike-node --name "$node" --role "$role" --listen "0.0.0.0:$LISTEN_PORT" \
         --ttl-s "$TTL_S" --republish-s "$REPUBLISH_S" --key-seed "$seed" "$@" > /dev/null || return 1
-    for n in ${nets#"$first"}; do
-        docker network connect "$(net_name "$n")" "$(ctr "$node")" || return 1
+    for ((i = 1; i < ${#nets[@]}; i++)); do
+        docker network connect --ip "${ips[$i]}" "$(net_name "${nets[$i]}")" "$(ctr "$node")" || return 1
     done
     docker cp "$BIN" "$(ctr "$node"):/usr/local/bin/spike-node" > /dev/null
 }
@@ -160,11 +205,13 @@ healthy() {
     return 1
 }
 
-# up NODE...: starts the nodes and waits until every one is healthy.
+# up NODE...: starts the nodes and waits until every one is healthy and at
+# its pinned addresses.
 up() {
     local node
     for node in "$@"; do docker start "$(ctr "$node")" > /dev/null || return 1; done
     for node in "$@"; do healthy "$node" || return 1; done
+    placed "$@"
 }
 
 # settle TAG: waits until what the routers store has not changed for
@@ -179,6 +226,8 @@ settle() {
         fi
         if [ "$SECONDS" -ge "$deadline" ]; then
             note "not settled ($1) after $SETTLE_MAX_S s: going on"
+            sc event settle settle-timeout tag="$1"
+            UNSETTLED="${UNSETTLED:+$UNSETTLED, }$1"
             return 0
         fi
         pause "$POLL_S"
@@ -188,7 +237,15 @@ settle() {
 # Set when the topology could not be put back: the scenarios left end in
 # `error`.
 BROKEN=
-restore() { up "$@" || BROKEN="$* did not start again"; }
+restore() { up "$@" || BROKEN="$* did not start again at their pinned addresses"; }
+# The settles that timed out since the last scenario began; the next one
+# that runs carries a note (unsettled S).
+UNSETTLED=
+unsettled() {
+    [ -z "$UNSETTLED" ] && return 0
+    sc event "$1" settle-timeout tag="$UNSETTLED"
+    UNSETTLED=
+}
 
 # begin S: whether to run S, and its first line.
 begin() {
@@ -202,6 +259,7 @@ begin() {
         return 1
     fi
     sc event "$1" begin
+    unsettled "$1"
 }
 
 # --- the run ---------------------------------------------------------------
@@ -228,10 +286,16 @@ build() {
 
 networks() {
     say "Networks"
-    local n
+    local n subnet out overlaps
+    # Read-only: every subnet Docker has, against the two pinned ones.
+    overlaps=$(docker network ls -q | xargs docker network inspect -f '{{.Name}} {{range .IPAM.Config}}{{.Subnet}} {{end}}' \
+        | sc overlaps "$NET_A_SUBNET" "$NET_B_SUBNET") \
+        || die "the pinned subnets overlap: ${overlaps//$'\n'/; }. Choose free ones for NET_A_SUBNET and NET_B_SUBNET in params.env (docker network ls -q | xargs docker network inspect -f '{{.Name}} {{range .IPAM.Config}}{{.Subnet}} {{end}}')"
     for n in "$NET_A" "$NET_B"; do
         [[ $n == "$P-"* ]] || die "network $n is not named $P-*"
-        docker network create --internal --label "$LABEL=$WORK" "$n" > /dev/null || die "cannot create network $n"
+        if [ "$n" = "$NET_A" ]; then subnet=$NET_A_SUBNET; else subnet=$NET_B_SUBNET; fi
+        out=$(docker network create --internal --subnet "$subnet" --label "$LABEL=$WORK" "$n" 2>&1) \
+            || die "cannot create network $n on $subnet: $out"
         [ "$(docker network inspect -f '{{.Internal}}' "$n")" = true ] || die "network $n is not internal"
         note "$n: internal, $(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' "$n")"
     done
@@ -240,12 +304,12 @@ networks() {
 setup() {
     say "Topology"
     local node others=()
-    if ! create "$BOOTSTRAP" router "a b" || ! up "$BOOTSTRAP"; then die "$BOOTSTRAP does not start"; fi
+    if ! create "$BOOTSTRAP" router || ! up "$BOOTSTRAP"; then die "$BOOTSTRAP does not start"; fi
     R1=$(sc get "$BOOTSTRAP" /stats bootstrap_addr) || die "$BOOTSTRAP gives no bootstrap_addr"
     note "$BOOTSTRAP is --bootstrap $R1"
     for node in "${ROUTER_LIST[@]}"; do
         [ "$node" = "$BOOTSTRAP" ] && continue
-        create "$node" router "a b" --bootstrap "$R1" || die "cannot create $node"
+        create "$node" router --bootstrap "$R1" || die "cannot create $node"
         others+=("$node")
     done
     up "${others[@]}" || die "a router does not start"
@@ -253,15 +317,13 @@ setup() {
     note "$SAVED_CONTACT is --bootstrap $SAVED"
     for node in $PROVIDERS_A $PROVIDERS_B; do
         announces "$node"
-        create "$node" provider "$([[ " $PROVIDERS_A " == *" $node "* ]] && echo a || echo b)" \
-            --bootstrap "$R1" "${ANN[@]}" || die "cannot create $node"
+        create "$node" provider --bootstrap "$R1" "${ANN[@]}" || die "cannot create $node"
     done
-    for node in $CLIENTS_A $CLIENTS_B; do
-        create "$node" client "$([[ " $CLIENTS_A " == *" $node "* ]] && echo a || echo b)" \
-            --bootstrap "$R1" --bootstrap "$SAVED" || die "cannot create $node"
+    for node in $CLIENTS; do
+        create "$node" client --bootstrap "$R1" --bootstrap "$SAVED" || die "cannot create $node"
     done
     # shellcheck disable=SC2086 # lists of node names
-    up $PROVIDERS_A $PROVIDERS_B $CLIENTS || die "a node does not start"
+    up $PROVIDERS_A $PROVIDERS_B $CLIENTS || die "a node does not start at its pinned addresses"
     local error
     for node in "${TOPOLOGY[@]}"; do
         note "$node: agent $(sc get "$node" /healthz agent_id)"
@@ -274,7 +336,7 @@ setup() {
 s0() {
     begin S0 || return 0
     local node=$S0_NODE
-    if create "$node" client "$S0_NET" && sc event S0 start node="$node" && up "$node"; then
+    if create "$node" client && sc event S0 start node="$node" && up "$node"; then
         pause "$S0_GRACE_S"
         sc search S0 grace --nodes "$node" --caps "$CAPABILITIES"
         sc stats S0 end "$node"
@@ -298,7 +360,7 @@ s2() {
     sc event S2 stop node="$BOOTSTRAP"
     docker kill "$(ctr "$BOOTSTRAP")" > /dev/null || { sc error S2 "cannot stop $BOOTSTRAP"; return 0; }
     sc search S2 connected --nodes "$CLIENTS" --caps "$CAPABILITIES"
-    if create "$node" client "$S2_NET" --bootstrap "$R1" --bootstrap "$SAVED" \
+    if create "$node" client --bootstrap "$R1" --bootstrap "$SAVED" \
         && sc event S2 start node="$node" && up "$node"; then
         deadline=$((SECONDS + 2 * REPUBLISH_S))
         until sc reached S2 || [ "$SECONDS" -ge "$deadline" ]; do
@@ -330,10 +392,17 @@ s3() {
 
 s4() {
     begin S4 || return 0
-    local node i=0 deadline
+    local node i=0 deadline killed=()
     sc event S4 stop nodes="$S4_NODES"
     for node in $S4_NODES; do
-        docker kill "$(ctr "$node")" > /dev/null || { sc error S4 "cannot stop $node"; return 0; }
+        if docker kill "$(ctr "$node")" > /dev/null; then
+            killed+=("$node")
+            continue
+        fi
+        sc error S4 "cannot stop $node"
+        [ "${#killed[@]}" -eq 0 ] || restore "${killed[@]}"
+        BROKEN=${BROKEN:-S4 could not stop $node}
+        return 0
     done
     deadline=$((SECONDS + 3 * REPUBLISH_S))
     until sc reached S4 || [ "$SECONDS" -ge "$deadline" ]; do
@@ -349,7 +418,7 @@ s5() {
     local node=$S5_NODE deadline
     sc stats S5 before "${ROUTER_LIST[@]}"
     announces "$node"
-    if create "$node" provider "$S5_NET" --rogue --bootstrap "$R1" "${ANN[@]}" \
+    if create "$node" provider --rogue --bootstrap "$R1" "${ANN[@]}" \
         && sc event S5 start node="$node" && up "$node"; then
         deadline=$((SECONDS + 2 * REPUBLISH_S))
         while :; do
@@ -369,6 +438,7 @@ s6() {
     begin S6 || return 0
     local end next
     settle before-S6
+    unsettled S6
     sc counters S6 start "${TOPOLOGY[@]}"
     sc stats S6 sample "${TOPOLOGY[@]}"
     end=$((SECONDS + IDLE_S))
@@ -387,11 +457,15 @@ s7() {
     read -r -a caps <<< "$(caps_of "$node")"
     sc event S7 move node="$node"
     if ! docker network disconnect "$NET_B" "$(ctr "$node")" \
-        || ! docker network connect "$NET_A" "$(ctr "$node")"; then
+        || ! docker network connect --ip "$S7_IP" "$NET_A" "$(ctr "$node")"; then
         sc error S7 "cannot move $node from $NET_B to $NET_A"
         return 0
     fi
-    ip=$(docker inspect -f "{{ (index .NetworkSettings.Networks \"$NET_A\").IPAddress }}" "$(ctr "$node")")
+    ip=$S7_IP
+    if [ "$(where "$node")" != "$NET_A=$ip " ]; then
+        sc error S7 "$node is at '$(where "$node")' after the move, not at $NET_A=$ip"
+        return 0
+    fi
     sc event S7 moved node="$node" ip="$ip"
     sc announce S7 "$node" "${caps[@]}" || note "S7: the new announce failed"
     deadline=$((SECONDS + 3 * REPUBLISH_S))
