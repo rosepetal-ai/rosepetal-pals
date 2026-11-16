@@ -12,8 +12,10 @@
 //! over the node's Iroh endpoint, with the address forms and the limits of
 //! `agentnet-kad/0`'s connections and streams; their tests,
 //! `crates/pals/tests/dht_transport.rs`, are the gate of any change of the
-//! `libp2p` or `iroh` versions.
+//! `libp2p` or `iroh` versions. [`validate`] is what a router stores under
+//! those keys, and the reason for each refusal.
 
 pub mod keys;
 pub mod muxer;
 pub mod transport;
+pub mod validate;

@@ -41,7 +41,7 @@ pub const ANNOUNCE_KEY_PREFIX: &str = "/agentnet/announce/";
 const IDENTITY_HASH: u64 = 0x00;
 /// The multihash code of SHA2-256 and its digest's length: the first two
 /// bytes of a provider key.
-const SHA2_256: [u8; 2] = [0x12, 0x20];
+pub(crate) const SHA2_256: [u8; 2] = [0x12, 0x20];
 
 /// The agent's `PeerId`: its own Ed25519 public key.
 pub fn peer_id(agent: &AgentId) -> PeerId {

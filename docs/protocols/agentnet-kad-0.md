@@ -4,7 +4,7 @@ Especificación de la DHT con la que un agente PALS encuentra a los proveedores 
 
 Los valores de este documento son los del código, `crates/pals/src/dht/`, y el vector `crates/pals-core/tests/vectors/kad-v0.json` congela la identidad, las claves y las formas de dirección. El backend es `kad-iroh`, ratificado en el [registro del backend](../decisions/2026-11-16-hito-3-backend-dht.md#decisión) (H3-D1).
 
-Este documento crece con el código de la fase 2 del hito 3. Hoy describe la identidad, las claves, las formas de dirección y la conexión con sus límites. Lo que guarda un router, el swarm y la publicación se añaden con su código.
+Este documento crece con el código de la fase 2 del hito 3. Hoy describe la identidad, las claves, las formas de dirección, la conexión con sus límites y lo que guarda un router. El swarm y la publicación se añaden con su código.
 
 ## 1. Identificación
 
@@ -132,3 +132,57 @@ El nodo cuenta desde el arranque las conexiones y los streams que rechaza.
 Un router necesita un puerto fijo para que los demás lo marquen. `[net] listen = "<ip>:<puerto>"` liga el endpoint de Iroh a esa dirección y solo a ella, con relay o sin él. Es el puerto de todo el endpoint: también el de A2A, los blobs y `agentnet-discovery/0`.
 
 Sin `listen`, todo queda como en el hito 2: con relay, los puertos libres del preset N0 en todas las interfaces; sin relay, un puerto libre de 127.0.0.1. Un valor que no es una dirección de socket, con IP y puerto, se rechaza al leer la configuración.
+
+## 6. Lo que guarda un router
+
+El código es `crates/pals/src/dht/validate.rs`, y sus pruebas, `crates/pals/tests/dht_validate.rs`. Un router comprueba cada `PutRecord` y cada `AddProvider` que recibe antes de que llegue a su tienda (`StoreInserts::FilterBoth` de `libp2p-kad`). Quien busca lee con las mismas comprobaciones los contactos y los anuncios que recibe. Cada registro tiene uno de tres resultados:
+
+| Resultado | Qué hace el router |
+|-|-|
+| Guardar | lo guarda |
+| Viejo | se queda con el que tiene, y no lo cuenta como rechazado: nada en él es inválido |
+| Rechazar | no lo guarda, y lo cuenta y lo registra con su motivo |
+
+Con `libp2p-kad` 0.49, quien publica no se entera de un rechazo: el router le contesta como si lo hubiera guardado. Cambiarlo pide un fork de `libp2p-kad`, y queda fuera del hito 3. Por eso el router cuenta cada rechazo con su motivo.
+
+### Valores
+
+Las comprobaciones van en este orden, y gana el primer fallo:
+
+1. La clave es la de un contacto o un anuncio, en la forma exacta de la sección 3 (`unknown_key`). El valor tiene como mucho 4 KiB (`MAX_RECORD_BYTES`), y se mide antes de leerlo (`too_large`).
+2. El valor es un registro firmado de su tipo, `agentnet.contact/1` o `agentnet.announce/1`, tal como lo lee `pals_core::signed` (`bad_contact`, `bad_announce`): JSON canónico, sin campos desconocidos, con una firma válida y con las reglas del registro, entre ellas 32 capacidades como mucho en un anuncio. Lo firma el agente cuyo `PeerId` nombra la clave (`wrong_key`). Está dentro de su ventana de validez, con 60 s de tolerancia en cada extremo (`CLOCK_SKEW_S`), como en el resto de PALS: un registro emitido 59 s en el futuro se guarda, y uno de 61 s se rechaza (`not_yet_valid`); uno que caducó hace 59 s se guarda, y uno de hace 61 s se rechaza (`expired`).
+3. Si el router guarda bajo esa clave un registro de ese agente que sigue siendo válido, con un `seq` mayor, o con el mismo `seq` y otros bytes, el nuevo es viejo. Los mismos bytes otra vez se guardan: una republicación nunca se rechaza.
+
+Por la regla 3, un proveedor que vuelve a arrancar con otro directorio de datos, y con él vuelve al `seq` 1, no sustituye en los routers su registro de `seq` mayor hasta que ese caduca.
+
+### Provider records
+
+Un provider record solo dice un `PeerId` bajo una clave, y la clave es un hash. El router lo comprueba contra el anuncio que guarda de ese agente, en este orden:
+
+1. La clave es un multihash SHA2-256 de 34 bytes: `12 20` y los 32 bytes del hash (`bad_provider_key`).
+2. El `PeerId` es el de un agente, en la forma de la sección 2 (`not_an_agent`). `libp2p-kad` ya descarta uno que no es el `PeerId` del par que lo envía, y el TLS de Iroh autenticó la clave de ese par.
+3. El router guarda un anuncio válido de ese agente, bajo la clave de su anuncio (`provider_without_announce`).
+4. Ese anuncio lista una capacidad cuya clave de la sección 3 es la del provider record (`capability_not_announced`). El anuncio lista las capacidades como las escribe el inventario, `vision.ocr` o `example:metal-plates`, y su clave sale de la cadena completa, la de `capability_tag`.
+
+Así, un router solo admite de un agente provider records de las capacidades de su anuncio firmado, como mucho 32 (`MAX_ANNOUNCED_CAPABILITIES`). Por eso quien publica envía su anuncio antes que sus provider records. La comprobación se hace al recibir cada provider record: si un anuncio nuevo sustituye al que el router guardaba, los provider records que ya tenía siguen hasta que caducan, aunque el anuncio nuevo no liste su capacidad.
+
+Con el anuncio del vector `announce-v1`, que lista `vision.ocr` y `example:metal-plates`, un router guarda los provider records de su agente bajo `122092485626d851a455cd10cd7ae3800eb76ff67220722638435d3ae050e92c8463` y `12202a561a2441f0cc4eba6d49bc3d437b467d69cb6c640d213337a81b4826b173b6`. Rechaza con `capability_not_announced` el de `code.rust.review` y el del SHA-256 de `vision.ocr` sin el prefijo `agentnet:capability:v1:`.
+
+### Motivos de rechazo
+
+Los nombres no cambian: son los que llevan los registros del daemon y `pals dht status`.
+
+| Motivo | Qué se rechaza |
+|-|-|
+| `unknown_key` | un valor bajo una clave que no es la de un contacto ni la de un anuncio |
+| `too_large` | un valor de más de 4 KiB |
+| `wrong_key` | un registro firmado por un agente distinto del de su clave |
+| `bad_contact` | bajo la clave de un contacto, algo que no es un contacto firmado válido |
+| `bad_announce` | bajo la clave de un anuncio, algo que no es un anuncio firmado válido |
+| `expired` | un registro pasada su ventana de validez |
+| `not_yet_valid` | un registro antes de su ventana de validez |
+| `bad_provider_key` | un provider record cuya clave no es un multihash SHA2-256 |
+| `not_an_agent` | un provider record cuyo `PeerId` no es el de un agente |
+| `provider_without_announce` | un provider record de un agente cuyo anuncio el router no guarda |
+| `capability_not_announced` | un provider record de una capacidad que el anuncio de su agente no lista |
+| `store_full` | un registro válido que ya no cabe en la tienda. No lo da ninguna comprobación: lo cuenta el swarm |
