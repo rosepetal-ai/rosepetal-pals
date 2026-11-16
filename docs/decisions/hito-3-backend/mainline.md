@@ -236,6 +236,8 @@ Las líneas de `src/`, sin pruebas, con `wc -l` (todas) y sin las vacías ni los
 
 `index.rs`, `krpc.rs` y `router.rs` son lo que costó definir el índice y validarlo en los routers: 692 líneas, 468 sin comentarios ni vacías. `lib.rs` existe para que las pruebas lleguen al nodo y al índice.
 
+`krpc.rs` lleva sus tres pruebas en el mismo fichero (`#[cfg(test)] mod tests`, de la línea 219 a la 262), y la tabla no las cuenta: de `krpc.rs` cuenta las líneas 1 a 217. Con `wc -l` sobre el fichero entero salen 262 (189), y el total, 1300 (942). Los demás ficheros de `src/` no llevan pruebas.
+
 Las pruebas son de dos clases:
 
 - sin red: tres en `tests/index.rs` (el *infohash* de una capacidad, contra un SHA-1 calculado aparte; lo que acepta y rechaza `index.rs`, motivo por motivo; el límite de 1000 bytes) y tres en `krpc.rs` (leer una consulta, un `put` mutable frente a uno inmutable y un error);
@@ -247,13 +249,13 @@ Las pruebas son de dos clases:
 
 ## Resultados
 
-Las cifras de esta sección son las de [`results/mainline.json`](results/mainline.json): la ejecución del arnés del 2026-11-16 sobre el commit `970f71a`, con los parámetros comunes de `params.env` (`TTL_S` = 120 s, `REPUBLISH_S` = 40 s, `IDLE_S` = 300 s, 10 búsquedas por cliente y capacidad y `SEARCH_LIMIT` = 8). Las de la línea base y los candidatos de Kademlia son las de [`results/baseline.json`](results/baseline.json), [`results/kad-libp2p.json`](results/kad-libp2p.json) y [`results/kad-iroh.json`](results/kad-iroh.json). Según `harness.log`, que git ignora, la ejecución duró 15 min 10 s, en un anfitrión de 32 CPU con una carga media al empezar de 16,8.
+Las cifras de esta sección son las de [`results/mainline.json`](results/mainline.json): la ejecución del arnés del 2026-11-16 sobre el commit `970f71a`, con los parámetros comunes de `params.env` (`TTL_S` = 120 s, `REPUBLISH_S` = 40 s, `IDLE_S` = 300 s, 10 búsquedas por cliente y capacidad y `SEARCH_LIMIT` = 8). Las de la línea base y los candidatos de Kademlia son las de [`results/baseline.json`](results/baseline.json), [`results/kad-libp2p.json`](results/kad-libp2p.json) y [`results/kad-iroh.json`](results/kad-iroh.json). Según `harness.log`, que git ignora, la ejecución duró 15 min 10 s, en un anfitrión de 32 CPU con una carga media al empezar de 16,8. Después de la medición, el commit `cc9ff99`, de la revisión final de la fase 1, solo añadió un comentario a la prueba `a_router_refuses_what_the_index_does_not_use`: no toca el código medido.
 
 | Escenario | Estado | Cifras |
 |-|-|-|
 | S0 | `pass` | 4 búsquedas, ningún candidato. `c0` acaba con 0 pares en la tabla de rutas y 0 conexiones |
 | S1 | `pass` | 160 búsquedas, todas con los dos proveedores verificados. Primer candidato válido a los 2 ms (p50 y p95), siempre fechado por el backend. Búsqueda entera en 3 ms (p50) y 1240 ms (p95). Peticiones por búsqueda: `null`, la biblioteca no las cuenta. 13 922 bytes netos por búsqueda (p50), 15 383 (p95) |
-| S2 | `fail` | Con `r1` parado, ninguna búsqueda de los clientes está completa (0 %). Su primer candidato válido llega a 1 ms (p50 y p95), siempre fechado por el backend, y la búsqueda termina a los 914 ms (p50) y 1252 ms (p95). `c5` tiene su primer candidato válido 5,8 s después de arrancar su contenedor, pero en sus 80 búsquedas nunca encuentra a todos los proveedores |
+| S2 | `fail` | Con `r1` parado, ninguna búsqueda de los clientes está completa (0 %). Su primer candidato válido llega a 1 ms (p50 y p95), siempre fechado por el backend, y la búsqueda termina a los 914 ms (p50) y 1252 ms (p95). `c5` termina su primera búsqueda con candidato válido 5,8 s después de arrancar su contenedor (el candidato llegó a los 5,2 s, según `raw/S2.jsonl`, que git ignora), pero en sus 80 búsquedas nunca encuentra a todos los proveedores |
 | S3 | `fail` | Los routers guardaban 4 registros de `p1` antes de pararlo. En los 34 sondeos, ni los routers dejan de guardarlos ni las búsquedas dejan de devolverlo: `routers_forget_s` y `searches_forget_s` son `null`. El límite es 160 s |
 | S4 | `pass` | Cobertura inmediata 1,0, completa desde el principio (0 s). Con `r2` y `r4` parados, el primer candidato válido llega a los 2 ms (p50) y 4 ms (p95), siempre fechado por el backend, y la búsqueda termina a los 905 ms (p50) y 1252 ms (p95) |
 | S5 | `pass` | Tres routers rechazan el contacto de `rogue`, 6 rechazos en total. Ninguno lo guarda, según lo que cada router pregunta a la biblioteca, también por el objetivo rechazado, y `records_stored` no crece sin explicación. Los clientes lo reciben las 4 veces como `bad_contact`, nunca como válido |
@@ -285,6 +287,7 @@ Lo que explica las cifras, sin que el JSON lo desglose. Lo que viene de los fich
 - **El contacto en uso.** Nadie marca el endpoint de Iroh que nombra el contacto: S7 comprueba que el cliente recibe la dirección nueva, no que conecte con ella.
 - **Peticiones por búsqueda.** La biblioteca no las cuenta.
 - **Lo que la biblioteca rechaza tras el gancho** (un *token* caducado, un `seq` viejo). El router no lo cuenta en `records_rejected`, y no se ve aparte.
+- **El gancho del router como diseño.** Sirve para medir, pero no es un diseño de producto. Su conjunto de objetivos que se pregunta a sí mismo crece sin límite: cualquier `put` o `announce_signed_peer` que el gancho pueda leer añade uno, aunque no lleve firma válida, y su identificador de `u16` da la vuelta pasados 65 536 objetivos.
 
 ## Metadatos que ve un nodo intermedio
 
