@@ -16,7 +16,7 @@ No es código del producto. El daemon no usa nada de aquí, y esta fase no toca 
 | `spike-kad-iroh` | `kad-iroh/` | `libp2p-kad` sobre un transporte de libp2p hecho con conexiones Iroh (tarea 4) |
 | `spike-mainline` | `mainline/` | Iroh más una DHT Mainline privada, con el contacto resuelto por pkarr (tarea 5) |
 
-Por ahora, cada binario solo nombra un elemento de cada dependencia para enlazarlas. Las tareas 2 a 5 escriben los nodos.
+`spike-common` y `spike-baseline` están escritos (tarea 2). Los otros tres binarios todavía solo nombran un elemento de cada dependencia para enlazarlas; las tareas 3 a 5 escriben sus nodos sobre el contrato de [más abajo](#el-contrato-de-nodo).
 
 ## Dependencias
 
@@ -29,6 +29,8 @@ Todas van fijadas con `=` en [`Cargo.toml`](Cargo.toml):
 | `mainline` | `=8.0.1` | `mainline` |
 | `pkarr` | `=9.0.0`, con sus features por defecto (`full-client`: `dht` y `relays`) | `mainline` |
 | `iroh-mainline-address-lookup` | `=0.6.1` | `mainline` |
+
+El contrato de nodo usa además, con las versiones que ya fija el `Cargo.lock` de la raíz: `axum =0.8.9` y `tokio =1.54.1` (la API de control, como la pasarela del daemon), `clap =4.6.7` (la línea de órdenes), `serde =1.0.229`, `serde_json =1.0.154`, `anyhow =1.0.104`, `base64 =0.23.1` (la firma que altera `--rogue`), `tracing =0.1.44` y `tracing-subscriber =0.3.23` (el registro de cada nodo).
 
 El `Cargo.lock` de aquí partió de una copia del de la raíz. Así, los crates que el daemon ya usa conservan sus versiones, y solo se resolvieron los nuevos.
 
@@ -79,9 +81,86 @@ Notas sobre los campos:
 
 `compat.sh` deja sus compilaciones en `target/compat/`, que git ignora.
 
+## El contrato de nodo
+
+Cada candidato es un binario cuyo `main` es `spike_common::run_node::<B>()` sobre su propio `B: spike_common::Backend` ([`common/src/lib.rs`](common/src/lib.rs)). El backend solo pone la DHT: arrancar, anunciar, retirar el anuncio, buscar y dar sus contadores. Lo demás es común, para que lo único que cambie entre candidatos sea la DHT:
+
+- **Línea de órdenes:** `--name <n> --role router|provider|client --listen <ip:puerto> [--bootstrap <s>]… [--announce <capacidad>]… --ttl-s <n> --republish-s <n> --key-seed <64 hex> [--rogue]`. La clave del agente sale de `--key-seed`. `--announce` y `--rogue` son solo para proveedores.
+- **Registros:** `run_node` emite los `agentnet.contact/1` y `agentnet.announce/1` de `pals-core`, sin cambios, con su vida de 24 h; la DHT aplica la suya, `--ttl-s`. El contacto lista las direcciones del nodo en ese momento: con `--listen 0.0.0.0:<puerto>`, todas sus IPv4 menos la de bucle, leídas de `/proc/net/fib_trie`. El `seq` sale del reloj, para que nunca retroceda aunque el arnés reinicie el nodo. No hay Agent Card, y el anuncio lleva un `agent_card_hash` fijo y bien formado.
+- **Verificación:** todo lo que devuelve `search` es ajeno. `verify` comprueba cada candidato (los dos registros pasan `Signed::from_json` y su firma verifica, son del mismo agente, el anuncio lista la capacidad buscada y los dos están en plazo), con el primer motivo que falle: `bad_contact`, `bad_announce`, `agent_mismatch`, `capability_missing` o `expired`. Después, `dedupe` deja un candidato por agente, el primero válido (spec §5.3, paso 4).
+- **`--rogue`:** el contacto que se publica lleva la firma con su primer byte alterado (`tamper_signature`, la misma función que usa la prueba `verify_rejects_a_tampered_contact`).
+- **API de control,** en `127.0.0.1:7600` dentro del contenedor, con `axum`:
+  - `POST /search {"capability", "limit"}` devuelve `{"elapsed_ms", "first_valid_ms", "candidates": [{"agent_id", "valid", "reason", "direct_addrs"}], "requests"}`;
+  - `POST /announce {"capabilities": [..]}` vuelve a emitir los registros, con las direcciones de ese momento y el `seq` siguiente, y llama a `announce`;
+  - `POST /unannounce`;
+  - `GET /stats` da los campos de `BackendStats` más `rss_kib`, de `/proc/self/status`;
+  - `GET /healthz` da `{"name", "role", "agent_id", "announced", "announce_error", "declared"}`, y solo contesta cuando el backend ha arrancado y se ha intentado el anuncio de `--announce`.
+
+  `run_node` llama a los métodos del backend de uno en uno, desde una sola tarea. Por eso sus futuros no necesitan ser `Send`, y el backend mueve su red en tareas propias.
+
+Tres cosas van más allá de lo que fija el plan, porque sin ellas el arnés no puede comprobar un escenario:
+
+- `direct_addrs` en cada candidato: las direcciones del contacto verificado. S7 ve con ellas que un cliente resolvió el contacto nuevo.
+- `stored_by_agent` en `BackendStats`: cuántos contactos, anuncios y provider records guarda el nodo de cada agente. S3 comprueba con él que los routers dejan de guardar lo del proveedor parado, y S5 que ninguno guarda el contacto inválido.
+- `Backend::DECLARED`, que sale en `declared` de `/healthz`: los escenarios que el backend no puede ejecutar tal cual, con su estado (`by-design` o `not-applicable`) y su motivo. Así el arnés no sabe qué candidato maneja. Un candidato real no declara ninguno; la línea base declara S1 `by-design` y S2 a S5 y S7 `not-applicable`.
+
 ## Arnés
 
-El arnés Docker (`harness/`) llega con la tarea 2 del plan. Monta la misma topología para todos los candidatos, con redes internas y sin DHT públicas, y la tarea 2 añadirá aquí cómo ejecutarlo.
+```bash
+bash spikes/hito-3/harness/harness.sh <id>               # p. ej. baseline; desde cualquier directorio
+bash spikes/hito-3/harness/harness.sh --teardown <id>    # lo que dejó una ejecución interrumpida
+```
+
+Necesita Linux, Docker, `python3`, `cargo` y `git`, y tarda unos 10 minutos con la línea base: el reposo de S6 son 5. Los parámetros, comunes a todos los candidatos, están en [`harness/params.env`](harness/params.env): los plazos y límites del plan, la topología, las capacidades y cómo espera y sondea el arnés.
+
+Qué hace `harness.sh <id>`:
+
+1. Compila `spike-<id>` (`cargo build --release --locked`) y la imagen `pals-spike:latest` ([`harness/Dockerfile`](harness/Dockerfile)): Debian trixie-slim fijado por digest, con `curl` e `iproute2`. El binario se copia en cada contenedor antes de arrancarlo.
+2. Crea `pals-spike-net-a` y `pals-spike-net-b` con `--internal`, y comprueba que `docker network inspect -f '{{.Internal}}'` dice `true`.
+3. Arranca la topología del plan, un contenedor por nodo con `--cpus 1 --memory 512m`: `r1`; luego `r2` a `r4`, con `--bootstrap` el `bootstrap_addr` de `r1`; los proveedores, con sus capacidades, y los clientes, que tienen además el de `r3`. Espera a que cada uno conteste `/healthz`.
+4. Espera a que la topología se asiente (ver abajo) y ejecuta S0 a S7 en orden, con `docker exec <contenedor> curl` sobre la API de control. Los bytes salen de `/sys/class/net/*/statistics` de cada contenedor, todas las interfaces menos `lo`.
+5. Escribe `docs/decisions/hito-3-backend/results/<id>.json` y lo pasa por `check_results.py`, cuyo código de salida es el de la ejecución.
+
+Los registros quedan en `harness/logs/<id>/`, que git ignora: `harness.log`, un `<nodo>.log` por contenedor y `raw/`, con cada observación en una línea JSON. Todo el JSON lo lee y lo escribe [`harness/scenarios.py`](harness/scenarios.py): las observaciones, las condiciones que esperan los bucles y la evaluación de cada escenario.
+
+Lo que el arnés necesita del candidato sale de su binario: cómo nombra un nodo a otro en `--bootstrap` (`bootstrap_addr` de `/stats`), el `agent_id` de cada nodo y los escenarios declarados (`/healthz`). Así, las tareas 3 a 5 lo ejecutan sin cambiarlo.
+
+**Seguridad en un anfitrión compartido,** como en `tests/exit/hito-2.sh`. Cada contenedor y red se llama `pals-spike-*` y lleva la etiqueta `pals-spike.dir=<directorio de registros de la ejecución>`. Una ejecución se niega a empezar si existe cualquier contenedor o red `pals-spike-*`. Al salir, y también con Ctrl-C, desmonta solo lo que tiene su prefijo y su etiqueta; la imagen se queda. No toca la red del anfitrión (ni `iptables`, `nft`, `tc` o `sysctl`, ni `prune`), y en los contenedores solo entra el binario del candidato.
+
+### Cómo se ejecuta cada escenario
+
+Entre escenarios, la topología vuelve a su estado. Los nodos que para un escenario se arrancan de nuevo, con el mismo contenedor, clave e IP, y los que solo arrancan para su escenario (`c0`, `c5` y `rogue`) se paran. Después, el arnés espera a que la topología se asiente: lo que guardan los routers no cambia en `SETTLE_STABLE_POLLS` sondeos seguidos y, salvo que el backend declare S1 `by-design`, todos los proveedores tienen algo guardado en algún router; como mucho, `SETTLE_MAX_S`. Las búsquedas van de una en una, y el cliente no hace nada más mientras tanto.
+
+| Id | Cómo | Superado si |
+|-|-|-|
+| S0 | Arranca `c0` en la red A sin lista de arranque. Espera `S0_GRACE_S`, por si un descubrimiento local (mDNS, difusión) llegara a los proveedores de la red A, y busca cada capacidad | No hay ningún candidato. Un error del backend cuenta como búsqueda sin candidatos |
+| S1 | Cada cliente busca cada capacidad, `SEARCHES` rondas | Cada búsqueda devuelve los dos proveedores, verificados. Declarado `by-design`, no debe haber ningún candidato válido, y si lo hay el escenario queda en `error` |
+| S2 | Para `r1` (`docker kill`). Cada cliente busca cada capacidad una vez. Arranca `c5` con `[r1, r3]` y busca hasta encontrar a los dos proveedores de cada capacidad, `2 × REPUBLISH_S` como mucho | Las búsquedas de los clientes están completas y `c5` encuentra a todos. El tiempo de `c5` cuenta desde que arranca su contenedor |
+| S3 | Mide lo que los routers guardan de `p1` y lo para (`docker kill`). Cada `POLL_S`, las estadísticas de los routers y una búsqueda por cliente de una capacidad de `p1`, hasta una ronda en que ninguna lo devuelve, `TTL_S + 2 × REPUBLISH_S` como mucho | Antes de pararlo los routers guardaban algo de `p1`, y en menos de `TTL_S + REPUBLISH_S` dejan de guardarlo y ninguna búsqueda lo devuelve, ni como inválido. El tiempo de las búsquedas es el de la primera después de la última que lo devolvió |
+| S4 | Para `r2` y `r4`. Rondas seguidas en que cada cliente busca cada capacidad, hasta una ronda completa, `3 × REPUBLISH_S` como mucho | La cobertura (proveedores esperados encontrados) vuelve a 1 en menos de `2 × REPUBLISH_S`. Cuenta la primera búsqueda completa, del mismo cliente y capacidad, después de la última incompleta, y es 0 si ninguna lo fue |
+| S5 | Arranca `rogue` en la red B con `--rogue`, que anuncia `vision.ocr`. Sondea los routers hasta que alguno cuente un rechazo, `2 × REPUBLISH_S` como mucho; después, cada cliente busca `vision.ocr` | Algún router sube `records_rejected`, ninguno guarda el contacto de `rogue` (`stored_by_agent`) y ningún cliente lo devuelve como válido |
+| S6 | `IDLE_S` sin búsquedas, con las estadísticas de los 12 nodos muestreadas cada `IDLE_SAMPLE_S` y los contadores al principio y al final | Siempre `measured`. Se dan los bytes recibidos más enviados y, aparte, los enviados, porque un contenedor que no envía nada recibe igualmente el tráfico de fondo del puente de Docker |
+| S7 | Saca `p3` de la red B y lo mete en la A (`docker network disconnect` y `connect`), y le pide `POST /announce`. Cada cliente busca una capacidad de `p3` por ronda, hasta `3 × REPUBLISH_S` | Todos los clientes reciben un contacto válido de `p3` con su IP nueva en menos de `2 × REPUBLISH_S`, contando desde la desconexión |
+
+Un escenario queda en `error`, y la ejecución sale con 1, cuando el arnés no obtuvo una respuesta: una búsqueda sin respuesta de la API, un nodo que no arranca o una topología que no se pudo restablecer. Sus cifras no valen. Los bytes por búsqueda de S1 son los de la interfaz del cliente durante la búsqueda, menos su tráfico en reposo de S6 en el mismo tiempo. Los percentiles son de rango más cercano.
+
+### Resultados
+
+`results/<id>.json` = `{"backend", "commit", "date", "params": {…params.env…}, "scenarios": {"S0".."S7": {"status", "metrics": {…}, "notes"}}}`, con `status` uno de `pass`, `fail`, `by-design`, `not-applicable`, `error` o `measured`. `commit` lleva `-dirty` si `crates/`, `spikes/hito-3/` o los `Cargo` de la raíz tenían cambios sin commit.
+
+```bash
+python3 spikes/hito-3/harness/check_results.py docs/decisions/hito-3-backend/results/*.json
+python3 spikes/hito-3/harness/summarize.py --compat docs/decisions/hito-3-backend/compat.json docs/decisions/hito-3-backend/results/*.json
+```
+
+- `check_results.py` valida el esquema, rechaza ficheros con `params` distintos entre sí o con el mismo `backend`, y rutas del anfitrión. Sale con 1 si algún escenario está en `error`.
+- `summarize.py` imprime la tabla Markdown del registro de decisión: una columna por candidato y una fila por métrica, con el `status` del escenario en cada celda. Las filas de compatibilidad salen de `compat.json`, que los resultados no copian. Mientras `compat.json` es provisional, las celdas de tamaño dicen `provisional`.
+
+### Línea base
+
+`baseline` solo conoce los contactos de `--bootstrap`. Su búsqueda pregunta a cada uno, por HTTP en su puerto de escucha (`POST /lookup`), si anuncia la capacidad, y un contacto que la anuncia contesta con sus dos registros. Ningún cliente tiene a un proveedor como contacto, así que sin contacto previo no encuentra a nadie. Como el daemon del hito 2, tiene un endpoint de Iroh con la clave del agente, en UDP en el mismo puerto, sin relay ni búsqueda de direcciones. No lo usa nadie, pero así su coste en reposo es la referencia a la que cada candidato suma el suyo. Su `bootstrap_addr` son todas sus direcciones, separadas por comas.
+
+Resultado esperado: S0 `pass`, S1 `by-design` sin candidatos, S2 a S5 y S7 `not-applicable` con su motivo, y S6 `measured`.
 
 ## Comprobaciones
 
@@ -91,6 +170,7 @@ Dentro de `spikes/hito-3/`:
 cargo build --release --locked
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked -p spike-common -p spike-baseline
 ```
 
 Las comprobaciones de la raíz (`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` y `cargo test --workspace --locked`) no ven este directorio.

@@ -8,4 +8,11 @@ publish.workspace = true
 
 [dependencies]
 spike-common.workspace = true
+pals-core.workspace = true
 iroh.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true

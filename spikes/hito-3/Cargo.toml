@@ -14,6 +14,21 @@ publish = false
 [workspace.dependencies]
 # Every dependency pinned with `=`, never `latest`.
 spike-common = { path = "common" }
+# The records that travel are pals-core's, unchanged.
+pals-core = { path = "../../crates/pals-core" }
+
+# The versions the root workspace already locks.
+anyhow = "=1.0.104"
+# The control API, as the daemon's gateway.
+axum = "=0.8.9"
+# The signature `--rogue` alters.
+base64 = "=0.23.1"
+clap = { version = "=4.6.7", features = ["derive"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+tokio = { version = "=1.54.1", features = ["macros", "net", "rt-multi-thread", "sync", "time", "io-util"] }
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 
 # The daemon's.
 iroh = "=1.4.1"
