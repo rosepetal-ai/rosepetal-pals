@@ -1,0 +1,12 @@
+[package]
+name = "spike-kad-libp2p"
+description = "Hito 3 spike: Iroh plus libp2p-kad on its own libp2p stack; not product code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+spike-common.workspace = true
+iroh.workspace = true
+libp2p = { workspace = true, features = ["kad", "quic", "tokio", "macros", "identify"] }

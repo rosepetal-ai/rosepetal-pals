@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/pals-core", "crates/pals"]
+# The hito 3 backend spikes are a separate workspace with their own lock.
+exclude = ["spikes"]
 
 [workspace.package]
 version = "0.1.0"

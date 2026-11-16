@@ -1,0 +1,13 @@
+[package]
+name = "spike-kad-iroh"
+description = "Hito 3 spike: libp2p-kad over Iroh connections; not product code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+spike-common.workspace = true
+iroh.workspace = true
+# No transports of its own: they are Iroh's.
+libp2p = { workspace = true, features = ["kad", "tokio", "macros"] }

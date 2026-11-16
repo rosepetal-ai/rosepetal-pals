@@ -1,0 +1,11 @@
+[package]
+name = "spike-common"
+description = "Shared code of the hito 3 backend spikes; not product code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The records that travel are pals-core's, unchanged.
+pals-core = { path = "../../../crates/pals-core" }

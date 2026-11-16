@@ -1,0 +1,103 @@
+{
+  "date": "2026-11-16T01:16:55Z",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "rustc_msrv": "rustc 1.91.1 (ed61e7d7e 2025-11-07)",
+  "commit": "d716c7c-dirty",
+  "host_cpus": 32,
+  "candidates": {
+    "baseline": {
+      "msrv_1_91": "pass",
+      "msrv_error": null,
+      "crates": 277,
+      "duplicates": [
+        "base64 v0.22.1, v0.23.1",
+        "cpufeatures v0.2.17, v0.3.1",
+        "crypto-common v0.1.7, v0.2.2",
+        "getrandom v0.2.17, v0.4.3",
+        "netlink-packet-core v0.8.2, v0.9.0",
+        "netlink-packet-route v0.31.0, v0.33.0",
+        "netlink-sys v0.8.8, v0.9.0",
+        "syn v2.0.119, v3.0.10"
+      ],
+      "release_build_s": 40.3,
+      "release_build_load_1m": [
+        15.66,
+        16.61
+      ],
+      "binary_bytes": 445728,
+      "binary_bytes_over_baseline": 0
+    },
+    "kad-libp2p": {
+      "msrv_1_91": "pass",
+      "msrv_error": null,
+      "crates": 348,
+      "duplicates": [
+        "base64 v0.22.1, v0.23.1",
+        "cpufeatures v0.2.17, v0.3.1",
+        "crypto-common v0.1.7, v0.2.2",
+        "getrandom v0.2.17, v0.4.3",
+        "netlink-packet-core v0.8.2, v0.9.0",
+        "netlink-packet-route v0.28.0, v0.31.0, v0.33.0",
+        "netlink-sys v0.8.8, v0.9.0",
+        "syn v2.0.119, v3.0.10",
+        "synstructure v0.13.2, v0.14.0",
+        "thiserror v1.0.69, v2.0.21",
+        "thiserror-impl v1.0.69, v2.0.21",
+        "yasna v0.5.2, v0.6.0"
+      ],
+      "release_build_s": 47.6,
+      "release_build_load_1m": [
+        16.23,
+        23.58
+      ],
+      "binary_bytes": 445888,
+      "binary_bytes_over_baseline": 160
+    },
+    "kad-iroh": {
+      "msrv_1_91": "pass",
+      "msrv_error": null,
+      "crates": 313,
+      "duplicates": [
+        "base64 v0.22.1, v0.23.1",
+        "cpufeatures v0.2.17, v0.3.1",
+        "crypto-common v0.1.7, v0.2.2",
+        "getrandom v0.2.17, v0.4.3",
+        "netlink-packet-core v0.8.2, v0.9.0",
+        "netlink-packet-route v0.31.0, v0.33.0",
+        "netlink-sys v0.8.8, v0.9.0",
+        "syn v2.0.119, v3.0.10"
+      ],
+      "release_build_s": 44.0,
+      "release_build_load_1m": [
+        23.29,
+        23.14
+      ],
+      "binary_bytes": 445872,
+      "binary_bytes_over_baseline": 144
+    },
+    "mainline": {
+      "msrv_1_91": "pass",
+      "msrv_error": null,
+      "crates": 297,
+      "duplicates": [
+        "base64 v0.22.1, v0.23.1",
+        "cpufeatures v0.2.17, v0.3.1",
+        "crypto-common v0.1.7, v0.2.2",
+        "getrandom v0.2.17, v0.4.3",
+        "lru v0.18.5, v0.19.0",
+        "netlink-packet-core v0.8.2, v0.9.0",
+        "netlink-packet-route v0.31.0, v0.33.0",
+        "netlink-sys v0.8.8, v0.9.0",
+        "spin v0.9.9, v0.10.1",
+        "syn v2.0.119, v3.0.10"
+      ],
+      "release_build_s": 64.9,
+      "release_build_load_1m": [
+        23.24,
+        30.65
+      ],
+      "binary_bytes": 445984,
+      "binary_bytes_over_baseline": 256
+    }
+  }
+}

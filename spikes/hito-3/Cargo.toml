@@ -1,0 +1,27 @@
+# The hito 3 backend comparison: one small binary per candidate, all on the
+# same node contract. Not product code: a workspace of its own, with its own
+# Cargo.lock, excluded from the root one and not built by CI.
+[workspace]
+resolver = "3"
+members = ["common", "baseline", "kad-libp2p", "kad-iroh", "mainline"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+
+[workspace.dependencies]
+# Every dependency pinned with `=`, never `latest`.
+spike-common = { path = "common" }
+
+# The daemon's.
+iroh = "=1.4.1"
+# Brings libp2p-kad =0.49.0. Each candidate picks its own features.
+libp2p = "=0.57.1"
+mainline = "=8.0.1"
+pkarr = "=9.0.0"
+# Iroh 1.x's pkarr address lookup over Mainline, from n0. It brings its own
+# Mainline client (`n0-mainline`) and the pkarr packets of `iroh-dns`, not
+# `mainline` and `pkarr` above.
+iroh-mainline-address-lookup = "=0.6.1"
