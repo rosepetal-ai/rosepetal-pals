@@ -1,0 +1,144 @@
+{
+  "backend": "baseline",
+  "commit": "41aeefa",
+  "date": "2026-11-16T02:49:01Z",
+  "params": {
+    "TTL_S": 120,
+    "REPUBLISH_S": 40,
+    "IDLE_S": 300,
+    "SEARCHES": 10,
+    "SEARCH_LIMIT": 8,
+    "NET_A": "pals-spike-net-a",
+    "NET_B": "pals-spike-net-b",
+    "CPUS": 1,
+    "MEMORY": "512m",
+    "LISTEN_PORT": 4433,
+    "ROUTERS": "r1 r2 r3 r4",
+    "OPERATOR_1": "r1 r2",
+    "OPERATOR_2": "r3 r4",
+    "PROVIDERS_A": "p1 p2",
+    "PROVIDERS_B": "p3 p4",
+    "CLIENTS_A": "c1 c2",
+    "CLIENTS_B": "c3 c4",
+    "BOOTSTRAP": "r1",
+    "SAVED_CONTACT": "r3",
+    "S0_NODE": "c0",
+    "S0_NET": "a",
+    "S2_NODE": "c5",
+    "S2_NET": "a",
+    "S5_NODE": "rogue",
+    "S5_NET": "b",
+    "S3_NODE": "p1",
+    "S7_NODE": "p3",
+    "S4_NODES": "r2 r4",
+    "CAPABILITY_PREFIX": "agentnet:capability:v1:",
+    "CAPABILITIES": "vision.ocr code.rust.review knowledge.documentation vision.defect-detection",
+    "CAPS_p1": "vision.ocr knowledge.documentation",
+    "CAPS_p2": "code.rust.review vision.defect-detection",
+    "CAPS_p3": "vision.ocr vision.defect-detection",
+    "CAPS_p4": "code.rust.review knowledge.documentation",
+    "CAPS_rogue": "vision.ocr",
+    "POLL_S": 3,
+    "SETTLE_STABLE_POLLS": 3,
+    "SETTLE_MAX_S": 80,
+    "S0_GRACE_S": 10,
+    "IDLE_SAMPLE_S": 60,
+    "HEALTH_TIMEOUT_S": 180,
+    "SEARCH_TIMEOUT_S": 120
+  },
+  "scenarios": {
+    "S0": {
+      "status": "pass",
+      "metrics": {
+        "searches": 4,
+        "candidates": 0,
+        "backend_errors": 0,
+        "routing_peers": 0,
+        "connections": 0
+      },
+      "notes": "c0, sin lista de arranque, buscó cada capacidad tras 10 s en la red A con los proveedores anunciados: no encontró ningún candidato."
+    },
+    "S1": {
+      "status": "by-design",
+      "metrics": {
+        "searches": 160,
+        "with_valid_pct": 0.0,
+        "complete_pct": 0.0,
+        "first_valid_ms_p50": null,
+        "first_valid_ms_p95": null,
+        "elapsed_ms_p50": 0,
+        "elapsed_ms_p95": 1,
+        "requests_p50": 2,
+        "requests_p95": 2,
+        "candidates_p50": 0,
+        "candidates_max": 0,
+        "bytes_raw_p50": 2182,
+        "bytes_p50": 2182,
+        "bytes_p95": 2182,
+        "backend_errors": 0
+      },
+      "notes": "Solo contactos, como en el hito 2: el nodo solo pregunta a los contactos que ya tiene, ninguno es proveedor, y sin contacto previo no encuentra a nadie. 160 búsquedas: 4 clientes, 4 capacidades, 10 veces cada una. Bytes por búsqueda: los de la interfaz del cliente menos su tráfico en reposo de S6 en el mismo tiempo."
+    },
+    "S2": {
+      "status": "not-applicable",
+      "metrics": {},
+      "notes": "Sin descubrimiento no hay búsqueda que siga funcionando al caer el arranque original: los clientes no encontraban a nadie antes del corte."
+    },
+    "S3": {
+      "status": "not-applicable",
+      "metrics": {},
+      "notes": "Los routers no guardan registros de nadie: no hay anuncio que caduque."
+    },
+    "S4": {
+      "status": "not-applicable",
+      "metrics": {},
+      "notes": "Sin DHT, la caída de routers no cambia una cobertura que ya es nula."
+    },
+    "S5": {
+      "status": "not-applicable",
+      "metrics": {},
+      "notes": "Los routers no aceptan registros ajenos, así que no hay nada que rechazar, y a los clientes no les llega el anuncio del nodo rogue. Lo que sí se comprueba es que el cliente rechaza su contacto (prueba verify_rejects_a_tampered_contact)."
+    },
+    "S6": {
+      "status": "measured",
+      "metrics": {
+        "router_rss_kib_p50": 14724,
+        "router_rss_kib_max": 14860,
+        "router_connections_p50": 0,
+        "router_connections_max": 0,
+        "router_routing_peers_p50": 1,
+        "router_routing_peers_max": 1,
+        "router_bytes_per_min_p50": 442,
+        "router_bytes_per_min_max": 442,
+        "router_sent_bytes_per_min_p50": 0,
+        "router_sent_bytes_per_min_max": 0,
+        "provider_rss_kib_p50": 14584,
+        "provider_rss_kib_max": 14944,
+        "provider_connections_p50": 0,
+        "provider_connections_max": 0,
+        "provider_routing_peers_p50": 1,
+        "provider_routing_peers_max": 1,
+        "provider_bytes_per_min_p50": 221,
+        "provider_bytes_per_min_max": 221,
+        "provider_sent_bytes_per_min_p50": 0,
+        "provider_sent_bytes_per_min_max": 0,
+        "client_rss_kib_p50": 14596,
+        "client_rss_kib_max": 14668,
+        "client_connections_p50": 0,
+        "client_connections_max": 0,
+        "client_routing_peers_p50": 2,
+        "client_routing_peers_max": 2,
+        "client_bytes_per_min_p50": 221,
+        "client_bytes_per_min_max": 221,
+        "client_sent_bytes_per_min_p50": 0,
+        "client_sent_bytes_per_min_max": 0
+      },
+      "notes": "300 s sin búsquedas, con los 12 nodos de la topología. Memoria, conexiones y tabla de rutas muestreadas cada 60 s; bytes por minuto, de los contadores de todas las interfaces del contenedor menos lo, al empezar y al acabar: recibidos y enviados (bytes), y solo enviados (sent_bytes), porque un contenedor que no envía nada también recibe el tráfico de fondo del puente de Docker. p50 y máximo por papel."
+    },
+    "S7": {
+      "status": "not-applicable",
+      "metrics": {},
+      "notes": "Sin descubrimiento, ningún cliente resuelve a un proveedor que no es contacto suyo, ni antes ni después de que cambie de red."
+    }
+  }
+}
