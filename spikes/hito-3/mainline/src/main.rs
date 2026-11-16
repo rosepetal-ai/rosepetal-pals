@@ -1,16 +1,7 @@
-//! `mainline`: Iroh plus a private Mainline DHT, with the contact resolved
-//! through pkarr.
-//!
-//! Task 5 of the plan writes the node. Until then the binary only names one
-//! item of each dependency, so that it links them all.
+//! `mainline`: Iroh plus a private Mainline DHT with a capability index of
+//! signed peers; the node is [`spike_mainline::Mainline`].
 
-fn main() {
-    println!("{:?}", spike_common::RECORD_SCHEMAS);
-    println!("{}", std::any::type_name::<iroh::Endpoint>());
-    println!("{}", std::any::type_name::<mainline::Dht>());
-    println!("{}", std::any::type_name::<pkarr::SignedPacket>());
-    println!(
-        "{}",
-        std::any::type_name::<iroh_mainline_address_lookup::DhtAddressLookup>()
-    );
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    spike_common::run_node::<spike_mainline::Mainline>().await
 }

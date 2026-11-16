@@ -14,9 +14,9 @@ No es código del producto. El daemon no usa nada de aquí, y esta fase no toca 
 | `spike-baseline` | `baseline/` | Línea base: solo contactos, la situación del hito 2 (tarea 2) |
 | `spike-kad-libp2p` | `kad-libp2p/` | Iroh más `libp2p-kad` en su propia pila libp2p (tarea 3) |
 | `spike-kad-iroh` | `kad-iroh/` | `libp2p-kad` sobre un transporte de libp2p hecho con conexiones Iroh (tarea 4) |
-| `spike-mainline` | `mainline/` | Iroh más una DHT Mainline privada, con el contacto resuelto por pkarr (tarea 5) |
+| `spike-mainline` | `mainline/` | Iroh más una DHT Mainline privada, con un índice de capacidades de *signed peers* y el contacto en un item BEP 44 (tarea 5) |
 
-`spike-common` y `spike-baseline` están escritos (tarea 2), `spike-kad-libp2p` (tarea 3) y `spike-kad-iroh` (tarea 4) también. `spike-mainline` todavía solo nombra un elemento de cada dependencia para enlazarlas; la tarea 5 escribe su nodo sobre el contrato de [más abajo](#el-contrato-de-nodo).
+`spike-common` y `spike-baseline` están escritos (tarea 2), y `spike-kad-libp2p` (tarea 3), `spike-kad-iroh` (tarea 4) y `spike-mainline` (tarea 5) también, sobre el contrato de [más abajo](#el-contrato-de-nodo).
 
 ## Dependencias
 
@@ -26,11 +26,9 @@ Todas van fijadas con `=` en [`Cargo.toml`](Cargo.toml):
 |-|-|-|
 | `iroh` | `=1.4.1`, la del daemon | Todos los binarios |
 | `libp2p` | `=0.57.1`, que trae `libp2p-kad 0.49.0` | `kad-libp2p`, con `kad`, `quic`, `tokio`, `macros`, `identify` y `ed25519`; `kad-iroh`, sin transportes de libp2p, porque los suyos son los de Iroh: `kad`, `tokio`, `macros`, `identify` y `ed25519` |
-| `mainline` | `=8.0.1` | `mainline` |
-| `pkarr` | `=9.0.0`, con sus features por defecto (`full-client`: `dht` y `relays`) | `mainline` |
-| `iroh-mainline-address-lookup` | `=0.6.1` | `mainline` |
+| `n0-mainline` | `=0.7.2`, la DHT Mainline de n0 | `mainline`, con `unstable_signed_peers` |
 
-El contrato de nodo usa además, con las versiones que ya fija el `Cargo.lock` de la raíz: `axum =0.8.9` y `tokio =1.54.1` (la API de control, como la pasarela del daemon), `clap =4.6.7` (la línea de órdenes), `serde =1.0.229`, `serde_json =1.0.154`, `anyhow =1.0.104`, `base64 =0.23.1` (la firma que altera `--rogue`), `tracing =0.1.44` y `tracing-subscriber =0.3.23` (el registro de cada nodo). `kad-libp2p` usa también `sha2 =0.11.0`, para la clave de los provider records y la clave libp2p que deriva de la semilla del agente, y `kad-iroh`, para la clave de los provider records.
+El contrato de nodo usa además, con las versiones que ya fija el `Cargo.lock` de la raíz: `axum =0.8.9` y `tokio =1.54.1` (la API de control, como la pasarela del daemon), `clap =4.6.7` (la línea de órdenes), `serde =1.0.229`, `serde_json =1.0.154`, `anyhow =1.0.104`, `base64 =0.23.1` (la firma que altera `--rogue`), `tracing =0.1.44` y `tracing-subscriber =0.3.23` (el registro de cada nodo). `kad-libp2p` usa también `sha2 =0.11.0`, para la clave de los provider records y la clave libp2p que deriva de la semilla del agente, y `kad-iroh`, para la clave de los provider records. `mainline` usa `serde_bencode =0.2.4` (los mensajes KRPC que leen sus routers), `sha1_smol =1.0.1` (el *infohash* de una capacidad) y `futures-core =0.3.34` (las búsquedas de `n0-mainline` son `Stream`), las versiones que `n0-mainline` ya fija.
 
 El `Cargo.lock` de aquí partió de una copia del de la raíz. Así, los crates que el daemon ya usa conservan sus versiones, y solo se resolvieron los nuevos.
 
@@ -43,6 +41,8 @@ El plan pide añadir, si existe, un crate de Iroh 1.x que haga la búsqueda de d
 - **`iroh-mainline-address-lookup 0.6.1`**, de n0 ([n0-computer/iroh-address-lookups](https://github.com/n0-computer/iroh-address-lookups)). Es la búsqueda de direcciones por pkarr sobre Mainline de Iroh 1.x (`DhtAddressLookup`, que implementa `iroh::address_lookup::AddressLookup`). Tiene MSRV 1.91 y depende de `iroh ^1.0.0`. **Se añade**, fijado a `=0.6.1`. Ojo: no usa `mainline 8.0.1` ni `pkarr 9.0.0`. Su DHT es `n0-mainline 0.7.2`, el fork de n0 de `mainline`, y sus paquetes pkarr son los de `iroh-dns 1.4.1`. Si la tarea 5 lo usa junto a `mainline` y `pkarr`, el binario lleva dos implementaciones de Mainline.
 - `iroh-mainline-endpoint-discovery 0.1.6`, también de n0. Sigue otro camino: Mainline lleva a un servidor de índice de direcciones (`udp-addr-index-proto`), que da la identidad firmada del endpoint. No depende de `iroh`, solo de `iroh-base`, así que no implementa su `AddressLookup`. No se añade.
 - `iroh-pkarr-node-discovery 0.6.0` depende de `iroh-net 0.22`, de antes de Iroh 1.x. No se añade.
+
+La tarea 5 se quedó con una sola pila Mainline, la de n0: `n0-mainline =0.7.2` directamente, con su feature `unstable_signed_peers`. Quitó `mainline`, `pkarr` e `iroh-mainline-address-lookup`, y con ellos lo que solo traían ellos (entre otros, el cliente de los relays de pkarr). `iroh-mainline-address-lookup` solo sirve como búsqueda de direcciones de Iroh, que la prueba lleva desactivada, y publica la dirección del endpoint en su formato, no el `agentnet.contact/1`. Por qué, y qué se comprobó, está en [`docs/decisions/hito-3-backend/mainline.md`](../../docs/decisions/hito-3-backend/mainline.md#la-pila-mainline).
 
 ## Compatibilidad de dependencias: `compat.sh`
 
@@ -170,6 +170,10 @@ Iroh, como en la línea base, más `libp2p-kad` sobre QUIC de libp2p en el puert
 
 Una sola pila: el endpoint de Iroh del nodo, con la clave del agente y en el puerto de `--listen`, sirve el ALPN `agentnet-kad/0`, y `libp2p-kad` va sobre sus conexiones con un transporte de libp2p hecho de conexiones Iroh. El `PeerId` es la clave pública del agente, así que no hay vínculo de identidades: el contacto firmado va en `/agentnet/contact/<PeerId>`. La configuración de Kademlia es la de `kad-libp2p`, copiada. Su `bootstrap_addr` tiene la misma forma, `/ip4/<ip>/udp/<puerto>/quic-v1/p2p/<PeerId>` por cada dirección del router, separadas por comas, y el transporte la traduce a un `EndpointId` de Iroh con su dirección directa. Cómo está hecho y sus resultados están en [`docs/decisions/hito-3-backend/kad-iroh.md`](../../docs/decisions/hito-3-backend/kad-iroh.md).
 
+### `mainline`
+
+Iroh, como en la línea base, más un nodo de una DHT Mainline privada (`n0-mainline`) en el puerto siguiente. Mainline no trae índice de capacidades, así que el candidato define uno: un *signed peer* por capacidad, con la clave del agente, bajo el SHA-1 de la cadena de la capacidad, y el contacto y el anuncio firmados como items BEP 44 de la clave del agente, con *salt* `agentnet:contact:v1` y `agentnet:announce:v1`. Los routers comprueban cada `put` antes de que la biblioteca lo guarde, y se preguntan a sí mismos qué guarda la biblioteca, porque no da otra forma de verlo. Su `bootstrap_addr` son todas sus direcciones con el puerto de la DHT, `ip:puerto` separados por comas, como en la línea base. Cómo está hecho, qué valida cada router y sus resultados están en [`docs/decisions/hito-3-backend/mainline.md`](../../docs/decisions/hito-3-backend/mainline.md).
+
 ## Comprobaciones
 
 Dentro de `spikes/hito-3/`:
@@ -178,7 +182,7 @@ Dentro de `spikes/hito-3/`:
 cargo build --release --locked
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked -p spike-common -p spike-baseline -p spike-kad-libp2p -p spike-kad-iroh
+cargo test --locked -p spike-common -p spike-baseline -p spike-kad-libp2p -p spike-kad-iroh -p spike-mainline
 (cd harness && python3 -m unittest -v)    # evaluate.py, con observaciones sintéticas
 ```
 
