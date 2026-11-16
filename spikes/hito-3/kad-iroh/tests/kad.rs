@@ -328,7 +328,8 @@ async fn an_announce_answers_within_the_control_api_time() {
         .await;
     let took = started.elapsed();
     assert!(result.is_err(), "the records reached no router");
-    assert!(took < Duration::from_secs(28), "answered after {took:?}");
+    // The control API's contract.
+    assert!(took < Duration::from_secs(30), "answered after {took:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

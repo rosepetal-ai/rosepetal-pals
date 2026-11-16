@@ -27,7 +27,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use iroh::endpoint::{ConnectError, Connection, VarInt};
@@ -66,6 +66,9 @@ pub struct IrohTransport {
     incoming: mpsc::Receiver<Connection>,
     listener: Option<ListenerId>,
     events: VecDeque<TransportEvent<<Self as Transport>::ListenerUpgrade, Error>>,
+    /// The task that last polled and found nothing, to wake when an event
+    /// is queued outside [`Transport::poll`].
+    waker: Option<Waker>,
 }
 
 /// The protocol handler of [`ALPN_KAD`] on the endpoint's router: it hands
@@ -116,6 +119,7 @@ impl IrohTransport {
             incoming,
             listener: None,
             events: VecDeque::new(),
+            waker: None,
         };
         (transport, IrohListener { connections })
     }
@@ -128,6 +132,15 @@ impl IrohTransport {
     /// The local public key, as libp2p names it.
     pub fn local_public_key(&self) -> identity::PublicKey {
         public_key(&self.endpoint.id())
+    }
+
+    /// Queues `event` for [`Transport::poll`], and wakes the task waiting on
+    /// it.
+    fn queue(&mut self, event: TransportEvent<<Self as Transport>::ListenerUpgrade, Error>) {
+        self.events.push_back(event);
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
     }
 
     /// The upgrade of an accepted connection, with the addresses libp2p
@@ -179,7 +192,7 @@ impl Transport for IrohTransport {
             return Err(TransportError::Other(Error::NotBound(addr)));
         };
         self.listener = Some(id);
-        self.events.push_back(TransportEvent::NewAddress {
+        self.queue(TransportEvent::NewAddress {
             listener_id: id,
             listen_addr: quic_addr(bound),
         });
@@ -191,7 +204,7 @@ impl Transport for IrohTransport {
             return false;
         }
         self.listener = None;
-        self.events.push_back(TransportEvent::ListenerClosed {
+        self.queue(TransportEvent::ListenerClosed {
             listener_id: id,
             reason: Ok(()),
         });
@@ -239,6 +252,8 @@ impl Transport for IrohTransport {
         if let Some(event) = this.events.pop_front() {
             return Poll::Ready(event);
         }
+        // `listen_on` and `remove_listener` queue events between polls.
+        this.waker = Some(cx.waker().clone());
         loop {
             match this.incoming.poll_recv(cx) {
                 Poll::Ready(Some(connection)) => match this.listener {

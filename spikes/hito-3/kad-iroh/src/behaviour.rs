@@ -19,7 +19,10 @@
 //!   `PeerId` is, with no link to remember;
 //! - the dial that `NoDial` saves a search from would wait the transport's
 //!   [`crate::transport::DIAL_TIMEOUT`] instead of `libp2p-quic`'s
-//!   handshake timeout, which is as long (5 s).
+//!   handshake timeout, which is as long (5 s);
+//! - an announce answers at its deadline even with a put still in flight
+//!   (`Task::end_announce`), so that the control API gets its answer within
+//!   its 30 s.
 //!
 //! The addresses keep libp2p's QUIC form,
 //! `/ip4/<ip>/udp/<port>/quic-v1/p2p/<peer_id>`, which the transport turns

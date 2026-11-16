@@ -5,6 +5,8 @@
 use std::future::poll_fn;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use iroh::protocol::Router;
 use libp2p::Multiaddr;
@@ -17,6 +19,8 @@ use libp2p::multiaddr::Protocol;
 use pals_core::identity::AgentKey;
 use spike_kad_iroh::bind_endpoint;
 use spike_kad_iroh::transport::{self, ALPN_KAD, IrohTransport};
+use tokio::sync::oneshot;
+use tokio::time::timeout;
 
 /// One node: its transport, listening, and the router that hands it the
 /// connections of [`ALPN_KAD`].
@@ -152,4 +156,89 @@ async fn dial_with_a_peer_id_not_matching_the_endpoint_fails() {
     );
     // An address with no PeerId names no Iroh endpoint.
     assert!(a.transport.dial(b.addr.clone(), dialer()).is_err());
+}
+
+/// How long a test waits for what must come at once: a hang fails it.
+const PROMPTLY: Duration = Duration::from_secs(10);
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closed_connection_ends_on_both_sides() {
+    let (mut a, mut b) = (node(&agent(1)).await, node(&agent(2)).await);
+    let ((_, mut at_a), (_, mut at_b)) = connect(&mut a, &mut b).await;
+    round_trip(&mut at_a, &mut at_b, b"before closing").await;
+    // A substream A keeps open across the close.
+    let mut open = poll_fn(|cx| at_a.poll_outbound_unpin(cx)).await.unwrap();
+    open.write_all(b"still here").await.unwrap();
+
+    // B closes, as libp2p does an idle connection.
+    timeout(PROMPTLY, poll_fn(|cx| at_b.poll_close_unpin(cx)))
+        .await
+        .expect("closing hangs")
+        .expect("a local close is clean");
+
+    // A learns it on every side of the connection, without hanging.
+    let inbound = timeout(PROMPTLY, poll_fn(|cx| at_a.poll_inbound_unpin(cx)))
+        .await
+        .expect("accepting hangs");
+    assert!(
+        inbound.is_err(),
+        "no substream comes from a closed connection"
+    );
+    let outbound = timeout(PROMPTLY, poll_fn(|cx| at_a.poll_outbound_unpin(cx)))
+        .await
+        .expect("opening hangs");
+    assert!(
+        outbound.is_err(),
+        "no substream opens on a closed connection"
+    );
+    let mut rest = Vec::new();
+    let read = timeout(PROMPTLY, open.read_to_end(&mut rest))
+        .await
+        .expect("reading hangs");
+    // It ends: the connection lost, or the stream's end.
+    assert!(read.is_err() || rest.is_empty(), "{read:?} {rest:?}");
+    // Closing A's side completes too. Whether it reports B's close or its
+    // own (noq reports its own) does not matter: the connection is gone.
+    let _closed = timeout(PROMPTLY, poll_fn(|cx| at_a.poll_close_unpin(cx)))
+        .await
+        .expect("closing hangs");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn listen_on_wakes_a_waiting_swarm() {
+    // The swarm polls the transport, which has nothing to say yet, and only
+    // then asks it to listen: the new address must reach the swarm without
+    // any other event to wake it.
+    let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let endpoint = bind_endpoint(listen, &agent(1)).await.unwrap();
+    let (transport, listener) = IrohTransport::new(endpoint.clone());
+    let _router = Router::builder(endpoint).accept(ALPN_KAD, listener).spawn();
+    let transport = Arc::new(Mutex::new(transport));
+    let (polled, waiting) = oneshot::channel();
+    let swarm = tokio::spawn({
+        let transport = Arc::clone(&transport);
+        let mut polled = Some(polled);
+        async move {
+            let event = poll_fn(|cx| {
+                let event = Pin::new(&mut *transport.lock().unwrap()).poll(cx);
+                if let Some(polled) = polled.take() {
+                    let _ = polled.send(());
+                }
+                event
+            })
+            .await;
+            matches!(event, TransportEvent::NewAddress { .. })
+        }
+    });
+    waiting.await.unwrap();
+    transport
+        .lock()
+        .unwrap()
+        .listen_on(ListenerId::next(), transport::quic_addr(listen))
+        .unwrap();
+    let new_address = timeout(PROMPTLY, swarm)
+        .await
+        .expect("the waiting swarm was never woken")
+        .unwrap();
+    assert!(new_address);
 }
