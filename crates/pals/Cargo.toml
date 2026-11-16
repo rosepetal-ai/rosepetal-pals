@@ -31,6 +31,8 @@ hyper-util = { workspace = true, features = ["tokio"] }
 iroh.workspace = true
 iroh-blobs.workspace = true
 iroh-tickets.workspace = true
+# Kademlia over the endpoint's own connections (`dht`).
+libp2p.workspace = true
 pals-core.workspace = true
 percent-encoding.workspace = true
 reqwest.workspace = true
@@ -45,6 +47,8 @@ rmcp = { workspace = true, features = [
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The key of a capability's provider records (`dht::keys`).
+sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = [
     "io-util",
