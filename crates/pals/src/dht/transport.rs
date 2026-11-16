@@ -82,20 +82,21 @@ pub struct KadQuotas {
     /// Streams of one peer open at a time, over all its connections.
     pub peer_streams: usize,
     /// Streams one peer opens in a minute of the node's clock, over all its
-    /// connections.
+    /// connections: by default, room for a full round of publication (about
+    /// 132 streams to each router) and some 25 lookups (17 each).
     pub peer_streams_per_minute: u32,
     /// Streams of all peers open at a time.
     pub global_streams: usize,
 }
 
 impl Default for KadQuotas {
-    /// A queue of 32 connections; 8 streams at a time and 120 a minute per
+    /// A queue of 32 connections; 8 streams at a time and 600 a minute per
     /// peer, 256 at a time in all.
     fn default() -> Self {
         Self {
             accept_queue: 32,
             peer_streams: 8,
-            peer_streams_per_minute: 120,
+            peer_streams_per_minute: 600,
             global_streams: 256,
         }
     }

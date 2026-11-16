@@ -825,7 +825,8 @@ fn inventory_refresh(home: &Path) -> anyhow::Result<()> {
 }
 
 /// Prints the running daemon's DHT status, as `GET /dht` of its gateway
-/// gives it: its JSON with `json`, else one line per figure.
+/// gives it: its JSON with `json`, else one line per figure, and, when it
+/// publishes, its last round of publication.
 fn dht_status(home: &Path, json: bool) -> anyhow::Result<()> {
     let (cfg, key) = load_agent(home)?;
     let (listen, own) = (cfg.gateway.listen, key.id());
@@ -869,6 +870,30 @@ fn dht_status(home: &Path, json: bool) -> anyhow::Result<()> {
             if count > 0 {
                 println!("rejected: {} {count}", shown(reason));
             }
+        }
+    }
+    let publication = &status["publication"];
+    if publication.is_object() {
+        let capabilities = publication["capabilities"].as_array().map_or(0, Vec::len);
+        let last_round = publication["last_round_unix"]
+            .as_i64()
+            .and_then(format_timestamp)
+            .map_or_else(
+                || "no round yet".to_owned(),
+                |at| format!("last round at {at}"),
+            );
+        println!("publication: {capabilities} capabilities, {last_round}");
+        let failed: Vec<String> = publication["failed_capabilities"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|capability| capability.as_str().map(shown))
+            .collect();
+        if !failed.is_empty() {
+            println!("  failed: {}", failed.join(" "));
+        }
+        if let Some(error) = publication["last_error"].as_str() {
+            println!("  last error: {}", shown(error));
         }
     }
     Ok(())

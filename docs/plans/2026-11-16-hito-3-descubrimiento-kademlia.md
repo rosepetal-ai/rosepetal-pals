@@ -423,7 +423,7 @@ Se mantienen los de los hitos 1 y 2. Esta fase añade:
 | Tienda de un router | 1024 valores de 8 KiB como mucho, 20 proveedores por clave (`K`) y 1024 claves de proveedores: los de la prueba. Un contacto o un anuncio, 4 KiB como mucho (`MAX_RECORD_BYTES`) |
 | Provider records de un agente en un router | Solo de capacidades que liste el anuncio de ese agente que el router guarda, y por tanto 32 como mucho (`MAX_ANNOUNCED_CAPABILITIES`) |
 | Conexiones de `agentnet-kad/0` | Una cola de 32 conexiones entrantes que nunca espera: llena, la conexión se cierra. 2 conexiones establecidas por par y 256 entrantes en total |
-| Streams de `agentnet-kad/0` | Por par, 8 a la vez y 120 por minuto del `Clock` del nodo; 256 a la vez en total. Un stream de más se resetea al aceptarlo, sin leerlo |
+| Streams de `agentnet-kad/0` | Por par, 8 a la vez y 600 por minuto del `Clock` del nodo; 256 a la vez en total. Un stream de más se resetea al aceptarlo, sin leerlo. Los propios, como mucho 4 abiertos a la vez con un mismo par, sumando sus conexiones: uno más espera a que se cierre otro |
 | Plazos | Marcado, 5 s. Consulta de Kademlia, 20 s. Conexión ociosa, 10 s (el de `libp2p-swarm`). Arranque periódico, 5 min (el de `libp2p-kad`). Una vuelta de publicación que no llegó a ningún router se repite a los 30 s |
 | La DHT en una búsqueda | Como mucho `per_candidate_timeout` (3 s) y lo que quede del presupuesto. Sus candidatos cuentan en `max_candidates` (8), detrás de los contactos |
 | Entrada | Los tickets de `[dht] bootstrap`. Si después de marcarlos la tabla de rutas sigue vacía, hasta 8 contactos guardados, por nombre |
@@ -661,7 +661,7 @@ Las cifras se calcularon al escribir este plan con un script independiente: `has
   pub const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
   pub const REFUSED: u32 = 1;                         // código con que se cierra una conexión rechazada
   pub struct KadQuotas { pub accept_queue: usize /*32*/, pub peer_streams: usize /*8*/,
-      pub peer_streams_per_minute: u32 /*120*/, pub global_streams: usize /*256*/ }
+      pub peer_streams_per_minute: u32 /*600*/, pub global_streams: usize /*256*/ }
   #[derive(Clone, Default)] pub struct AddressBook;   // las direcciones directas conocidas de cada par
   impl AddressBook { pub fn learn(&self, peer: PeerId, addr: SocketAddr); pub fn of(&self, peer: &PeerId) -> Vec<SocketAddr>; }
   pub struct IrohTransport;                           // impl Transport<Output = (PeerId, StreamMuxerBox)>

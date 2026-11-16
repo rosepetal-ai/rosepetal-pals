@@ -13,8 +13,9 @@ use std::future::poll_fn;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::Poll;
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use iroh::endpoint::{ConnectionError, PortmapperConfig, ReadError, VarInt, presets};
@@ -547,6 +548,9 @@ async fn a_peer_beyond_its_stream_quota_is_reset() {
     let mut second_in = accepted(&mut substreams).await;
     let mut third = open(&mut at_a, b"third").await;
     assert_refused(&mut third).await;
+    // Refused, it is dropped, as libp2p does: A keeps no more of its own
+    // open than it must.
+    drop(third);
     assert_eq!(b.refusals.counts().streams, 1);
     answer(&mut first, &mut first_in, b"first").await;
     answer(&mut second, &mut second_in, b"second").await;
@@ -556,6 +560,7 @@ async fn a_peer_beyond_its_stream_quota_is_reset() {
     let mut again = accept_all(again_at_b);
     let mut fourth = open(&mut again_at_a, b"fourth").await;
     assert_refused(&mut fourth).await;
+    drop(fourth);
     assert_eq!(b.refusals.counts().streams, 2);
 
     // A substream dropped makes room for another, on either connection.
@@ -630,6 +635,53 @@ async fn global_stream_cap_refuses_beyond_it() {
     let mut again_in = accepted(&mut from_a).await;
     answer(&mut again, &mut again_in, b"again").await;
     assert_eq!(b.refusals.counts().streams, 1);
+}
+
+/// A waker that remembers it was woken.
+struct Woken(AtomicBool);
+
+impl Wake for Woken {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn outbound_streams_to_one_peer_wait_for_a_free_slot() {
+    // B takes 8 streams at a time from a peer, its default: A keeps at
+    // most half of that open of its own, over all its connections to B.
+    let (mut a, mut b) = (node(&agent(1)).await, node(&agent(2)).await);
+    let ((_, mut at_a), (_, at_b)) = connect(&mut a, &mut b).await;
+    let ((_, mut again_at_a), (_, again_at_b)) = connect(&mut a, &mut b).await;
+    let mut substreams = accept_all(at_b);
+    let _again = accept_all(again_at_b);
+    let mut open_four = Vec::new();
+    for message in [&b"one"[..], b"two", b"three", b"four"] {
+        let outbound = open(&mut at_a, message).await;
+        let inbound = accepted(&mut substreams).await;
+        open_four.push((outbound, inbound, message));
+    }
+
+    // The fifth waits, on either connection, and fails nothing.
+    let woken = Arc::new(Woken(AtomicBool::new(false)));
+    let waker = Waker::from(Arc::clone(&woken));
+    let mut cx = Context::from_waker(&waker);
+    assert!(at_a.poll_outbound_unpin(&mut cx).is_pending());
+    assert!(again_at_a.poll_outbound_unpin(&mut cx).is_pending());
+    assert!(!woken.0.load(Ordering::SeqCst));
+
+    // One of the four closes: the waiting side is woken, and opens it.
+    let (mut outbound, mut inbound, message) = open_four.remove(0);
+    answer(&mut outbound, &mut inbound, message).await;
+    drop(outbound);
+    assert!(woken.0.load(Ordering::SeqCst), "not woken");
+    let mut fifth = open(&mut at_a, b"five").await;
+    let mut fifth_in = accepted(&mut substreams).await;
+    answer(&mut fifth, &mut fifth_in, b"five").await;
+    for (mut outbound, mut inbound, message) in open_four {
+        answer(&mut outbound, &mut inbound, message).await;
+    }
+    assert_eq!(b.refusals.counts().streams, 0);
 }
 
 /// A UDP port of 127.0.0.1 that was free a moment ago.

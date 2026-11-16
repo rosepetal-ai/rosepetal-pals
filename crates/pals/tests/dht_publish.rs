@@ -30,7 +30,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, TransportAddr};
 use iroh_tickets::endpoint::EndpointTicket;
 use libp2p::kad::store::MemoryStoreConfig;
-use pals::config::{DhtCfg, DhtMode, INVENTORY_FILE};
+use pals::config::{CONFIG_FILE, DhtCfg, DhtMode, INVENTORY_FILE};
 use pals::dht::keys::peer_id;
 use pals::dht::swarm::STORE_LIMITS;
 use pals::dht::transport::{ALPN_KAD, KadQuotas, located_nowhere};
@@ -44,7 +44,8 @@ use pals_core::clock::{Clock, ManualClock, SystemClock};
 use pals_core::grant::format_timestamp;
 use pals_core::identity::{AgentId, AgentKey};
 use pals_core::records::{
-    ANNOUNCE_SCHEMA, AnnounceRecord, CONTACT_SCHEMA, ContactRecord, IrohContact, RECORD_TTL_S,
+    ANNOUNCE_SCHEMA, AnnounceRecord, CONTACT_SCHEMA, ContactRecord, IrohContact,
+    MAX_ANNOUNCED_CAPABILITIES, RECORD_TTL_S,
 };
 use pals_core::signed::Signed;
 use pals_core::store::Store;
@@ -54,8 +55,9 @@ use tokio::sync::watch;
 /// it, the test fails.
 const CONVERGES: Duration = Duration::from_secs(60);
 
-/// The pause between two lookups of [`wait_for_lookup`]: fewer than a
-/// router's 120 streams a minute from one peer.
+/// The pause between two lookups of [`wait_for_lookup`]: well under a
+/// router's 600 streams a minute from one peer, beside the rest of the
+/// test's traffic.
 const LOOKUP_PAUSE: Duration = Duration::from_secs(2);
 
 /// P1's inventory: two public services.
@@ -201,7 +203,7 @@ async fn lookup(node: &TestNode, capability: &str, limit: usize) -> DhtLookup {
 
 /// Looks `capability` up from `node` until a lookup is as `done` wants it,
 /// and returns that one; fails, saying `what`, after [`CONVERGES`]. A lookup
-/// opens three streams at each router, and a router takes 120 a minute from
+/// opens three streams at each router, and a router takes 600 a minute from
 /// one peer: the tests wait for the routers' state first, and the lookups
 /// here go [`LOOKUP_PAUSE`] apart.
 async fn wait_for_lookup(
@@ -223,17 +225,8 @@ async fn wait_for_lookup(
 
 /// Two routers that know each other, with `timing`.
 async fn routers(timing: DhtTiming) -> (TestNode, TestNode) {
-    routers_taking(timing, KadQuotas::default()).await
-}
-
-/// [`routers`], with the stream quotas `quotas`.
-async fn routers_taking(timing: DhtTiming, quotas: KadQuotas) -> (TestNode, TestNode) {
-    let opts = || NodeOptions {
-        kad_quotas: quotas,
-        ..with_timing(timing)
-    };
-    let r1 = spawn_dht_node_with(DhtMode::Router, &[], opts(), |_| {}).await;
-    let r2 = spawn_dht_node_with(DhtMode::Router, &[&r1], opts(), |_| {}).await;
+    let r1 = spawn_dht_node(DhtMode::Router, &[], timing).await;
+    let r2 = spawn_dht_node(DhtMode::Router, &[&r1], timing).await;
     wait_for(&r1, "R2 in R1's table", |s| s.routing_peers == 1).await;
     wait_for(&r2, "R1 in R2's table", |s| s.routing_peers == 1).await;
     (r1, r2)
@@ -546,16 +539,10 @@ async fn a_client_providers_record_carries_no_ip_address() {
 
 #[tokio::test]
 async fn concurrent_lookups_and_a_round_all_finish() {
-    // Four lookups and a round put about ten requests at once in each
-    // router, past the 8 streams at a time a router takes from one peer by
-    // default (`KadQuotas::peer_streams`), which would refuse some of them:
-    // these routers take more, so that what the test shows is the node's
-    // own state per query.
-    let quotas = KadQuotas {
-        peer_streams: 32,
-        ..KadQuotas::default()
-    };
-    let (r1, r2) = routers_taking(short(), quotas).await;
+    // Four lookups and a round want about ten requests at once at each
+    // router, which takes 8 streams at a time from one peer: P2 keeps its
+    // own within the routers' quotas, and none is refused.
+    let (r1, r2) = routers(short()).await;
     let p1 = spawn_provider(P1_INVENTORY, &[&r1, &r2], short()).await;
     for router in [&r1, &r2] {
         wait_for(router, "P1's records", |s| held(s, p1.id()) == 4).await;
@@ -751,9 +738,8 @@ async fn a_router_back_after_a_stop_is_dialed_again() {
     .await;
 }
 
-#[tokio::test]
-async fn a_capability_that_does_not_fit_fails_alone() {
-    let inventory = r#"
+/// Two public services: `vision.ocr`, then `code.rust.review`.
+const OCR_AND_REVIEW: &str = r#"
 [[services]]
 id = "ocr"
 name = "OCR"
@@ -768,7 +754,10 @@ description = "Reviews Rust code"
 capabilities = ["code.rust.review"]
 visibility = "public"
 "#;
-    // A router that announces, with room for the providers of one key.
+
+/// A router with no other, that announces [`OCR_AND_REVIEW`] and has room
+/// for the providers of one key.
+async fn crowded_router() -> TestNode {
     let opts = NodeOptions {
         kad_store: MemoryStoreConfig {
             max_provided_keys: 1,
@@ -776,14 +765,19 @@ visibility = "public"
         },
         ..with_timing(short())
     };
-    let r3 = spawn_dht_node_in(
-        with_inventory(inventory),
+    spawn_dht_node_in(
+        with_inventory(OCR_AND_REVIEW),
         DhtMode::Router,
         &[],
         opts,
         |cfg| cfg.dht.announce = true,
     )
-    .await;
+    .await
+}
+
+#[tokio::test]
+async fn a_capability_that_does_not_fit_fails_alone() {
+    let r3 = crowded_router().await;
     let c = spawn_dht_node(DhtMode::Client, &[&r3], short()).await;
     let published = wait_for_publication(dht(&r3), "R3's first round", |p| {
         p.last_round_unix.is_some()
@@ -979,5 +973,101 @@ async fn a_provider_with_a_tampered_contact_is_discarded() {
         found.discarded,
         [(key.id(), "no valid contact".to_owned())],
         "{found:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_round_of_32_capabilities_fits_the_routers_quotas() {
+    // The most capabilities an announce lists: some 130 streams to each
+    // router in one round, against routers with the default quotas.
+    let (r1, r2) = routers(long()).await;
+    let capabilities: Vec<String> = (0..MAX_ANNOUNCED_CAPABILITIES)
+        .map(|n| format!("test.capability-{n:02}"))
+        .collect();
+    let listed: Vec<&str> = capabilities.iter().map(String::as_str).collect();
+    let key = AgentKey::generate();
+    let timing = DhtTiming {
+        republish: Duration::from_secs(3600),
+        ..long()
+    };
+    let p = Publisher::spawn(
+        &key,
+        TestRecords::of(&key, &listed),
+        &[&r1, &r2],
+        timing,
+        Arc::new(SystemClock),
+    )
+    .await;
+    let round = wait_for_publication(&p.dht, "P's round", |p| p.last_round_unix.is_some()).await;
+    assert_eq!(round.last_error, None, "{round:?}");
+    assert!(round.failed_capabilities.is_empty(), "{round:?}");
+    for router in [&r1, &r2] {
+        let now = status(router).await;
+        assert_eq!(now.refused.streams, 0, "{now:?}");
+        let now = wait_for(router, "P's provider records", |s| {
+            held(s, key.id()) == 2 + 32
+        })
+        .await;
+        assert_eq!(now.refused.streams, 0, "{now:?}");
+        for capability in &capabilities {
+            assert_eq!(
+                holders(router, capability).await,
+                [key.id()],
+                "{capability}"
+            );
+        }
+    }
+}
+
+/// Runs `pals --home <home> <args>`, off the async threads: its exit code,
+/// stdout and stderr.
+async fn pals(home: &std::path::Path, args: &[&str]) -> (i32, String, String) {
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("pals");
+    cmd.env_remove("PALS_HOME")
+        .env_remove("RUST_LOG")
+        .arg("--home")
+        .arg(home)
+        .args(args);
+    let output = tokio::task::spawn_blocking(move || cmd.output().expect("run pals"))
+        .await
+        .unwrap();
+    (
+        output.status.code().expect("an exit code"),
+        String::from_utf8(output.stdout).unwrap(),
+        String::from_utf8(output.stderr).unwrap(),
+    )
+}
+
+/// Points a configuration in `node`'s data directory at its gateway, so
+/// that the `pals` command finds its key and its running daemon.
+fn cli_home(node: &TestNode) -> &std::path::Path {
+    let listen = node.gateway_url().replace("http://", "");
+    std::fs::write(
+        node.dir.path().join(CONFIG_FILE),
+        format!("[gateway]\nlisten = \"{listen}\"\n\n[net]\nrelay = false\n"),
+    )
+    .unwrap();
+    node.dir.path()
+}
+
+#[tokio::test]
+async fn pals_dht_status_prints_the_publication() {
+    // A round that falls short both ways: no router took it, and one of
+    // its capabilities did not fit.
+    let r3 = crowded_router().await;
+    wait_for_publication(dht(&r3), "R3's first round", |p| {
+        p.last_round_unix.is_some()
+    })
+    .await;
+    let (code, out, err) = pals(cli_home(&r3), &["dht", "status"]).await;
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("publication: 2 capabilities, last round at 20"),
+        "{out}"
+    );
+    assert!(out.contains("  failed: code.rust.review\n"), "{out}");
+    assert!(
+        out.contains("  last error: no DHT router answered\n"),
+        "{out}"
     );
 }

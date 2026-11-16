@@ -15,8 +15,17 @@
 //!   connections, and at most [`KadQuotas::global_streams`] of all peers at
 //!   a time. A stream beyond them is reset with [`REFUSED`] as it is
 //!   accepted, without reading it, and counted in [`Refusals`]; libp2p never
-//!   sees it. A stream counts until libp2p drops its substream. The streams
-//!   this side opens count in no quota.
+//!   sees it. A stream counts until libp2p drops its substream.
+//! - **This side's own streams.** The node keeps at most
+//!   [`OUTBOUND_STREAMS_PER_PEER`] of its own streams open to one peer,
+//!   counting all its connections to it: half the 8 at a time that a peer
+//!   with the default quotas takes, which leaves room for the time the
+//!   other side takes to see a stream close, and for a second connection.
+//!   Rounds of publication, lookups and a router's replication all go
+//!   through this one cap. One more waits ([`StreamMuxer::poll_outbound`]
+//!   is pending) until one of them closes, which wakes it; the cap never
+//!   fails a stream. A well-behaved node is never refused for its own
+//!   traffic.
 //! - **Idle streams.** A stream the other side opened that goes the idle
 //!   timeout with no read or write through it is reset with [`REFUSED`] and
 //!   counted in [`Refusals`], and libp2p drops it, which frees its place in
@@ -37,7 +46,7 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream, VarInt};
@@ -65,6 +74,9 @@ const REFUSALS_PER_POLL: usize = 16;
 /// The stream credit a connection grants beyond [`KadQuotas::peer_streams`]:
 /// room for the streams past the quota to arrive and be refused.
 pub const STREAM_HEADROOM: usize = 4;
+/// This side's own streams open to one peer at a time, over all its
+/// connections to it: half the default [`KadQuotas::peer_streams`].
+pub const OUTBOUND_STREAMS_PER_PEER: usize = 4;
 
 /// The stream quotas of every connection of one transport, and what they
 /// refused.
@@ -75,6 +87,17 @@ pub(crate) struct StreamQuotas {
     /// How long an admitted stream may go with no read or write.
     idle_timeout: Duration,
     used: Mutex<Used>,
+    /// This side's own streams open to each peer, and the muxers waiting
+    /// for one of them to close.
+    own: Mutex<HashMap<PeerId, Own>>,
+}
+
+/// This side's own streams to one peer.
+#[derive(Default)]
+struct Own {
+    open: usize,
+    /// Woken, all of them, each time one of those streams closes.
+    waiting: Vec<Waker>,
 }
 
 /// What the peers are using of the quotas.
@@ -119,7 +142,31 @@ impl StreamQuotas {
             refusals,
             idle_timeout,
             used: Mutex::new(Used::default()),
+            own: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// A place for one more of this side's own streams to `peer`, as the
+    /// module says; pending, and woken when one frees, while
+    /// [`OUTBOUND_STREAMS_PER_PEER`] are open.
+    fn claim_own(self: &Arc<Self>, peer: PeerId, cx: &mut Context<'_>) -> Poll<OwnSlot> {
+        let mut own = self.own.lock().unwrap_or_else(PoisonError::into_inner);
+        let of_peer = own.entry(peer).or_default();
+        if of_peer.open < OUTBOUND_STREAMS_PER_PEER {
+            of_peer.open += 1;
+            return Poll::Ready(OwnSlot {
+                quotas: Arc::clone(self),
+                peer,
+            });
+        }
+        if !of_peer
+            .waiting
+            .iter()
+            .any(|waiting| waiting.will_wake(cx.waker()))
+        {
+            of_peer.waiting.push(cx.waker().clone());
+        }
+        Poll::Pending
     }
 
     /// A stream of `peer`'s, within the quotas at the clock's time now;
@@ -196,6 +243,38 @@ impl Drop for Slot {
     }
 }
 
+/// One of this side's own streams to a peer, open or being opened: it
+/// counts in [`OUTBOUND_STREAMS_PER_PEER`] until it is dropped, which wakes
+/// whoever waits for a place.
+struct OwnSlot {
+    quotas: Arc<StreamQuotas>,
+    peer: PeerId,
+}
+
+impl Drop for OwnSlot {
+    fn drop(&mut self) {
+        let waiting = {
+            let mut own = self
+                .quotas
+                .own
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(of_peer) = own.get_mut(&self.peer) else {
+                return;
+            };
+            of_peer.open = of_peer.open.saturating_sub(1);
+            let waiting = std::mem::take(&mut of_peer.waiting);
+            if of_peer.open == 0 {
+                own.remove(&self.peer);
+            }
+            waiting
+        };
+        for waker in waiting {
+            waker.wake();
+        }
+    }
+}
+
 /// One Iroh connection, as libp2p's muxer.
 pub struct IrohMuxer {
     connection: Connection,
@@ -203,7 +282,8 @@ pub struct IrohMuxer {
     peer: PeerId,
     quotas: Arc<StreamQuotas>,
     inbound: Option<Streams>,
-    outbound: Option<Streams>,
+    /// A stream of this side's being opened, with its place.
+    outbound: Option<(OwnSlot, Streams)>,
     closing: Option<BoxFuture<'static, ConnectionError>>,
 }
 
@@ -247,7 +327,7 @@ impl StreamMuxer for IrohMuxer {
             this.inbound = None;
             let (send, recv) = accepted?;
             match this.quotas.admit(this.peer) {
-                Some(slot) => return Poll::Ready(Ok(IrohSubstream::new(send, recv, Some(slot)))),
+                Some(slot) => return Poll::Ready(Ok(IrohSubstream::inbound(send, recv, slot))),
                 None => this.quotas.refuse(this.peer, send, recv),
             }
         }
@@ -256,19 +336,25 @@ impl StreamMuxer for IrohMuxer {
         Poll::Pending
     }
 
+    /// A stream of this side's, once it has a place among
+    /// [`OUTBOUND_STREAMS_PER_PEER`]: pending until then.
     fn poll_outbound(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::Substream, Self::Error>> {
         let this = self.get_mut();
-        let outbound = this.outbound.get_or_insert_with(|| {
+        if this.outbound.is_none() {
+            let slot = std::task::ready!(this.quotas.claim_own(this.peer, cx));
             let connection = this.connection.clone();
-            async move { connection.open_bi().await }.boxed()
-        });
-        let opened = std::task::ready!(outbound.poll_unpin(cx));
-        this.outbound = None;
+            let opening = async move { connection.open_bi().await }.boxed();
+            this.outbound = Some((slot, opening));
+        }
+        let (_, opening) = this.outbound.as_mut().expect("being opened");
+        let opened = std::task::ready!(opening.poll_unpin(cx));
+        // A stream that failed to open gives its place back here.
+        let (slot, _) = this.outbound.take().expect("being opened");
         let (send, recv) = opened?;
-        Poll::Ready(Ok(IrohSubstream::new(send, recv, None)))
+        Poll::Ready(Ok(IrohSubstream::outbound(send, recv, slot)))
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -305,6 +391,8 @@ pub struct IrohSubstream {
     /// Its place in the quotas and its idle deadline, for a stream the
     /// other side opened.
     inbound: Option<Inbound>,
+    /// Its place among this side's own streams, for one this side opened.
+    _own: Option<OwnSlot>,
 }
 
 /// What a stream the other side opened holds: its place in the quotas, and
@@ -319,16 +407,29 @@ struct Inbound {
 }
 
 impl IrohSubstream {
-    fn new(send: SendStream, recv: RecvStream, slot: Option<Slot>) -> Self {
+    /// A stream the other side opened, admitted in `slot`.
+    fn inbound(send: SendStream, recv: RecvStream, slot: Slot) -> Self {
         Self {
             send,
             recv,
             closed: None,
-            inbound: slot.map(|slot| Inbound {
+            inbound: Some(Inbound {
                 slot,
                 deadline: None,
                 expired: false,
             }),
+            _own: None,
+        }
+    }
+
+    /// A stream this side opened, in its place `own`.
+    fn outbound(send: SendStream, recv: RecvStream, own: OwnSlot) -> Self {
+        Self {
+            send,
+            recv,
+            closed: None,
+            inbound: None,
+            _own: Some(own),
         }
     }
 

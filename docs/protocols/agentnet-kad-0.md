@@ -122,16 +122,31 @@ Antes de entregar a libp2p un stream que abrió el otro lado, el nodo comprueba 
 | Cuota | Valor |
 |-|-|
 | Streams de un par abiertos a la vez | 8, sumando todas sus conexiones |
-| Streams que abre un par en un minuto | 120, en el minuto del reloj del nodo, sumando todas sus conexiones |
+| Streams que abre un par en un minuto | 600, en el minuto del reloj del nodo, sumando todas sus conexiones |
 | Streams de todos los pares abiertos a la vez | 256 |
 
-Un stream que pasa de una cuota se resetea al aceptarlo, sin leerlo: el nodo cierra sus dos mitades con el código `1` (`RESET_STREAM` y `STOP_SENDING`), y libp2p no llega a verlo. Un stream cuenta mientras libp2p lo tiene abierto, y uno rechazado no cuenta en el minuto. Los streams que abre el propio nodo no cuentan en ninguna cuota.
+Un stream que pasa de una cuota se resetea al aceptarlo, sin leerlo: el nodo cierra sus dos mitades con el código `1` (`RESET_STREAM` y `STOP_SENDING`), y libp2p no llega a verlo. Un stream cuenta mientras libp2p lo tiene abierto, y uno rechazado no cuenta en el minuto.
+
+**Por qué 8 y 600.** Las cuotas defienden al nodo y nunca rechazan el tráfico propio de un nodo que se porta bien:
+
+- Una vuelta de publicación de 32 capacidades (sección 8) abre unos 4 + 4 × 32 = 132 streams con cada router, en una red de 20 routers o menos. Son el contacto y el anuncio, con la búsqueda de sus routers, y, por cada capacidad, la búsqueda de sus routers, el anuncio, la búsqueda de los routers del provider record y el provider record.
+- Una búsqueda de 8 proveedores abre 1 + 2 × 8 = 17 streams con cada router: la de los proveedores, y la del contacto y la del anuncio de cada uno.
+
+600 por minuto deja sitio para una vuelta completa y unas 25 búsquedas. Lo que un nodo abre a la vez lo limita él mismo, por debajo de 8 (más abajo, «Streams propios»).
+
+**La replicación entre routers.** Un router replica lo que guarda cada `[dht] republish_s`, con dos streams por valor: la búsqueda de sus routers y el `put`. Por eso, si un router replica a otro más de unos 300 valores en un minuto, el otro rechaza una parte. La vuelta siguiente de los que publicaron esos valores la recupera.
 
 **Streams ociosos.** Un stream que abrió el otro lado y pasa 10 s (el plazo de conexión ociosa de la sección 7) sin que se lea ni se escriba nada en él se resetea igual, con el código `1`, y libp2p lo suelta: deja su sitio en las cuotas. `libp2p-kad` 0.49 espera la petición siguiente en un stream entrante sin plazo propio, así que sin este un par podría quedarse con sus 8 streams para siempre, y 32 identidades con los 256 del nodo.
 
 **Crédito de streams.** En cada conexión de `agentnet-kad/0`, el nodo da al otro lado crédito de QUIC para 12 streams bidireccionales a la vez: los 8 de su cuota y 4 más, para que uno de más llegue y se rechace en lugar de quedarse esperando. Es lo que hacen `agentnet-discovery/0` y el túnel de A2A. QUIC no retira el crédito que dio el handshake (100 streams): el nuevo límite vale según se cierran los streams.
 
 El nodo cuenta desde el arranque las conexiones y los streams que rechaza, y aparte los streams que resetea por ociosos.
+
+### Streams propios
+
+Un nodo tiene abiertos como mucho 4 streams propios de `agentnet-kad/0` con un mismo par, sumando todas sus conexiones con él (`OUTBOUND_STREAMS_PER_PEER`). Son la mitad de los 8 a la vez que acepta un par con las cuotas por defecto. El margen cubre lo que tarda el otro lado en ver que un stream se cerró, y una segunda conexión.
+
+Pasan por este límite las vueltas de publicación, las búsquedas y la replicación de un router. Un stream de más espera a que se cierre uno de los 4: el límite nunca hace fallar un stream. La espera cuenta, eso sí, en el plazo de 10 s que `libp2p-kad` da a cada petición. Así, un nodo que se porta bien nunca recibe un rechazo por su propio tráfico.
 
 ### El puerto: `[net] listen`
 
@@ -312,7 +327,7 @@ Una vuelta nueva cierra las consultas que quedaban de la anterior. Cada vuelta:
 
 1. Deja de anunciar las capacidades que el anuncio ya no lista. Después guarda en la tienda del nodo el provider record propio de cada una de las demás, en el orden del inventario. Una capacidad que no cabe falla sola, por ejemplo en un router que también anuncia y tiene llenas sus 1024 claves de proveedores: va a `failed_capabilities` y se intenta en la vuelta siguiente. Las demás siguen, y no se deshace nada.
 2. Pone el contacto y el anuncio en los routers más cercanos a sus claves, con quórum de todos ellos. Un registro llegó cuando al menos un router contestó que lo guardó.
-3. Cuando ha terminado el `put` del anuncio, para cada capacidad, busca los routers más cercanos a su clave, les pone el anuncio, con quórum de uno, y después les envía el provider record. Así el anuncio viaja con cada provider record: el router que guarda uno tiene el anuncio que pide la sección 6, aunque con muchos routers los más cercanos a la clave del anuncio y a la de la capacidad no sean los mismos.
+3. Cuando ha terminado el `put` del anuncio, para cada capacidad busca los routers más cercanos a su clave y les pone el anuncio, con quórum de todos ellos: el `put` espera a cada uno. Si llegó al menos a uno, les envía después el provider record. Si no llegó a ninguno, esa vuelta no anuncia la capacidad, y la siguiente lo intenta otra vez. Así el anuncio viaja con cada provider record: cada router que guarda uno tiene ya el anuncio que pide la sección 6, aunque con muchos routers los más cercanos a la clave del anuncio y a la de la capacidad no sean los mismos.
 
 Una vuelta en la que ningún router contestó que guardaba algo termina con `last_error`, y la siguiente llega a los 30 s. Con `libp2p-kad` 0.49, un router contesta así también a lo que rechaza (sección 6): si lo guardó o no, lo dicen el estado del router y sus rechazos.
 

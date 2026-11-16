@@ -29,10 +29,13 @@
 //! 2. puts the contact and the announce with `Quorum::All`. A put is done
 //!    once a router stored it: `QuorumFailed` with some `success`;
 //! 3. once the announce's put ended, for each capability, finds the routers
-//!    closest to its key (`get_closest_peers`), puts the announce at them
-//!    with `Quorum::One` (`put_record_to`), and then provides it
-//!    (`start_providing`). The announce travels with every provider record:
-//!    the router that stores one holds the announce that
+//!    closest to its key (`get_closest_peers`) and puts the announce at
+//!    them with `Quorum::All` (`put_record_to`): the put waits for every
+//!    one of them. When it reached at least one (`Ok`, or `QuorumFailed` or
+//!    `Timeout` with some `success`), the node provides the capability
+//!    (`start_providing`); when it reached none, it does not, and the next
+//!    round tries again. The announce travels with every provider record:
+//!    each router that stores one already holds the announce that
 //!    [`validate::check_provider`] asks for, even when the routers closest
 //!    to the announce's key are not those closest to the capability's.
 //!
@@ -468,16 +471,24 @@ impl Task {
         let Some((mut round, step)) = self.round_step(id) else {
             return;
         };
-        round.reached |= match result {
+        let reached = match result {
             Ok(_) => true,
             Err(
                 PutRecordError::QuorumFailed { success, .. }
                 | PutRecordError::Timeout { success, .. },
             ) => !success.is_empty(),
         };
+        round.reached |= reached;
         match step {
             Step::Announce => self.start_capabilities(&mut round),
-            Step::AnnounceAt(capability, key) => self.provide(&mut round, capability, key),
+            Step::AnnounceAt(capability, key) if reached => {
+                self.provide(&mut round, capability, key);
+            }
+            Step::AnnounceAt(capability, _) => tracing::debug!(
+                %capability,
+                "the announce reached none of the routers closest to a capability: not provided \
+                 this round"
+            ),
             Step::Contact | Step::Closest(..) | Step::Providing => {}
         }
         self.keep_round(round);
@@ -503,7 +514,7 @@ impl Task {
                 let at = self.kad().put_record_to(
                     round.announce.clone(),
                     peers.into_iter(),
-                    Quorum::One,
+                    Quorum::All,
                 );
                 round.queries.insert(at, Step::AnnounceAt(capability, key));
             }
