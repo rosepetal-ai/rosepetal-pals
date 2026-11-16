@@ -34,7 +34,8 @@ def providers_of(cap):
     return [p for p in PROVIDERS if cap in PARAMS[f"CAPS_{p}"].split()]
 
 
-def search(node, cap, tag, t1, found=(), invalid=(), http=200, first_valid_ms=None, source=None, addrs=None):
+def search(node, cap, tag, t1, found=(), invalid=(), http=200, first_valid_ms=None, source=None, addrs=None,
+           elapsed_ms=30):
     """A search line: `found` providers valid, `invalid` ones with a bad contact."""
     candidates = [{"agent_id": AGENT[p], "valid": True, "reason": None,
                    "direct_addrs": (addrs or {}).get(p, ["10.0.0.1:4433"]), "contact_seq": 1} for p in found]
@@ -42,7 +43,7 @@ def search(node, cap, tag, t1, found=(), invalid=(), http=200, first_valid_ms=No
                     "contact_seq": None} for p in invalid]
     answer = None
     if http == 200:
-        answer = {"elapsed_ms": 30, "first_valid_ms": first_valid_ms if found else None,
+        answer = {"elapsed_ms": elapsed_ms, "first_valid_ms": first_valid_ms if found else None,
                   "first_valid_source": source if found else None, "candidates": candidates, "requests": 2}
     return {"kind": "search", "tag": tag, "node": node, "capability": PREFIX + cap,
             "t0": BASE + t1 - 0.5, "t1": BASE + t1,
@@ -191,6 +192,27 @@ class S3(Case):
         self.assertEqual(self.judge("S3", lines)["status"], "fail")
 
 
+class S2(Case):
+    def lines(self, connected):
+        newcomer = [search(PARAMS["S2_NODE"], cap, "newcomer", 30 + k, found=providers_of(cap), first_valid_ms=5)
+                    for k, cap in enumerate(CAPS)]
+        return [event("begin", -1), event("stop", 0)] + connected + [event("start", 20)] + newcomer
+
+    def test_latency_of_the_connected_clients(self):
+        # The k-th search (1 to 16) has its first valid candidate at k ms and
+        # ends at 100 k ms; a 500 has no answer and counts in neither.
+        connected = [search(c, cap, "connected", k, found=providers_of(cap), first_valid_ms=k, elapsed_ms=100 * k)
+                     for k, (c, cap) in enumerate(((c, cap) for c in CLIENTS for cap in CAPS), 1)]
+        connected.append(search(CLIENTS[0], CAPS[0], "connected", 17, http=500))
+        result = self.judge("S2", self.lines(connected))
+        metrics = result["metrics"]
+        self.assertEqual((metrics["connected_first_valid_ms_p50"], metrics["connected_first_valid_ms_p95"]), (8, 16))
+        self.assertEqual((metrics["connected_elapsed_ms_p50"], metrics["connected_elapsed_ms_p95"]), (800, 1600))
+        self.assertEqual(metrics["newcomer_first_valid_s"], 10)
+        # The 500 found no one: not complete.
+        self.assertEqual(result["status"], "fail")
+
+
 class S4(Case):
     def round(self, i, t, short=None):
         lines = []
@@ -213,6 +235,18 @@ class S4(Case):
     def test_never_degraded_is_zero(self):
         result = self.judge("S4", [event("begin", -1), event("stop", 0)] + self.round(0, 1))
         self.assertEqual(result["metrics"]["full_coverage_s"], 0)
+
+    def test_latency_while_the_routers_are_down(self):
+        # Every search of S4: here the k-th (0 to 15) has its first valid
+        # candidate at k + 1 ms and ends at 1000 + k ms, and one more finds
+        # no one, so it only has an end.
+        lines = [event("begin", -1), event("stop", 0)]
+        lines += [search(c, cap, "round=0", 1 + k, found=providers_of(cap), first_valid_ms=k + 1, elapsed_ms=1000 + k)
+                  for k, (c, cap) in enumerate((c, cap) for c in CLIENTS for cap in CAPS)]
+        lines.append(search(CLIENTS[0], CAPS[0], "round=1", 20, elapsed_ms=5000))
+        metrics = self.judge("S4", lines)["metrics"]
+        self.assertEqual((metrics["degraded_first_valid_ms_p50"], metrics["degraded_first_valid_ms_p95"]), (8, 16))
+        self.assertEqual((metrics["degraded_elapsed_ms_p50"], metrics["degraded_elapsed_ms_p95"]), (1008, 5000))
 
 
 class S5(Case):

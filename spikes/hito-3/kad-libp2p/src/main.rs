@@ -16,7 +16,6 @@
 //! multiaddrs ending in `/p2p/<PeerId>`, comma-separated.
 
 use std::net::SocketAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use iroh::endpoint::{PortmapperConfig, presets};
@@ -27,7 +26,7 @@ use pals_core::records::{AnnounceRecord, ContactRecord};
 use pals_core::signed::Signed;
 use spike_common::{Backend, BackendStats, NodeConfig, RawSearch};
 use spike_kad_libp2p::behaviour::{self, Handle, Settings};
-use spike_kad_libp2p::link;
+use spike_kad_libp2p::{link, now_unix};
 
 struct KadLibp2p {
     libp2p: Handle,
@@ -97,12 +96,6 @@ impl Backend for KadLibp2p {
     fn stats(&self) -> BackendStats {
         self.libp2p.stats()
     }
-}
-
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 #[tokio::main]

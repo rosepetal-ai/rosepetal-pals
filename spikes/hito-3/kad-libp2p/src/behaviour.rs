@@ -14,7 +14,7 @@
 //! default and republishes only on its runs). Replication never extends a
 //! record's life. `libp2p-kad` removes an expired record lazily (when it is
 //! read, or on the job's run); the task sweeps the store every
-//! [`SWEEP_EVERY`] of what the library itself marked expired, so that what
+//! `SWEEP_EVERY` of what the library itself marked expired, so that what
 //! a router counts is what it would still serve.
 //!
 //! Every `PutRecord` and `AddProvider` a router receives comes to the task
@@ -35,17 +35,21 @@
 //! It verifies each copy of a link and keeps the newest valid one, and
 //! passes on the contact it carries and the announce of the same agent,
 //! for `spike_common::verify` to check again. It never dials the providers
-//! it finds ([`Task::on_providers`] says why). A candidate's `found_ms` is
+//! it finds (`Task::on_providers` says why). A candidate's `found_ms` is
 //! when the search first had a valid link and a valid announce of the same
 //! agent; `requests` sums `QueryStats::num_requests` of every query of the
 //! search.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::task::Poll;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail, ensure};
+use libp2p::core::Endpoint;
+use libp2p::core::transport::PortUse;
 use libp2p::futures::StreamExt;
 use libp2p::identity::Keypair;
 use libp2p::kad::store::{MemoryStore, MemoryStoreConfig, RecordStore};
@@ -54,8 +58,11 @@ use libp2p::kad::{
     PutRecordError, QueryId, QueryResult, QueryStats, Quorum, Record, RecordKey, StoreInserts,
 };
 use libp2p::multiaddr::Protocol;
-use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, allow_block_list, identify};
+use libp2p::swarm::{
+    ConnectionDenied, ConnectionId, FromSwarm, NetworkBehaviour, SwarmEvent, THandler,
+    THandlerInEvent, THandlerOutEvent, ToSwarm, dummy,
+};
+use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, identify};
 use pals_core::identity::AgentId;
 use pals_core::records::AnnounceRecord;
 use pals_core::signed::Signed;
@@ -63,6 +70,7 @@ use spike_common::{BackendStats, RawCandidate, RawSearch, Role, StoredRecords, l
 use tokio::sync::{mpsc, oneshot};
 
 use crate::link::Link;
+use crate::now_unix;
 use crate::validate::{self, Slot, Verdict};
 
 /// The DHT's own Kademlia protocol (spec §6.2), never IPFS's.
@@ -104,7 +112,105 @@ const SWEEP_EVERY: Duration = Duration::from_secs(1);
 pub struct Behaviour {
     pub kad: kad::Behaviour<MemoryStore>,
     pub identify: identify::Behaviour,
-    pub undialed: allow_block_list::Behaviour<allow_block_list::BlockedPeers>,
+    pub undialed: NoDial,
+}
+
+/// The peers a search keeps itself from dialing (`Task::on_providers`):
+/// a dial to one of them is denied, and counted, before it starts. Unlike
+/// `allow_block_list`, it never closes a connection, and it lets a peer
+/// dial in.
+#[derive(Debug, Default)]
+pub struct NoDial {
+    peers: HashSet<PeerId>,
+    denied: u64,
+}
+
+impl NoDial {
+    /// Denies the dials to `peer`; whether it was not denied already.
+    fn deny(&mut self, peer: PeerId) -> bool {
+        self.peers.insert(peer)
+    }
+
+    fn allow(&mut self, peer: &PeerId) {
+        self.peers.remove(peer);
+    }
+
+    /// The dials denied since the last call.
+    fn take_denied(&mut self) -> u64 {
+        std::mem::take(&mut self.denied)
+    }
+}
+
+/// Why [`NoDial`] denied a dial.
+#[derive(Debug)]
+struct NotDialed;
+
+impl std::fmt::Display for NotDialed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a search does not dial the providers it finds")
+    }
+}
+
+impl std::error::Error for NotDialed {}
+
+impl NetworkBehaviour for NoDial {
+    type ConnectionHandler = dummy::ConnectionHandler;
+    type ToSwarm = Infallible;
+
+    fn handle_established_inbound_connection(
+        &mut self,
+        _: ConnectionId,
+        _: PeerId,
+        _: &Multiaddr,
+        _: &Multiaddr,
+    ) -> Result<THandler<Self>, ConnectionDenied> {
+        Ok(dummy::ConnectionHandler)
+    }
+
+    fn handle_pending_outbound_connection(
+        &mut self,
+        _: ConnectionId,
+        peer: Option<PeerId>,
+        _: &[Multiaddr],
+        _: Endpoint,
+    ) -> Result<Vec<Multiaddr>, ConnectionDenied> {
+        if let Some(peer) = peer
+            && self.peers.contains(&peer)
+        {
+            self.denied += 1;
+            return Err(ConnectionDenied::new(NotDialed));
+        }
+        Ok(Vec::new())
+    }
+
+    fn handle_established_outbound_connection(
+        &mut self,
+        _: ConnectionId,
+        _: PeerId,
+        _: &Multiaddr,
+        _: Endpoint,
+        _: PortUse,
+    ) -> Result<THandler<Self>, ConnectionDenied> {
+        Ok(dummy::ConnectionHandler)
+    }
+
+    fn on_swarm_event(&mut self, _: FromSwarm) {}
+
+    fn on_connection_handler_event(
+        &mut self,
+        _: PeerId,
+        _: ConnectionId,
+        event: THandlerOutEvent<Self>,
+    ) {
+        match event {}
+    }
+
+    fn poll(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
+        Poll::Pending
+    }
 }
 
 /// What the libp2p side starts with.
@@ -194,7 +300,7 @@ impl Handle {
         .await?
     }
 
-    /// The counters as the task last left them, at most [`SWEEP_EVERY`]
+    /// The counters as the task last left them, at most `SWEEP_EVERY`
     /// ago.
     pub fn stats(&self) -> BackendStats {
         self.stats.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -216,7 +322,7 @@ impl Handle {
 /// Starts the libp2p side: QUIC at `settings.listen` with `keypair`,
 /// Kademlia in the role's mode, joined through `settings.bootstrap`.
 /// Returns once it listens and its first bootstrap finished, or
-/// [`JOIN_TIMEOUT`] passed.
+/// `JOIN_TIMEOUT` passed.
 pub async fn spawn(settings: Settings, keypair: Keypair) -> anyhow::Result<Handle> {
     let bootstrap = settings
         .bootstrap
@@ -248,7 +354,7 @@ pub async fn spawn(settings: Settings, keypair: Keypair) -> anyhow::Result<Handl
                     .with_hide_listen_addrs(true)
                     .with_cache_size(0),
             ),
-            undialed: allow_block_list::Behaviour::default(),
+            undialed: NoDial::default(),
         })?
         .build();
     let mode = match settings.role {
@@ -485,6 +591,7 @@ impl Task {
                 limit,
                 reply,
             } => {
+                self.swarm.behaviour_mut().undialed.take_denied();
                 let providers = self
                     .kad()
                     .get_providers(validate::provider_key(&capability));
@@ -514,6 +621,14 @@ impl Task {
             .iter()
             .map(|c| validate::provider_key(c))
             .collect();
+        let records = vec![
+            Record::new(validate::link_key(&local), link),
+            Record::new(validate::announce_key(&local), announce),
+        ];
+        if let Err(error) = self.check_room(&records, &capabilities) {
+            let _ = reply.send(Err(error));
+            return;
+        }
         let dropped: Vec<RecordKey> = self
             .provided
             .iter()
@@ -524,10 +639,6 @@ impl Task {
             self.kad().stop_providing(key);
         }
         self.provided.retain(|key| !dropped.contains(key));
-        let records = vec![
-            Record::new(validate::link_key(&local), link),
-            Record::new(validate::announce_key(&local), announce),
-        ];
         let mut announcing = Announcing {
             reply,
             deadline: Instant::now() + ANNOUNCE_DEADLINE,
@@ -540,6 +651,8 @@ impl Task {
         };
         for i in 0..announcing.records.len() {
             let record = announcing.records[i].clone();
+            // Fails only when the store has no room, which `check_room`
+            // ruled out with nothing run since.
             match self.kad().put_record(record, Quorum::All) {
                 Ok(id) => {
                     announcing.puts.insert(id, i);
@@ -555,8 +668,74 @@ impl Task {
         self.announcing = Some(announcing);
     }
 
+    /// Whether the store has room for `records` and for providing `keys`:
+    /// `put_record` and `start_providing` fail only when it has none, so an
+    /// announce checks first and fails, if it must, before it changes
+    /// anything. It counts as `MemoryStore` does: a value as large as
+    /// `max_value_bytes` does not fit, and every distinct provider key the
+    /// store holds, the node's own and others', counts towards
+    /// `max_provided_keys`.
+    fn check_room(&mut self, records: &[Record], keys: &[RecordKey]) -> anyhow::Result<()> {
+        let held: HashSet<&RecordKey> = self.provider_keys.iter().chain(&self.provided).collect();
+        let new_keys = keys.iter().filter(|key| !held.contains(key)).count();
+        ensure!(
+            held.len() + new_keys <= STORE_LIMITS.max_provided_keys,
+            "the store has no room to provide {new_keys} more capabilities"
+        );
+        let store = self.swarm.behaviour_mut().kad.store_mut();
+        ensure!(
+            records
+                .iter()
+                .all(|r| r.value.len() < STORE_LIMITS.max_value_bytes),
+            "an own record is {} bytes or more",
+            STORE_LIMITS.max_value_bytes
+        );
+        let new_records = records
+            .iter()
+            .filter(|r| store.get(&r.key).is_none())
+            .count();
+        ensure!(
+            store.records().count() + new_records <= STORE_LIMITS.max_records,
+            "the store has no room for the own records"
+        );
+        Ok(())
+    }
+
+    /// Provides each of `keys`. When one cannot be (only if, after
+    /// `check_room`, others' provider records filled the store, which only
+    /// happens to a node that is also a router), stops providing the keys
+    /// this call started and fails: the node then provides what it did
+    /// before, minus what the new announcement dropped, while the DHT
+    /// already has its new link and announce.
+    fn provide(&mut self, keys: &[RecordKey]) -> anyhow::Result<HashSet<QueryId>> {
+        let mut queries = HashSet::new();
+        let mut started = Vec::new();
+        for key in keys {
+            match self.kad().start_providing(key.clone()) {
+                Ok(id) => {
+                    queries.insert(id);
+                    if !self.provided.contains(key) {
+                        self.provided.push(key.clone());
+                        started.push(key.clone());
+                    }
+                }
+                Err(error) => {
+                    for key in &started {
+                        self.kad().stop_providing(key);
+                    }
+                    self.provided.retain(|key| !started.contains(key));
+                    return Err(anyhow!("cannot provide a capability: {error:?}"));
+                }
+            }
+        }
+        Ok(queries)
+    }
+
     /// A put of the announce in flight finished: once both did, provides
     /// the capabilities, or tries again the ones that reached no router.
+    /// Past the deadline, it provides them all the same and fails: the node
+    /// holds its new records and the library republishes them, so its
+    /// provider records must match them.
     fn on_put(&mut self, id: QueryId, result: Result<kad::PutRecordOk, PutRecordError>) {
         let Some(announcing) = self.announcing.as_mut() else {
             return;
@@ -578,37 +757,29 @@ impl Task {
         if !announcing.puts.is_empty() {
             return;
         }
-        if announcing.reached.iter().all(|r| *r) {
-            let keys = announcing.capabilities.clone();
-            let mut providing = HashSet::new();
-            for key in keys {
-                match self.kad().start_providing(key.clone()) {
-                    Ok(id) => {
-                        providing.insert(id);
-                        if !self.provided.contains(&key) {
-                            self.provided.push(key);
-                        }
-                    }
-                    Err(error) => {
-                        let announcing = self.announcing.take().expect("in progress");
-                        let _ = announcing
-                            .reply
-                            .send(Err(anyhow!("cannot provide a capability: {error:?}")));
-                        return;
-                    }
-                }
-            }
-            let announcing = self.announcing.as_mut().expect("in progress");
-            announcing.providing = providing;
-            self.finish_announce_if_done();
-        } else if Instant::now() < announcing.deadline {
+        let all_reached = announcing.reached.iter().all(|r| *r);
+        if !all_reached && Instant::now() < announcing.deadline {
             announcing.retry_at = Some(Instant::now() + RETRY_AFTER);
-        } else {
-            let announcing = self.announcing.take().expect("in progress");
-            let _ = announcing.reply.send(Err(anyhow!(
-                "the records reached no router in {} s",
-                ANNOUNCE_DEADLINE.as_secs()
-            )));
+            return;
+        }
+        let keys = announcing.capabilities.clone();
+        match self.provide(&keys) {
+            Ok(providing) if all_reached => {
+                let announcing = self.announcing.as_mut().expect("in progress");
+                announcing.providing = providing;
+                self.finish_announce_if_done();
+            }
+            Ok(_) => {
+                let announcing = self.announcing.take().expect("in progress");
+                let _ = announcing.reply.send(Err(anyhow!(
+                    "the records reached no router in {} s; the node republishes them",
+                    ANNOUNCE_DEADLINE.as_secs()
+                )));
+            }
+            Err(error) => {
+                let announcing = self.announcing.take().expect("in progress");
+                let _ = announcing.reply.send(Err(error));
+            }
         }
     }
 
@@ -858,7 +1029,10 @@ impl Task {
             searching.requests.insert(id, stats.num_requests());
         }
         match result {
-            QueryResult::Bootstrap(_) => {
+            QueryResult::Bootstrap(result) => {
+                if let Err(error) = result {
+                    tracing::debug!("bootstrap: {error}");
+                }
                 if last && self.joining == Some(id) {
                     self.joining = None;
                 }
@@ -876,8 +1050,12 @@ impl Task {
                 }
             }
             QueryResult::GetProviders(result) => {
-                if let Ok(GetProvidersOk::FoundProviders { providers, .. }) = result {
-                    self.on_providers(id, providers);
+                match result {
+                    Ok(GetProvidersOk::FoundProviders { providers, .. }) => {
+                        self.on_providers(id, providers);
+                    }
+                    Ok(GetProvidersOk::FinishedWithNoAdditionalRecord { .. }) => {}
+                    Err(error) => tracing::debug!(query = ?id, "providers: {error}"),
                 }
                 if last
                     && let Some(searching) = self.searching.as_mut()
@@ -888,8 +1066,10 @@ impl Task {
                 }
             }
             QueryResult::GetRecord(result) => {
-                if let Ok(GetRecordOk::FoundRecord(found)) = result {
-                    self.on_record(id, found.record);
+                match result {
+                    Ok(GetRecordOk::FoundRecord(found)) => self.on_record(id, found.record),
+                    Ok(GetRecordOk::FinishedWithNoAdditionalRecord { .. }) => {}
+                    Err(error) => tracing::debug!(query = ?id, "record: {error}"),
                 }
                 if last
                     && let Some(searching) = self.searching.as_mut()
@@ -918,8 +1098,8 @@ impl Task {
     /// network would hold the query until libp2p's QUIC handshake gives up
     /// (5 s), because a datagram with no route is only a lost packet to
     /// QUIC. So the search keeps itself from dialing, until it ends, every
-    /// provider not in its routing table: the dial fails at once, and the
-    /// query goes on without it.
+    /// provider not in its routing table ([`NoDial`]): the dial fails at
+    /// once, and the query goes on without it.
     fn on_providers(&mut self, id: QueryId, providers: HashSet<PeerId>) {
         let local = self.local;
         let Some(searching) = self.searching.as_ref() else {
@@ -941,7 +1121,7 @@ impl Task {
         for peer in &providers {
             if *peer != local
                 && !routers.contains(peer)
-                && self.swarm.behaviour_mut().undialed.block_peer(*peer)
+                && self.swarm.behaviour_mut().undialed.deny(*peer)
             {
                 let searching = self.searching.as_mut().expect("in progress");
                 searching.undialed.push(*peer);
@@ -1038,10 +1218,20 @@ impl Task {
                 query.finish();
             }
         }
+        let undialed = &mut self.swarm.behaviour_mut().undialed;
         for peer in &searching.undialed {
-            self.swarm.behaviour_mut().undialed.unblock_peer(*peer);
+            undialed.allow(peer);
         }
-        let requests = searching.requests.values().map(|n| u64::from(*n)).sum();
+        // `QueryStats` counts a request when the query picks a peer, before
+        // any dial: the dials to the providers that `NoDial` denied never
+        // reached the network.
+        let denied = undialed.take_denied();
+        let requests = searching
+            .requests
+            .values()
+            .map(|n| u64::from(*n))
+            .sum::<u64>()
+            .saturating_sub(denied);
         let candidates = searching.found.into_iter().map(Found::into_raw).collect();
         let _ = searching.reply.send(Ok(RawSearch {
             candidates,
@@ -1199,12 +1389,6 @@ fn key_text(key: &RecordKey) -> String {
         Ok(text) if text.starts_with('/') => text.to_owned(),
         _ => key.as_ref().iter().map(|b| format!("{b:02x}")).collect(),
     }
-}
-
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 fn millis(since: Instant) -> u64 {

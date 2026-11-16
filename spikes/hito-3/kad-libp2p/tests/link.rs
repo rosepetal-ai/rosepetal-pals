@@ -6,10 +6,14 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use libp2p::PeerId;
 use libp2p::kad::RecordKey;
 use pals_core::grant::format_timestamp;
 use pals_core::identity::AgentKey;
+use pals_core::jcs::canonical;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use spike_common::{BackendStats, Role, issue_announce, issue_contact, tamper_signature, verify};
 use spike_kad_libp2p::behaviour::{self, Handle, Settings};
@@ -76,6 +80,32 @@ fn link_rejects_a_peer_id_not_matching_its_key() {
     };
     let value = link::sign(&link::libp2p_keypair(&a), &a, &doc).unwrap();
     assert_eq!(link::verify(&value, NOW), Err(LinkError::PeerIdMismatch));
+}
+
+#[test]
+fn link_rejects_a_bad_libp2p_signature() {
+    let a = agent(1);
+    let mut envelope: Value = serde_json::from_slice(&link_of(&a, 1)).unwrap();
+    envelope["libp2p_signature"] = URL_SAFE_NO_PAD.encode([7u8; 64]).into();
+    assert_eq!(
+        link::verify(&canonical(&envelope), NOW),
+        Err(LinkError::BadLibp2pSignature)
+    );
+}
+
+#[test]
+fn link_rejects_a_libp2p_signature_by_another_key() {
+    // Signed by B's libp2p key, with A's public key in the envelope: the
+    // key is the one A's PeerId names, the signature is not that key's.
+    let (a, b) = (agent(1), agent(2));
+    let forged = link::sign(&link::libp2p_keypair(&b), &a, &doc_of(&a)).unwrap();
+    let mut envelope: Value = serde_json::from_slice(&forged).unwrap();
+    let a_key = link::libp2p_keypair(&a).public().encode_protobuf();
+    envelope["libp2p_key"] = URL_SAFE_NO_PAD.encode(a_key).into();
+    assert_eq!(
+        link::verify(&canonical(&envelope), NOW),
+        Err(LinkError::BadLibp2pSignature)
+    );
 }
 
 #[test]
@@ -331,7 +361,10 @@ async fn routers_store_an_honest_announcement_and_reject_a_tampered_link() {
             .all(|(_, c)| c.valid || c.reason == Some("bad_contact")),
         "{candidates:#?}"
     );
-    assert!(found.requests.is_some_and(|n| n > 0));
+    // The two routers asked for the providers, and both asked for each
+    // candidate's link and announce: 2 + 2 × 2 × 2. The denied dials to the
+    // two providers reach no network and do not count.
+    assert_eq!(found.requests, Some(10));
 
     // The search reached the providers through their links, and dialed
     // none of them: only the two routers. A provider can answer no

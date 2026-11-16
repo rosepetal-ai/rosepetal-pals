@@ -271,10 +271,14 @@ def s2(ctx, lines):
     first = next((s for s in newcomer if valid_ids(s)), None)
     caps = [ctx.cap(c) for c in ctx.words("CAPABILITIES")]
     newcomer_complete = all(any(complete(ctx, s) for s in newcomer if s["capability"] == c) for c in caps)
+    connected_answers = [s["answer"] for s in connected if s["answer"]]
     metrics = {
         "connected_complete_pct": rnd(100 * sum(1 for s in connected if complete(ctx, s)) / len(connected))
         if connected else None,
-        "connected_first_valid_ms_p50": pct([s["answer"]["first_valid_ms"] for s in connected if s["answer"]], 0.5),
+        "connected_first_valid_ms_p50": pct([a["first_valid_ms"] for a in connected_answers], 0.5),
+        "connected_first_valid_ms_p95": pct([a["first_valid_ms"] for a in connected_answers], 0.95),
+        "connected_elapsed_ms_p50": pct([a["elapsed_ms"] for a in connected_answers], 0.5),
+        "connected_elapsed_ms_p95": pct([a["elapsed_ms"] for a in connected_answers], 0.95),
         "newcomer_first_valid_s": rnd(first["t1"] - start["t"]) if first is not None and start else None,
         "newcomer_complete": newcomer_complete,
         "newcomer_searches": len(newcomer),
@@ -286,7 +290,9 @@ def s2(ctx, lines):
     notes = (f"Parado {ctx.p['BOOTSTRAP']}, cada cliente buscó cada capacidad una vez; después arrancó {node} "
              f"con [{ctx.p['BOOTSTRAP']}, {ctx.p['SAVED_CONTACT']}] y buscó hasta encontrar a los dos proveedores "
              f"de cada capacidad, {2 * ctx.p['REPUBLISH_S']} s como mucho. "
-             f"newcomer_first_valid_s cuenta desde que arrancó su contenedor.")
+             f"newcomer_first_valid_s cuenta desde que arrancó su contenedor. connected_first_valid_ms y "
+             f"connected_elapsed_ms son de las búsquedas de los clientes con {ctx.p['BOOTSTRAP']} parado: cuándo "
+             "tuvo el backend el primer candidato válido y cuándo terminó la búsqueda.")
     ok = all(complete(ctx, s) for s in connected) and newcomer_complete
     return outcome("pass" if ok else "fail", metrics, notes, reached)
 
@@ -366,9 +372,16 @@ def s4(ctx, lines):
             last = max(short, key=lambda s: s["t1"])
             full = min(s["t1"] for s in searches if s["t1"] > last["t1"] and complete(ctx, s)
                        and (s["node"], s["capability"]) == (last["node"], last["capability"]))
+    # Every search of S4 runs with the stopped routers down: the harness
+    # starts them again only after its loop.
+    answers = [s["answer"] for s in searches if s["answer"]]
     metrics = {
         "immediate_coverage": rnd(coverage(ctx, groups[0]), 3) if groups else None,
         "full_coverage_s": rnd(full - t) if full is not None and t is not None else None,
+        "degraded_first_valid_ms_p50": pct([a["first_valid_ms"] for a in answers], 0.5),
+        "degraded_first_valid_ms_p95": pct([a["first_valid_ms"] for a in answers], 0.95),
+        "degraded_elapsed_ms_p50": pct([a["elapsed_ms"] for a in answers], 0.5),
+        "degraded_elapsed_ms_p95": pct([a["elapsed_ms"] for a in answers], 0.95),
         "rounds": len(groups),
         "limit_s": limit,
     }
@@ -377,7 +390,9 @@ def s4(ctx, lines):
     notes = (f"Parados {ctx.p['S4_NODES']}. Rondas seguidas en que cada cliente busca cada capacidad, hasta "
              "una ronda completa; la cobertura es la fracción de los proveedores esperados que se encuentran. "
              "La cobertura completa cuenta en la primera búsqueda completa, del mismo cliente y capacidad, "
-             "después de la última incompleta, y es 0 si ninguna lo fue.")
+             "después de la última incompleta, y es 0 si ninguna lo fue. degraded_first_valid_ms y "
+             "degraded_elapsed_ms son de todas las búsquedas de S4, hechas con los routers parados: cuándo tuvo "
+             "el backend el primer candidato válido y cuándo terminó la búsqueda.")
     ok = metrics["full_coverage_s"] is not None and metrics["full_coverage_s"] < limit
     return outcome("pass" if ok else "fail", metrics, notes, reached)
 

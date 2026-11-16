@@ -119,7 +119,7 @@ impl LinkError {
 }
 
 /// The node's libp2p key: Ed25519, its seed the SHA-256 of
-/// [`KEY_DERIVATION`] and the agent's seed, so that it is never the agent's
+/// `KEY_DERIVATION` and the agent's seed, so that it is never the agent's
 /// own key and is the same on every start.
 pub fn libp2p_keypair(agent: &AgentKey) -> Keypair {
     let mut hash = Sha256::new();
