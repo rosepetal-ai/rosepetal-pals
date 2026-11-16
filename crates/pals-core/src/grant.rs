@@ -9,6 +9,12 @@
 //! the issuer's Ed25519 signature of `GRANT_SIG_DOMAIN || JCS(grant)`, in
 //! base64url without padding. [`SignedGrant::from_token`] verifies it over the
 //! JSON value it received, before deserializing it into a [`Grant`].
+//!
+//! An agent accepts a token a peer presents with [`accept_grant`], the one
+//! rule both the HTTP layer of milestone 1 and the discovery protocol apply:
+//! verified, issued by the agent or an issuer it trusts, for the agent, to
+//! the peer of the connection, in force, not revoked, and allowing what the
+//! request needs ([`Need`]).
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -20,6 +26,7 @@ use time::{OffsetDateTime, PrimitiveDateTime};
 
 use crate::identity::{AgentId, AgentKey};
 use crate::jcs::{canonical, sign_domain, verify_domain};
+use crate::store::Store;
 
 /// The value of [`Grant::schema`].
 pub const GRANT_SCHEMA: &str = "agentnet.grant/1";
@@ -128,6 +135,103 @@ impl GrantError {
     /// [`GrantError::OperationNotGranted`] and [`GrantError::ResourceNotGranted`].
     pub fn is_authentication(&self) -> bool {
         !matches!(self, Self::OperationNotGranted | Self::ResourceNotGranted)
+    }
+
+    /// The reason in snake case, as a refusal names it: `expired`,
+    /// `not_yet_valid`, `wrong_subject`...
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Malformed => "malformed",
+            Self::TooLarge => "too_large",
+            Self::UnknownSchema => "unknown_schema",
+            Self::BadSignature => "bad_signature",
+            Self::IssuerNotAccepted => "issuer_not_accepted",
+            Self::WrongSubject => "wrong_subject",
+            Self::WrongAudience => "wrong_audience",
+            Self::NotYetValid => "not_yet_valid",
+            Self::Expired => "expired",
+            Self::Revoked => "revoked",
+            Self::OperationNotGranted => "operation_not_granted",
+            Self::ResourceNotGranted => "resource_not_granted",
+        }
+    }
+}
+
+/// What a request needs its grant to allow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Need<'a> {
+    /// This operation on this resource.
+    Operation(Operation, &'a str),
+    /// Nothing in particular: only the grant's own validity counts, and
+    /// what it allows is the caller's to read (a scope, say). A grant that
+    /// allows no operation, or none on the resource, is accepted.
+    AnyOperation,
+}
+
+/// The request a presented grant is accepted for.
+#[derive(Debug, Clone, Copy)]
+pub struct Acceptance<'a> {
+    /// The agent that serves the request.
+    pub audience: &'a AgentId,
+    /// The peer that makes it, as its connection authenticated it.
+    pub subject: &'a AgentId,
+    /// Issuers whose grants the audience accepts: itself and those it
+    /// trusts.
+    pub accepted_issuers: &'a [AgentId],
+    pub need: Need<'a>,
+    /// The audience's clock, in Unix seconds.
+    pub now_unix: i64,
+}
+
+/// Why a presented grant was not accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AcceptError {
+    /// The grant is unusable, or does not allow what is needed.
+    #[error("{0}")]
+    Grant(GrantError),
+    /// The revocations could not be read: nothing is accepted then.
+    #[error("the revocations cannot be read")]
+    Store,
+}
+
+/// The resource [`Need::AnyOperation`] checks against: any would do, since
+/// what the grant allows is not checked then.
+const ANY_RESOURCE: &str = "skill:ask";
+
+/// Accepts `token`, a grant a peer presents, for the request `a`: parsed and
+/// verified ([`SignedGrant::from_token`]), then checked against `a` with the
+/// audience's revocations in `store` ([`SignedGrant::check`], whose order
+/// of rules decides which error wins). With [`Need::AnyOperation`], a grant
+/// that does not allow an operation or a resource is still accepted.
+///
+/// [`AcceptError::Store`] when the revocations cannot be read, logged here.
+pub fn accept_grant(
+    store: &Store,
+    token: &str,
+    a: &Acceptance,
+) -> Result<SignedGrant, AcceptError> {
+    let grant = SignedGrant::from_token(token).map_err(AcceptError::Grant)?;
+    let revoked = store.is_revoked(&grant.grant.grant_id).map_err(|err| {
+        tracing::error!(error = %format!("{err:#}"), "cannot read revocations");
+        AcceptError::Store
+    })?;
+    let (operation, resource, any) = match a.need {
+        Need::Operation(operation, resource) => (operation, resource, false),
+        Need::AnyOperation => (Operation::TaskRead, ANY_RESOURCE, true),
+    };
+    let check = GrantCheck {
+        now_unix: a.now_unix,
+        audience: a.audience,
+        subject: a.subject,
+        accepted_issuers: a.accepted_issuers,
+        operation,
+        resource,
+        revoked,
+    };
+    match grant.check(&check) {
+        Ok(()) => Ok(grant),
+        Err(err) if any && !err.is_authentication() => Ok(grant),
+        Err(err) => Err(AcceptError::Grant(err)),
     }
 }
 

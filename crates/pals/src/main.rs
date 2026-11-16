@@ -1,13 +1,17 @@
 //! The `pals` command line.
 //!
-//! Only `pals daemon` takes the data directory's lock; every other command
-//! opens the store directly, which a running daemon shares. `pals ask` and
-//! `pals task resume|cancel` reach peers through the running daemon's
-//! gateway.
+//! Only `pals daemon` takes the data directory's lock; every other command,
+//! `pals benchmark import|ls` and `pals contact add-a2a` included, opens the
+//! store directly, which a running daemon shares; `pals contact add-a2a`
+//! reads the plain agent's card itself. `pals ask`, `pals task
+//! resume|cancel`, `pals card show <peer>`, `pals inventory get`, `pals
+//! query` and `pals discover` reach peers through the running daemon's
+//! gateway; `pals ask --offer` reads the offer it names from the store
+//! first, and sends nothing when it expired.
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -16,20 +20,38 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
-use http_body_util::{BodyExt, Empty, Limited};
+use http_body_util::{BodyExt, Empty, Full, Limited};
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
 use iroh_tickets::endpoint::EndpointTicket;
-use pals::config::{self, CONFIG_FILE, Config, INIT_TEMPLATE, is_header_safe};
+use pals::a2a::CardSet;
+use pals::config::{self, CONFIG_FILE, Config, INIT_TEMPLATE, INVENTORY_TEMPLATE, is_header_safe};
+use pals::discovery::cards::PUBLIC_CONTEXT;
+use pals::gateway::plain::{self, fetch_contact_card};
+use pals::gateway::{CARD_HASH_HEADER, held_task_grant, query_for_grant};
+use pals::inventory::{InventoryState, RefreshReport};
 use pals::net::agent_id_of;
 use pals::node::{Node, STORE_FILE};
-use pals::outbox::{AskError, AskOutcome, AskRequest, Outbox};
+use pals::outbox::{
+    AskError, AskOutcome, AskRequest, OfferLookupError, Outbox, PLAIN_NOT_RESENT,
+    received_offer_ref,
+};
+use pals_core::benchmark::{BenchmarkReport, MAX_REPORT_BYTES};
+use pals_core::card_jws::{CardSigner, verify_card};
+use pals_core::discovery::query::{
+    MAX_QUERY_BYTES, MAX_REPLY_TIMEOUT_MS, QUERY_SCHEMA, Requirements, ServiceQuery, accept_offer,
+    new_query_id,
+};
+use pals_core::discovery::selection::{Coverage, SearchOutcome, SearchRequest, Stage};
 use pals_core::grant::{
     GRANT_SCHEMA, Grant, GrantError, MAX_TOKEN_BYTES, Operation, SignedGrant, format_timestamp,
     parse_timestamp,
 };
 use pals_core::identity::{AgentId, AgentKey};
-use pals_core::store::{Contact, Store};
+use pals_core::inventory::view::{INVENTORY_SECTIONS, render, verify_page};
+use pals_core::inventory::{Scope, Section, Visibility};
+use pals_core::signed::{Signed, SignedError};
+use pals_core::store::{Contact, KeptBenchmark, PLAIN_PEER_PREFIX, Store};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -50,7 +72,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create config.toml and agent.key, keeping any that already exist
+    /// Create config.toml, inventory.toml and agent.key, keeping any that
+    /// already exist
     Init,
     /// Print this agent's id
     Id {
@@ -84,10 +107,173 @@ enum Command {
         /// How long to wait for the answer: a number and s, m, h or d
         #[arg(long, default_value = "600s")]
         wait: String,
+        /// The offer the peer made this agent to name in the question, by
+        /// its id, as `pals discover` printed it; one expired by this
+        /// agent's clock sends nothing and exits 2
+        #[arg(long, value_name = "OFFER_ID")]
+        offer: Option<String>,
+    },
+    /// Search the contacts for a provider of a capability, through the
+    /// running daemon's gateway: verify their cards, ask the PALS peers for
+    /// offers over agentnet-discovery/0, within the limits of [discovery],
+    /// and print the ranking, with the id and expiry of each offer, the
+    /// candidates discarded and why, the coverage and the metrics.
+    /// Searching runs nothing on any peer. With
+    /// --ask, the question goes to the best candidate that takes it, with
+    /// its offer, and the command exits as `pals ask` does
+    Discover {
+        /// The capability: one of the common vocabulary, as vision.ocr, or
+        /// of its provider's namespace, as example:ocr
+        #[arg(long)]
+        capability: String,
+        /// A media type the provider must accept; repeat for more
+        #[arg(long = "input", value_name = "MIME")]
+        inputs: Vec<String>,
+        /// A media type the provider must produce; repeat for more
+        #[arg(long = "output", value_name = "MIME")]
+        outputs: Vec<String>,
+        /// A JSON file with the requirements: language,
+        /// external_cloud_allowed, required_region and inventory, with its
+        /// required and preferred ids and resources
+        #[arg(long, value_name = "JSON")]
+        requirements_file: Option<PathBuf>,
+        /// The project the task is for: only the contacts that gave this
+        /// agent a grant for it get the inventory ids of the requirements
+        #[arg(long)]
+        project: Option<String>,
+        /// A contact to search among, by name or agent id; repeat for more
+        /// [default: every contact]
+        #[arg(long = "peer", value_name = "PEER")]
+        peers: Vec<String>,
+        /// Ask the best candidate that takes it this question
+        #[arg(long, value_name = "QUESTION")]
+        ask: Option<String>,
+        /// With --ask, how long to wait for the answer: a number and s, m,
+        /// h or d
+        #[arg(long, default_value = "600s")]
+        wait: String,
     },
     /// The questions this agent asked its peers
     #[command(subcommand)]
     Task(TaskCommand),
+    /// Agent Cards: this agent's, and its peers'
+    #[command(subcommand)]
+    Card(CardCommand),
+    /// This agent's inventory
+    #[command(subcommand)]
+    Inventory(InventoryCommand),
+    /// Benchmark reports this agent holds, its own or imported, each as its
+    /// measurer signed it. Peers read them over agentnet-discovery/0, as
+    /// their visibility lets them; reading one never measures anything
+    #[command(subcommand)]
+    Benchmark(BenchmarkCommand),
+    /// Ask a peer whether it can serve a case, over agentnet-discovery/0
+    /// through the running daemon's gateway, which keeps its offer: print
+    /// the offer as the peer signed it for this agent, then `verified:
+    /// <agent id> <offer id> <status>`. Asking runs nothing on the peer, and
+    /// an offer authorizes nothing
+    Query {
+        /// The peer, by contact name or agent id
+        peer: String,
+        /// The capability: one of the common vocabulary, as vision.ocr, or
+        /// of its provider's namespace, as example:ocr
+        #[arg(long)]
+        capability: String,
+        /// A media type the peer must accept; repeat for more
+        #[arg(long = "input", value_name = "MIME")]
+        inputs: Vec<String>,
+        /// A media type the peer must produce; repeat for more
+        #[arg(long = "output", value_name = "MIME")]
+        outputs: Vec<String>,
+        /// A JSON file with the requirements: language,
+        /// external_cloud_allowed, required_region and inventory, with its
+        /// required and preferred ids and resources
+        #[arg(long, value_name = "JSON")]
+        requirements_file: Option<PathBuf>,
+        /// The project to be answered for, among those of the grant this
+        /// agent holds for the peer; another is answered as public
+        #[arg(long)]
+        project: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum InventoryCommand {
+    /// Print what a peer of a scope sees of this agent's inventory, rendered
+    /// here from the inventory file: the entries of its view in one piece,
+    /// unsigned, as JSON
+    Show {
+        /// The scope: public (any peer), project:<project> (a grant for
+        /// task.read or task.cancel on skill:ask in that project) or
+        /// task:<project> (one for task.send)
+        #[arg(long, default_value = "public")]
+        scope: String,
+        /// The sections, comma separated: services, skills, plugins, mcp,
+        /// runtime, models, information, hardware, network [default: all]
+        #[arg(long, value_delimiter = ',')]
+        sections: Vec<String>,
+    },
+    /// Print a peer's inventory, as this agent's grant lets it see it, read
+    /// over agentnet-discovery/0 through the running daemon's gateway: each
+    /// page as the peer signed it, then `verified: <agent id> <scope> seq
+    /// <revision>`
+    Get {
+        /// The peer, by contact name or agent id
+        peer: String,
+        /// The sections, comma separated: services, skills, plugins, mcp,
+        /// runtime, models, information, hardware, network [default: all]
+        #[arg(long, value_delimiter = ',')]
+        sections: Vec<String>,
+        /// Every page, following each page's cursor, instead of the first
+        #[arg(long)]
+        all: bool,
+    },
+    /// Check now, through the running daemon, the MCP connections the
+    /// inventory configures an adapter for: initialize and tools/list on
+    /// each, never a tool call. Print `generation <n>`, `observed <n>, ok
+    /// <n>, failed <n>`, then `failed: <id> <code>` for each one not
+    /// operational. The daemon also checks them when it starts and every
+    /// [inventory] refresh_interval_s
+    Refresh,
+}
+
+#[derive(Subcommand)]
+enum BenchmarkCommand {
+    /// Keep a signed benchmark report (agentnet.benchmark-report/1) read from
+    /// a JSON file, as its measurer signed it: it must verify with the key
+    /// of its provenance.measured_by, whoever that is. Importing the same
+    /// report again only changes who sees it; another report under an id
+    /// kept already is refused
+    Import {
+        /// The signed report: {"report": {...}, "signature": "..."}
+        file: PathBuf,
+        /// Who sees it: public, project:<project>, task:<project> or
+        /// private. Kept beside the report, never in it
+        #[arg(long, default_value = "private")]
+        visibility: String,
+    },
+    /// List the reports kept, by id: id, kind, profile and version, subject,
+    /// measurer, measured_at, expires_at and visibility, tab separated. A
+    /// row that does not read, which no peer is shown, is listed as its id,
+    /// `unreadable` and why
+    Ls,
+}
+
+#[derive(Subcommand)]
+enum CardCommand {
+    /// Print a signed Agent Card, then `verified: <agent id> <card hash>`:
+    /// this agent's own, as its daemon signs it from config.toml and the
+    /// inventory, or a peer's, read and verified through the running
+    /// daemon's gateway
+    Show {
+        /// The peer, by contact name or agent id; this agent when left out
+        peer: Option<String>,
+        /// The peer's extended card instead, as this agent's grant lets it
+        /// see it: the view the gateway checked, and the hash of the card it
+        /// verified
+        #[arg(long, requires = "peer")]
+        extended: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -116,7 +302,26 @@ enum ContactCommand {
         #[arg(long)]
         name: String,
     },
-    /// List the saved peers
+    /// Save a plain A2A agent, one with no PALS daemon, which this agent
+    /// asks and never answers: its card is read and checked now, and at
+    /// every use. Only interfaces of the URL's origin are ever called; no
+    /// proxy, no redirect, no files
+    #[command(name = "add-a2a")]
+    AddA2a {
+        /// The agent's base URL, https://<host>[/<path>], whose card is at
+        /// <url>/.well-known/agent-card.json, or its card's URL (ending in
+        /// .json); http:// only to 127.0.0.1, [::1] or localhost
+        url: String,
+        /// The name to reach the agent by: letters, digits, '-', '_' and '.'
+        #[arg(long)]
+        name: String,
+        /// The environment variable that holds the agent's bearer token,
+        /// read when a request is sent; the token itself is never saved
+        #[arg(long, value_name = "VAR")]
+        bearer_env: Option<String>,
+    },
+    /// List the saved peers: name and agent id, or name and card URL for a
+    /// plain A2A agent
     Ls,
 }
 
@@ -186,6 +391,11 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Id { ticket: true } => id_ticket(&home),
         Command::Daemon => daemon(&home),
         Command::Contact(ContactCommand::Add { ticket, name }) => contact_add(&home, &ticket, name),
+        Command::Contact(ContactCommand::AddA2a {
+            url,
+            name,
+            bearer_env,
+        }) => contact_add_a2a(&home, &url, &name, bearer_env.as_deref()),
         Command::Contact(ContactCommand::Ls) => contact_ls(&home),
         Command::Grant(GrantCommand::Issue {
             to,
@@ -202,13 +412,69 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             question,
             attach,
             wait,
-        } => return ask(&home, peer, question, attach, &wait),
+            offer,
+        } => return ask(&home, peer, question, attach, &wait, offer.as_deref()),
+        Command::Discover {
+            capability,
+            inputs,
+            outputs,
+            requirements_file,
+            project,
+            peers,
+            ask,
+            wait,
+        } => {
+            let search = Searched {
+                asked: Asked {
+                    capability,
+                    inputs,
+                    outputs,
+                    requirements_file,
+                    project,
+                },
+                peers,
+            };
+            return discover(&home, search, ask, &wait);
+        }
         Command::Task(TaskCommand::Ls) => task_ls(&home),
         Command::Task(TaskCommand::Resume { message_id, wait }) => {
             return task_resume(&home, &message_id, &wait);
         }
         Command::Task(TaskCommand::Cancel { message_id }) => {
             return task_cancel(&home, &message_id);
+        }
+        Command::Card(CardCommand::Show { peer, extended }) => {
+            card_show(&home, peer.as_deref(), extended)
+        }
+        Command::Inventory(InventoryCommand::Show { scope, sections }) => {
+            inventory_show(&home, &scope, &sections)
+        }
+        Command::Inventory(InventoryCommand::Get {
+            peer,
+            sections,
+            all,
+        }) => inventory_get(&home, &peer, &sections, all),
+        Command::Inventory(InventoryCommand::Refresh) => inventory_refresh(&home),
+        Command::Benchmark(BenchmarkCommand::Import { file, visibility }) => {
+            benchmark_import(&home, &file, &visibility)
+        }
+        Command::Benchmark(BenchmarkCommand::Ls) => benchmark_ls(&home),
+        Command::Query {
+            peer,
+            capability,
+            inputs,
+            outputs,
+            requirements_file,
+            project,
+        } => {
+            let asked = Asked {
+                capability,
+                inputs,
+                outputs,
+                requirements_file,
+                project,
+            };
+            query(&home, &peer, asked)
         }
     };
     done.map(|()| ExitCode::SUCCESS)
@@ -217,25 +483,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 fn init(home: &Path) -> anyhow::Result<()> {
     create_private_dir(home)?;
     let config_path = home.join(CONFIG_FILE);
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&config_path)
-    {
-        Ok(mut file) => {
-            file.write_all(INIT_TEMPLATE.as_bytes())
-                .with_context(|| format!("cannot write {}", config_path.display()))?;
-            println!("created {}", config_path.display());
-        }
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            println!("kept the existing {}", config_path.display());
-        }
-        Err(err) => {
-            return Err(err).with_context(|| format!("cannot create {}", config_path.display()));
-        }
-    }
-
+    write_new(&config_path, INIT_TEMPLATE)?;
     let cfg = Config::load(&config_path)?;
+    write_new(&cfg.inventory.file, INVENTORY_TEMPLATE)?;
+
     create_private_dir(&cfg.data_dir)?;
     let key_path = cfg.key_path();
     let existed = key_path.exists();
@@ -248,6 +499,24 @@ fn init(home: &Path) -> anyhow::Result<()> {
     };
     println!("{verb} {}", key_path.display());
     println!("agent id: {}", key.id());
+    Ok(())
+}
+
+/// Writes `contents` to a new file at `path`, keeping one that exists.
+fn write_new(path: &Path, contents: &str) -> anyhow::Result<()> {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => {
+            file.write_all(contents.as_bytes())
+                .with_context(|| format!("cannot write {}", path.display()))?;
+            println!("created {}", path.display());
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            println!("kept the existing {}", path.display());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("cannot create {}", path.display()));
+        }
+    }
     Ok(())
 }
 
@@ -310,6 +579,711 @@ async fn gateway_health(listen: SocketAddr) -> anyhow::Result<Value> {
     tokio::time::timeout(TIMEOUT, exchange)
         .await
         .map_err(|_| anyhow!("/healthz did not answer within {TIMEOUT:?}"))?
+}
+
+/// The largest answer `pals card show` and `pals inventory get` read from
+/// the gateway: a card or a page, re-encoded in ASCII.
+const MAX_GATEWAY_ANSWER_BYTES: usize = 256 * 1024;
+
+/// The most pages `pals inventory get --all` follows: far more than a chain
+/// of cursors serves within its 1 MiB.
+const MAX_PAGES: usize = 1024;
+
+/// The agent `peer` names: an agent id, or a contact's name.
+fn peer_id(store: &Store, peer: &str) -> anyhow::Result<AgentId> {
+    match peer.parse::<AgentId>() {
+        Ok(id) => Ok(id),
+        Err(_) => Ok(store
+            .contact_by_name(peer)?
+            .ok_or_else(|| {
+                anyhow!("unknown contact {peer}: save it first with `pals contact add`")
+            })?
+            .agent_id),
+    }
+}
+
+/// Fails unless a daemon of the agent `id` answers at `listen`.
+async fn this_daemon(listen: SocketAddr, id: &AgentId) -> anyhow::Result<()> {
+    let health = gateway_health(listen).await.with_context(|| {
+        format!("no pals daemon answers at http://{listen}: start it with `pals daemon`")
+    })?;
+    let running = health["agent_id"].as_str().unwrap_or_default();
+    ensure!(
+        running == id.to_string(),
+        "the pals daemon at http://{listen} runs agent {running}, not this agent {id}"
+    );
+    Ok(())
+}
+
+/// Prints a signed card and the agent it was verified as signed by: this
+/// agent's own when `peer` is `None`, else `peer`'s public card, or its
+/// extended card's gateway view with `extended`.
+fn card_show(home: &Path, peer: Option<&str>, extended: bool) -> anyhow::Result<()> {
+    let (cfg, key) = load_agent(home)?;
+    let store = Arc::new(open_store(&cfg, &key)?);
+    let Some(peer) = peer else {
+        let inventory = InventoryState::load(&cfg, Arc::clone(&store))?.snapshot();
+        let key = Arc::new(key);
+        let cards = CardSet::build(
+            &cfg,
+            &CardSigner::new(Arc::clone(&key)),
+            &inventory.inventory,
+        )?;
+        let card = &cards.public().json;
+        let verified = verify_card(card, &key.id())
+            .map_err(|err| anyhow!("this agent's own card does not verify: {err}"))?;
+        print_card(card, &key.id(), verified.hash.as_str())?;
+        return Ok(());
+    };
+    let peer_id = peer_id(&store, peer)?;
+    let listen = cfg.gateway.listen;
+    runtime(false)?.block_on(async move {
+        this_daemon(listen, &key.id()).await?;
+        if extended {
+            let call =
+                json!({"jsonrpc": "2.0", "id": 1, "method": "GetExtendedAgentCard", "params": {}});
+            let path = format!("/peers/{peer_id}/jsonrpc");
+            let (status, headers, body) =
+                gateway_call(listen, http::Method::POST, &path, Some(&call)).await?;
+            let answer = gateway_json(status, &body)?;
+            if let Some(error) = answer.get("error") {
+                bail!("{peer} refused its extended card: {error}");
+            }
+            let card = answer
+                .get("result")
+                .ok_or_else(|| anyhow!("the gateway answered no card: {answer}"))?;
+            let hash = headers
+                .get(CARD_HASH_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| anyhow!("the gateway did not say which card it verified"))?;
+            print_card(card, &peer_id, hash)
+        } else {
+            let path = format!("/peers/{peer_id}/signed-agent-card.json");
+            let (status, _, body) = gateway_call(listen, http::Method::GET, &path, None).await?;
+            let card = gateway_json(status, &body)?;
+            let verified = verify_card(&card, &peer_id)
+                .map_err(|err| anyhow!("the card of {peer} does not verify: {err}"))?;
+            print_card(&card, &peer_id, verified.hash.as_str())
+        }
+    })
+}
+
+/// Prints the entries `scope` sees of this agent's inventory in `sections`
+/// (all when empty), as the daemon renders them for a peer of that scope,
+/// with the observations it starts with: unsigned and in one piece, without
+/// the `seq`, pages and signature that only an answer to a peer carries.
+fn inventory_show(home: &Path, scope: &str, sections: &[String]) -> anyhow::Result<()> {
+    let scope = Scope::from_key(scope).ok_or_else(|| {
+        anyhow!("unknown scope {scope:?}: public, project:<project> or task:<project>")
+    })?;
+    let sections = inventory_sections(sections)?;
+    let (cfg, key) = load_agent(home)?;
+    let store = Arc::new(open_store(&cfg, &key)?);
+    let snapshot = InventoryState::load(&cfg, store)?.snapshot();
+    let view = json!({
+        "scope": scope.key(),
+        "sections": sections,
+        "entries": render(&snapshot, &scope, &sections),
+    });
+    println!("{}", serde_json::to_string_pretty(&view)?);
+    Ok(())
+}
+
+/// The inventory sections `names` names, in order and without repeats; all
+/// of them when it names none.
+fn inventory_sections(names: &[String]) -> anyhow::Result<Vec<Section>> {
+    let mut sections = if names.is_empty() {
+        INVENTORY_SECTIONS.to_vec()
+    } else {
+        names
+            .iter()
+            .map(|name| {
+                serde_json::from_value::<Section>(json!(name))
+                    .ok()
+                    .filter(|section| INVENTORY_SECTIONS.contains(section))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "unknown section {name:?}: services, skills, plugins, mcp, runtime, \
+                             models, information, hardware or network"
+                        )
+                    })
+            })
+            .collect::<anyhow::Result<_>>()?
+    };
+    sections.sort_unstable();
+    sections.dedup();
+    Ok(sections)
+}
+
+/// Prints the pages of `peer`'s inventory view of `sections` (all when
+/// empty) the running daemon's gateway reads, verified here again as the
+/// peer's pages for this agent: the first, or with `all` every page of the
+/// chain of cursors. Each page is printed as the peer signed it, then
+/// `verified: <agent id> <scope> seq <revision>`.
+fn inventory_get(home: &Path, peer: &str, sections: &[String], all: bool) -> anyhow::Result<()> {
+    let sections = inventory_sections(sections)?;
+    let names: Vec<String> = sections
+        .iter()
+        .map(|section| match serde_json::to_value(section) {
+            Ok(Value::String(name)) => name,
+            other => unreachable!("a section is named by a string, not {other:?}"),
+        })
+        .collect();
+    let (cfg, key) = load_agent(home)?;
+    let store = open_store(&cfg, &key)?;
+    let peer_id = peer_id(&store, peer)?;
+    let (listen, own) = (cfg.gateway.listen, key.id());
+    runtime(false)?.block_on(async move {
+        this_daemon(listen, &own).await?;
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let mut path = format!(
+                "/discovery/inventory/{peer_id}?sections={}",
+                names.join(",")
+            );
+            if let Some(cursor) = &cursor {
+                let encoded = percent_encoding::utf8_percent_encode(
+                    cursor,
+                    percent_encoding::NON_ALPHANUMERIC,
+                );
+                path.push_str(&format!("&cursor={encoded}"));
+            }
+            let (status, _, body) = gateway_call(listen, http::Method::GET, &path, None).await?;
+            let signed = gateway_json(status, &body)?;
+            // The JCS of what the gateway re-encoded is what the peer signed.
+            let page = verify_page(
+                &pals_core::jcs::canonical(&signed),
+                &peer_id,
+                Some(&own),
+                now_unix(),
+            )
+            .map_err(|err| anyhow!("a page of {peer} does not verify: {err}"))?;
+            println!("{}", serde_json::to_string_pretty(&signed)?);
+            println!("verified: {peer_id} {} seq {}", page.scope, page.seq);
+            match page.next_cursor {
+                Some(next) if all => cursor = Some(next),
+                _ => return Ok(()),
+            }
+        }
+        bail!("{peer} keeps sending pages: stopped after {MAX_PAGES}")
+    })
+}
+
+/// How long `pals inventory refresh` waits for the daemon: its adapters, at
+/// once, each within its time, and the kill of a stdio server.
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Runs the inventory adapters of the running daemon now (`POST
+/// /inventory/refresh` of its gateway) and prints their report: only fixed
+/// codes, which the daemon's log details.
+fn inventory_refresh(home: &Path) -> anyhow::Result<()> {
+    let (cfg, key) = load_agent(home)?;
+    let (listen, own) = (cfg.gateway.listen, key.id());
+    runtime(false)?.block_on(async move {
+        this_daemon(listen, &own).await?;
+        let (status, _, body) = gateway_call_within(
+            listen,
+            http::Method::POST,
+            "/inventory/refresh",
+            None,
+            REFRESH_TIMEOUT,
+            MAX_GATEWAY_ANSWER_BYTES,
+        )
+        .await?;
+        let report: RefreshReport = serde_json::from_value(gateway_json(status, &body)?)
+            .context("the gateway answered something that is not a refresh report")?;
+        println!("generation {}", report.generation);
+        println!(
+            "observed {}, ok {}, failed {}",
+            report.observed,
+            report.ok,
+            report.failed.len()
+        );
+        for (id, code) in &report.failed {
+            println!("failed: {} {}", shown(id), shown(code));
+        }
+        Ok(())
+    })
+}
+
+/// The largest file `pals benchmark import` reads: a signed report is at
+/// most [`MAX_REPORT_BYTES`] once canonical, whatever whitespace its file
+/// has.
+const MAX_REPORT_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Keeps the signed report in `file`, seen by `visibility`, as its measurer
+/// signed it. The file may spell it any way JSON allows: what is signed is
+/// the JCS of the report.
+fn benchmark_import(home: &Path, file: &Path, visibility: &str) -> anyhow::Result<()> {
+    let visibility = parse_visibility(visibility)?;
+    let mut bytes = Vec::new();
+    fs::File::open(file)
+        .with_context(|| format!("cannot read {}", file.display()))?
+        .take(MAX_REPORT_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("cannot read {}", file.display()))?;
+    ensure!(
+        bytes.len() as u64 <= MAX_REPORT_FILE_BYTES,
+        "{} is larger than {MAX_REPORT_FILE_BYTES} bytes: not a benchmark report",
+        file.display()
+    );
+    let json: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("{} is not JSON", file.display()))?;
+    let report =
+        Signed::<BenchmarkReport>::from_json(&pals_core::jcs::canonical(&json)).map_err(|err| {
+            match err {
+                SignedError::BadSignature => anyhow!(
+                    "the report in {} is not signed by its measurer (provenance.measured_by)",
+                    file.display()
+                ),
+                SignedError::TooLarge => anyhow!(
+                    "the report in {} is larger than {MAX_REPORT_BYTES} bytes: raw results go \
+                 as evidence, a hash and a blob reference",
+                    file.display()
+                ),
+                other => anyhow!(
+                    "{} is not a benchmark report (agentnet.benchmark-report/1): {other}",
+                    file.display()
+                ),
+            }
+        })?;
+    let (cfg, key) = load_agent(home)?;
+    open_store(&cfg, &key)?.benchmark_put(&report, &visibility, now_unix())?;
+    let doc = &report.doc;
+    println!(
+        "kept {}: {} of {}, measured by {}, {}",
+        doc.benchmark_id,
+        doc.measurement_kind.as_str(),
+        doc.subject.key(),
+        doc.provenance.measured_by,
+        visibility_name(&visibility)
+    );
+    Ok(())
+}
+
+/// Lists the reports kept, one per line, those whose row does not read
+/// too ([`benchmark_line`]).
+fn benchmark_ls(home: &Path) -> anyhow::Result<()> {
+    let (cfg, key) = load_agent(home)?;
+    for kept in open_store(&cfg, &key)?.benchmarks()? {
+        println!("{}", benchmark_line(&kept));
+    }
+    Ok(())
+}
+
+/// The line `pals benchmark ls` prints for `kept`, tab separated: id, kind,
+/// profile and version, subject, measurer, measured_at, expires_at and
+/// visibility; or, for a row that does not read, its id, `unreadable` and
+/// why, so that no peer sees it and the operator does.
+fn benchmark_line(kept: &KeptBenchmark) -> String {
+    match &kept.report {
+        Ok((report, visibility)) => {
+            let doc = &report.doc;
+            format!(
+                "{}\t{}\t{} {}\t{}\t{}\t{}\t{}\t{}",
+                doc.benchmark_id,
+                doc.measurement_kind.as_str(),
+                doc.procedure.profile,
+                doc.procedure.profile_version,
+                doc.subject.key(),
+                doc.provenance.measured_by,
+                doc.measured_at,
+                doc.expires_at,
+                visibility_name(visibility)
+            )
+        }
+        Err(why) => format!("{}\tunreadable\t{why}", kept.benchmark_id),
+    }
+}
+
+/// The visibility `text` names: `public`, `private`, `project:<project>` or
+/// `task:<project>`.
+fn parse_visibility(text: &str) -> anyhow::Result<Visibility> {
+    match (text, Scope::from_key(text)) {
+        ("private", _) => Ok(Visibility::Private),
+        (_, Some(Scope::Public)) => Ok(Visibility::Public),
+        (_, Some(Scope::Project(project))) => Ok(Visibility::Project(vec![project])),
+        (_, Some(Scope::Task(project))) => Ok(Visibility::Task(vec![project])),
+        (_, None) => bail!(
+            "unknown visibility {text:?}: public, private, project:<project> or task:<project>"
+        ),
+    }
+}
+
+/// `visibility` as `--visibility` names it, its projects comma separated.
+fn visibility_name(visibility: &Visibility) -> String {
+    match visibility {
+        Visibility::Private => "private".to_owned(),
+        Visibility::Public => "public".to_owned(),
+        Visibility::Project(projects) => format!("project:{}", projects.join(",")),
+        Visibility::Task(projects) => format!("task:{}", projects.join(",")),
+    }
+}
+
+/// What `pals query` asks.
+struct Asked {
+    capability: String,
+    inputs: Vec<String>,
+    outputs: Vec<String>,
+    requirements_file: Option<PathBuf>,
+    project: Option<String>,
+}
+
+/// Asks `peer`, through the running daemon's gateway, for an offer for the
+/// query `asked` makes, and prints it as the peer signed it once it is
+/// accepted here too ([`accept_offer`]), then `verified: <agent id> <offer
+/// id> <status>`. The query is checked before anything is asked.
+fn query(home: &Path, peer: &str, asked: Asked) -> anyhow::Result<()> {
+    let requirements = read_requirements(asked.requirements_file.as_deref())?;
+    let query = ServiceQuery {
+        schema: QUERY_SCHEMA.to_owned(),
+        query_id: new_query_id(),
+        capability: asked.capability,
+        input_media_types: asked.inputs,
+        output_media_types: asked.outputs,
+        requirements,
+        summary: None,
+        reply_timeout_ms: Some(MAX_REPLY_TIMEOUT_MS),
+        requested_inventory_sections: Vec::new(),
+        project: asked.project,
+        execution_authorized: false,
+    };
+    query
+        .validate()
+        .map_err(|err| anyhow!("invalid query: {err}"))?;
+    ensure!(
+        query.to_jcs().len() <= MAX_QUERY_BYTES,
+        "the query is larger than {MAX_QUERY_BYTES} bytes: ask for fewer things"
+    );
+    let (cfg, key) = load_agent(home)?;
+    let store = open_store(&cfg, &key)?;
+    let peer_id = peer_id(&store, peer)?;
+    // As the gateway sends it, so that the offer is for it.
+    let grant = held_task_grant(&store, &peer_id, query.project.as_deref(), now_unix())?;
+    let sent = query_for_grant(query.clone(), grant.as_ref());
+    if sent != query {
+        match &query.project {
+            Some(project) => eprintln!(
+                "pals: this agent holds no grant of {}'s for project {}: the query goes \
+                 without the project and without inventory ids",
+                shown(peer),
+                shown(project)
+            ),
+            None => eprintln!(
+                "pals: the query names no project, so it goes without inventory ids: they go \
+                 only with a grant for the project"
+            ),
+        }
+    }
+    let query = sent;
+    let (listen, own) = (cfg.gateway.listen, key.id());
+    runtime(false)?.block_on(async move {
+        this_daemon(listen, &own).await?;
+        let path = format!("/discovery/query/{peer_id}");
+        let body = serde_json::to_value(&query)?;
+        let (status, _, answer) =
+            gateway_call(listen, http::Method::POST, &path, Some(&body)).await?;
+        let signed = gateway_json(status, &answer)?;
+        // The JCS of what the gateway re-encoded is what the peer signed.
+        let offer = accept_offer(
+            &pals_core::jcs::canonical(&signed),
+            &peer_id,
+            &own,
+            &query,
+            now_unix(),
+        )
+        .map_err(|err| anyhow!("the offer of {peer} is refused: {err}"))?;
+        let status = match serde_json::to_value(offer.doc.status)? {
+            Value::String(status) => status,
+            other => unreachable!("a status is named by a string, not {other}"),
+        };
+        println!("{}", serde_json::to_string_pretty(&signed)?);
+        println!("verified: {peer_id} {} {status}", offer.doc.offer_id);
+        Ok(())
+    })
+}
+
+/// The requirements in the JSON file at `path`; none without one.
+fn read_requirements(path: Option<&Path>) -> anyhow::Result<Requirements> {
+    let Some(path) = path else {
+        return Ok(Requirements::default());
+    };
+    let text = fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    serde_json::from_slice::<Requirements>(&text)
+        .with_context(|| format!("invalid requirements in {}", path.display()))
+}
+
+/// What `pals discover` searches for.
+struct Searched {
+    asked: Asked,
+    peers: Vec<String>,
+}
+
+/// The longest answer of the gateway to a search.
+const MAX_SEARCH_ANSWER_BYTES: usize = 4 * 1024 * 1024;
+
+/// Searches the contacts for a provider through the running daemon's
+/// gateway (`POST /discovery/search`) and prints the outcome; with `ask`,
+/// asks the one chosen and exits as `pals ask` does.
+fn discover(
+    home: &Path,
+    searched: Searched,
+    ask: Option<String>,
+    wait: &str,
+) -> anyhow::Result<ExitCode> {
+    let wait = parse_wait(wait)?;
+    let Searched { asked, peers } = searched;
+    let search = SearchRequest {
+        requirements: read_requirements(asked.requirements_file.as_deref())?,
+        capability: asked.capability,
+        input_media_types: asked.inputs,
+        output_media_types: asked.outputs,
+        project: asked.project,
+        peers: (!peers.is_empty()).then_some(peers),
+        ..SearchRequest::default()
+    };
+    let (cfg, key) = load_agent(home)?;
+    let (listen, own) = (cfg.gateway.listen, key.id());
+    runtime(false)?.block_on(async move {
+        this_daemon(listen, &own).await?;
+        let mut body = json!({ "search": search });
+        // A search takes at most a minute; an ask, its wait too.
+        let mut timeout = Duration::from_secs(120);
+        if let Some(question) = &ask {
+            body["ask"] = json!(question);
+            body["wait_s"] = json!(wait.as_secs());
+            timeout += wait;
+        }
+        let (status, _, answer) = gateway_call_within(
+            listen,
+            http::Method::POST,
+            "/discovery/search",
+            Some(&body),
+            timeout,
+            MAX_SEARCH_ANSWER_BYTES,
+        )
+        .await?;
+        let answer = gateway_json(status, &answer)?;
+        if ask.is_none() {
+            print_search(&serde_json::from_value(answer)?);
+            return Ok(ExitCode::SUCCESS);
+        }
+        print_search(&serde_json::from_value(answer["search"].clone())?);
+        if let Some(chosen) = answer.get("chosen") {
+            let peer = shown(chosen["candidate"]["peer"].as_str().unwrap_or_default());
+            print_tried(&chosen["tried"]);
+            println!("asked: {peer}");
+            let outcome: AskOutcome = serde_json::from_value(chosen["outcome"].clone())?;
+            return report(&peer, wait, Ok(outcome));
+        }
+        print_tried(&answer["tried"]);
+        let error = shown(
+            answer["error"]
+                .as_str()
+                .unwrap_or("no candidate took the task"),
+        );
+        if let Some(message_id) = answer["kept"].as_str() {
+            eprintln!(
+                "pals: {error}; the question is kept: `pals task resume {}` tries again",
+                shown(message_id)
+            );
+            return Ok(ExitCode::from(EXIT_NO_OUTCOME));
+        }
+        eprintln!("pals: {error}");
+        Ok(ExitCode::from(EXIT_NOT_COMPLETED))
+    })
+}
+
+/// Prints a search's ranking, its discards with why, its coverage and its
+/// metrics, one line each; a candidate that made an offer ends its line
+/// with `, offer <offer id> until <expires_at>`, the id `pals ask --offer`
+/// takes. What a peer named is printed as printable ASCII.
+fn print_search(outcome: &SearchOutcome) {
+    println!("ranked:");
+    for (n, candidate) in outcome.ranked.iter().enumerate() {
+        let status = candidate.offer.as_ref().map_or_else(
+            || "card only".to_owned(),
+            |offer| match serde_json::to_value(offer.status) {
+                Ok(Value::String(status)) => status,
+                _ => "unknown".to_owned(),
+            },
+        );
+        let time = candidate
+            .offer
+            .as_ref()
+            .and_then(|offer| {
+                offer
+                    .estimated_start_delay_ms?
+                    .checked_add(offer.estimated_duration_ms?)
+            })
+            .map_or_else(|| "unknown".to_owned(), |ms| format!("{ms} ms"));
+        let benchmark = candidate.benchmark.as_ref().map_or_else(
+            || "none".to_owned(),
+            |(kind, value)| format!("{} {value}", shown(kind)),
+        );
+        let who = candidate
+            .agent_id
+            .map_or_else(|| "plain A2A agent".to_owned(), |id| format!("agent {id}"));
+        let grant = match (candidate.agent_id, candidate.grant_held) {
+            (None, _) => "no grant needed",
+            (Some(_), true) => "grant held",
+            (Some(_), false) => "no grant held",
+        };
+        let offer = candidate.offer.as_ref().map_or_else(String::new, |offer| {
+            format!(
+                ", offer {} until {}",
+                shown(&offer.offer_id),
+                shown(&offer.expires_at)
+            )
+        });
+        println!(
+            "  {}. {} ({who}): {status}, skill {}, time {time}, preferred met {}, benchmark \
+             {benchmark}, completed {} failed {}, {grant}, card {}{offer}",
+            n + 1,
+            shown(&candidate.peer),
+            shown(candidate.skill_id.as_deref().unwrap_or("-")),
+            candidate.preferred_met,
+            candidate.experience.0,
+            candidate.experience.1,
+            shown(&candidate.card_signature.to_string()),
+        );
+    }
+    println!("discarded:");
+    for discarded in &outcome.discarded {
+        let stage = match discarded.stage {
+            Stage::Card => "card",
+            Stage::Offer => "offer",
+        };
+        println!(
+            "  {} ({stage}): {}",
+            shown(&discarded.peer),
+            shown(&discarded.reason)
+        );
+    }
+    match &outcome.coverage {
+        Coverage::Complete => println!("coverage: complete"),
+        Coverage::Partial { reasons } => {
+            let reasons: Vec<String> = reasons.iter().map(|r| shown(r)).collect();
+            println!("coverage: partial ({})", reasons.join(", "));
+        }
+    }
+    let metrics = &outcome.metrics;
+    let first = metrics
+        .time_to_first_valid_ms
+        .map_or_else(|| "none".to_owned(), |ms| format!("{ms} ms"));
+    println!(
+        "metrics: contacted {}, messages {}, bytes sent {}, bytes received {}, first valid \
+         {first}, matching {} us, elapsed {} ms",
+        metrics.contacted,
+        metrics.messages,
+        metrics.bytes_sent,
+        metrics.bytes_received,
+        metrics.matching_us,
+        metrics.elapsed_ms
+    );
+}
+
+/// Prints the candidates asked before the one chosen, and why they did not
+/// take the question: `tried`, a list of `[peer, why]`.
+fn print_tried(tried: &Value) {
+    for pair in tried.as_array().into_iter().flatten() {
+        let (peer, why) = (
+            pair[0].as_str().unwrap_or_default(),
+            pair[1].as_str().unwrap_or_default(),
+        );
+        println!("tried: {}: {}", shown(peer), shown(why));
+    }
+}
+
+/// `text`, which may come from a peer, as printable ASCII, whole: a line
+/// of output bounds nothing.
+fn shown(text: &str) -> String {
+    pals::printable_ascii(text, usize::MAX)
+}
+
+/// Prints `card`, then `verified: <signer> <hash>`.
+fn print_card(card: &Value, signer: &AgentId, hash: &str) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(card)?);
+    println!("verified: {signer} {hash}");
+    Ok(())
+}
+
+/// The JSON of a gateway answer of `status`; its error when it is not a
+/// success.
+fn gateway_json(status: http::StatusCode, body: &[u8]) -> anyhow::Result<Value> {
+    let json: Option<Value> = serde_json::from_slice(body).ok();
+    if !status.is_success() {
+        let reason = json
+            .as_ref()
+            .and_then(|json| json.get("error"))
+            .map_or_else(
+                || String::from_utf8_lossy(body).into_owned(),
+                Value::to_string,
+            );
+        bail!("the gateway answered {status}: {reason}");
+    }
+    json.ok_or_else(|| anyhow!("the gateway answered something that is not JSON"))
+}
+
+/// `method path` of the gateway listening on `listen`, with `body` as JSON:
+/// the status, headers and body of its answer, read up to
+/// [`MAX_GATEWAY_ANSWER_BYTES`].
+async fn gateway_call(
+    listen: SocketAddr,
+    method: http::Method,
+    path: &str,
+    body: Option<&Value>,
+) -> anyhow::Result<(http::StatusCode, http::HeaderMap, Bytes)> {
+    const TIMEOUT: Duration = Duration::from_secs(60);
+    gateway_call_within(
+        listen,
+        method,
+        path,
+        body,
+        TIMEOUT,
+        MAX_GATEWAY_ANSWER_BYTES,
+    )
+    .await
+}
+
+/// [`gateway_call`], within `timeout`, its answer read up to `max_bytes`.
+async fn gateway_call_within(
+    listen: SocketAddr,
+    method: http::Method,
+    path: &str,
+    body: Option<&Value>,
+    timeout: Duration,
+    max_bytes: usize,
+) -> anyhow::Result<(http::StatusCode, http::HeaderMap, Bytes)> {
+    let exchange = async {
+        let stream = tokio::net::TcpStream::connect(listen).await?;
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+        tokio::spawn(connection);
+        let mut request = http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(http::header::HOST, listen.to_string())
+            .header("a2a-version", "1.0");
+        let bytes = match body {
+            Some(body) => {
+                request = request.header(http::header::CONTENT_TYPE, "application/json");
+                Bytes::from(serde_json::to_vec(body)?)
+            }
+            None => Bytes::new(),
+        };
+        let response = sender.send_request(request.body(Full::new(bytes))?).await?;
+        let (parts, body) = response.into_parts();
+        let body = Limited::new(body, max_bytes)
+            .collect()
+            .await
+            .map_err(|err| anyhow!("cannot read the gateway's answer: {err}"))?
+            .to_bytes();
+        Ok((parts.status, parts.headers, body))
+    };
+    tokio::time::timeout(timeout, exchange)
+        .await
+        .map_err(|_| anyhow!("the gateway did not answer within {timeout:?}"))?
 }
 
 fn daemon(home: &Path) -> anyhow::Result<()> {
@@ -392,8 +1366,29 @@ fn ask(
     question: String,
     attachments: Vec<PathBuf>,
     wait: &str,
+    offer: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     let wait = parse_wait(wait)?;
+    // Looked up by (the peer's agent id, its id): before anything is sent,
+    // and nothing is when it expired, by this agent's clock.
+    let offer = match offer {
+        Some(offer_id) => {
+            let (cfg, key) = load_agent(home)?;
+            let store = open_store(&cfg, &key)?;
+            match received_offer_ref(&store, &peer, offer_id, now_unix()) {
+                Ok(reference) => Some(reference),
+                Err(OfferLookupError::Expired) => {
+                    eprintln!("pals: {}", OfferLookupError::Expired);
+                    return Ok(ExitCode::from(EXIT_NOT_COMPLETED));
+                }
+                Err(OfferLookupError::Unknown) => {
+                    bail!("no offer {offer_id} from {peer}: run pals discover again")
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        None => None,
+    };
     let attachments = attachments
         .iter()
         .map(|path| {
@@ -405,6 +1400,7 @@ fn ask(
         question,
         attachments,
         wait,
+        offer,
     };
     with_outbox(home, |outbox| async move {
         // At once, so that an interrupted command leaves the id to resume.
@@ -423,16 +1419,16 @@ fn ask(
 fn task_ls(home: &Path) -> anyhow::Result<()> {
     let (cfg, key) = load_agent(home)?;
     let store = open_store(&cfg, &key)?;
-    let names: HashMap<AgentId, String> = store
+    let names: HashMap<String, String> = store
         .contacts()?
         .into_iter()
-        .map(|contact| (contact.agent_id, contact.name))
+        .map(|contact| (contact.agent_id.to_string(), contact.name))
         .collect();
     for row in store.outbox_all()? {
-        let peer = names
-            .get(&row.peer)
-            .cloned()
-            .unwrap_or_else(|| row.peer.to_string());
+        let peer = match row.peer.strip_prefix(PLAIN_PEER_PREFIX) {
+            Some(plain_name) => plain_name.to_owned(),
+            None => names.get(&row.peer).cloned().unwrap_or(row.peer),
+        };
         println!(
             "{}\t{}\t{}\t{}\t{}",
             row.message_id,
@@ -560,6 +1556,13 @@ fn refused_or_unreachable(err: AskError) -> anyhow::Result<ExitCode> {
             );
             Ok(ExitCode::from(EXIT_NO_OUTCOME))
         }
+        AskError::NotResent { message_id } => {
+            eprintln!(
+                "pals: {PLAIN_NOT_RESENT}; the question is kept: `pals task resume \
+                 {message_id}` sends it again"
+            );
+            Ok(ExitCode::from(EXIT_NO_OUTCOME))
+        }
         AskError::Local(reason) => Err(anyhow!(reason)),
     }
 }
@@ -586,10 +1589,60 @@ fn contact_add(home: &Path, ticket: &str, name: String) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn contact_add_a2a(
+    home: &Path,
+    url: &str,
+    name: &str,
+    bearer_env: Option<&str>,
+) -> anyhow::Result<()> {
+    let contact = plain::new_contact(name, url, bearer_env, now_unix())?;
+    let (cfg, key) = load_agent(home)?;
+    let store = open_store(&cfg, &key)?;
+    if store.contact_by_name(name)?.is_some() {
+        bail!("{name} is the name of a PALS contact already: one name, one contact");
+    }
+    let card = runtime(false)?
+        .block_on(fetch_contact_card(
+            &plain::http_client(),
+            &contact,
+            cfg.gateway.listen.port(),
+        ))
+        .with_context(|| format!("cannot use the card at {}", contact.card_url))?;
+    store.a2a_contact_put(&contact)?;
+    let peer = format!("{PLAIN_PEER_PREFIX}{name}");
+    store.peer_card_put(
+        &peer,
+        PUBLIC_CONTEXT,
+        &card.json,
+        &card.hash,
+        None,
+        now_unix(),
+    )?;
+    // The card's words are the agent's: shown, never printed raw.
+    println!(
+        "saved contact {name}: {} ({}), card signature {}",
+        contact.origin,
+        shown(&card.card.name),
+        shown(&card.signature.to_string())
+    );
+    if card.card.capabilities.streaming != Some(true) {
+        println!(
+            "note: its card does not declare streaming, so pals ask, pals_ask and pals \
+             discover cannot ask it in milestone 2; a stock A2A client can still call it \
+             through the gateway, at /peers/{name}/"
+        );
+    }
+    Ok(())
+}
+
 fn contact_ls(home: &Path) -> anyhow::Result<()> {
     let (cfg, key) = load_agent(home)?;
-    for contact in open_store(&cfg, &key)?.contacts()? {
+    let store = open_store(&cfg, &key)?;
+    for contact in store.contacts()? {
         println!("{}\t{}", contact.name, contact.agent_id);
+    }
+    for contact in store.a2a_contacts()? {
+        println!("{}\t{}", contact.name, contact.card_url);
     }
     Ok(())
 }
@@ -932,6 +1985,39 @@ fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visibilities_take_the_names_of_scopes() {
+        assert_eq!(parse_visibility("private").unwrap(), Visibility::Private);
+        assert_eq!(parse_visibility("public").unwrap(), Visibility::Public);
+        let demo = || vec!["demo".to_owned()];
+        assert_eq!(
+            parse_visibility("project:demo").unwrap(),
+            Visibility::Project(demo())
+        );
+        assert_eq!(
+            parse_visibility("task:demo").unwrap(),
+            Visibility::Task(demo())
+        );
+        for text in ["", "friends", "project:", "project:two words", "PUBLIC"] {
+            assert!(parse_visibility(text).is_err(), "{text:?}");
+        }
+        for text in ["private", "public", "project:demo", "task:demo"] {
+            assert_eq!(visibility_name(&parse_visibility(text).unwrap()), text);
+        }
+    }
+
+    #[test]
+    fn an_unreadable_benchmark_row_is_listed_by_its_id() {
+        let kept = KeptBenchmark {
+            benchmark_id: "r-1".to_owned(),
+            report: Err("its report does not verify (bad signature)".to_owned()),
+        };
+        assert_eq!(
+            benchmark_line(&kept),
+            "r-1\tunreadable\tits report does not verify (bad signature)"
+        );
+    }
 
     #[test]
     fn ttl_takes_a_positive_number_and_a_unit() {

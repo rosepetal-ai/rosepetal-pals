@@ -2725,10 +2725,12 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "axum",
+ "base64 0.23.1",
  "blake3",
  "bytes",
  "chrono",
  "clap",
+ "ed25519-dalek",
  "futures",
  "getrandom 0.4.3",
  "http",
@@ -2761,6 +2763,7 @@ name = "pals-core"
 version = "0.1.0"
 dependencies = [
  "a2a-lf",
+ "a2a-pb",
  "anyhow",
  "base64 0.23.1",
  "blake3",
@@ -2768,13 +2771,16 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.4.3",
  "iroh",
+ "prost",
  "rusqlite",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
+ "sha2",
  "tempfile",
  "thiserror 2.0.21",
  "time",
+ "toml",
  "tracing",
 ]
 

@@ -1,6 +1,6 @@
 [package]
 name = "pals-core"
-description = "PALS core without networking: identity, grants, storage and the signed event log"
+description = "PALS core, which opens no sockets and holds no endpoint, worker or adapter handle: identity, grants, storage, the signed event log, the inventory and the answers of the discovery protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,21 +9,27 @@ repository.workspace = true
 
 [dependencies]
 a2a.workspace = true
+a2a-pb.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 blake3.workspace = true
 chrono.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true
+# The frames of agentnet-discovery/0.
+prost.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_json_canonicalizer.workspace = true
 thiserror.workspace = true
 time.workspace = true
+# The inventory file, inventory.toml.
+toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 # Only to check that an AgentId is byte for byte Iroh's EndpointId.
 iroh.workspace = true
+sha2.workspace = true
 tempfile.workspace = true

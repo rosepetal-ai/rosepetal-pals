@@ -1,0 +1,13 @@
+{
+  "name": "pals-exit-mcp-everything",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The MCP server the providers of the hito 2 exit test observe: @modelcontextprotocol/server-everything, pinned with its dependencies in package-lock.json",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@modelcontextprotocol/server-everything": "2026.8.31"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

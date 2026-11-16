@@ -20,6 +20,9 @@ iroh-tickets = "=1.0.0"
 a2a = { package = "a2a-lf", version = "=0.4.2" }
 a2a-server = { package = "a2a-server-lf", version = "=0.5.3", default-features = false }
 a2a-client = { package = "a2a-client-lf", version = "=0.2.9", default-features = false }
+# The SDK's ProtoJSON types, for the canonical forms of a signed Agent Card
+# that other SDKs verify. Already in the lock: the SDKs bring it.
+a2a-pb = "=0.3.2"
 rmcp = "=3.10.0"
 
 pals-core = { path = "crates/pals-core" }
@@ -46,6 +49,10 @@ hyper-util = "0.1"
 libc = "0.2"
 # Decodes path parameters as axum does: unpinned, to be axum's.
 percent-encoding = "2"
+# The frames of agentnet-discovery/0, protobuf messages written by hand with
+# its derive (no build script, no protoc). Already in the lock: the SDKs
+# bring it.
+prost = "=0.14.6"
 rusqlite = { version = "=0.42.0", features = ["bundled"] }
 # The HTTP client the A2A client is built on, to give it a client that never
 # goes through a proxy: unpinned, to be `a2a-client-lf`'s.
@@ -71,4 +78,7 @@ tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 
 # Test-only.
 assert_cmd = "=2.2.2"
+# HMAC-SHA256 for the algorithm-confusion test of card signatures. Pinned to
+# the version ed25519-dalek already brings.
+sha2 = "=0.11.0"
 tempfile = "=3.27.0"

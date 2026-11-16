@@ -31,6 +31,7 @@ use pals::net::{agent_id_of, endpoint_id_of};
 use pals_core::grant::Operation::{self, TaskCancel, TaskRead, TaskSend};
 use pals_core::grant::{GRANT_SCHEMA, Grant, SignedGrant, format_timestamp};
 use pals_core::identity::{AgentId, AgentKey};
+use pals_core::inventory::Inventory;
 use pals_core::store::{Contact, Store};
 use serde_json::{Value, json};
 
@@ -342,7 +343,11 @@ async fn gateway_view_declares_standard_bindings_and_no_security() {
     assert!(card.get("signatures").is_none());
 
     // Otherwise it is the peer's canonical card.
-    let canonical = canonical_card(&test_config(b.dir.path(), WorkerCfg::Echo), &b.id());
+    let canonical = canonical_card(
+        &test_config(b.dir.path(), WorkerCfg::Echo),
+        &b.id(),
+        &Inventory::default(),
+    );
     assert_eq!(
         &serde_json::to_value(gateway_view(&canonical, &gw, &b.id())).unwrap(),
         card
@@ -900,7 +905,8 @@ async fn browser_requests_are_403_and_every_response_is_sandboxed() {
     assert_sandboxed(&res, "a peer's page");
     let res = gateway_request(&gw, "GET", "/peers/mallory/rest/error-page", &[], None).await;
     assert_eq!(res.status, 404, "{}", String::from_utf8_lossy(&res.body));
-    assert_eq!(res.header("content-type"), "text/html");
+    // Typed by the gateway, as text, whatever the peer said.
+    assert_eq!(res.header("content-type"), "text/plain; charset=utf-8");
     assert_sandboxed(&res, "a peer's error page");
 }
 

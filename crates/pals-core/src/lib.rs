@@ -1,14 +1,35 @@
-//! PALS core: the parts of an agent that do not touch the network.
+//! PALS core: the parts of an agent that open no sockets and hold no
+//! endpoint, worker or adapter handle.
 //!
 //! [`identity`] holds the agent's persistent Ed25519 key, [`jcs`] canonical
 //! JSON and the domain-separated signatures over it, [`grant`] the signed
-//! direct grants, [`store`] the local SQLite database (contacts, grants,
-//! revocations, the A2A tasks the agent serves, the messages it has seen
-//! and the questions it asks), and [`events`] the signed, hash-chained event
-//! log kept in it.
+//! direct grants, [`card_jws`] the JWS signatures, limits and hash of Agent
+//! Cards, [`signed`] the signed JSON documents of milestone 2, [`records`]
+//! the signed contact and announce records, [`inventory`] what the agent
+//! offers and with what (`agentnet.inventory/1`), who may see each part of
+//! it, the scopes grants give and the signed, paginated views each scope
+//! gets (`agentnet.inventory-view/1`), [`store`] the local SQLite database
+//! (contacts, grants, revocations, the A2A tasks the agent serves, the
+//! messages it has seen, the questions it asks, its own and its peers'
+//! records, its peers' verified cards, the revisions of its own views and
+//! the pages of its peers', the service offers it issued and received, the
+//! benchmark reports it holds), [`events`] the signed, hash-chained event
+//! log kept in it, [`benchmark`] the signed benchmark reports
+//! (`agentnet.benchmark-report/1`) and when one can stand for another,
+//! [`discovery`] the messages of `agentnet-discovery/0` and the answers to
+//! them, service queries matched on metadata and the signed offers that
+//! answer them, which read and sign but never run work, and [`clock`] the
+//! clock quotas, records and offers follow, which tests set by hand.
 
+pub mod benchmark;
+pub mod card_jws;
+pub mod clock;
+pub mod discovery;
 pub mod events;
 pub mod grant;
 pub mod identity;
+pub mod inventory;
 pub mod jcs;
+pub mod records;
+pub mod signed;
 pub mod store;

@@ -1,0 +1,133 @@
+{
+  "agent_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+  "canonical_hex": "7b226167656e745f636172645f68617368223a22626c616b65333a38353661636330363663373330346164626165396334343432303463313061306332653364313133343931666361363263316130366461373466656464346665222c226167656e745f6964223a2238613838653364643734303966313935666435326462326433636261356437326361363730396266316439343132316266333734383830316234306636663563222c2262656e63686d61726b5f72656673223a5b5d2c22636f6d70617469626c65223a747275652c22636f6e646974696f6e73223a7b22617574686f72697a6174696f6e5f7265717569726564223a747275652c2265787465726e616c5f636c6f75645f75736564223a66616c73652c2270726f63657373696e675f726567696f6e223a224555227d2c22657374696d617465645f6475726174696f6e5f6d73223a343030302c22657374696d617465645f73746172745f64656c61795f6d73223a3530302c22657870697265735f6174223a22323032362d31312d31345430303a30303a31355a222c22696e76656e746f72795f7265766973696f6e223a312c226973737565645f6174223a22323032362d31312d31345430303a30303a30305a222c226c696d69746174696f6e73223a5b22496d6167657320757020746f203230204d6942225d2c226f666665725f6964223a226f666665722d303031222c2271756572795f68617368223a22626c616b65333a38316439303431396566316238326136303266656235633330616239363431323337333666393062616230306164663364623461343865303232363066623632222c2271756572795f6964223a22712d6f63722d303031222c22726571756573746572223a2238313339373730656138376431373566353661333534363663333463376563636362386438613931623465653337613235646636306635623866633962333934222c22726571756972656d656e745f726573756c7473223a5b7b226261736973223a226465636c61726564222c226d616e6461746f7279223a747275652c22726571756972656d656e74223a22696e7075745f6d656469615f747970653a696d6167652f706e67222c22726573756c74223a226d6574227d2c7b226261736973223a226465636c61726564222c226d616e6461746f7279223a747275652c22726571756972656d656e74223a226f75747075745f6d656469615f747970653a6170706c69636174696f6e2f6a736f6e222c22726573756c74223a226d6574227d2c7b226261736973223a226465636c61726564222c226d616e6461746f7279223a747275652c22726571756972656d656e74223a226c616e6775616765222c22726573756c74223a226d6574227d2c7b226261736973223a226465636c61726564222c226d616e6461746f7279223a747275652c22726571756972656d656e74223a2265787465726e616c5f636c6f75645f616c6c6f776564222c22726573756c74223a226d6574227d2c7b226261736973223a226465636c61726564222c226d616e6461746f7279223a747275652c22726571756972656d656e74223a2272657175697265645f726567696f6e222c22726573756c74223a226d6574227d5d2c22736368656d61223a226167656e746e65742e736572766963652d6f666665722f31222c2273636f7065223a227075626c6963222c22736b696c6c5f6964223a226f63722d6d6574616c2d7631222c22737461747573223a22617661696c61626c65222c22756e6b6e6f776e5f726571756972656d656e7473223a5b5d2c2276616c69645f666f725f6d73223a31353030307d",
+  "description": "agentnet.service-offer/1 test vector: the offer of the industrial OCR agent of inventory-v1.json for the query of service-query-v1.json, matched in the public scope with a worker running nothing of two places, at revision 1, issued at 2026-11-14T00:00:00Z for 15000 ms. The provider's Ed25519 secret key is 32 bytes of 0x01 (signing_key_hex); agent_id is its public key in hex. The requester's secret key is 32 bytes of 0x02 (requester_key_hex); offer.requester is its public key. agent_card_hash is the hash of the card-jws-v1.json vector. canonical_hex is JCS (RFC 8785) of offer; signature is Ed25519 over \"agentnet.offer/1\\n\" followed by those bytes, base64url without padding; signed is the signed offer as it travels, whose JCS is the exact bytes: {\"offer\": offer, \"signature\": signature}.",
+  "offer": {
+    "agent_card_hash": "blake3:856acc066c7304adbae9c444204c10a0c2e3d113491fca62c1a06da74fedd4fe",
+    "agent_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "benchmark_refs": [],
+    "compatible": true,
+    "conditions": {
+      "authorization_required": true,
+      "external_cloud_used": false,
+      "processing_region": "EU"
+    },
+    "estimated_duration_ms": 4000,
+    "estimated_start_delay_ms": 500,
+    "expires_at": "2026-11-14T00:00:15Z",
+    "inventory_revision": 1,
+    "issued_at": "2026-11-14T00:00:00Z",
+    "limitations": [
+      "Images up to 20 MiB"
+    ],
+    "offer_id": "offer-001",
+    "query_hash": "blake3:81d90419ef1b82a602feb5c30ab964123736f90bab00adf3db4a48e02260fb62",
+    "query_id": "q-ocr-001",
+    "requester": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+    "requirement_results": [
+      {
+        "basis": "declared",
+        "mandatory": true,
+        "requirement": "input_media_type:image/png",
+        "result": "met"
+      },
+      {
+        "basis": "declared",
+        "mandatory": true,
+        "requirement": "output_media_type:application/json",
+        "result": "met"
+      },
+      {
+        "basis": "declared",
+        "mandatory": true,
+        "requirement": "language",
+        "result": "met"
+      },
+      {
+        "basis": "declared",
+        "mandatory": true,
+        "requirement": "external_cloud_allowed",
+        "result": "met"
+      },
+      {
+        "basis": "declared",
+        "mandatory": true,
+        "requirement": "required_region",
+        "result": "met"
+      }
+    ],
+    "schema": "agentnet.service-offer/1",
+    "scope": "public",
+    "skill_id": "ocr-metal-v1",
+    "status": "available",
+    "unknown_requirements": [],
+    "valid_for_ms": 15000
+  },
+  "requester_key_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+  "signature": "_z3EYBHtcNmg-fyYssdaACg63kEQlL_UYtWXWbWDECVA__RheJwYe5pyRr68s9iX9YfYNyntpqeHi6uGTeu0Cg",
+  "signed": {
+    "offer": {
+      "agent_card_hash": "blake3:856acc066c7304adbae9c444204c10a0c2e3d113491fca62c1a06da74fedd4fe",
+      "agent_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "benchmark_refs": [],
+      "compatible": true,
+      "conditions": {
+        "authorization_required": true,
+        "external_cloud_used": false,
+        "processing_region": "EU"
+      },
+      "estimated_duration_ms": 4000,
+      "estimated_start_delay_ms": 500,
+      "expires_at": "2026-11-14T00:00:15Z",
+      "inventory_revision": 1,
+      "issued_at": "2026-11-14T00:00:00Z",
+      "limitations": [
+        "Images up to 20 MiB"
+      ],
+      "offer_id": "offer-001",
+      "query_hash": "blake3:81d90419ef1b82a602feb5c30ab964123736f90bab00adf3db4a48e02260fb62",
+      "query_id": "q-ocr-001",
+      "requester": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+      "requirement_results": [
+        {
+          "basis": "declared",
+          "mandatory": true,
+          "requirement": "input_media_type:image/png",
+          "result": "met"
+        },
+        {
+          "basis": "declared",
+          "mandatory": true,
+          "requirement": "output_media_type:application/json",
+          "result": "met"
+        },
+        {
+          "basis": "declared",
+          "mandatory": true,
+          "requirement": "language",
+          "result": "met"
+        },
+        {
+          "basis": "declared",
+          "mandatory": true,
+          "requirement": "external_cloud_allowed",
+          "result": "met"
+        },
+        {
+          "basis": "declared",
+          "mandatory": true,
+          "requirement": "required_region",
+          "result": "met"
+        }
+      ],
+      "schema": "agentnet.service-offer/1",
+      "scope": "public",
+      "skill_id": "ocr-metal-v1",
+      "status": "available",
+      "unknown_requirements": [],
+      "valid_for_ms": 15000
+    },
+    "signature": "_z3EYBHtcNmg-fyYssdaACg63kEQlL_UYtWXWbWDECVA__RheJwYe5pyRr68s9iX9YfYNyntpqeHi6uGTeu0Cg"
+  },
+  "signing_key_hex": "0101010101010101010101010101010101010101010101010101010101010101"
+}

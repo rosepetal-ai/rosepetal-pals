@@ -75,6 +75,7 @@ fn request(question: &str) -> AskRequest {
         question: question.to_owned(),
         attachments: Vec::new(),
         wait: WAIT,
+        offer: None,
     }
 }
 
@@ -502,6 +503,7 @@ fn outbox_with_attachment(gateway_url: String, wait: Duration) -> (Outbox, AskRe
         question: "hola".to_owned(),
         attachments: vec![path],
         wait,
+        offer: None,
     };
     (outbox, req, store)
 }

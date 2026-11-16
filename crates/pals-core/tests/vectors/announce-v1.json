@@ -1,0 +1,36 @@
+{
+  "agent_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+  "canonical_hex": "7b226167656e745f636172645f68617368223a22626c616b65333a38353661636330363663373330346164626165396334343432303463313061306332653364313133343931666361363263316130366461373466656464346665222c226167656e745f6964223a2238613838653364643734303966313935666435326462326433636261356437326361363730396266316439343132316266333734383830316234306636663563222c226361706162696c6974696573223a5b22766973696f6e2e6f6372222c226578616d706c653a6d6574616c2d706c61746573225d2c22646973636f766572795f616c706e223a226167656e746e65742d646973636f766572792f30222c22657870697265735f6174223a22323032362d31312d31355430303a30303a30305a222c226973737565645f6174223a22323032362d31312d31345430303a30303a30305a222c22736368656d61223a226167656e746e65742e616e6e6f756e63652f31222c22736571223a317d",
+  "description": "agentnet.announce/1 test vector. The agent's Ed25519 secret key is 32 bytes of 0x01 (signing_key_hex); agent_id is its public key in hex, the record's agent_id; agent_card_hash is the hash of the card-jws-v1.json vector. canonical_hex is JCS (RFC 8785) of record; signature is Ed25519 over \"agentnet.announce/1\\n\" followed by those bytes, base64url without padding; signed is the signed record as it travels, whose JCS is the exact bytes: {\"record\": record, \"signature\": signature}.",
+  "record": {
+    "agent_card_hash": "blake3:856acc066c7304adbae9c444204c10a0c2e3d113491fca62c1a06da74fedd4fe",
+    "agent_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "capabilities": [
+      "vision.ocr",
+      "example:metal-plates"
+    ],
+    "discovery_alpn": "agentnet-discovery/0",
+    "expires_at": "2026-11-15T00:00:00Z",
+    "issued_at": "2026-11-14T00:00:00Z",
+    "schema": "agentnet.announce/1",
+    "seq": 1
+  },
+  "signature": "QZxfy7TFN9jrEttC9cYubgaPKAJGisz_WLGOZ4Kcf4vg1B2swWUmcvaSGwWorsJVjFOchA1ez-zVfh_c9M6ZBw",
+  "signed": {
+    "record": {
+      "agent_card_hash": "blake3:856acc066c7304adbae9c444204c10a0c2e3d113491fca62c1a06da74fedd4fe",
+      "agent_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "capabilities": [
+        "vision.ocr",
+        "example:metal-plates"
+      ],
+      "discovery_alpn": "agentnet-discovery/0",
+      "expires_at": "2026-11-15T00:00:00Z",
+      "issued_at": "2026-11-14T00:00:00Z",
+      "schema": "agentnet.announce/1",
+      "seq": 1
+    },
+    "signature": "QZxfy7TFN9jrEttC9cYubgaPKAJGisz_WLGOZ4Kcf4vg1B2swWUmcvaSGwWorsJVjFOchA1ez-zVfh_c9M6ZBw"
+  },
+  "signing_key_hex": "0101010101010101010101010101010101010101010101010101010101010101"
+}

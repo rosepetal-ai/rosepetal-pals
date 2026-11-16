@@ -2,9 +2,14 @@
 //! domain.
 //!
 //! A signature covers `domain || JCS(value)`. Each kind of signed object has
-//! its own domain (`agentnet.grant/1\n`, `agentnet.event/1\n`), so a signature
-//! made for one kind is never valid for another. Signatures travel as base64url
-//! without padding.
+//! its own domain, so a signature made for one kind is never valid for
+//! another: grants `agentnet.grant/1\n` and events `agentnet.event/1\n`, and
+//! the signed documents of milestone 2 ([`crate::signed`]), contact records
+//! `agentnet.contact/1\n`, announce records `agentnet.announce/1\n`,
+//! inventory views `agentnet.inventory-view/1\n`, service offers
+//! `agentnet.offer/1\n` and benchmark reports `agentnet.benchmark/1\n`.
+//! Signatures travel as base64url without padding. Agent Card signatures are
+//! JWS instead, with no domain ([`crate::card_jws`]).
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;

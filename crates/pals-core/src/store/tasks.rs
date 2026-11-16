@@ -283,7 +283,7 @@ impl Store {
     /// are left out unless `include_artifacts` is true.
     ///
     /// A page token is the cursor of where the page before ended
-    /// ([`Cursor`]); `INVALID_PARAMS` for one that is not. `next_page_token`
+    /// (`Cursor`); `INVALID_PARAMS` for one that is not. `next_page_token`
     /// is empty on the last page, and `total_size` counts the filtered list.
     pub fn tasks_list(&self, req: &ListTasksRequest) -> anyhow::Result<ListTasksResponse> {
         self.tasks_list_where(None, req)
@@ -547,8 +547,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pals.db");
         let owner = AgentKey::generate().id();
-        // The schema as this version first wrote it, and two tasks in it.
-        let old_schema = super::super::SCHEMA
+        // The schema as version 1 first wrote it, and two tasks in it.
+        let old_schema = include_str!("../../tests/fixtures/schema-v1.sql")
             .replace(",\n    status_at  INTEGER NOT NULL", "")
             .replace(
                 "CREATE INDEX tasks_by_status_at ON tasks (status_at, task_id);\n",

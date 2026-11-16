@@ -6,11 +6,12 @@
 //! the A2A name of the state its task ended in (`TASK_STATE_COMPLETED`), or
 //! [`OUTBOX_REFUSED`] when the request was refused before any task.
 
+use std::collections::HashMap;
+
 use anyhow::ensure;
 use rusqlite::{OptionalExtension, Row, params};
 
 use super::Store;
-use crate::identity::AgentId;
 
 /// The state of a row whose outcome is not known yet.
 pub const OUTBOX_PENDING: &str = "pending";
@@ -22,8 +23,9 @@ pub const OUTBOX_REFUSED: &str = "refused";
 pub struct OutboxRow {
     /// The A2A `messageId`, unique among rows.
     pub message_id: String,
-    /// The peer asked.
-    pub peer: AgentId,
+    /// The peer asked, as its [`PeerRef::key`](super::PeerRef::key): its
+    /// agent id in hex, or `a2a:<name>` for a plain A2A contact.
+    pub peer: String,
     /// The A2A `SendMessageRequest` as JSON, sent unchanged on every attempt.
     pub request_json: String,
     /// The task the peer runs it as, once known.
@@ -138,6 +140,29 @@ impl Store {
         attempts.ok_or_else(|| anyhow::anyhow!("no outbox row for message {message_id}"))
     }
 
+    /// How the questions to each peer ended, by its
+    /// [`PeerRef::key`](super::PeerRef::key): how many completed
+    /// (`TASK_STATE_COMPLETED`) and how many failed (`TASK_STATE_FAILED`).
+    /// A peer with neither is not in it. Local experience only, which
+    /// orders candidates and grants nothing.
+    pub fn outbox_outcomes_by_peer(&self) -> anyhow::Result<HashMap<String, (u32, u32)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT peer,
+                    SUM(state = 'TASK_STATE_COMPLETED'),
+                    SUM(state = 'TASK_STATE_FAILED')
+             FROM outbox
+             WHERE state IN ('TASK_STATE_COMPLETED', 'TASK_STATE_FAILED')
+             GROUP BY peer",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, (row.get(1)?, row.get(2)?)))
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
     /// The rows still [`OUTBOX_PENDING`], oldest first.
     pub fn outbox_pending(&self) -> anyhow::Result<Vec<OutboxRow>> {
         self.outbox_where(Some(OUTBOX_PENDING))
@@ -169,7 +194,7 @@ mod tests {
     fn row(message_id: &str, created_at: i64) -> OutboxRow {
         OutboxRow {
             message_id: message_id.to_owned(),
-            peer: AgentKey::generate().id(),
+            peer: AgentKey::generate().id().to_string(),
             request_json: "{}".to_owned(),
             task_id: None,
             state: OUTBOX_PENDING.to_owned(),
@@ -221,6 +246,35 @@ mod tests {
                 updated_at: 15,
                 ..first
             }
+        );
+    }
+
+    #[test]
+    fn outcomes_are_counted_by_peer() {
+        let store = Store::open_in_memory(AgentKey::generate().id()).unwrap();
+        let bob = AgentKey::generate().id().to_string();
+        let ended = [
+            ("m-1", bob.as_str(), "TASK_STATE_COMPLETED"),
+            ("m-2", bob.as_str(), "TASK_STATE_COMPLETED"),
+            ("m-3", bob.as_str(), "TASK_STATE_FAILED"),
+            ("m-4", bob.as_str(), OUTBOX_PENDING),
+            ("m-5", "a2a:plain", "TASK_STATE_FAILED"),
+            ("m-6", "a2a:other", "TASK_STATE_CANCELED"),
+            ("m-7", "a2a:other", OUTBOX_REFUSED),
+        ];
+        for (n, (message_id, peer, state)) in ended.into_iter().enumerate() {
+            let at = i64::try_from(n).unwrap();
+            let row = OutboxRow {
+                peer: peer.to_owned(),
+                ..row(message_id, at)
+            };
+            store.outbox_insert(&row).unwrap();
+            store.outbox_set_state(message_id, state, at).unwrap();
+        }
+        let outcomes = store.outbox_outcomes_by_peer().unwrap();
+        assert_eq!(
+            outcomes,
+            HashMap::from([(bob, (2, 1)), ("a2a:plain".to_owned(), (0, 1))])
         );
     }
 }

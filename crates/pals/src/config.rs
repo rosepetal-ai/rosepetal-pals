@@ -1,7 +1,8 @@
 //! The daemon's configuration file and the single-instance lock.
 //!
 //! The PALS home directory is `--home DIR`, else `$PALS_HOME`, else `~/.pals`.
-//! It holds [`CONFIG_FILE`]; the data directory, the home directory unless the
+//! It holds [`CONFIG_FILE`] and, unless the configuration says otherwise,
+//! [`INVENTORY_FILE`]; the data directory, the home directory unless the
 //! configuration says otherwise, holds [`KEY_FILE`] and [`LOCK_FILE`].
 
 use std::collections::BTreeMap;
@@ -11,6 +12,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use pals_core::discovery::MAX_OFFER_VALID_FOR_MS;
 use pals_core::identity::AgentId;
 use serde::Deserialize;
 
@@ -18,6 +20,9 @@ use crate::path_policy::lexically_normal;
 
 /// The configuration file, in the PALS home directory.
 pub const CONFIG_FILE: &str = "config.toml";
+/// The inventory file, in the directory of [`CONFIG_FILE`] unless
+/// `[inventory] file` says otherwise.
+pub const INVENTORY_FILE: &str = "inventory.toml";
 /// The agent's secret key, in the data directory.
 pub const KEY_FILE: &str = "agent.key";
 /// The single-instance lock, in the data directory.
@@ -74,6 +79,39 @@ relay = true
 # against the directory that holds this file.
 # download_dir = "/path/to/downloads"
 
+[inventory]
+# What this agent offers and with what: its services, which become skills
+# of its Agent Card, and the skills, plugins, MCP connections, runtime,
+# models, information sources, hardware and network behind them. `pals init`
+# writes it with a commented example of each block. A relative path is
+# resolved against the directory that holds this file; when the file does
+# not exist the inventory is empty. It is read when the daemon starts, and
+# only then: restart the daemon after changing it.
+file = "inventory.toml"
+# Seconds between two checks of the MCP connections the inventory configures.
+refresh_interval_s = 900
+
+[discovery]
+# Peers ask this agent what it offers over agentnet-discovery/0, its own
+# Iroh ALPN: they get the view of the inventory their grant gives, signed.
+# true: a peer without a grant sees the public view; false: an empty one.
+public = true
+# How long the offers this agent makes in answer to service queries last,
+# in milliseconds, rounded up to whole seconds: at most 300000. An offer
+# reserves nothing and authorizes nothing.
+offer_valid_for_ms = 15000
+# What a search of this agent's (`pals discover`) may take: at most this
+# many candidates per search (up to 32), this many queries in flight for
+# the whole daemon (up to 8), this long for each candidate, its card, its
+# offer and its benchmark reports (up to 10000 ms; a query waits for what
+# is left of it, and tells the peer at most 3000 ms) and this long in all
+# (up to 60000 ms). Past them, a search answers with what it has and says
+# it is partial.
+max_candidates = 8
+max_concurrent_queries = 3
+per_candidate_timeout_ms = 3000
+total_budget_ms = 15000
+
 [limits]
 max_body_bytes = 1048576      # 1 MiB
 max_blob_bytes = 2147483648   # 2 GiB
@@ -82,6 +120,156 @@ blob_fetch_timeout_s = 120
 # Projects this agent answers about, by name.
 # [projects.demo]
 # path = "/path/to/repo"
+"#;
+
+/// What `pals init` writes to [`INVENTORY_FILE`]: comments only, so an empty
+/// inventory, with an example of each block to uncomment.
+pub const INVENTORY_TEMPLATE: &str = r#"# What this agent offers and with what (agentnet.inventory/1), written by
+# `pals init`. The daemon reads this file when it starts, and only then:
+# restart it after changing anything here.
+#
+# Every block is optional, and so is every field of an entry but id,
+# description and provenance. Leave out what you do not know: a field left
+# out is unknown, never zero, and an empty string is refused.
+#
+# Entry ids are <namespace>:<name>, such as example:repo-reader; the
+# agentnet namespace is reserved, and one id names one entry. Keys of your
+# own go in an entry's extensions table, under a namespace too.
+#
+# Who sees an entry or a service is its visibility, private by default:
+#   visibility = "private"                # nobody
+#   visibility = "public"                 # every requester
+#   visibility = { project = ["demo"] }   # grants for a task operation on skill:ask in demo
+#   visibility = { task = ["demo"] }      # grants for task.send on skill:ask in demo
+#
+# Nothing here can say that something works: only the inventory adapters
+# observe that, and a declaration is never a check.
+#
+# To use an example, uncomment it and edit it.
+
+# Services: each one becomes a skill of the Agent Card when its visibility
+# shows it, so it needs a name, a description and a capability or a tag. Its
+# id is a skill id, such as ocr-metal-v1. A capability without a namespace,
+# such as vision.ocr, is from the common vocabulary. Components are entries
+# of this file, required, optional or alternative (with a group).
+# [[services]]
+# id = "ocr-metal-v1"
+# name = "Industrial OCR"
+# description = "Reads serial numbers stamped on metal parts"
+# capabilities = ["vision.ocr"]
+# tags = ["ocr", "metal"]
+# examples = ["Read the serial number in this photo"]
+# input_modes = ["image/png", "image/jpeg"]
+# output_modes = ["application/json"]
+# languages = ["en"]
+# processing_region = "EU"
+# external_cloud_used = false
+# estimated_duration_ms = 4000
+# limitations = ["Images up to 20 MiB"]
+# components = [{ id = "example:ocr-model", role = "required" }, { id = "example:workstation", role = "optional" }]
+# visibility = "public"
+
+# Skill packages installed in the runtime.
+# [[skills]]
+# id = "example:rust-review"
+# description = "Procedure for reviewing Rust code"
+# provenance = "operator"
+# version = "1.2.0"
+# package_id = "example/rust-review"
+# name = "Rust review"
+# offered_for = ["code review"]
+# visibility = { project = ["demo"] }
+
+# Plugins.
+# [[plugins]]
+# id = "example:vision-pack"
+# description = "Vision tools for industrial inspection"
+# provenance = "operator"
+# version = "0.4.1"
+# runtime = "claude-code"
+# components = ["ocr", "deskew"]
+
+# MCP connections. Peers may see only the offered tools, never the rest.
+# The adapter table says how this agent checks the connection and is never
+# shown to a peer: transport "stdio", with command, args and the names (never
+# the values) of the environment variables passed on, or "http", with url
+# (https://, or http:// only to 127.0.0.1, [::1] or localhost). The daemon
+# asks the server for its tools (tools/list, never a tool call) when it
+# starts, every refresh_interval_s of config.toml and on `pals inventory
+# refresh`; at most 16 connections have an adapter.
+# [[mcp]]
+# id = "example:repo-reader"
+# description = "Reads the project repository"
+# provenance = "operator"
+# server = "@modelcontextprotocol/server-filesystem"
+# tools = [{ name = "read_file", description = "Reads a file" }]
+# offered_tools = ["read_file"]
+# visibility = { project = ["demo"] }
+# [mcp.adapter]
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/srv/repo"]
+# env_passthrough = []
+
+# The runtime that does the work.
+# [runtime]
+# id = "example:claude-code"
+# description = "Claude Code in print mode"
+# provenance = "operator"
+# version = "2.0.0"
+# kind = "claude-code"
+# modes = ["print"]
+# restrictions = ["no network access outside the project"]
+
+# Models. The role is primary, auxiliary or offered; execution is local, or
+# external with the provider that runs it.
+# [[models]]
+# id = "example:ocr-model"
+# description = "OCR model for stamped metal"
+# provenance = "operator"
+# provider = "Example"
+# model_id = "example-ocr-metal"
+# revision = "2026-10-01"
+# role = "offered"
+# execution = { kind = "local" }
+# quantization = "int8"
+# modalities = ["image", "text"]
+# visibility = "public"
+
+# Information sources. The operations are among answer_with_sources, search,
+# query_records, aggregate, process_in_place and deliver_subset; timestamps
+# are strings in UTC.
+# [[information]]
+# id = "project:repo-controller"
+# description = "The controller repository"
+# provenance = "operator"
+# domains = ["industrial control"]
+# languages = ["en"]
+# updated_at = "2026-11-14T00:00:00Z"
+# live = true
+# operations = ["answer_with_sources", "search"]
+# visibility = { task = ["demo"] }
+
+# Hardware: what is installed, and in offered what a task may use, which is
+# what requirements are compared with. The figures are declared, never
+# measured.
+# [hardware]
+# id = "example:workstation"
+# description = "Inspection workstation"
+# provenance = "operator"
+# cpu = { arch = "x86_64", cores = 16 }
+# ram_mib = 65536
+# accelerators = [{ kind = "gpu", model = "NVIDIA RTX 4090", count = 1, memory_mib_each = 24576 }]
+# storage = { kind = "nvme", capacity_gib = 2000 }
+# offered = { cpu_cores = 4, ram_mib = 8192, vram_mib_each = 8192, concurrency = 2, accelerators = ["gpu"] }
+
+# Network.
+# [network]
+# id = "example:uplink"
+# description = "Office uplink"
+# provenance = "operator"
+# transports = ["iroh-quic"]
+# region = "EU"
 "#;
 
 /// The contents of `config.toml`.
@@ -107,6 +295,10 @@ pub struct Config {
     pub net: NetCfg,
     #[serde(default)]
     pub mcp: McpCfg,
+    #[serde(default)]
+    pub inventory: InventoryCfg,
+    #[serde(default)]
+    pub discovery: DiscoveryCfg,
     /// Issuers whose grants this agent accepts, besides itself.
     #[serde(default)]
     pub trusted_issuers: Vec<AgentId>,
@@ -284,6 +476,81 @@ impl McpCfg {
     }
 }
 
+/// The inventory, see [`pals_core::inventory`] and
+/// [`InventoryState`](crate::inventory::InventoryState).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InventoryCfg {
+    /// The inventory file, read when the node starts and only then; when it
+    /// does not exist the inventory is empty. After [`Config::load`] it is
+    /// absolute, resolved against the configuration file's directory when it
+    /// is relative.
+    pub file: PathBuf,
+    /// Seconds between two runs of the inventory adapters, which check the
+    /// MCP connections the inventory configures. At least 1.
+    pub refresh_interval_s: u64,
+}
+
+impl Default for InventoryCfg {
+    fn default() -> Self {
+        Self {
+            file: PathBuf::from(INVENTORY_FILE),
+            refresh_interval_s: 900,
+        }
+    }
+}
+
+/// What the discovery protocol, `agentnet-discovery/0`, shows, see
+/// [`pals_core::discovery`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiscoveryCfg {
+    /// Whether a peer without a grant sees the public view of the
+    /// inventory; without it, it sees an empty one. A grant's view is shown
+    /// either way.
+    pub public: bool,
+    /// How long a service offer lasts, from 1 to
+    /// [`MAX_OFFER_VALID_FOR_MS`]; rounded up to whole seconds.
+    pub offer_valid_for_ms: u32,
+    /// The candidates a search contacts, from 1 to
+    /// [`MAX_SEARCH_CANDIDATES`].
+    pub max_candidates: usize,
+    /// The service queries in flight at once for the whole daemon, from 1
+    /// to [`MAX_CONCURRENT_QUERIES`].
+    pub max_concurrent_queries: usize,
+    /// How long a search gives each candidate, from 1 to
+    /// [`MAX_PER_CANDIDATE_TIMEOUT_MS`].
+    pub per_candidate_timeout_ms: u64,
+    /// How long a search takes at most, from 1 to
+    /// [`MAX_TOTAL_BUDGET_MS`].
+    pub total_budget_ms: u64,
+}
+
+/// The most candidates a search may be configured to contact.
+pub const MAX_SEARCH_CANDIDATES: usize = 32;
+/// The most service queries a daemon may be configured to have in flight.
+pub const MAX_CONCURRENT_QUERIES: usize = 8;
+/// The longest a search may be configured to give a candidate.
+pub const MAX_PER_CANDIDATE_TIMEOUT_MS: u64 = 10_000;
+/// The longest a search may be configured to take.
+pub const MAX_TOTAL_BUDGET_MS: u64 = 60_000;
+
+impl Default for DiscoveryCfg {
+    /// The public view, offers valid 15 s, as the example of design §7.2,
+    /// and the limits of a search of design §7.3: 8 candidates, 3 queries
+    /// at once, 3 s per candidate and 15 s in all.
+    fn default() -> Self {
+        Self {
+            public: true,
+            offer_valid_for_ms: 15_000,
+            max_candidates: 8,
+            max_concurrent_queries: 3,
+            per_candidate_timeout_ms: 3000,
+            total_budget_ms: 15_000,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsCfg {
@@ -332,6 +599,52 @@ impl Config {
                 );
             }
             cfg.mcp.download_dir = Some(downloads);
+        }
+        cfg.inventory.file = dir.join(&cfg.inventory.file);
+        if cfg.inventory.refresh_interval_s == 0 {
+            bail!(
+                "invalid {}: inventory.refresh_interval_s must be at least 1",
+                path.display()
+            );
+        }
+        if !(1..=MAX_OFFER_VALID_FOR_MS).contains(&cfg.discovery.offer_valid_for_ms) {
+            bail!(
+                "invalid {}: discovery.offer_valid_for_ms must be from 1 to \
+                 {MAX_OFFER_VALID_FOR_MS}",
+                path.display()
+            );
+        }
+        let discovery = &cfg.discovery;
+        let limits = [
+            (
+                "max_candidates",
+                u64::try_from(discovery.max_candidates).unwrap_or(u64::MAX),
+                MAX_SEARCH_CANDIDATES as u64,
+            ),
+            (
+                "max_concurrent_queries",
+                u64::try_from(discovery.max_concurrent_queries).unwrap_or(u64::MAX),
+                MAX_CONCURRENT_QUERIES as u64,
+            ),
+            (
+                "per_candidate_timeout_ms",
+                discovery.per_candidate_timeout_ms,
+                MAX_PER_CANDIDATE_TIMEOUT_MS,
+            ),
+            (
+                "total_budget_ms",
+                discovery.total_budget_ms,
+                MAX_TOTAL_BUDGET_MS,
+            ),
+        ];
+        if let Some((name, _, max)) = limits
+            .iter()
+            .find(|(_, value, max)| !(1..=*max).contains(value))
+        {
+            bail!(
+                "invalid {}: discovery.{name} must be from 1 to {max}",
+                path.display()
+            );
         }
         if !cfg.gateway.listen.ip().is_loopback() {
             bail!(
@@ -596,6 +909,75 @@ path = "/srv/demo"
     }
 
     #[test]
+    fn discovery_shows_the_public_view_unless_told_not_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load(&write_config(dir.path(), "")).unwrap();
+        assert!(cfg.discovery.public);
+        let text = "[discovery]\npublic = false\n";
+        let cfg = Config::load(&write_config(dir.path(), text)).unwrap();
+        assert!(!cfg.discovery.public);
+        assert_eq!(cfg.discovery.offer_valid_for_ms, 15_000);
+        let err =
+            Config::load(&write_config(dir.path(), "[discovery]\nforward = true\n")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unknown field `forward`"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn offers_last_from_a_millisecond_to_five_minutes() {
+        let dir = tempfile::tempdir().unwrap();
+        for (ms, valid) in [(0, false), (1, true), (300_000, true), (300_001, false)] {
+            let text = format!("[discovery]\noffer_valid_for_ms = {ms}\n");
+            match Config::load(&write_config(dir.path(), &text)) {
+                Ok(cfg) => {
+                    assert!(valid, "{ms}");
+                    assert_eq!(cfg.discovery.offer_valid_for_ms, ms);
+                }
+                Err(err) => {
+                    assert!(!valid, "{ms}: {err:#}");
+                    assert!(format!("{err:#}").contains("offer_valid_for_ms"), "{err:#}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn search_limits_default_to_the_design_and_are_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load(&write_config(dir.path(), "")).unwrap();
+        let discovery = &cfg.discovery;
+        assert_eq!(
+            (
+                discovery.max_candidates,
+                discovery.max_concurrent_queries,
+                discovery.per_candidate_timeout_ms,
+                discovery.total_budget_ms
+            ),
+            (8, 3, 3000, 15_000)
+        );
+        for (name, max) in [
+            ("max_candidates", 32),
+            ("max_concurrent_queries", 8),
+            ("per_candidate_timeout_ms", 10_000),
+            ("total_budget_ms", 60_000),
+        ] {
+            for (value, valid) in [(0, false), (1, true), (max, true), (max + 1, false)] {
+                let text = format!("[discovery]\n{name} = {value}\n");
+                match Config::load(&write_config(dir.path(), &text)) {
+                    Ok(_) => assert!(valid, "{name} = {value}"),
+                    Err(err) => {
+                        assert!(!valid, "{name} = {value}: {err:#}");
+                        let err = format!("{err:#}");
+                        assert!(err.contains(&format!("discovery.{name}")), "{err}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn project_names_must_be_header_safe() {
         let dir = tempfile::tempdir().unwrap();
         for name in ["\"diseño\"", "\"two words\"", "\"\""] {
@@ -715,6 +1097,77 @@ max_output_bytes = 10
             let err = Config::load(&write_config(dir.path(), &text)).unwrap_err();
             assert!(format!("{err:#}").contains(word), "{setting}: {err:#}");
         }
+    }
+
+    #[test]
+    fn inventory_file_is_beside_the_config_and_refreshes_every_900_s() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load(&write_config(dir.path(), "")).unwrap();
+        assert_eq!(cfg.inventory.file, dir.path().join(INVENTORY_FILE));
+        assert_eq!(cfg.inventory.refresh_interval_s, 900);
+
+        let text = "data_dir = \"state\"\n[inventory]\nfile = \"inv/mine.toml\"\nrefresh_interval_s = 60\n";
+        let cfg = Config::load(&write_config(dir.path(), text)).unwrap();
+        assert_eq!(cfg.inventory.file, dir.path().join("inv").join("mine.toml"));
+        assert_eq!(cfg.inventory.refresh_interval_s, 60);
+        let text = "[inventory]\nfile = \"/srv/pals/inventory.toml\"\n";
+        let cfg = Config::load(&write_config(dir.path(), text)).unwrap();
+        assert_eq!(
+            cfg.inventory.file,
+            PathBuf::from("/srv/pals/inventory.toml")
+        );
+
+        for (text, word) in [
+            (
+                "[inventory]\nrefresh_interval_s = 0\n",
+                "refresh_interval_s",
+            ),
+            ("[inventory]\nrefresh = 60\n", "unknown field `refresh`"),
+        ] {
+            let err = Config::load(&write_config(dir.path(), text)).unwrap_err();
+            assert!(format!("{err:#}").contains(word), "{text}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn inventory_template_is_empty_and_its_examples_fill_every_block() {
+        use pals_core::inventory::Inventory;
+
+        assert_eq!(
+            Inventory::from_toml(INVENTORY_TEMPLATE).unwrap(),
+            Inventory::default()
+        );
+        // Uncommenting every example line, and no prose, gives an inventory
+        // with every block: the examples stay valid.
+        let is_example = |line: &str| {
+            line.starts_with('[')
+                || line.split_once(" = ").is_some_and(|(key, _)| {
+                    !key.is_empty()
+                        && key
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"_-.\"".contains(&b))
+                })
+        };
+        let uncommented: String = INVENTORY_TEMPLATE
+            .lines()
+            .map(|line| match line.strip_prefix("# ") {
+                Some(example) if is_example(example) => example,
+                _ => line,
+            })
+            .flat_map(|line| [line, "\n"])
+            .collect();
+        let inventory =
+            Inventory::from_toml(&uncommented).unwrap_or_else(|err| panic!("{err}\n{uncommented}"));
+        crate::inventory::mcp_adapter::check_adapters(&inventory).unwrap();
+        assert!(!inventory.services.is_empty());
+        assert!(!inventory.skills.is_empty());
+        assert!(!inventory.plugins.is_empty());
+        assert!(inventory.mcp.iter().any(|mcp| mcp.body.adapter.is_some()));
+        assert!(inventory.runtime.is_some());
+        assert!(!inventory.models.is_empty());
+        assert!(!inventory.information.is_empty());
+        assert!(inventory.hardware.is_some());
+        assert!(inventory.network.is_some());
     }
 
     #[test]

@@ -1,0 +1,312 @@
+{
+  "description": "agentnet.inventory/1 test vector. toml is an inventory.toml with every block; inventory is the JSON form PALS reads it as (Inventory::from_toml) and writes it back as: a field left out is unknown and stays out, never zero or empty; visibility is always written, \"private\" when the file leaves it out; hardware always carries \"basis\": \"declared\". The JSON form is what docs/extensions/inventory-v1/inventory.schema.json describes. The inventory is local: the views a peer reads leave out the adapter and whatever their scope does not show.",
+  "toml": "# An industrial OCR agent: every block of agentnet.inventory/1.\n\n[[services]]\nid = \"ocr-metal-v1\"\nname = \"Industrial OCR\"\ndescription = \"Reads serial numbers stamped on metal parts\"\ncapabilities = [\"vision.ocr\", \"example:ocr-metal\"]\ntags = [\"ocr\", \"metal\"]\nexamples = [\"Read the serial number in this photo\"]\ninput_modes = [\"image/png\", \"image/jpeg\"]\noutput_modes = [\"application/json\"]\nlanguages = [\"en\", \"es\"]\nprocessing_region = \"EU\"\nexternal_cloud_used = false\nestimated_start_delay_ms = 500\nestimated_duration_ms = 4000\nlimitations = [\"Images up to 20 MiB\"]\nvisibility = \"public\"\ncomponents = [\n  { id = \"example:ocr-model\", role = \"required\" },\n  { id = \"example:workstation\", role = \"required\" },\n  { id = \"example:vision-pack\", role = \"optional\" },\n]\n\n[[services]]\nid = \"repo-review\"\nname = \"Repository review\"\ndescription = \"Reviews the demo repository and runs its tests\"\ncapabilities = [\"code.rust.review\"]\nvisibility = { project = [\"demo\"] }\ncomponents = [\n  { id = \"example:repo-reader\", role = \"required\" },\n  { id = \"project:repo-controller\", role = \"required\" },\n  { id = \"example:assistant\", role = \"alternative\", group = \"reviewer\" },\n  { id = \"example:rust-review\", role = \"alternative\", group = \"reviewer\" },\n]\n\n[[skills]]\nid = \"example:rust-review\"\ndescription = \"Procedure for reviewing Rust code for soundness and style\"\nprovenance = \"operator\"\nversion = \"1.2.0\"\nvisibility = { project = [\"demo\"] }\npackage_id = \"example/rust-review\"\nname = \"Rust review\"\noffered_for = [\"code review\", \"unsafe audit\"]\n\n[[plugins]]\nid = \"example:vision-pack\"\ndescription = \"Vision tools for industrial inspection\"\nprovenance = \"operator\"\nversion = \"0.4.1\"\nvisibility = \"public\"\nruntime = \"claude-code\"\ncomponents = [\"ocr\", \"deskew\"]\n\n[[mcp]]\nid = \"example:repo-reader\"\ndescription = \"Reads the project repository\"\nprovenance = \"operator\"\nvisibility = { project = [\"demo\"] }\nserver = \"@modelcontextprotocol/server-filesystem\"\nserver_version = \"2025.8.21\"\ntools = [\n  { name = \"read_file\", description = \"Reads a file\", annotations = { readOnlyHint = true } },\n  { name = \"delete_file\" },\n]\nresources = [\"repo://demo\"]\noffered_tools = [\"read_file\"]\n\n[mcp.adapter]\ntransport = \"stdio\"\ncommand = \"npx\"\nargs = [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"/srv/repo\"]\nenv_passthrough = [\"GITHUB_TOKEN\"]\n\n[runtime]\nid = \"example:claude-code\"\ndescription = \"Claude Code in print mode\"\nprovenance = \"operator\"\nversion = \"2.0.0\"\nvisibility = \"public\"\nkind = \"claude-code\"\nmodes = [\"print\"]\nrestrictions = [\"no network access outside the project\"]\n\n[[models]]\nid = \"example:ocr-model\"\ndescription = \"OCR model for stamped metal\"\nprovenance = \"operator\"\nvisibility = \"public\"\nprovider = \"Example\"\nmodel_id = \"example-ocr-metal\"\nrevision = \"2026-10-01\"\nrole = \"offered\"\nexecution = { kind = \"local\" }\ninference_runtime = \"onnxruntime 1.20\"\nquantization = \"int8\"\nprecision = \"int8\"\nmodalities = [\"image\", \"text\"]\n\n[[models]]\nid = \"example:assistant\"\ndescription = \"The agent's main model\"\nprovenance = \"operator\"\nprovider = \"Anthropic\"\nmutable_alias = \"claude-sonnet-latest\"\nrole = \"primary\"\nexecution = { kind = \"external\", provider = \"anthropic-api\" }\nmodalities = [\"text\"]\ncontext_tokens = 200000\noutput_tokens = 64000\ndynamic_selection = \"A smaller model may answer short questions\"\n\n[[information]]\nid = \"project:repo-controller\"\ndescription = \"The controller repository\"\nprovenance = \"operator\"\nversion = \"a1b2c3d\"\nvisibility = { task = [\"demo\"] }\nexpires_at = \"2026-12-14T00:00:00Z\"\nevidence = { reference = \"https://example.org/repo-controller/commit/a1b2c3d\", hash = \"blake3:5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b\" }\ndomains = [\"industrial control\"]\nlanguages = [\"en\"]\ncoverage = \"main branch\"\nupdated_at = \"2026-11-14T00:00:00Z\"\nlive = true\nformats = [\"text/x-rust\"]\nschema_ref = \"https://example.org/repo-controller/README.md\"\napproximate_volume = \"40k lines\"\noperations = [\"answer_with_sources\", \"search\", \"process_in_place\"]\nlimits = [\"no export of whole files\"]\n\n[information.extensions]\n\"example:retention\" = { days = 30 }\n\n[hardware]\nid = \"example:workstation\"\ndescription = \"Inspection workstation\"\nprovenance = \"operator\"\nvisibility = \"public\"\ncpu = { arch = \"x86_64\", model = \"AMD Ryzen 9 7950X\", cores = 16 }\nram_mib = 65536\naccelerators = [{ kind = \"gpu\", model = \"NVIDIA RTX 4090\", count = 1, memory_mib_each = 24576 }]\nstorage = { kind = \"nvme\", capacity_gib = 2000 }\noffered = { cpu_cores = 4, ram_mib = 8192, vram_mib_each = 8192, concurrency = 2, accelerators = [\"gpu\"] }\n\n[network]\nid = \"example:uplink\"\ndescription = \"Office uplink\"\nprovenance = \"operator\"\nvisibility = \"public\"\ntransports = [\"iroh-quic\"]\nregion = \"EU\"\ndirect_connectivity_observed = true\n",
+  "inventory": {
+    "services": [
+      {
+        "id": "ocr-metal-v1",
+        "name": "Industrial OCR",
+        "description": "Reads serial numbers stamped on metal parts",
+        "capabilities": [
+          "vision.ocr",
+          "example:ocr-metal"
+        ],
+        "tags": [
+          "ocr",
+          "metal"
+        ],
+        "examples": [
+          "Read the serial number in this photo"
+        ],
+        "input_modes": [
+          "image/png",
+          "image/jpeg"
+        ],
+        "output_modes": [
+          "application/json"
+        ],
+        "languages": [
+          "en",
+          "es"
+        ],
+        "processing_region": "EU",
+        "external_cloud_used": false,
+        "estimated_start_delay_ms": 500,
+        "estimated_duration_ms": 4000,
+        "components": [
+          {
+            "id": "example:ocr-model",
+            "role": "required"
+          },
+          {
+            "id": "example:workstation",
+            "role": "required"
+          },
+          {
+            "id": "example:vision-pack",
+            "role": "optional"
+          }
+        ],
+        "limitations": [
+          "Images up to 20 MiB"
+        ],
+        "visibility": "public"
+      },
+      {
+        "id": "repo-review",
+        "name": "Repository review",
+        "description": "Reviews the demo repository and runs its tests",
+        "capabilities": [
+          "code.rust.review"
+        ],
+        "components": [
+          {
+            "id": "example:repo-reader",
+            "role": "required"
+          },
+          {
+            "id": "project:repo-controller",
+            "role": "required"
+          },
+          {
+            "id": "example:assistant",
+            "role": "alternative",
+            "group": "reviewer"
+          },
+          {
+            "id": "example:rust-review",
+            "role": "alternative",
+            "group": "reviewer"
+          }
+        ],
+        "visibility": {
+          "project": [
+            "demo"
+          ]
+        }
+      }
+    ],
+    "skills": [
+      {
+        "id": "example:rust-review",
+        "description": "Procedure for reviewing Rust code for soundness and style",
+        "provenance": "operator",
+        "version": "1.2.0",
+        "visibility": {
+          "project": [
+            "demo"
+          ]
+        },
+        "package_id": "example/rust-review",
+        "name": "Rust review",
+        "offered_for": [
+          "code review",
+          "unsafe audit"
+        ]
+      }
+    ],
+    "plugins": [
+      {
+        "id": "example:vision-pack",
+        "description": "Vision tools for industrial inspection",
+        "provenance": "operator",
+        "version": "0.4.1",
+        "visibility": "public",
+        "runtime": "claude-code",
+        "components": [
+          "ocr",
+          "deskew"
+        ]
+      }
+    ],
+    "mcp": [
+      {
+        "id": "example:repo-reader",
+        "description": "Reads the project repository",
+        "provenance": "operator",
+        "visibility": {
+          "project": [
+            "demo"
+          ]
+        },
+        "server": "@modelcontextprotocol/server-filesystem",
+        "server_version": "2025.8.21",
+        "tools": [
+          {
+            "name": "read_file",
+            "description": "Reads a file",
+            "annotations": {
+              "readOnlyHint": true
+            }
+          },
+          {
+            "name": "delete_file"
+          }
+        ],
+        "resources": [
+          "repo://demo"
+        ],
+        "adapter": {
+          "transport": "stdio",
+          "command": "npx",
+          "args": [
+            "-y",
+            "@modelcontextprotocol/server-filesystem",
+            "/srv/repo"
+          ],
+          "env_passthrough": [
+            "GITHUB_TOKEN"
+          ]
+        },
+        "offered_tools": [
+          "read_file"
+        ]
+      }
+    ],
+    "runtime": {
+      "id": "example:claude-code",
+      "description": "Claude Code in print mode",
+      "provenance": "operator",
+      "version": "2.0.0",
+      "visibility": "public",
+      "kind": "claude-code",
+      "modes": [
+        "print"
+      ],
+      "restrictions": [
+        "no network access outside the project"
+      ]
+    },
+    "models": [
+      {
+        "id": "example:ocr-model",
+        "description": "OCR model for stamped metal",
+        "provenance": "operator",
+        "visibility": "public",
+        "provider": "Example",
+        "model_id": "example-ocr-metal",
+        "revision": "2026-10-01",
+        "role": "offered",
+        "execution": {
+          "kind": "local"
+        },
+        "inference_runtime": "onnxruntime 1.20",
+        "quantization": "int8",
+        "precision": "int8",
+        "modalities": [
+          "image",
+          "text"
+        ]
+      },
+      {
+        "id": "example:assistant",
+        "description": "The agent's main model",
+        "provenance": "operator",
+        "visibility": "private",
+        "provider": "Anthropic",
+        "mutable_alias": "claude-sonnet-latest",
+        "role": "primary",
+        "execution": {
+          "kind": "external",
+          "provider": "anthropic-api"
+        },
+        "modalities": [
+          "text"
+        ],
+        "context_tokens": 200000,
+        "output_tokens": 64000,
+        "dynamic_selection": "A smaller model may answer short questions"
+      }
+    ],
+    "information": [
+      {
+        "id": "project:repo-controller",
+        "description": "The controller repository",
+        "provenance": "operator",
+        "version": "a1b2c3d",
+        "visibility": {
+          "task": [
+            "demo"
+          ]
+        },
+        "expires_at": "2026-12-14T00:00:00Z",
+        "evidence": {
+          "reference": "https://example.org/repo-controller/commit/a1b2c3d",
+          "hash": "blake3:5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b"
+        },
+        "domains": [
+          "industrial control"
+        ],
+        "languages": [
+          "en"
+        ],
+        "coverage": "main branch",
+        "updated_at": "2026-11-14T00:00:00Z",
+        "live": true,
+        "formats": [
+          "text/x-rust"
+        ],
+        "schema_ref": "https://example.org/repo-controller/README.md",
+        "approximate_volume": "40k lines",
+        "operations": [
+          "answer_with_sources",
+          "search",
+          "process_in_place"
+        ],
+        "limits": [
+          "no export of whole files"
+        ],
+        "extensions": {
+          "example:retention": {
+            "days": 30
+          }
+        }
+      }
+    ],
+    "hardware": {
+      "id": "example:workstation",
+      "description": "Inspection workstation",
+      "provenance": "operator",
+      "visibility": "public",
+      "basis": "declared",
+      "cpu": {
+        "arch": "x86_64",
+        "model": "AMD Ryzen 9 7950X",
+        "cores": 16
+      },
+      "ram_mib": 65536,
+      "accelerators": [
+        {
+          "kind": "gpu",
+          "model": "NVIDIA RTX 4090",
+          "count": 1,
+          "memory_mib_each": 24576
+        }
+      ],
+      "storage": {
+        "kind": "nvme",
+        "capacity_gib": 2000
+      },
+      "offered": {
+        "cpu_cores": 4,
+        "ram_mib": 8192,
+        "vram_mib_each": 8192,
+        "concurrency": 2,
+        "accelerators": [
+          "gpu"
+        ]
+      }
+    },
+    "network": {
+      "id": "example:uplink",
+      "description": "Office uplink",
+      "provenance": "operator",
+      "visibility": "public",
+      "transports": [
+        "iroh-quic"
+      ],
+      "region": "EU",
+      "direct_connectivity_observed": true
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "canonical_hex": "7b226361706162696c697479223a22766973696f6e2e6f6372222c22657865637574696f6e5f617574686f72697a6564223a66616c73652c22696e7075745f6d656469615f7479706573223a5b22696d6167652f706e67225d2c226f75747075745f6d656469615f7479706573223a5b226170706c69636174696f6e2f6a736f6e225d2c2271756572795f6964223a22712d6f63722d303031222c227265706c795f74696d656f75745f6d73223a333030302c22726571756972656d656e7473223a7b2265787465726e616c5f636c6f75645f616c6c6f776564223a66616c73652c226c616e6775616765223a226573222c2272657175697265645f726567696f6e223a224555227d2c22736368656d61223a226167656e746e65742e736572766963652d71756572792f31222c2273756d6d617279223a22546578746f207065717565c3b16f206772616261646f20736f62726520756e612073757065726669636965206d6574c3a16c696361227d",
+  "description": "agentnet.service-query/1 test vector: the query of design §7.1, as it is written there. canonical_hex is its JCS (RFC 8785): the exact bytes that travel in ServiceQuery.query of agentnet-discovery/0, in its one spelling (absent fields left out). query_hash is \"blake3:\" and the hex of BLAKE3 over those bytes, which every offer for this query carries (service-offer-v1.json).",
+  "query": {
+    "capability": "vision.ocr",
+    "execution_authorized": false,
+    "input_media_types": [
+      "image/png"
+    ],
+    "output_media_types": [
+      "application/json"
+    ],
+    "query_id": "q-ocr-001",
+    "reply_timeout_ms": 3000,
+    "requirements": {
+      "external_cloud_allowed": false,
+      "language": "es",
+      "required_region": "EU"
+    },
+    "schema": "agentnet.service-query/1",
+    "summary": "Texto pequeño grabado sobre una superficie metálica"
+  },
+  "query_hash": "blake3:81d90419ef1b82a602feb5c30ab964123736f90bab00adf3db4a48e02260fb62"
+}

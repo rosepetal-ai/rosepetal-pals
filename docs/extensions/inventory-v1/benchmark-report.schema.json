@@ -1,0 +1,228 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Informe de benchmark firmado, agentnet.benchmark-report/1",
+  "description": "Un informe de benchmark (diseño §9.7): qué se midió, cómo, cuándo y quién lo midió. Viaja como el JCS (RFC 8785) de este objeto, de 65536 bytes y 64 resultados como mucho, en el resultado benchmark_report de agentnet-discovery/0. La firma es Ed25519 de la clave de report.provenance.measured_by, quien midió, sobre \"agentnet.benchmark/1\\n\" seguido del JCS de report, en base64url sin relleno, y se comprueba sobre el informe recibido antes de leerlo: uno firmado por otro se rechaza. Lo ausente se omite, nunca es null. La visibilidad no forma parte del informe: la guarda aparte quien lo tiene, que no puede cambiar lo que firmó otro. Una firma dice quién emitió el informe y que no ha cambiado; no prueba que el hardware exista ni que la ejecución ocurriera como se afirma. Los resultados brutos voluminosos solo van como evidence, un hash y una referencia a un blob, que nadie descarga al consultar.",
+  "type": "object",
+  "properties": {
+    "report": { "$ref": "#/$defs/report" },
+    "signature": { "$ref": "#/$defs/signature" }
+  },
+  "required": ["report", "signature"],
+  "additionalProperties": false,
+  "$defs": {
+    "report": {
+      "type": "object",
+      "properties": {
+        "schema": { "const": "agentnet.benchmark-report/1" },
+        "benchmark_id": {
+          "$ref": "#/$defs/benchmarkId",
+          "description": "Único entre los informes que guarda un agente: guardar otro informe con el mismo id se rechaza."
+        },
+        "subject": { "$ref": "#/$defs/subject" },
+        "measurement_kind": {
+          "$ref": "#/$defs/measurementKind",
+          "description": "Se conserva tal cual al importar, guardar y servir: una especificación declarada nunca se presenta como medición."
+        },
+        "procedure": { "$ref": "#/$defs/procedure" },
+        "environment": { "$ref": "#/$defs/environment" },
+        "measured_at": {
+          "$ref": "#/$defs/timestamp",
+          "description": "Cuándo se midió, o se declaró."
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Cuánto duró la medición."
+        },
+        "samples": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "Cuántas muestras; al menos 1 salvo en una especificación declarada."
+        },
+        "expires_at": {
+          "$ref": "#/$defs/timestamp",
+          "description": "Posterior a measured_at: desde entonces el informe no cuenta como actual. Quien lo compara usa su propio reloj, sin desfase."
+        },
+        "results": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/result" }
+        },
+        "provenance": { "$ref": "#/$defs/provenance" },
+        "evidence": { "$ref": "#/$defs/evidence" }
+      },
+      "required": [
+        "schema",
+        "benchmark_id",
+        "subject",
+        "measurement_kind",
+        "procedure",
+        "environment",
+        "measured_at",
+        "duration_ms",
+        "samples",
+        "expires_at",
+        "results",
+        "provenance"
+      ],
+      "additionalProperties": false,
+      "if": { "properties": { "measurement_kind": { "const": "declared_spec" } } },
+      "else": { "properties": { "samples": { "minimum": 1 } } }
+    },
+    "benchmarkId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,128}$"
+    },
+    "subject": {
+      "description": "Lo medido, con una sola clave: un servicio por su id, un modelo o un perfil de hardware por su id de entrada del inventario, o una pareja de nodos distintos.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": { "service": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" } },
+          "required": ["service"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": { "model": { "$ref": "#/$defs/entryId" } },
+          "required": ["model"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": { "hardware": { "$ref": "#/$defs/entryId" } },
+          "required": ["hardware"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "node_pair": {
+              "type": "object",
+              "properties": {
+                "a": { "$ref": "#/$defs/agentId" },
+                "b": { "$ref": "#/$defs/agentId" }
+              },
+              "required": ["a", "b"],
+              "additionalProperties": false,
+              "description": "Dos nodos distintos; este esquema no puede comprobar que lo son, PALS rechaza el informe que no lo cumple."
+            }
+          },
+          "required": ["node_pair"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "measurementKind": {
+      "enum": ["declared_spec", "own_measurement", "peer_observation"],
+      "description": "declared_spec: especificación declarada, no medida; own_measurement: medición propia de quien mide; peer_observation: observación de otro peer."
+    },
+    "profile": {
+      "type": "string",
+      "pattern": "^(compute\\.inference|compute\\.llm|storage\\.io|network\\.rtt|network\\.transfer|service\\.task|(?!agentnet:)[a-z0-9._-]{1,64}:[A-Za-z0-9._/-]{1,128})$",
+      "description": "Uno de los seis perfiles que propone el diseño (§9.7), por su nombre, o uno del espacio de nombres de su autor."
+    },
+    "profileVersion": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,64}$"
+    },
+    "procedure": {
+      "type": "object",
+      "properties": {
+        "profile": { "$ref": "#/$defs/profile" },
+        "profile_version": { "$ref": "#/$defs/profileVersion" },
+        "runner": { "$ref": "#/$defs/text", "description": "La herramienta que lo ejecutó." },
+        "config": {
+          "type": "object",
+          "description": "Los parámetros del perfil, anidados 16 niveles como mucho. Dos informes solo se comparan con la misma configuración, comparada por su JCS."
+        },
+        "inputs_hash": { "$ref": "#/$defs/hash", "description": "Hash o referencia de las entradas." }
+      },
+      "required": ["profile", "profile_version", "config"],
+      "additionalProperties": false
+    },
+    "environment": {
+      "type": "object",
+      "description": "Dónde se ejecutó, en lo que sabe quien mide; lo desconocido se omite.",
+      "properties": {
+        "model_revision": { "$ref": "#/$defs/text" },
+        "runtime": { "$ref": "#/$defs/text" },
+        "hardware_ref": { "$ref": "#/$defs/text" },
+        "load": { "$ref": "#/$defs/text" },
+        "warmup": { "$ref": "#/$defs/text" },
+        "cache_state": { "$ref": "#/$defs/text" },
+        "route": { "enum": ["direct", "relay"], "description": "Entre nodos: directa o por relay." },
+        "peer": { "$ref": "#/$defs/agentId", "description": "El otro nodo, si se midió contra uno." }
+      },
+      "additionalProperties": false
+    },
+    "result": {
+      "type": "object",
+      "properties": {
+        "metric": { "$ref": "#/$defs/name" },
+        "unit": { "$ref": "#/$defs/name" },
+        "statistic": { "$ref": "#/$defs/name", "description": "p50, p95, mean…" },
+        "value": { "type": "number", "description": "Un número finito; nunca un cero en lugar de un dato desconocido." },
+        "errors": { "type": "integer", "minimum": 0 },
+        "uncertainty": { "type": "number", "minimum": 0 }
+      },
+      "required": ["metric", "unit", "statistic", "value"],
+      "additionalProperties": false
+    },
+    "provenance": {
+      "type": "object",
+      "properties": {
+        "measured_by": {
+          "$ref": "#/$defs/agentId",
+          "description": "Quien midió, que es también quien firma el informe."
+        },
+        "method": { "$ref": "#/$defs/text", "description": "Cómo se observó." }
+      },
+      "required": ["measured_by", "method"],
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "object",
+      "properties": {
+        "hash": { "$ref": "#/$defs/hash" },
+        "blob": { "$ref": "#/$defs/hash", "description": "Referencia al blob con los resultados brutos; nadie lo descarga al consultar el informe." }
+      },
+      "required": ["hash"],
+      "additionalProperties": false
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[ -~]{1,64}$"
+    },
+    "hash": {
+      "type": "string",
+      "pattern": "^[!-~]{1,256}$"
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "entryId": {
+      "type": "string",
+      "pattern": "^(?!agentnet:)[a-z0-9._-]{1,64}:[A-Za-z0-9._/-]{1,128}$"
+    },
+    "agentId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Clave pública Ed25519 del agente en hexadecimal en minúsculas."
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$",
+      "description": "RFC 3339 en UTC con segundos enteros: 2026-11-14T00:00:00Z."
+    },
+    "signature": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{85}[AQgw]$",
+      "description": "Firma Ed25519 de 64 bytes en base64url sin relleno."
+    }
+  }
+}

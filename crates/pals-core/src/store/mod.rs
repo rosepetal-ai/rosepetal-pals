@@ -3,33 +3,45 @@
 //! One connection behind a mutex, in WAL mode with `foreign_keys = ON` and a
 //! 30 s busy timeout, so the daemon and CLI commands can share the file, even
 //! on a host so loaded that another connection holds a write for seconds. The
-//! schema version lives in `PRAGMA user_version`; a database written by a
-//! newer version is refused. All calls are synchronous.
+//! schema version lives in `PRAGMA user_version`: opening a database written
+//! by an older version upgrades it, in one transaction, and one written by a
+//! newer version is refused (`migrate.rs`). All calls are synchronous.
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use anyhow::{Context, bail, ensure};
+use anyhow::{Context, ensure};
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, ToSql, TransactionBehavior};
 
 use crate::identity::AgentId;
 
+mod a2a_contacts;
+mod benchmarks;
+mod cards;
 mod contacts;
 mod dedup;
 mod grants;
+mod migrate;
+mod observations;
+mod offers;
 mod outbox;
+mod records;
 mod tasks;
+mod views;
 
+pub use a2a_contacts::{
+    A2aContact, MAX_PLAIN_CONTACT_NAME, PLAIN_PEER_PREFIX, PeerRef, is_plain_contact_name,
+};
+pub use benchmarks::KeptBenchmark;
+pub use cards::MAX_CARD_CONTEXTS_PER_PEER;
 pub use contacts::Contact;
 pub use dedup::{DEDUP_INFLIGHT_WAIT_S, DEDUP_RETENTION_S, DedupBegin, DedupRow};
 pub use outbox::{OUTBOX_PENDING, OUTBOX_REFUSED, OutboxRow};
+pub use records::RecordAccept;
 pub use tasks::INTERRUPTED_MESSAGE;
 
-/// The schema this build writes and reads.
-const SCHEMA_VERSION: i64 = 1;
-const SCHEMA: &str = include_str!("schema.sql");
 const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The local store of one agent, its owner. `Send + Sync`: share it behind
@@ -45,10 +57,11 @@ pub struct Store {
 
 impl Store {
     /// Opens `owner`'s database at `path`, creating it and its schema if
-    /// needed.
+    /// needed, or upgrading the schema of an older version.
     ///
     /// Fails with an error containing `unsupported schema version` when the
-    /// file was written by a newer schema.
+    /// file was written by a newer schema, and leaves the file as it was
+    /// when an upgrade fails.
     pub fn open(path: &Path, owner: AgentId) -> anyhow::Result<Self> {
         let conn = Connection::open(path)
             .with_context(|| format!("cannot open the database {}", path.display()))?;
@@ -76,23 +89,10 @@ impl Store {
         );
         conn.pragma_update(None, "foreign_keys", true)?;
 
-        // Immediate, so two processes opening a new file do not both create
-        // the schema.
+        // Immediate, so two processes opening a new or older file do not
+        // both create or upgrade the schema.
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let version: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        match version {
-            0 => {
-                tx.execute_batch(SCHEMA)?;
-                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            }
-            // Written before `tasks.status_at` was added to this version,
-            // while it was unreleased.
-            SCHEMA_VERSION => tasks::add_status_at(&tx)?,
-            _ => bail!(
-                "unsupported schema version {version}: this build of pals reads version \
-                 {SCHEMA_VERSION}"
-            ),
-        }
+        migrate::upgrade(&tx)?;
         tx.commit()?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -148,6 +148,6 @@ mod tests {
         assert_eq!(pragma("journal_mode"), "wal");
         assert_eq!(pragma("foreign_keys"), "1");
         assert_eq!(pragma("busy_timeout"), "30000");
-        assert_eq!(pragma("user_version"), "1");
+        assert_eq!(pragma("user_version"), "2");
     }
 }

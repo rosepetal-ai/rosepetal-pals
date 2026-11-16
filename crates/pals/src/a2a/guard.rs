@@ -19,14 +19,20 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::{self, BoxStream};
 use futures::{FutureExt, StreamExt};
+use pals_core::clock::Clock;
+use pals_core::discovery::query::{OFFER_EXPIRED, OFFER_STALE, OFFER_UNKNOWN, OfferRef};
+use pals_core::discovery::scope_revision;
 use pals_core::identity::{AgentId, AgentKey};
+use pals_core::inventory::{INVENTORY_EXTENSION, Scope};
 use pals_core::jcs;
 use pals_core::store::{DEDUP_INFLIGHT_WAIT_S, DedupBegin, DedupRow, Store};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, warn};
 
-use super::IDEMPOTENCY_EXTENSION;
+use super::auth::SCOPE_HEADER;
 use super::task_store::{a2a_error, blocking};
+use super::{CardSet, IDEMPOTENCY_EXTENSION};
+use crate::inventory::InventoryState;
 use crate::net::PEER_HEADER;
 
 /// The message of the `InvalidParamsError` a request gets when its
@@ -54,7 +60,7 @@ type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 /// the pinned SDK that break A2A conformance.
 ///
 /// **Ownership.** The owner of a task is the peer, [`PEER_HEADER`], whose
-/// request created it. The [`BindingExecutor`](super::BindingExecutor)
+/// request created it. The `BindingExecutor`
 /// records it when the task's execution starts; the guard records it again,
 /// a no-op then, with the first task the inner handler returns or streams,
 /// before the peer sees the task's id. Getting,
@@ -65,11 +71,11 @@ type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 ///
 /// **Validation.** A `SendMessage` or `SendStreamingMessage` whose message
 /// has no `messageId`, no `role` or no parts, all REQUIRED in A2A, fails
-/// with `InvalidParamsError` before anything else ([`check_message`]).
+/// with `InvalidParamsError` before anything else (`check_message`).
 ///
 /// **Idempotency**, the opt-in [`IDEMPOTENCY_EXTENSION`]. A request that does
 /// not activate it with the `A2A-Extensions` service parameter
-/// ([`idempotency_requested`]) runs as the reference SDK runs it: every
+/// (`idempotency_requested`) runs as the reference SDK runs it: every
 /// message is new, whatever its `messageId`. A request that activates it is
 /// keyed by `(peer, messageId)`, with the BLAKE3 of the JCS form of the
 /// request's params (the same for both methods and both bindings) as its
@@ -77,7 +83,7 @@ type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 ///
 /// - The first request with a key runs. The key is bound to its task when
 ///   the task's execution starts, by the
-///   [`BindingExecutor`](super::BindingExecutor), so a retry attaches to it
+///   `BindingExecutor`, so a retry attaches to it
 ///   however long it runs, and after a restart that failed it. When the
 ///   agent answers with a message and no task, the guard binds the key to
 ///   that message as well, and the message is the outcome; with a task, the
@@ -102,17 +108,101 @@ type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
 ///   it. A key a restart left with no execution behind it is freed when the
 ///   node starts again ([`Store::dedup_clear_unbound`]).
 ///
+/// **Offers** ([`GuardedHandler::with_offers`]). A `SendMessage` or
+/// `SendStreamingMessage` that activates the inventory extension and names
+/// an offer in its message's metadata ([`OfferRef`]) runs only if the offer
+/// holds now, for the scope of the grant the request presents (see
+/// `OfferCheck::refusal`); else it fails with
+/// `InvalidParamsError`, [`OFFER_UNKNOWN`], [`OFFER_EXPIRED`] or
+/// [`OFFER_STALE`], before any task exists. The grant layer acted before:
+/// an offer never stands for a grant, and the capacity is still checked
+/// when the task runs. With idempotency, the check comes once the request
+/// is known to be new (`dedup_begin` created its key), and a refusal frees
+/// the key as any refusal before a run does; a repeated request takes the
+/// path above and never reaches it, so a retry of a request that ran
+/// attaches to its task even after its offer expired. A request that does
+/// not activate the extension runs as in milestone 1, whatever its
+/// metadata says.
+///
 /// **Subscription to a task with no execution.** `SubscribeToTask` on a task
 /// that is not terminal and has no live execution, such as one waiting for
 /// input, streams the task as it is now and then follows it until it ends
-/// ([`follow`]); the SDK would answer `TaskNotFoundError`.
+/// (`follow`); the SDK would answer `TaskNotFoundError`.
 ///
-/// Push notification configs and the extended card go to the inner handler
-/// unchecked, and it refuses them because the agent card declares neither.
-/// Serving push configs would need an ownership check here first.
+/// Push notification configs go to the inner handler unchecked, and it
+/// refuses them because the agent card declares none; serving them would
+/// need an ownership check here first. The extended card goes to it too,
+/// and it serves the card of the request's scope, which the grant layer set
+/// from the accepted grant ([`SCOPE_HEADER`](super::auth::SCOPE_HEADER)):
+/// a card shows services, and owns no task.
 pub struct GuardedHandler<H> {
     inner: Arc<H>,
     store: Arc<Store>,
+    /// What a task that names an offer is checked against; without it, an
+    /// offer named is only metadata.
+    offers: Option<OfferCheck>,
+}
+
+/// What a task that names an offer is checked against when it arrives: the
+/// agent's cards, its inventory now and its clock, with the offers it
+/// issued in the guard's store.
+#[derive(Clone)]
+pub struct OfferCheck {
+    pub cards: CardSet,
+    pub inventory: InventoryState,
+    pub clock: Arc<dyn Clock>,
+}
+
+impl OfferCheck {
+    /// Why `reference`, named by a task of `peer`'s that presents a grant
+    /// of the scope `scope`, does not hold now, if it does not:
+    /// [`OFFER_UNKNOWN`] when the agent did not issue it to `peer` as
+    /// referred to (its id, card and query) or does not keep it, as it never
+    /// keeps an offer made in another scope than a task's (the public one
+    /// among them), [`OFFER_EXPIRED`] when it
+    /// expired by the agent's own clock, [`OFFER_STALE`] when it was made
+    /// for another scope than the grant's, or its scope's card or the
+    /// revision of its scope's view, computed now as an answer computes it
+    /// ([`scope_revision`]), is another than the offer's. An error when the
+    /// store cannot be read.
+    fn refusal(
+        &self,
+        store: &Store,
+        peer: &AgentId,
+        reference: &OfferRef,
+        scope: Option<&str>,
+    ) -> anyhow::Result<Option<&'static str>> {
+        let Some(offer) = store.offer_issued(&reference.offer_id)? else {
+            return Ok(Some(OFFER_UNKNOWN));
+        };
+        let offer = offer.doc;
+        if offer.requester != *peer
+            || offer.query_id != reference.query_id
+            || offer.agent_card_hash != reference.agent_card_hash
+        {
+            return Ok(Some(OFFER_UNKNOWN));
+        }
+        let now = self.clock.now_unix();
+        if offer.expired(now) {
+            return Ok(Some(OFFER_EXPIRED));
+        }
+        // An offer is for what the scope it was made in shows: a task under
+        // a grant of another scope asks for a new one.
+        if scope != Some(offer.scope.as_str()) {
+            return Ok(Some(OFFER_STALE));
+        }
+        let Some(scope) = Scope::from_key(&offer.scope) else {
+            return Ok(Some(OFFER_UNKNOWN));
+        };
+        if self.cards.for_scope(&scope).hash != offer.agent_card_hash {
+            return Ok(Some(OFFER_STALE));
+        }
+        let revision = scope_revision(store, &self.inventory.snapshot(), &scope, now)?;
+        if revision != offer.inventory_revision {
+            return Ok(Some(OFFER_STALE));
+        }
+        Ok(None)
+    }
 }
 
 impl<H: RequestHandler> GuardedHandler<H> {
@@ -126,7 +216,32 @@ impl<H: RequestHandler> GuardedHandler<H> {
         Self {
             inner: Arc::new(inner),
             store,
+            offers: None,
         }
+    }
+
+    /// This guard, checking again with `offers` the offer a task names
+    /// before it runs (see **Offers** above).
+    pub fn with_offers(mut self, offers: OfferCheck) -> Self {
+        self.offers = Some(offers);
+        self
+    }
+
+    /// The offer `req` names, when it activates the inventory extension
+    /// and the guard checks offers, with the scope of the grant the request
+    /// was accepted with ([`SCOPE_HEADER`]); its `reference` is `None` for
+    /// an entry that is no reference.
+    fn offer_named(&self, params: &ServiceParams, req: &SendMessageRequest) -> Option<Named> {
+        self.offers.as_ref()?;
+        if !inventory_requested(params) {
+            return None;
+        }
+        let reference = OfferRef::in_metadata(req.message.metadata.as_ref())?;
+        let scope = match params.get(SCOPE_HEADER).map(Vec::as_slice) {
+            Some([scope]) => Some(scope.clone()),
+            _ => None,
+        };
+        Some(Named { reference, scope })
     }
 
     /// Fails with `TaskNotFoundError` unless `peer` owns `task_id`.
@@ -151,13 +266,20 @@ impl<H: RequestHandler> GuardedHandler<H> {
         params: &ServiceParams,
         req: SendMessageRequest,
         key: Key,
+        named: Option<Named>,
     ) -> Result<Start<SendMessageResponse>, A2AError> {
         let inner = Arc::clone(&self.inner);
         let store = Arc::clone(&self.store);
+        let offers = self.offers.clone();
         let params = params.clone();
         let unit = tokio::spawn(async move {
             if let Attempt::Repeat(outcome) = attempt(&store, &key).await? {
                 return Ok(Start::Repeat(outcome));
+            }
+            // A new request: its offer, if it names one, must hold now.
+            if let Err(refused) = check_offer(offers.as_ref(), &store, key.peer, named).await {
+                release(&store, &key).await;
+                return Err(refused);
             }
             let response = first_call(&store, &key, inner.send_message(&params, req)).await?;
             let outcome = match &response {
@@ -187,15 +309,26 @@ impl<H: RequestHandler> GuardedHandler<H> {
         params: &ServiceParams,
         req: SendMessageRequest,
         key: Key,
+        named: Option<Named>,
     ) -> Result<Start<Events>, A2AError> {
         let inner = Arc::clone(&self.inner);
         let store = Arc::clone(&self.store);
+        let offers = self.offers.clone();
         let params = params.clone();
         let (started_tx, started_rx) = oneshot::channel();
         tokio::spawn(async move {
             let started = match attempt(&store, &key).await {
                 Ok(Attempt::First) => {
-                    first_call(&store, &key, inner.send_streaming_message(&params, req)).await
+                    match check_offer(offers.as_ref(), &store, key.peer, named).await {
+                        Ok(()) => {
+                            first_call(&store, &key, inner.send_streaming_message(&params, req))
+                                .await
+                        }
+                        Err(refused) => {
+                            release(&store, &key).await;
+                            Err(refused)
+                        }
+                    }
                 }
                 Ok(Attempt::Repeat(outcome)) => {
                     let _ = started_tx.send(Ok(Start::Repeat(outcome)));
@@ -393,22 +526,70 @@ fn single(event: StreamResponse) -> Events {
 /// `A2A-Extensions` service parameter, a comma-separated list of extension
 /// URIs (A2A §3.2.6), names it, in any of its values.
 pub(crate) fn idempotency_requested(params: &ServiceParams) -> bool {
-    names_idempotency(
-        params
-            .get(EXTENSIONS_PARAM)
-            .into_iter()
-            .flatten()
-            .map(String::as_str),
-    )
+    names_idempotency(extensions_param(params))
+}
+
+/// Whether a request activates the [`INVENTORY_EXTENSION`], as
+/// [`idempotency_requested`] reads it.
+fn inventory_requested(params: &ServiceParams) -> bool {
+    names_extension(extensions_param(params), INVENTORY_EXTENSION)
+}
+
+/// The values of the `A2A-Extensions` service parameter of a request.
+fn extensions_param(params: &ServiceParams) -> impl Iterator<Item = &str> {
+    params
+        .get(EXTENSIONS_PARAM)
+        .into_iter()
+        .flatten()
+        .map(String::as_str)
 }
 
 /// Whether one of `values`, each a comma-separated list of extension URIs
 /// as `A2A-Extensions` carries them, names the [`IDEMPOTENCY_EXTENSION`].
 pub(crate) fn names_idempotency<'a>(values: impl IntoIterator<Item = &'a str>) -> bool {
+    names_extension(values, IDEMPOTENCY_EXTENSION)
+}
+
+/// Whether one of `values`, as [`names_idempotency`] reads them, names
+/// `uri`.
+pub(crate) fn names_extension<'a>(values: impl IntoIterator<Item = &'a str>, uri: &str) -> bool {
     values
         .into_iter()
         .flat_map(|value| value.split(','))
-        .any(|uri| uri.trim() == IDEMPOTENCY_EXTENSION)
+        .any(|named| named.trim() == uri)
+}
+
+/// An offer a request names, and the scope of the grant it presents.
+struct Named {
+    /// `None` for a metadata entry that is no reference.
+    reference: Option<OfferRef>,
+    scope: Option<String>,
+}
+
+/// Refuses, with `InvalidParamsError`, a new request of `peer`'s whose
+/// offer `named` does not hold now (`OfferCheck::refusal`); an entry that
+/// is no reference is [`OFFER_UNKNOWN`]. Nothing to check, `Ok`.
+async fn check_offer(
+    offers: Option<&OfferCheck>,
+    store: &Arc<Store>,
+    peer: AgentId,
+    named: Option<Named>,
+) -> Result<(), A2AError> {
+    let (Some(offers), Some(Named { reference, scope })) = (offers, named) else {
+        return Ok(());
+    };
+    let Some(reference) = reference else {
+        return Err(A2AError::invalid_params(OFFER_UNKNOWN));
+    };
+    let offers = offers.clone();
+    let refusal = blocking(store, move |store| {
+        offers.refusal(store, &peer, &reference, scope.as_deref())
+    })
+    .await?;
+    match refusal {
+        Some(why) => Err(A2AError::invalid_params(why)),
+        None => Ok(()),
+    }
 }
 
 /// Fails with `InvalidParamsError` unless `message` has the fields A2A makes
@@ -782,7 +963,9 @@ impl<H: RequestHandler> RequestHandler for GuardedHandler<H> {
         if let Some(task_id) = &req.message.task_id {
             self.ensure_owner(peer, task_id).await?;
         }
+        let named = self.offer_named(params, &req);
         if !idempotency_requested(params) {
+            check_offer(self.offers.as_ref(), &self.store, peer, named).await?;
             let response = self.inner.send_message(params, req).await?;
             let task_id = match &response {
                 SendMessageResponse::Task(task) => Some(&task.id),
@@ -794,7 +977,7 @@ impl<H: RequestHandler> RequestHandler for GuardedHandler<H> {
             return Ok(response);
         }
         let key = Key::of(peer, &req)?;
-        match self.start_send(params, req.clone(), key).await? {
+        match self.start_send(params, req.clone(), key, named).await? {
             Start::Ran(response) => Ok(response),
             Start::Repeat(outcome) => self.repeat_send(params, &req, peer, outcome).await,
         }
@@ -810,12 +993,14 @@ impl<H: RequestHandler> RequestHandler for GuardedHandler<H> {
         if let Some(task_id) = &req.message.task_id {
             self.ensure_owner(peer, task_id).await?;
         }
+        let named = self.offer_named(params, &req);
         if !idempotency_requested(params) {
+            check_offer(self.offers.as_ref(), &self.store, peer, named).await?;
             let events = self.inner.send_streaming_message(params, req).await?;
             return Ok(owning(events, Arc::clone(&self.store), peer));
         }
         let key = Key::of(peer, &req)?;
-        match self.start_stream(params, req.clone(), key).await? {
+        match self.start_stream(params, req.clone(), key, named).await? {
             Start::Ran(events) => Ok(events),
             Start::Repeat(outcome) => self.repeat_stream(params, &req, peer, outcome).await,
         }

@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Registro de anuncio firmado, agentnet.announce/1",
+  "description": "Qué ofrece un agente y qué versión firmada de su Agent Card pública lo describe, firmado por el propio agente. Viaja como el JCS (RFC 8785) de este objeto. La firma es Ed25519 de la clave de record.agent_id sobre \"agentnet.announce/1\\n\" seguido del JCS de record, en base64url sin relleno, y se comprueba sobre el record recibido antes de leerlo. El documento firmado ocupa como mucho 4096 bytes. Caduca como mucho a las 24 h de emitirse; quien lo recibe admite 60 s de desfase de reloj, solo para rechazarlo, y rechaza un registro con seq menor que el último vigente que conoce de ese agente, o con el mismo seq y otros bytes.",
+  "type": "object",
+  "properties": {
+    "record": { "$ref": "#/$defs/record" },
+    "signature": { "$ref": "#/$defs/signature" }
+  },
+  "required": ["record", "signature"],
+  "additionalProperties": false,
+  "$defs": {
+    "record": {
+      "type": "object",
+      "properties": {
+        "schema": { "const": "agentnet.announce/1" },
+        "agent_id": {
+          "$ref": "#/$defs/agentId",
+          "description": "El agente del registro, que es también quien lo firma."
+        },
+        "seq": { "$ref": "#/$defs/seq" },
+        "agent_card_hash": {
+          "type": "string",
+          "pattern": "^blake3:[0-9a-f]{64}$",
+          "description": "BLAKE3 del JCS de la Agent Card pública del agente tal como la sirve, firmas incluidas."
+        },
+        "capabilities": {
+          "type": "array",
+          "maxItems": 32,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Capacidades públicas: del vocabulario común (vision.ocr) o del espacio de nombres de su proveedor (ex:foo)."
+        },
+        "discovery_alpn": {
+          "type": "string",
+          "minLength": 1,
+          "description": "El ALPN del protocolo de descubrimiento del agente: agentnet-discovery/0."
+        },
+        "issued_at": { "$ref": "#/$defs/timestamp" },
+        "expires_at": {
+          "$ref": "#/$defs/timestamp",
+          "description": "Posterior a issued_at, y como mucho 86400 s (24 h) después. Este esquema no puede expresarlo; PALS rechaza el registro que lo incumple."
+        }
+      },
+      "required": [
+        "schema",
+        "agent_id",
+        "seq",
+        "agent_card_hash",
+        "capabilities",
+        "discovery_alpn",
+        "issued_at",
+        "expires_at"
+      ],
+      "additionalProperties": false
+    },
+    "agentId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Clave pública Ed25519 del agente en hexadecimal en minúsculas."
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991,
+      "description": "Empieza en 1 y el agente nunca lo repite para este tipo de registro."
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$",
+      "description": "RFC 3339 en UTC con segundos enteros: 2026-11-14T00:00:00Z."
+    },
+    "signature": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{85}[AQgw]$",
+      "description": "Firma Ed25519 de 64 bytes en base64url sin relleno."
+    }
+  }
+}

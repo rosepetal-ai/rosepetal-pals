@@ -16,22 +16,44 @@
 //! the JSON-RPC binding, the `method` of a request object,
 //! `SendStreamingMessage` or `SubscribeToTask` (the pinned SDK's
 //! `methods::is_streaming`), and a batch or a body that is not JSON is
-//! unary; on the HTTP+JSON binding, the routes the pinned SDK's
-//! `rest_router` answers with a stream: `POST /message:stream` and
-//! `/message/stream`, and `GET` or `POST` on `/tasks/{id}` whose decoded
-//! `{id}` ends with `:subscribe` or on `/tasks/{id}/subscribe` (that router
-//! serves no tenant-prefixed paths). Only a streaming call whose `2xx`
+//! unary (a batch that asks for the extended card is refused before it is
+//! sent, below); on the HTTP+JSON
+//! binding, the routes the pinned SDK's `rest_router` answers with a
+//! stream: `POST /message:stream` and `/message/stream`, and `GET` or
+//! `POST` on `/tasks/{id}` whose decoded `{id}` ends with `:subscribe` or
+//! on `/tasks/{id}/subscribe` (that router serves no tenant-prefixed
+//! paths). Only a streaming call whose `2xx`
 //! answer is `text/event-stream` is read as events; anything else is read
 //! whole, so a unary call answered with an event stream is refused as a
 //! body that is not JSON.
 //!
+//! **The extended card** ([`Call::ExtendedCard`]): `GetExtendedAgentCard`
+//! on JSON-RPC, `GET /extendedAgentCard` or `GET /agent-card/extended` on
+//! HTTP+JSON. A JSON-RPC batch with an item that asks for it is refused,
+//! never sent: `200` with a JSON-RPC `InvalidRequest` (`-32600`) error,
+//! [`EXTENDED_CARD_BATCH`], `id` null. Its answer is read up to [`MAX_CARD_ANSWER_BYTES`]; a `2xx`
+//! one must hold a card the peer signed, verified with `kid` equal to the
+//! peer's agent id, the one Iroh's handshake proved (the card itself on
+//! HTTP+JSON, the `result` of a JSON-RPC response), which is replaced by its
+//! [`gateway_view`], built from what the signature covers
+//! ([`extended_card_view`]). A JSON-RPC error goes on as any other. A card
+//! that does not verify is refused, as a body that is not JSON is. A plain
+//! A2A contact's extended card ([`CardOwner::Plain`]) needs no signature: it
+//! must be a valid card ([`validate_card`]), and goes on as its view, which
+//! declares only the bindings its public card has.
+//!
 //! **A whole body** is read up to the gateway's bound; a `2xx` one must be
 //! empty or JSON (RFC 8259, UTF-8). JSON, of any status, is checked
-//! ([`unsafe_id`]), its blob URLs become the gateway's, and it goes on
+//! ([`unsafe_id`]), a PALS peer's blob URLs become the gateway's (a plain
+//! contact's stay as sent), and it goes on
 //! re-encoded ([`ascii_json`]), typed `application/json` (or
 //! `application/a2a+json` when the peer said so). A non-`2xx` body that is
-//! not JSON goes on as it came, bounded: a client takes no task id from an
-//! error page.
+//! not JSON goes on as it came, bounded, but typed by the gateway
+//! (`text/plain; charset=utf-8`, or `application/octet-stream` when it is
+//! no UTF-8), never as the peer said: so no client, not even the pinned
+//! JSON-RPC one, which reads events from any `text/event-stream` whatever
+//! the status, takes a task id from an error page. A plain contact's such
+//! body is replaced by the gateway's own (`plain::replaced_body`).
 //!
 //! **An event stream** is split into events by [`EventFramer`], in time
 //! linear in its bytes: an event ends at an empty line, lines end with
@@ -60,8 +82,9 @@
 //! that wears a `jsonrpc` member is taken for what a client would take it:
 //! a task, whose `id` it checks. The objects of A2A v1.0 with an `id` are the
 //! task, the push notification configuration (not served: the card
-//! declares no push notifications) and the agent skill (only in an extended
-//! card, not served either); their ids are checked like a task's. Skipped,
+//! declares no push notifications) and the agent skill (in an extended
+//! card, whose skill ids PALS keeps safe); their ids are checked like a
+//! task's. Skipped,
 //! because no client takes an id from them: `metadata` (a free-form
 //! object), `data` (a data part's free-form value, and a JSON-RPC error's)
 //! and `details` (an HTTP+JSON error's `google.rpc.Status` details).
@@ -75,11 +98,15 @@ use std::io;
 
 use bytes::{Bytes, BytesMut};
 use http::Method;
+use pals_core::card_jws::{CardHash, MAX_CARD_BYTES, card_hash, validate_card, verify_card};
+use pals_core::identity::AgentId;
 use serde::Serialize;
 use serde_json::Value;
 
+use super::plain::{PlainCard, served_view};
 use super::rewrite;
-use crate::a2a::is_safe_task_id;
+use crate::a2a::{gateway_view, is_safe_task_id};
+use crate::discovery::signed_card_json;
 
 /// The A2A binding a call speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,27 +115,70 @@ pub(crate) enum Binding {
     Rest,
 }
 
-/// What a client expects of a call: one JSON document, or an event stream.
+/// What a client expects of a call: one JSON document, an event stream,
+/// or the peer's extended card, one JSON document checked as a card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Call {
     Unary,
     Streaming,
+    ExtendedCard,
+}
+
+/// Whose answer the gateway checks: whose extended card it must be.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum CardOwner<'a> {
+    /// A PALS peer: its card must be signed with its agent id as `kid`.
+    Peer(&'a AgentId),
+    /// A plain A2A contact, by name, with its public card as read for the
+    /// call: its extended card need not be signed, and its view declares
+    /// only the bindings that public card has, which the gateway serves.
+    Plain(&'a str, &'a PlainCard),
 }
 
 /// The JSON-RPC methods the pinned SDK answers with an event stream.
 const STREAMING_METHODS: [&str; 2] = ["SendStreamingMessage", "SubscribeToTask"];
+/// The JSON-RPC method of the extended card.
+const EXTENDED_CARD_METHOD: &str = "GetExtendedAgentCard";
+/// The most bytes of a peer's answer to an extended card call: the card, at
+/// most [`MAX_CARD_BYTES`], and its JSON-RPC envelope, whose `id` is the
+/// client's.
+pub(crate) const MAX_CARD_ANSWER_BYTES: usize = 2 * MAX_CARD_BYTES;
+
+/// The method of `request`, a JSON-RPC request object.
+fn method_of(request: &Value) -> Option<&str> {
+    request
+        .as_object()
+        .and_then(|request| request.get("method"))
+        .and_then(Value::as_str)
+}
+
+/// Whether `request`, a JSON-RPC body, is a batch with an item that asks
+/// for the extended card: the gateway refuses it, before anything is sent
+/// ([`EXTENDED_CARD_BATCH`]), since it checks a card as one response's
+/// `result`.
+pub(crate) fn is_extended_card_batch(request: &Value) -> bool {
+    matches!(request, Value::Array(batch)
+        if batch.iter().any(|item| method_of(item) == Some(EXTENDED_CARD_METHOD)))
+}
+
+/// The message of the gateway's JSON-RPC `InvalidRequest` for a batch that
+/// asks for the extended card.
+pub(crate) const EXTENDED_CARD_BATCH: &str =
+    "a JSON-RPC batch cannot ask for the extended card: ask for it alone";
 
 impl Call {
     /// A call to the JSON-RPC binding whose body, when it is JSON, is
-    /// `request`.
+    /// `request`. A batch is unary: one that asks for the extended card is
+    /// refused first ([`is_extended_card_batch`]).
     pub(crate) fn jsonrpc(request: Option<&Value>) -> Self {
-        let method = request
-            .and_then(Value::as_object)
-            .and_then(|request| request.get("method"))
-            .and_then(Value::as_str);
-        match method {
-            Some(method) if STREAMING_METHODS.contains(&method) => Self::Streaming,
-            _ => Self::Unary,
+        match request {
+            Some(Value::Array(_)) => Self::Unary,
+            Some(request) => match method_of(request) {
+                Some(method) if STREAMING_METHODS.contains(&method) => Self::Streaming,
+                Some(EXTENDED_CARD_METHOD) => Self::ExtendedCard,
+                _ => Self::Unary,
+            },
+            None => Self::Unary,
         }
     }
 
@@ -117,6 +187,13 @@ impl Call {
     pub(crate) fn rest(method: &Method, path: &str) -> Self {
         let get_or_post = method == Method::GET || method == Method::POST;
         let segments: Vec<&str> = path.split('/').collect();
+        if matches!(
+            segments.as_slice(),
+            ["", "extendedAgentCard"] | ["", "agent-card", "extended"]
+        ) && method == Method::GET
+        {
+            return Self::ExtendedCard;
+        }
         let streaming = match segments.as_slice() {
             ["", "message:stream"] | ["", "message", "stream"] => method == Method::POST,
             ["", "tasks", id] => {
@@ -135,6 +212,54 @@ impl Call {
             Self::Unary
         }
     }
+}
+
+/// `answer`, a peer's successful answer to an extended card call on
+/// `binding`, with its card verified as `owner`'s and replaced by its
+/// [`gateway_view`] at `base_url`; the [hash](card_hash) of the card as
+/// the peer signed it ([`signed_card_json`]). A plain contact's card is
+/// validated instead, and replaced by its view with no hash.
+///
+/// On HTTP+JSON the answer is the card. On JSON-RPC it is a response
+/// envelope, with the card as its `result`, or with an `error`, which is
+/// left as it is (`None`). Refused, saying why, when the card does not
+/// verify as the peer's (is not a valid card, for a plain contact), or when
+/// the answer is not one of those.
+pub(crate) fn extended_card_view(
+    answer: &mut Value,
+    binding: Binding,
+    owner: CardOwner<'_>,
+    base_url: &str,
+) -> Result<Option<CardHash>, String> {
+    let card = match binding {
+        Binding::Rest => answer,
+        Binding::JsonRpc => {
+            let envelope = answer
+                .as_object_mut()
+                .filter(|envelope| is_response_envelope(envelope))
+                .ok_or("an extended card answer that is not a JSON-RPC response")?;
+            match envelope.get_mut("result") {
+                Some(result) => result,
+                None => return Ok(None),
+            }
+        }
+    };
+    let peer = match owner {
+        CardOwner::Peer(peer) => peer,
+        CardOwner::Plain(name, plain) => {
+            let valid = validate_card(card)
+                .map_err(|err| format!("an extended card that is not valid: {err}"))?;
+            let view = served_view(&valid, plain, base_url, name);
+            *card = serde_json::to_value(view).expect("an AgentCard always serializes");
+            return Ok(None);
+        }
+    };
+    let verified = verify_card(card, peer)
+        .map_err(|err| format!("an extended card that is not the peer's: {err}"))?;
+    let hash = card_hash(&signed_card_json(&verified));
+    let view = gateway_view(&verified.card, base_url, peer);
+    *card = serde_json::to_value(view).expect("an AgentCard always serializes");
+    Ok(Some(hash))
 }
 
 /// The members whose values are free-form, and hold no id a client uses.
@@ -350,10 +475,18 @@ impl EventFramer {
 
 /// `event`, one event of a peer's stream on `binding`, as it goes to the
 /// client: `data: <JSON>\n\n` with its data checked ([`unsafe_id`]), its
-/// blob URLs the gateway's and re-encoded ([`ascii_json`]), or
+/// blob URLs those of the gateway at `blobs_at` when given (a PALS peer's
+/// answer, never a plain contact's) and re-encoded ([`ascii_json`]), or
 /// [`KEEPALIVE`] when it has no data. Refused when it is not UTF-8, its
-/// data is not JSON, or the data names an unsafe id.
-pub(crate) fn check_event(event: &[u8], base_url: &str, binding: Binding) -> Result<Bytes, String> {
+/// data is not JSON, or the data names an unsafe id; a plain agent's
+/// (`plain`), also when it says what only the gateway says
+/// (`plain::forges_not_sent`).
+pub(crate) fn check_event(
+    event: &[u8],
+    blobs_at: Option<&str>,
+    binding: Binding,
+    plain: bool,
+) -> Result<Bytes, String> {
     let text = std::str::from_utf8(event).map_err(|_| "an event that is not UTF-8".to_owned())?;
     let data: Vec<&str> = sse_lines(text).into_iter().filter_map(sse_data).collect();
     if data.is_empty() {
@@ -364,7 +497,12 @@ pub(crate) fn check_event(event: &[u8], base_url: &str, binding: Binding) -> Res
     if let Some(id) = unsafe_id(&value, binding) {
         return Err(format!("an event with an unsafe id {id}"));
     }
-    rewrite::rewrite_to_gateway(&mut value, base_url);
+    if plain && super::plain::forges_not_sent(&value) {
+        return Err("an event that says what only the gateway says".to_owned());
+    }
+    if let Some(base_url) = blobs_at {
+        rewrite::rewrite_to_gateway(&mut value, base_url);
+    }
     let mut out = b"data: ".to_vec();
     out.extend_from_slice(&ascii_json(&value));
     out.extend_from_slice(b"\n\n");
@@ -451,6 +589,158 @@ mod tests {
             assert_eq!(Call::jsonrpc(Some(&request)), Call::Unary, "{request}");
         }
         assert_eq!(Call::jsonrpc(None), Call::Unary);
+    }
+
+    #[test]
+    fn extended_card_calls_are_recognized_on_both_bindings() {
+        for path in ["/extendedAgentCard", "/agent-card/extended"] {
+            assert_eq!(Call::rest(&Method::GET, path), Call::ExtendedCard, "{path}");
+            for method in [Method::HEAD, Method::POST] {
+                assert_eq!(Call::rest(&method, path), Call::Unary, "{method} {path}");
+            }
+        }
+        for path in [
+            "/extendedAgentCard/",
+            "/tasks/extendedAgentCard",
+            "/agent-card",
+        ] {
+            assert_eq!(Call::rest(&Method::GET, path), Call::Unary, "{path}");
+        }
+        let call = json!({"jsonrpc": "2.0", "id": 1, "method": "GetExtendedAgentCard"});
+        assert_eq!(Call::jsonrpc(Some(&call)), Call::ExtendedCard);
+        // A batch that asks for it is refused, never read as a card.
+        let batch = json!([{"method": "GetTask"}, call]);
+        assert_eq!(Call::jsonrpc(Some(&batch)), Call::Unary);
+        assert!(is_extended_card_batch(&batch));
+        assert!(!is_extended_card_batch(&call));
+        assert!(!is_extended_card_batch(&json!([{"method": "GetTask"}])));
+        let other = json!({"jsonrpc": "2.0", "id": 1, "method": "getExtendedAgentCard"});
+        assert_eq!(Call::jsonrpc(Some(&other)), Call::Unary);
+    }
+
+    #[test]
+    fn only_a_card_the_peer_signed_goes_on_as_its_view() {
+        use std::sync::Arc;
+
+        use pals_core::card_jws::CardSigner;
+        use pals_core::identity::AgentKey;
+        use pals_core::inventory::Inventory;
+
+        let key = AgentKey::generate();
+        let peer = key.id();
+        let cfg: crate::config::Config = toml::from_str("[agent]\nname = \"bob\"\n").unwrap();
+        let signer = CardSigner::new(Arc::new(AgentKey::from_bytes(&key.to_bytes())));
+        let cards = crate::a2a::CardSet::build(&cfg, &signer, &Inventory::default()).unwrap();
+        let signed = cards.public();
+        let base = "http://127.0.0.1:7420";
+        let view = serde_json::to_value(gateway_view(&signed.card, base, &peer)).unwrap();
+
+        let mut rest = signed.json.clone();
+        let hash =
+            extended_card_view(&mut rest, Binding::Rest, CardOwner::Peer(&peer), base).unwrap();
+        assert_eq!(hash, Some(signed.hash.clone()));
+        assert_eq!(rest, view);
+        let mut rpc = json!({"jsonrpc": "2.0", "id": "x", "result": signed.json});
+        let hash =
+            extended_card_view(&mut rpc, Binding::JsonRpc, CardOwner::Peer(&peer), base).unwrap();
+        assert_eq!(hash, Some(signed.hash.clone()));
+        assert_eq!(rpc, json!({"jsonrpc": "2.0", "id": "x", "result": view}));
+
+        // A JSON-RPC error goes on as it is.
+        let error = json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32004}});
+        let mut answer = error.clone();
+        assert_eq!(
+            extended_card_view(&mut answer, Binding::JsonRpc, CardOwner::Peer(&peer), base),
+            Ok(None)
+        );
+        assert_eq!(answer, error);
+
+        // Refused: another agent's card, a tampered one, no card at all.
+        let mut tampered = signed.json.clone();
+        tampered["name"] = json!("mallory");
+        for (mut answer, binding, signer) in [
+            (
+                signed.json.clone(),
+                Binding::Rest,
+                AgentKey::generate().id(),
+            ),
+            (tampered.clone(), Binding::Rest, peer),
+            (
+                json!({"jsonrpc": "2.0", "id": 1, "result": tampered}),
+                Binding::JsonRpc,
+                peer,
+            ),
+            (json!({"result": signed.json}), Binding::JsonRpc, peer),
+            (
+                json!([{"jsonrpc": "2.0", "id": 1, "result": signed.json}]),
+                Binding::JsonRpc,
+                peer,
+            ),
+            (json!({}), Binding::Rest, peer),
+        ] {
+            assert!(
+                extended_card_view(&mut answer, binding, CardOwner::Peer(&signer), base).is_err(),
+                "{answer}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_contact_s_extended_card_needs_no_signature_but_must_be_valid() {
+        let base = "http://127.0.0.1:7420";
+        let card = json!({
+            "name": "plain", "description": "d", "version": "1",
+            "supportedInterfaces": [{"url": "https://agent.example/rpc",
+                "protocolBinding": "JSONRPC", "protocolVersion": "1.0"}],
+            "capabilities": {}, "defaultInputModes": ["text/plain"],
+            "defaultOutputModes": ["text/plain"], "skills": [],
+            "securitySchemes": {"bearer": {"httpAuthSecurityScheme": {"scheme": "Bearer"}}}
+        });
+        let valid = validate_card(&card).unwrap();
+        // Its public card, as read for the call, has a JSON-RPC interface
+        // only: the view of its extended card declares no other.
+        let public = PlainCard {
+            card: valid.clone(),
+            json: card.clone(),
+            hash: card_hash(&card),
+            signature: pals_core::card_jws::SignatureStatus::Unsigned,
+            jsonrpc_url: Some("https://agent.example/rpc".to_owned()),
+            rest_url: None,
+        };
+        let view =
+            serde_json::to_value(crate::a2a::gateway_view_for(&valid, base, "echo")).unwrap();
+        assert!(view.get("securitySchemes").is_none(), "{view}");
+        let mut extended = card.clone();
+        extended["supportedInterfaces"] = json!([
+            {"url": "https://agent.example/rpc", "protocolBinding": "JSONRPC",
+             "protocolVersion": "1.0"},
+            {"url": "https://agent.example/rest", "protocolBinding": "HTTP+JSON",
+             "protocolVersion": "1.0"}
+        ]);
+        let mut view = view;
+        view["supportedInterfaces"] = json!([view["supportedInterfaces"][0].clone()]);
+        assert_eq!(view["supportedInterfaces"][0]["protocolBinding"], "JSONRPC");
+        let card = extended;
+
+        let mut rest = card.clone();
+        let owner = CardOwner::Plain("echo", &public);
+        assert_eq!(
+            extended_card_view(&mut rest, Binding::Rest, owner, base),
+            Ok(None)
+        );
+        assert_eq!(rest, view);
+        let mut rpc = json!({"jsonrpc": "2.0", "id": 1, "result": card});
+        assert_eq!(
+            extended_card_view(&mut rpc, Binding::JsonRpc, owner, base),
+            Ok(None)
+        );
+        assert_eq!(rpc["result"], view);
+        for mut answer in [json!({"name": "no card"}), json!("text")] {
+            assert!(
+                extended_card_view(&mut answer, Binding::Rest, owner, base).is_err(),
+                "{answer}"
+            );
+        }
     }
 
     #[test]
@@ -590,7 +880,7 @@ mod tests {
     #[test]
     fn events_go_on_rebuilt_from_their_checked_data() {
         let base = "http://127.0.0.1:7420";
-        let check = |event: &str| check_event(event.as_bytes(), base, Binding::Rest);
+        let check = |event: &str| check_event(event.as_bytes(), Some(base), Binding::Rest, false);
         // Fields, comments and ids go; data, joined, stays.
         let rebuilt =
             check("event: x\r\nid: 7\r\n: c\r\ndata: {\"a\":\r\ndata: 1}\r\n\r\n").unwrap();
@@ -615,6 +905,6 @@ mod tests {
         ] {
             assert!(check(refused).is_err(), "{refused:?}");
         }
-        assert!(check_event(b"data: \xff\n\n", base, Binding::Rest).is_err());
+        assert!(check_event(b"data: \xff\n\n", Some(base), Binding::Rest, false).is_err());
     }
 }

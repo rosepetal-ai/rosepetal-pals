@@ -11,10 +11,12 @@ use common::{
     TestNode, grant, issue_grant, key_in, message_params, now_unix, spawn_node, spawn_node_in,
     spawn_node_with, test_config,
 };
-use pals::a2a::{SECURITY_SCHEME, canonical_card};
+use pals::a2a::{CardSet, IDEMPOTENCY_EXTENSION, SECURITY_SCHEME};
 use pals::config::{AlreadyRunning, WorkerCfg};
 use pals::node::Node;
+use pals_core::card_jws::CardSigner;
 use pals_core::grant::Operation::{self, TaskCancel, TaskRead, TaskSend};
+use pals_core::inventory::{INVENTORY_EXTENSION, Inventory};
 use pals_core::store::{INTERRUPTED_MESSAGE, Store};
 use serde_json::{Value, json};
 
@@ -72,7 +74,16 @@ async fn card_is_public_and_declares_only_what_is_served() {
     );
     assert_eq!(card["capabilities"]["streaming"], true);
     assert_eq!(card["capabilities"]["pushNotifications"], false);
-    assert_eq!(card["capabilities"]["extendedAgentCard"], false);
+    assert_eq!(card["capabilities"]["extendedAgentCard"], true);
+    // The optional idempotency and inventory extensions, and no other.
+    let extensions = card["capabilities"]["extensions"].as_array().unwrap();
+    assert_eq!(extensions.len(), 2, "{card}");
+    assert_eq!(extensions[0]["uri"], IDEMPOTENCY_EXTENSION);
+    assert_eq!(extensions[1]["uri"], INVENTORY_EXTENSION);
+    assert!(
+        extensions.iter().all(|e| e.get("required").is_none()),
+        "{card}"
+    );
     // Text, and files of any media type.
     assert_eq!(card["defaultInputModes"], json!(["text/plain", "*/*"]));
     assert_eq!(
@@ -96,18 +107,19 @@ async fn card_is_public_and_declares_only_what_is_served() {
     );
     let requirements = card["securityRequirements"].as_array().unwrap();
     assert_eq!(requirements.len(), 1, "{card}");
-    assert!(
-        requirements[0]["schemes"][SECURITY_SCHEME].is_object(),
+    assert_eq!(
+        requirements[0]["schemes"][SECURITY_SCHEME],
+        json!({"list": ["skill:ask"]}),
         "{card}"
     );
-    assert!(card.get("signatures").is_none());
+    // Signed by the agent, once.
+    assert_eq!(card["signatures"].as_array().unwrap().len(), 1, "{card}");
 
-    // The served card is the canonical one.
+    // The served card is the one the agent signs.
     let cfg = test_config(b.dir.path(), WorkerCfg::Echo);
-    assert_eq!(
-        &serde_json::to_value(canonical_card(&cfg, &b.id())).unwrap(),
-        card
-    );
+    let signer = CardSigner::new(Arc::new(key_in(b.dir.path())));
+    let cards = CardSet::build(&cfg, &signer, &Inventory::default()).unwrap();
+    assert_eq!(&cards.public().json, card);
 }
 
 #[tokio::test]
@@ -570,9 +582,11 @@ async fn push_config_call_reports_not_supported() {
     let err = rpc_error(&res);
     assert_eq!(err["code"], -32003, "{err}");
 
-    // The extended card is not offered either.
+    // The extended card is offered: with an empty inventory, the public
+    // card.
     let res = a.rpc(&b, Some(&g), "GetExtendedAgentCard", json!({})).await;
-    assert_eq!(rpc_error(&res)["code"], -32004);
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["result"], b.node.cards().public().json);
 }
 
 #[tokio::test]

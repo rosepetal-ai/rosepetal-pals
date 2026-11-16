@@ -4,15 +4,35 @@
 //!
 //! An ask gets a new `messageId`, a UUID v4, and its whole
 //! `SendMessageRequest` is written to the outbox before the first attempt
-//! to send it. Every attempt goes through the gateway
-//! (`<gateway>/peers/<agent id>/rest`) with the stock A2A client, on the
-//! HTTP+JSON binding, whose errors keep the gateway's HTTP status, and with
-//! `A2A-Version: 1.0`:
+//! to send it, with the peer it goes to as its [`PeerRef::key`]: an agent id,
+//! or `a2a:<name>` for a plain A2A contact (`crate::gateway::plain`), which
+//! is asked, kept and taken up again just the same. Every attempt goes
+//! through the gateway with the stock A2A client and `A2A-Version: 1.0`: to
+//! a PALS peer at `<gateway>/peers/<agent id>/rest`, on the HTTP+JSON
+//! binding, whose errors keep the gateway's HTTP status; to a plain contact
+//! at `<gateway>/peers/<name>/rest`, or, when its card has no HTTP+JSON
+//! interface and has a JSON-RPC one, at `<gateway>/peers/<name>/jsonrpc`
+//! with the client's JSON-RPC transport. A plain contact's card is read
+//! through the gateway, which checks it (`Outbox::plain_speaks`), before
+//! anything is kept: when it cannot be had, or does not declare
+//! `capabilities.streaming`, which the outbox needs
+//! ([`PLAIN_NEEDS_STREAMING`]), the ask fails with [`AskError::Local`] and
+//! nothing is asked. Then:
 //!
 //! - while the peer's task is not known, the same request, byte for byte,
-//!   with `SendStreamingMessage`: the peer runs the first copy that reaches
-//!   it, and attaches every other one to that run;
+//!   with `SendStreamingMessage`: a PALS peer runs the first copy that
+//!   reaches it, and attaches every other one to that run, as does a plain
+//!   agent whose card declares the idempotency extension;
 //! - once it is known, `GetTask`, and `SubscribeToTask` while it runs.
+//!
+//! A question asked with the offer its peer was chosen by
+//! ([`AskRequest::offer`]) names it in its message, under the inventory
+//! extension's URI in `metadata` ([`OfferRef`]), and every attempt
+//! activates that extension too, and presents the grant this agent holds
+//! for the scope the offer was made in: being in the request kept, the
+//! reference goes again with every retry. The provider checks the offer again, and
+//! refuses a message whose offer is unknown, expired or stale before it
+//! runs anything; the grant is checked first all the same.
 //!
 //! An attempt fails on the way when the gateway cannot be reached or answers
 //! a server error (`502` when it cannot reach the peer), when a stream
@@ -23,6 +43,42 @@
 //! [`Outbox::resume`] takes it up again, and nothing else does, the daemon
 //! that starts included. Any other refusal, of the gateway (`4xx`) or of the
 //! peer (an A2A error), is [`AskError::Rejected`], at once.
+//!
+//! A plain agent whose card does not declare the idempotency extension may
+//! run every copy that reaches it. So while its task is not known, the
+//! question goes again on its own only when it certainly never reached the
+//! agent: the route's own connection to the gateway was never made (its
+//! client keeps no connection, and sees it: `ConnectWatch`), or the
+//! gateway said back the nonce of that very send. Every send to such an
+//! agent carries a nonce of its own, 128 random bits, to the gateway
+//! ([`NOT_SENT_NONCE_HEADER`]), which never passes it on to the agent and
+//! says it back only in its own
+//! [`PLAIN_NOT_SENT`](crate::gateway::plain::PLAIN_NOT_SENT), when it
+//! could not reach the agent and sent it nothing. The agent never sees it,
+//! so whatever it answers, and whatever the client makes of that, cannot
+//! hold it: nothing is decided on the text or the shape of an answer. Any
+//! other failure on the way then (every refusal of the agent's answer by
+//! the gateway, an unsafe task id, a `2xx` that is not JSON, an event too
+//! large or a `Content-Encoding`; a `5xx`, a `408` or a `429`; an
+//! `InternalError`; a stream broken after the question left; a nonce of
+//! another send) leaves the row pending, and the ask fails with
+//! [`AskError::NotResent`],
+//! [`PLAIN_NOT_RESENT`]: only [`Outbox::resume`], asked for, sends it
+//! again. The gateway's own refusals before sending (a `4xx`, such as
+//! `bearer env var not set`) are refusals on both bindings: on JSON-RPC
+//! they come as JSON-RPC errors of their own code, and the ask is
+//! [`AskError::Rejected`] with the gateway's reason. Once the task is
+//! known, reading and following it are retried as for a peer. To PALS peers
+//! and to plain agents that declare the idempotency extension no nonce
+//! goes, and none is looked for. On a plain contact's JSON-RPC route, whose
+//! client reads no HTTP status, the gateway's own not-sent code
+//! ([`NOT_SENT_CODE`]) is a failure on the way, as its `502` is on
+//! HTTP+JSON; anywhere else that code is a peer's A2A error, a refusal, as
+//! in milestone 1. The client's messages read here are the pinned client's
+//! (`HTTP request failed: …`, `HTTP <status>: <body>`, which carries the
+//! gateway's body and so its nonce), to check again on an upgrade: one
+//! that dropped the nonce would leave a question that was never sent
+//! pending, never send one twice.
 //!
 //! An ask ends when its task does (`COMPLETED`, `FAILED`, `CANCELED`,
 //! `REJECTED`) or waits for the requester (`INPUT_REQUIRED`,
@@ -38,39 +94,52 @@
 //! nor ever put in a URL; a task the peer answers for must be the one asked
 //! about. The gateway checks task ids first ([`crate::gateway`]): an answer
 //! that names an unsafe one never gets through it, so the attempt breaks
-//! as on a cut connection, and is retried.
+//! as on a cut connection, and is retried, but to a plain agent that may
+//! run every copy.
 //!
-//! An attachment is read only as the path policy's reading rule allows
+//! Files go to PALS peers only: an ask to a plain contact with attachments
+//! is refused before anything is read or sent. An attachment is read only
+//! as the path policy's reading rule allows
 //! (`crate::path_policy`): resolved first, symbolic links and `..`
 //! included, it must be a regular file outside the agent's data directory
 //! ([`Outbox::with_data_dir`]), which holds its key and its grants, and
 //! outside `/proc`, `/sys`, `/dev` and any procfs or sysfs; the file opened
 //! must be the one checked.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use a2a::{
-    A2AError, CancelTaskRequest, GetTaskRequest, Message, Part, PartContent, Role,
-    SVC_PARAM_EXTENSIONS, SendMessageRequest, StreamResponse, SubscribeToTaskRequest, Task,
-    TaskState, error_code,
+    A2AError, AgentCard, CancelTaskRequest, GetTaskRequest, Message, Part, PartContent, Role,
+    SVC_PARAM_EXTENSIONS, SendMessageRequest, StreamResponse, SubscribeToTaskRequest,
+    TRANSPORT_PROTOCOL_HTTP_JSON, TRANSPORT_PROTOCOL_JSONRPC, Task, TaskState, error_code,
 };
 use a2a_client::A2AClient;
+use a2a_client::jsonrpc::JsonRpcTransport;
 use a2a_client::middleware::CallInterceptor;
 use a2a_client::rest::RestTransport;
-use a2a_client::transport::ServiceParams;
+use a2a_client::transport::{ServiceParams, Transport};
 use async_trait::async_trait;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
-use pals_core::identity::AgentId;
-use pals_core::store::{OUTBOX_PENDING, OUTBOX_REFUSED, OutboxRow, Store};
-use serde::Serialize;
+use http::header::AUTHORIZATION;
+use pals_core::discovery::query::OfferRef;
+use pals_core::grant::SignedGrant;
+use pals_core::inventory::{INVENTORY_EXTENSION, Scope};
+use pals_core::store::{A2aContact, OUTBOX_PENDING, OUTBOX_REFUSED, OutboxRow, PeerRef, Store};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::a2a::{IDEMPOTENCY_EXTENSION, is_safe_task_id};
+use crate::gateway::plain::{NONCE_HEX_LEN, NOT_SENT_CODE, NOT_SENT_NONCE_HEADER, path_segment};
+use crate::gateway::serves_tasks;
 use crate::path_policy::open_attachment;
 
 /// How many times an ask retries an attempt that failed on the way, after
@@ -87,25 +156,44 @@ const CANCEL_TIMEOUT: Duration = Duration::from_secs(30);
 /// The media type of an attachment whose extension says nothing.
 const OCTET_STREAM: &str = "application/octet-stream";
 /// Why a peer's answer naming an unsafe or another task is refused.
-const INVALID_TASK_ID: &str = "the peer returned an invalid task id";
+pub(crate) const INVALID_TASK_ID: &str = "the peer returned an invalid task id";
+/// Why a question to a plain A2A contact whose card does not declare
+/// streaming is refused, before anything is kept or sent.
+pub const PLAIN_NEEDS_STREAMING: &str = "the plain A2A agent's card does not declare \
+    streaming, which pals ask needs in milestone 2: a stock A2A client can still call it \
+    through the gateway";
+/// The most bytes of a plain contact's card read through the gateway.
+const MAX_PLAIN_CARD_BYTES: usize = 64 * 1024;
+/// The longest reason of the gateway's quoted.
+const MAX_REASON_CHARS: usize = 200;
+/// Why a question to a plain A2A contact that may have reached it is not
+/// sent again on its own ([`AskError::NotResent`]).
+pub const PLAIN_NOT_RESENT: &str = "the plain A2A agent may have received the question, and it \
+    is not sent again on its own, since the agent may run every copy that reaches it";
+/// How the pinned client's message for a request it could not send begins.
+const REQUEST_FAILED: &str = "HTTP request failed: ";
 
 type Events = BoxStream<'static, Result<StreamResponse, A2AError>>;
-type Client = A2AClient<RestTransport>;
+type Client = A2AClient<Box<dyn Transport>>;
 
 /// A question for a peer.
 #[derive(Debug, Clone)]
 pub struct AskRequest {
-    /// A contact name or an agent id.
+    /// A contact name, a plain A2A contact's name or an agent id.
     pub peer: String,
     pub question: String,
     /// Files sent with the question.
     pub attachments: Vec<PathBuf>,
     /// How long to wait for the answer.
     pub wait: Duration,
+    /// The offer the peer was chosen by, which the message names
+    /// ([`OfferRef`]); none for a question asked without one, which goes as
+    /// in milestone 1.
+    pub offer: Option<OfferRef>,
 }
 
 /// A file a peer answered with.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactRef {
     /// The name the peer gave it: untrusted, never a path.
     pub name: String,
@@ -114,7 +202,7 @@ pub struct ArtifactRef {
 }
 
 /// How an ask ended, or where it stands when its wait ran out.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskOutcome {
     pub message_id: String,
     /// The peer's task, once known.
@@ -138,6 +226,12 @@ pub enum AskError {
     /// [`Outbox::resume`].
     #[error("the peer could not be reached; the question is kept as message {message_id}")]
     Unreachable { message_id: String },
+    /// The question may have reached a plain A2A agent that does not
+    /// declare the idempotency extension, and it is not sent again on its
+    /// own ([`PLAIN_NOT_RESENT`]): it is kept, pending, and
+    /// [`Outbox::resume`] sends it again.
+    #[error("{PLAIN_NOT_RESENT}; the question is kept as message {message_id}")]
+    NotResent { message_id: String },
     /// The gateway or the peer refused the request.
     #[error("refused: {0}")]
     Rejected(String),
@@ -199,9 +293,12 @@ impl Outbox {
     /// `req.wait` for the answer.
     ///
     /// Fails with [`AskError::Local`], having sent nothing, when the peer is
-    /// neither a contact nor an agent id, or an attachment cannot be read
-    /// or uploaded: one that is not a regular file, is inside the data
-    /// directory or is a system file is refused.
+    /// neither a contact nor an agent id; is a plain A2A contact and there
+    /// are attachments or an offer, or its card cannot be read through the
+    /// gateway or does not declare streaming ([`PLAIN_NEEDS_STREAMING`]);
+    /// or an attachment cannot be read or uploaded: one that is not a
+    /// regular file, is inside the data directory or is a system file is
+    /// refused.
     pub async fn ask(&self, req: AskRequest) -> Result<AskOutcome, AskError> {
         self.ask_kept(req, &CancellationToken::new(), |_| {}).await
     }
@@ -225,17 +322,42 @@ impl Outbox {
             question,
             attachments,
             wait,
+            offer,
         } = req;
         let deadline = Instant::now() + wait;
         let prepared = async {
             let peer = self.resolve(peer).await?;
+            if matches!(peer, PeerRef::Plain(_)) && !attachments.is_empty() {
+                return Err(AskError::Local("attachments need a PALS peer".to_owned()));
+            }
+            if matches!(peer, PeerRef::Plain(_)) && offer.is_some() {
+                return Err(AskError::Local(
+                    "offers come only from PALS peers".to_owned(),
+                ));
+            }
+            let plain = match &peer {
+                PeerRef::Plain(contact) => {
+                    let speaks = self.plain_speaks(contact).await.map_err(|why| {
+                        AskError::Local(format!(
+                            "cannot read the card of {} through the gateway ({why}): nothing \
+                             was asked",
+                            contact.name
+                        ))
+                    })?;
+                    if !speaks.streaming {
+                        return Err(AskError::Local(PLAIN_NEEDS_STREAMING.to_owned()));
+                    }
+                    Some(speaks)
+                }
+                PeerRef::Pals(_) => None,
+            };
             let mut parts = vec![Part::text(question)];
             for path in &attachments {
                 parts.push(self.upload(path).await?);
             }
-            Ok::<_, AskError>((peer, parts))
+            Ok::<_, AskError>((peer, plain, parts))
         };
-        let (peer, parts) = tokio::select! {
+        let (peer, plain, parts) = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(nothing_asked("the ask was canceled")),
             prepared = tokio::time::timeout_at(deadline, prepared) => match prepared {
@@ -251,6 +373,12 @@ impl Outbox {
         let message_id = new_message_id();
         let mut message = Message::new(Role::User, parts);
         message.message_id = message_id.clone();
+        if let Some(offer) = &offer {
+            message.metadata = Some(HashMap::from([(
+                INVENTORY_EXTENSION.to_owned(),
+                offer.to_value(),
+            )]));
+        }
         let request = SendMessageRequest {
             message,
             configuration: None,
@@ -264,7 +392,7 @@ impl Outbox {
         let now = now_unix();
         let row = OutboxRow {
             message_id: message_id.clone(),
-            peer,
+            peer: peer.key(),
             request_json,
             task_id: None,
             state: OUTBOX_PENDING.to_owned(),
@@ -272,42 +400,56 @@ impl Outbox {
             created_at: now,
             updated_at: now,
         };
+        let route = self.route(&peer, plain, &request).await?;
         if cancel.is_cancelled() {
             return Err(nothing_asked("the ask was canceled"));
         }
         self.with_store(move |store| store.outbox_insert(&row))
             .await?;
         kept(&message_id);
-        self.drive(Ask {
-            message_id,
-            peer,
-            request,
-            task_id: None,
-            deadline,
-        })
+        self.drive(
+            Ask {
+                message_id,
+                request,
+                task_id: None,
+                deadline,
+            },
+            route,
+        )
         .await
     }
 
     /// Takes up the question `message_id` again, as [`Outbox::ask`] left
     /// it, and waits up to `wait` for its answer: sends it again while its
     /// task is not known, follows the task once it is. A question that has
-    /// an outcome gets it again.
+    /// an outcome gets it again. A question to a plain contact whose card
+    /// cannot be read through the gateway now stays pending
+    /// ([`AskError::Unreachable`]); one whose card no longer declares
+    /// streaming is [`AskError::Local`], and stays as it was.
     pub async fn resume(&self, message_id: &str, wait: Duration) -> Result<AskOutcome, AskError> {
         let row = self.row(message_id).await?;
         check_stored_task(&row)?;
         let request = decode_request(&row.request_json)?;
+        let peer = self.peer_of(&row).await?;
+        let plain = self.plain_speaks_of(&peer, &row.message_id).await?;
+        if plain.is_some_and(|speaks| !speaks.streaming) {
+            return Err(AskError::Local(PLAIN_NEEDS_STREAMING.to_owned()));
+        }
+        let route = self.route(&peer, plain, &request).await?;
         if row.state == OUTBOX_REFUSED {
             let id = row.message_id.clone();
             self.with_store(move |store| store.outbox_set_state(&id, OUTBOX_PENDING, now_unix()))
                 .await?;
         }
-        self.drive(Ask {
-            message_id: row.message_id,
-            peer: row.peer,
-            request,
-            task_id: row.task_id,
-            deadline: Instant::now() + wait,
-        })
+        self.drive(
+            Ask {
+                message_id: row.message_id,
+                request,
+                task_id: row.task_id,
+                deadline: Instant::now() + wait,
+            },
+            route,
+        )
         .await
     }
 
@@ -321,13 +463,17 @@ impl Outbox {
     pub async fn cancel(&self, message_id: &str) -> Result<AskOutcome, AskError> {
         let row = self.row(message_id).await?;
         check_stored_task(&row)?;
-        let Some(task_id) = row.task_id else {
+        let Some(task_id) = row.task_id.clone() else {
             return Err(AskError::Local(format!(
                 "no task of the peer is known for message {message_id} yet: there is nothing \
                  to cancel"
             )));
         };
-        let client = self.client(&row.peer);
+        let peer = self.peer_of(&row).await?;
+        let asked = decode_request(&row.request_json)?;
+        let plain = self.plain_speaks_of(&peer, message_id).await?;
+        let route = self.route(&peer, plain, &asked).await?;
+        let client = &route.client;
         let request = CancelTaskRequest {
             id: task_id,
             metadata: None,
@@ -344,7 +490,7 @@ impl Outbox {
                     return Err(AskError::Rejected(INVALID_TASK_ID.to_owned()));
                 }
                 Ok(task) => return self.finish(message_id, &task, attempts).await,
-                Err(err) => match Failure::of(&err) {
+                Err(err) => match route.failure(&err) {
                     Failure::Refused(reason) => return Err(AskError::Rejected(reason)),
                     Failure::Transport(reason) => {
                         tracing::debug!(message_id, %reason, "a cancel did not get through");
@@ -366,17 +512,17 @@ impl Outbox {
         self.store.outbox_pending()
     }
 
-    /// Attempts `ask` until it has an outcome, is refused, runs out of
-    /// retries or of time.
-    async fn drive(&self, mut ask: Ask) -> Result<AskOutcome, AskError> {
+    /// Attempts `ask` on `route` until it has an outcome, is refused, runs
+    /// out of retries or of time, or, to a plain agent that may run every
+    /// copy, may have been sent.
+    async fn drive(&self, mut ask: Ask, route: Route) -> Result<AskOutcome, AskError> {
         let deadline = ask.deadline;
-        let client = self.client(&ask.peer);
         let mut failures: u32 = 0;
         // The state last seen, by this call.
         let mut seen: Option<TaskState> = None;
         loop {
             let attempts = self.count_attempt(&ask.message_id).await?;
-            let exchange = self.exchange(&client, &mut ask, &mut seen);
+            let exchange = self.exchange(&route, &mut ask, &mut seen);
             let Ok(ended) = tokio::time::timeout_at(deadline, exchange).await else {
                 return out_of_time(&ask, seen.as_ref(), attempts);
             };
@@ -398,12 +544,22 @@ impl Outbox {
                     return Err(AskError::Rejected(reason));
                 }
                 Ended::Local(err) => return Err(err),
-                Ended::Broken { progressed, reason } => {
+                Ended::Broken {
+                    progressed,
+                    reason,
+                    unsent,
+                } => {
                     tracing::debug!(
                         message_id = %ask.message_id,
                         %reason,
                         "an attempt did not get through"
                     );
+                    // Its task not known, the next attempt sends it again.
+                    if ask.task_id.is_none() && !unsent && route.resends_only_unsent() {
+                        return Err(AskError::NotResent {
+                            message_id: ask.message_id,
+                        });
+                    }
                     if progressed {
                         failures = 0;
                     }
@@ -425,22 +581,19 @@ impl Outbox {
 
     /// One attempt: the request, while the task is not known; else the task,
     /// and its events while it runs.
-    async fn exchange(
-        &self,
-        client: &Client,
-        ask: &mut Ask,
-        seen: &mut Option<TaskState>,
-    ) -> Ended {
+    async fn exchange(&self, route: &Route, ask: &mut Ask, seen: &mut Option<TaskState>) -> Ended {
+        let client = &route.client;
         let Some(task_id) = ask.task_id.clone() else {
+            route.before_send();
             return match client.send_streaming_message(&ask.request).await {
-                Ok(events) => self.follow(client, ask, events, seen).await,
-                Err(err) => Ended::failed(&err, false),
+                Ok(events) => self.follow(route, ask, events, seen).await,
+                Err(err) => Ended::send_failed(route.failure(&err), route.never_sent(&err)),
             };
         };
         let task = match get_task(client, &task_id).await {
             Ok(task) if task.id != task_id => return Ended::Refused(INVALID_TASK_ID.to_owned()),
             Ok(task) => task,
-            Err(err) => return Ended::failed(&err, false),
+            Err(err) => return Ended::failed(route.failure(&err), false),
         };
         *seen = Some(task.status.state.clone());
         if is_final(&task.status.state) {
@@ -451,12 +604,12 @@ impl Outbox {
             tenant: None,
         };
         match client.subscribe_to_task(&subscription).await {
-            Ok(events) => self.follow(client, ask, events, seen).await,
+            Ok(events) => self.follow(route, ask, events, seen).await,
             // It ended in between.
             Err(err) if err.code == error_code::UNSUPPORTED_OPERATION => {
-                final_task(client, &task_id, seen).await
+                final_task(route, &task_id, seen).await
             }
-            Err(err) => Ended::failed(&err, false),
+            Err(err) => Ended::failed(route.failure(&err), false),
         }
     }
 
@@ -464,7 +617,7 @@ impl Outbox {
     /// as an event names it.
     async fn follow(
         &self,
-        client: &Client,
+        route: &Route,
         ask: &mut Ask,
         mut events: Events,
         seen: &mut Option<TaskState>,
@@ -473,7 +626,7 @@ impl Outbox {
         while let Some(event) = events.next().await {
             let event = match event {
                 Ok(event) => event,
-                Err(err) => return Ended::failed(&err, progressed),
+                Err(err) => return Ended::failed(route.failure(&err), progressed),
             };
             progressed = true;
             if let StreamResponse::Message(message) = &event
@@ -511,7 +664,7 @@ impl Outbox {
                     if is_final(&update.status.state) {
                         // The whole task, artifacts included: the one
                         // checked and recorded above.
-                        return final_task(client, &update.task_id, seen).await;
+                        return final_task(route, &update.task_id, seen).await;
                     }
                 }
                 StreamResponse::ArtifactUpdate(_) | StreamResponse::Message(_) => {}
@@ -520,6 +673,7 @@ impl Outbox {
         Ended::Broken {
             progressed,
             reason: "the stream ended before the task".to_owned(),
+            unsent: false,
         }
     }
 
@@ -538,18 +692,28 @@ impl Outbox {
         Ok(task_outcome(message_id, task, attempts))
     }
 
-    /// The agent `peer` names: an agent id, or a contact's name.
-    async fn resolve(&self, peer: String) -> Result<AgentId, AskError> {
-        if let Ok(id) = peer.parse::<AgentId>() {
-            return Ok(id);
-        }
+    /// The agent `peer` names: an agent id, a contact's name, or a plain A2A
+    /// contact's name, in that order.
+    async fn resolve(&self, peer: String) -> Result<PeerRef, AskError> {
         let name = peer.clone();
-        let contact = self
-            .with_store(move |store| store.contact_by_name(&name))
+        let resolved = self
+            .with_store(move |store| store.resolve_peer(&name))
             .await?;
-        contact.map(|contact| contact.agent_id).ok_or_else(|| {
+        resolved.ok_or_else(|| {
             AskError::Local(format!(
                 "unknown peer {peer}: neither a contact nor an agent id"
+            ))
+        })
+    }
+
+    /// The peer `row` was asked of, from the reference it keeps.
+    async fn peer_of(&self, row: &OutboxRow) -> Result<PeerRef, AskError> {
+        let key = row.peer.clone();
+        let peer = self.with_store(move |store| store.peer_ref(&key)).await?;
+        peer.ok_or_else(|| {
+            AskError::Local(format!(
+                "the peer of message {} is not known any more: {}",
+                row.message_id, row.peer
             ))
         })
     }
@@ -599,13 +763,176 @@ impl Outbox {
             .with_media_type(media_type(path)))
     }
 
-    /// The A2A client for `peer`, through the gateway. Every request it
-    /// sends activates the [idempotency extension](IDEMPOTENCY_EXTENSION),
-    /// which the resends of an ask rely on.
-    fn client(&self, peer: &AgentId) -> Client {
-        let base_url = format!("{}/peers/{peer}/rest", self.gateway_url);
-        A2AClient::new(RestTransport::new(self.http.clone(), base_url))
-            .with_interceptors(vec![Arc::new(Idempotent)])
+    /// The route to `peer`, through the gateway, for the question
+    /// `request`: an A2A client on the HTTP+JSON binding,
+    /// `<gateway>/peers/<peer>/rest`, but for a plain contact whose card has
+    /// no HTTP+JSON interface and has a JSON-RPC one (`plain`, from
+    /// [`Outbox::plain_speaks`]), on the JSON-RPC binding,
+    /// `<gateway>/peers/<name>/jsonrpc`, with the pinned client's JSON-RPC
+    /// transport; and when a send that failed on the way goes again
+    /// ([`Resend`]): for a plain contact whose card does not declare the
+    /// idempotency extension, only when it certainly never left, which its
+    /// own HTTP client, with no pooled connections, tells for a connection
+    /// to the gateway ([`ConnectWatch`]), and the gateway for the agent by
+    /// saying back the send's nonce ([`Nonce`]). Every request it sends
+    /// activates the [idempotency extension](IDEMPOTENCY_EXTENSION), which
+    /// the resends of an ask rely on; a plain A2A agent may ignore it. For
+    /// a question that
+    /// names an offer, it activates the [inventory
+    /// extension](INVENTORY_EXTENSION) too, and presents the grant of the
+    /// offer's scope ([`Outbox::offer_grant`]) when this agent holds one, so
+    /// that the task runs under the scope it was offered for; any other
+    /// question goes with the grant the gateway chooses, as in milestone 1.
+    async fn route(
+        &self,
+        peer: &PeerRef,
+        plain: Option<PlainSpeaks>,
+        request: &SendMessageRequest,
+    ) -> Result<Route, AskError> {
+        let inventory = names_an_offer(request);
+        let bearer = if inventory {
+            self.offer_grant(peer, request)
+                .await?
+                .map(|grant| format!("Bearer {}", grant.to_token()))
+        } else {
+            None
+        };
+        let base_url = format!("{}/peers/{}", self.gateway_url, path_segment(peer));
+        let jsonrpc = plain.is_some_and(|speaks| speaks.jsonrpc);
+        let (http, resend) = match plain {
+            Some(speaks) if !speaks.idempotent => {
+                let no_connection = Arc::new(AtomicBool::new(false));
+                let http = reqwest::Client::builder()
+                    .no_proxy()
+                    .pool_max_idle_per_host(0)
+                    .connector_layer(ConnectWatch(Arc::clone(&no_connection)))
+                    .build()
+                    .map_err(|err| AskError::Local(format!("cannot build a client: {err}")))?;
+                let resend = Resend::OnlyUnsent {
+                    no_connection,
+                    nonce: Nonce::default(),
+                };
+                (http, resend)
+            }
+            _ => (self.http.clone(), Resend::OnTheWay),
+        };
+        let transport: Box<dyn Transport> = if jsonrpc {
+            Box::new(JsonRpcTransport::new(http, format!("{base_url}/jsonrpc")))
+        } else {
+            Box::new(RestTransport::new(http, format!("{base_url}/rest")))
+        };
+        let nonce = match &resend {
+            Resend::OnlyUnsent { nonce, .. } => Some(nonce.clone()),
+            Resend::OnTheWay => None,
+        };
+        let client = A2AClient::new(transport).with_interceptors(vec![Arc::new(Extensions {
+            inventory,
+            bearer,
+            nonce,
+        })]);
+        Ok(Route {
+            client,
+            resend,
+            plain_jsonrpc: jsonrpc,
+        })
+    }
+
+    /// What the card of the plain contact `contact` says of how to ask it:
+    /// the card as the gateway serves it
+    /// (`<gateway>/peers/<name>/.well-known/agent-card.json`), which the
+    /// gateway reads and checks now, with only the bindings the agent has;
+    /// why not, in the gateway's words, when it cannot be had.
+    async fn plain_speaks(&self, contact: &A2aContact) -> Result<PlainSpeaks, String> {
+        let url = format!(
+            "{}/peers/{}/.well-known/agent-card.json",
+            self.gateway_url, contact.name
+        );
+        let mut response = self
+            .http
+            .get(url)
+            .header("a2a-version", a2a::VERSION)
+            .send()
+            .await
+            .map_err(|err| format!("the gateway cannot be reached: {err}"))?;
+        let status = response.status();
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|err| format!("no answer from the gateway: {err}"))?
+        {
+            if body.len() + chunk.len() > MAX_PLAIN_CARD_BYTES {
+                return Err("the card is too large".to_owned());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        if status != http::StatusCode::OK {
+            let reason = serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|refusal| refusal["error"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let reason = crate::printable_ascii(&reason, MAX_REASON_CHARS);
+            return Err(format!("the gateway answered {status}: {reason}"));
+        }
+        let card: AgentCard = serde_json::from_slice(&body)
+            .map_err(|_| "the gateway answered something that is not a card".to_owned())?;
+        Ok(PlainSpeaks::of(&card))
+    }
+
+    /// [`Outbox::plain_speaks`] of `peer` when it is a plain contact, for
+    /// the question kept as `message_id`: [`AskError::Unreachable`] when
+    /// its card cannot be had, so that the question stays pending.
+    async fn plain_speaks_of(
+        &self,
+        peer: &PeerRef,
+        message_id: &str,
+    ) -> Result<Option<PlainSpeaks>, AskError> {
+        let PeerRef::Plain(contact) = peer else {
+            return Ok(None);
+        };
+        match self.plain_speaks(contact).await {
+            Ok(speaks) => Ok(Some(speaks)),
+            Err(why) => {
+                tracing::debug!(message_id, contact = %contact.name, %why, "no card of a plain contact");
+                Err(AskError::Unreachable {
+                    message_id: message_id.to_owned(),
+                })
+            }
+        }
+    }
+
+    /// The grant this agent holds of `peer`'s, a PALS peer, that serves
+    /// tasks in the scope of the offer `request` names, as the offer this
+    /// agent keeps says it ([`Store::offer_received`]); none when it keeps
+    /// no such offer any more (expired and purged: a retry of a request
+    /// that ran attaches whatever grant it presents) or holds no such
+    /// grant. Then the provider checks the offer against the grant the
+    /// gateway presents: an offer of another scope than a task's, the
+    /// public one among them, it never keeps, and refuses as
+    /// `offer_unknown`; a task's offer whose grant this agent no longer
+    /// holds, revoked or expired, it refuses as `offer_stale`.
+    async fn offer_grant(
+        &self,
+        peer: &PeerRef,
+        request: &SendMessageRequest,
+    ) -> Result<Option<SignedGrant>, AskError> {
+        let (PeerRef::Pals(provider), Some(Some(reference))) = (
+            peer,
+            OfferRef::in_metadata(request.message.metadata.as_ref()),
+        ) else {
+            return Ok(None);
+        };
+        let provider = *provider;
+        self.with_store(move |store| {
+            let Some(offer) = store.offer_received(&provider, &reference.offer_id)? else {
+                return Ok(None);
+            };
+            let held = store.grants_held_for(&provider, now_unix())?;
+            Ok(held.into_iter().find(|g| {
+                serves_tasks(&g.grant) && Scope::for_grant(Some(&g.grant)).key() == offer.doc.scope
+            }))
+        })
+        .await
     }
 
     /// The row of `message_id`.
@@ -639,10 +966,220 @@ impl Outbox {
     }
 }
 
+/// What the card of a plain A2A contact says of how the outbox asks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlainSpeaks {
+    /// On the JSON-RPC binding: the card has a JSON-RPC interface and no
+    /// HTTP+JSON one.
+    jsonrpc: bool,
+    /// The card declares `capabilities.streaming`, which the outbox needs.
+    streaming: bool,
+    /// The card declares the [idempotency extension](IDEMPOTENCY_EXTENSION).
+    idempotent: bool,
+}
+
+impl PlainSpeaks {
+    /// What `card`, a plain contact's card as the gateway serves it, says.
+    fn of(card: &AgentCard) -> Self {
+        let has = |binding: &str| {
+            card.supported_interfaces
+                .iter()
+                .any(|iface| iface.protocol_binding == binding)
+        };
+        Self {
+            jsonrpc: !has(TRANSPORT_PROTOCOL_HTTP_JSON) && has(TRANSPORT_PROTOCOL_JSONRPC),
+            streaming: card.capabilities.streaming == Some(true),
+            idempotent: card
+                .capabilities
+                .extensions
+                .iter()
+                .flatten()
+                .any(|extension| extension.uri == IDEMPOTENCY_EXTENSION),
+        }
+    }
+}
+
+/// How the outbox reaches a peer, through the gateway.
+struct Route {
+    client: Client,
+    resend: Resend,
+    /// To a plain contact, on the JSON-RPC binding.
+    plain_jsonrpc: bool,
+}
+
+/// When a `SendStreamingMessage` that failed on the way is sent again.
+enum Resend {
+    /// After any failure on the way: a PALS peer, or a plain agent whose
+    /// card declares the idempotency extension, runs the first copy that
+    /// reaches it and attaches every other one to that run.
+    OnTheWay,
+    /// Only when it certainly never reached the agent, a plain one that may
+    /// run every copy: the route's client could make no connection to the
+    /// gateway (`no_connection`), or the gateway said back the nonce of the
+    /// send (`nonce`), which it does only in its
+    /// [`PLAIN_NOT_SENT`](crate::gateway::plain::PLAIN_NOT_SENT).
+    OnlyUnsent {
+        no_connection: Arc<AtomicBool>,
+        nonce: Nonce,
+    },
+}
+
+/// The nonce of the last send on a route ([`NOT_SENT_NONCE_HEADER`]): drawn
+/// for every `SendStreamingMessage` as it goes ([`Extensions`]), and
+/// cleared before each ([`Route::before_send`]).
+#[derive(Clone, Default)]
+struct Nonce(Arc<Mutex<Option<String>>>);
+
+impl Nonce {
+    /// A new nonce, kept as the send's.
+    fn draw(&self) -> String {
+        let nonce = new_nonce();
+        *self.slot() = Some(nonce.clone());
+        nonce
+    }
+
+    fn clear(&self) {
+        *self.slot() = None;
+    }
+
+    /// The last send's, if it drew one.
+    fn get(&self) -> Option<String> {
+        self.slot().clone()
+    }
+
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// [`NONCE_HEX_LEN`] lowercase hex digits from the operating system's
+/// random number generator.
+fn new_nonce() -> String {
+    let mut bytes = [0u8; NONCE_HEX_LEN / 2];
+    getrandom::fill(&mut bytes).expect("the OS random number generator failed");
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+impl Route {
+    /// Whether a send that failed on the way goes again only when it never
+    /// left.
+    fn resends_only_unsent(&self) -> bool {
+        matches!(self.resend, Resend::OnlyUnsent { .. })
+    }
+
+    /// Before each send: no connection failed yet, and no nonce drawn.
+    fn before_send(&self) {
+        if let Resend::OnlyUnsent {
+            no_connection,
+            nonce,
+        } = &self.resend
+        {
+            no_connection.store(false, Ordering::SeqCst);
+            nonce.clear();
+        }
+    }
+
+    /// Whether `err`, the pinned client's error for the send just made,
+    /// says that the question certainly never reached the agent
+    /// ([`never_sent`]). Never for [`Resend::OnTheWay`], which does not
+    /// need to know.
+    fn never_sent(&self, err: &A2AError) -> bool {
+        let Resend::OnlyUnsent {
+            no_connection,
+            nonce,
+        } = &self.resend
+        else {
+            return false;
+        };
+        never_sent(
+            err,
+            no_connection.load(Ordering::SeqCst),
+            nonce.get().as_deref(),
+        )
+    }
+
+    /// What `err` was, on this route ([`failure_on`]).
+    fn failure(&self, err: &A2AError) -> Failure {
+        failure_on(err, self.plain_jsonrpc)
+    }
+}
+
+/// Whether `err`, the pinned client's error for a send, says that it
+/// certainly never reached the agent: the client could not send the
+/// request and could make no connection to the gateway
+/// (`no_connection`), or the error says the send's own `nonce`, which only
+/// the gateway's [`PLAIN_NOT_SENT`](crate::gateway::plain::PLAIN_NOT_SENT)
+/// does. Nothing else of the error counts.
+fn never_sent(err: &A2AError, no_connection: bool, nonce: Option<&str>) -> bool {
+    if err.code == error_code::INTERNAL_ERROR
+        && err.message.starts_with(REQUEST_FAILED)
+        && no_connection
+    {
+        return true;
+    }
+    nonce.is_some_and(|nonce| err.message.contains(nonce))
+}
+
+/// A connector layer for an HTTP client that sets its flag when a
+/// connection cannot be made: then the request it was for never left.
+#[derive(Clone)]
+struct ConnectWatch(Arc<AtomicBool>);
+
+impl<S> tower::Layer<S> for ConnectWatch {
+    type Service = Watched<S>;
+
+    fn layer(&self, inner: S) -> Watched<S> {
+        Watched {
+            inner,
+            failed: Arc::clone(&self.0),
+        }
+    }
+}
+
+/// A connector that [`ConnectWatch`] watches.
+#[derive(Clone)]
+struct Watched<S> {
+    inner: S,
+    failed: Arc<AtomicBool>,
+}
+
+impl<S, R> tower::Service<R> for Watched<S>
+where
+    S: tower::Service<R>,
+    S::Future: Send + 'static,
+    S::Response: 'static,
+    S::Error: 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = BoxFuture<'static, Result<S::Response, S::Error>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), S::Error>> {
+        let ready = self.inner.poll_ready(cx);
+        if matches!(ready, Poll::Ready(Err(_))) {
+            self.failed.store(true, Ordering::SeqCst);
+        }
+        ready
+    }
+
+    fn call(&mut self, request: R) -> Self::Future {
+        let failed = Arc::clone(&self.failed);
+        let connecting = self.inner.call(request);
+        Box::pin(async move {
+            let connected = connecting.await;
+            if connected.is_err() {
+                failed.store(true, Ordering::SeqCst);
+            }
+            connected
+        })
+    }
+}
+
 /// A question being attempted.
 struct Ask {
     message_id: String,
-    peer: AgentId,
     /// What every attempt that sends it sends.
     request: SendMessageRequest,
     task_id: Option<String>,
@@ -659,16 +1196,39 @@ enum Ended {
     /// Refused, by the gateway or by the peer.
     Refused(String),
     /// On the way: the attempt may be retried. `progressed` when it saw the
-    /// task move first.
-    Broken { progressed: bool, reason: String },
+    /// task move first; `unsent` when what it sent certainly never reached
+    /// the peer ([`Route::never_sent`]).
+    Broken {
+        progressed: bool,
+        reason: String,
+        unsent: bool,
+    },
     /// The outbox could not be written.
     Local(AskError),
 }
 
 impl Ended {
-    fn failed(err: &A2AError, progressed: bool) -> Self {
-        match Failure::of(err) {
-            Failure::Transport(reason) => Self::Broken { progressed, reason },
+    /// How an exchange ended, with `failure`.
+    fn failed(failure: Failure, progressed: bool) -> Self {
+        match failure {
+            Failure::Transport(reason) => Self::Broken {
+                progressed,
+                reason,
+                unsent: false,
+            },
+            Failure::Refused(reason) => Self::Refused(reason),
+        }
+    }
+
+    /// How sending the question ended, with `failure`; `unsent` when it
+    /// certainly never reached the peer.
+    fn send_failed(failure: Failure, unsent: bool) -> Self {
+        match failure {
+            Failure::Transport(reason) => Self::Broken {
+                progressed: false,
+                reason,
+                unsent,
+            },
             Failure::Refused(reason) => Self::Refused(reason),
         }
     }
@@ -685,7 +1245,7 @@ enum Failure {
 }
 
 impl Failure {
-    /// What the A2A client's `err` was.
+    /// What the A2A client's `err` was, as in milestone 1.
     ///
     /// The peer's A2A errors keep their code, and all but `InternalError`
     /// are refusals. A response with no A2A error, from the gateway or from
@@ -708,6 +1268,21 @@ impl Failure {
     }
 }
 
+/// What `err` was on a route to a plain contact on the JSON-RPC binding
+/// (`plain_jsonrpc`), or on any other ([`Failure::of`]). On the former,
+/// whose client reads no HTTP status, the gateway's own not-sent code
+/// ([`NOT_SENT_CODE`]), which no answer of the agent's carries through the
+/// gateway, is on the way, as the gateway's `502` is on HTTP+JSON: so that
+/// an agent that declares idempotency is asked again. Whether a question
+/// to one that does not goes again is decided by its nonce alone
+/// ([`never_sent`]). Anywhere else the code is a peer's A2A error.
+fn failure_on(err: &A2AError, plain_jsonrpc: bool) -> Failure {
+    if plain_jsonrpc && err.code == NOT_SENT_CODE {
+        return Failure::Transport(err.message.clone());
+    }
+    Failure::of(err)
+}
+
 /// The status and reason of an `HTTP <status> <phrase>: <body>` message: the
 /// body's `error` when it is JSON with one, else the body.
 fn http_failure(message: &str) -> Option<(u16, String)> {
@@ -722,8 +1297,8 @@ fn http_failure(message: &str) -> Option<(u16, String)> {
 }
 
 /// `task_id`, which an event said is final, as the peer keeps it.
-async fn final_task(client: &Client, task_id: &str, seen: &mut Option<TaskState>) -> Ended {
-    match get_task(client, task_id).await {
+async fn final_task(route: &Route, task_id: &str, seen: &mut Option<TaskState>) -> Ended {
+    match get_task(&route.client, task_id).await {
         Ok(task) if task.id != task_id => Ended::Refused(INVALID_TASK_ID.to_owned()),
         Ok(task) if is_final(&task.status.state) => Ended::Task(task),
         Ok(task) => {
@@ -731,9 +1306,10 @@ async fn final_task(client: &Client, task_id: &str, seen: &mut Option<TaskState>
             Ended::Broken {
                 progressed: true,
                 reason: "the task is not final yet".to_owned(),
+                unsent: false,
             }
         }
-        Err(err) => Ended::failed(&err, true),
+        Err(err) => Ended::failed(route.failure(&err), true),
     }
 }
 
@@ -905,18 +1481,95 @@ fn new_message_id() -> String {
 }
 
 /// Activates the [`IDEMPOTENCY_EXTENSION`] on every request, with the
-/// `A2A-Extensions` service parameter.
-struct Idempotent;
+/// `A2A-Extensions` service parameter, and the [`INVENTORY_EXTENSION`]
+/// after it with `inventory`; presents `bearer`, when given, as the
+/// request's own `Authorization`, which the gateway passes intact; and,
+/// with `nonce`, gives every `SendStreamingMessage` a new nonce of its own
+/// for the gateway ([`NOT_SENT_NONCE_HEADER`]), kept as the send's.
+struct Extensions {
+    inventory: bool,
+    bearer: Option<String>,
+    nonce: Option<Nonce>,
+}
 
 #[async_trait]
-impl CallInterceptor for Idempotent {
-    async fn before(&self, _method: &str, params: &mut ServiceParams) -> Result<(), A2AError> {
-        params.insert(
-            SVC_PARAM_EXTENSIONS.to_owned(),
-            vec![IDEMPOTENCY_EXTENSION.to_owned()],
-        );
+impl CallInterceptor for Extensions {
+    async fn before(&self, method: &str, params: &mut ServiceParams) -> Result<(), A2AError> {
+        let mut extensions = IDEMPOTENCY_EXTENSION.to_owned();
+        if self.inventory {
+            extensions.push_str(", ");
+            extensions.push_str(INVENTORY_EXTENSION);
+        }
+        params.insert(SVC_PARAM_EXTENSIONS.to_owned(), vec![extensions]);
+        if let Some(bearer) = &self.bearer {
+            params.insert(AUTHORIZATION.to_string(), vec![bearer.clone()]);
+        }
+        if let Some(nonce) = &self.nonce
+            && method == a2a::jsonrpc::methods::SEND_STREAMING_MESSAGE
+        {
+            params.insert(NOT_SENT_NONCE_HEADER.to_owned(), vec![nonce.draw()]);
+        }
         Ok(())
     }
+}
+
+/// Whether `request`, as the outbox keeps it, names an offer: then every
+/// attempt activates the inventory extension, as the first did.
+fn names_an_offer(request: &SendMessageRequest) -> bool {
+    OfferRef::in_metadata(request.message.metadata.as_ref()).is_some()
+}
+
+/// Why an offer received cannot be named in an ask.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OfferLookupError {
+    /// The peer is no PALS peer this agent knows: only those make offers.
+    #[error("{0}")]
+    NotAPeer(String),
+    /// This agent keeps no offer of the peer's with that id.
+    #[error("no such offer of the peer's: run pals discover again")]
+    Unknown,
+    /// It expired, by this agent's own clock.
+    #[error("offer expired: run pals discover again")]
+    Expired,
+    /// The store could not be read.
+    #[error("cannot read the offers: {0}")]
+    Store(String),
+}
+
+/// The reference to the offer `offer_id` that `peer` (a contact's name or
+/// an agent id) sent this agent and `store` keeps, looked up by (the
+/// peer's agent id, `offer_id`): two providers may use the same id. Refused
+/// when it is expired at `now_unix` by this agent's own clock, without
+/// skew: nothing is sent with an offer that no longer holds, and asking
+/// for a new one is a new search.
+pub fn received_offer_ref(
+    store: &Store,
+    peer: &str,
+    offer_id: &str,
+    now_unix: i64,
+) -> Result<OfferRef, OfferLookupError> {
+    let failed = |err: anyhow::Error| OfferLookupError::Store(format!("{err:#}"));
+    let provider = match store.resolve_peer(peer).map_err(failed)? {
+        Some(PeerRef::Pals(id)) => id,
+        Some(PeerRef::Plain(_)) => {
+            return Err(OfferLookupError::NotAPeer(format!(
+                "{peer} is a plain A2A agent, which makes no offers"
+            )));
+        }
+        None => {
+            return Err(OfferLookupError::NotAPeer(format!(
+                "unknown peer {peer}: neither a contact nor an agent id"
+            )));
+        }
+    };
+    let offer = store
+        .offer_received(&provider, offer_id)
+        .map_err(failed)?
+        .ok_or(OfferLookupError::Unknown)?;
+    if offer.doc.expired(now_unix) {
+        return Err(OfferLookupError::Expired);
+    }
+    Ok(OfferRef::of(&offer.doc))
 }
 
 /// The media type an attachment is sent with, from its extension;
@@ -946,6 +1599,7 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gateway::plain::PLAIN_NOT_SENT;
 
     #[test]
     fn message_ids_are_random_uuid_v4() {
@@ -997,6 +1651,135 @@ mod tests {
             Failure::Refused("messageId reused".to_owned())
         );
         assert!(!transport(A2AError::task_not_found("t-1")));
+    }
+
+    #[test]
+    fn the_not_sent_code_is_on_the_way_only_on_a_plain_json_rpc_route() {
+        let code = A2AError {
+            code: NOT_SENT_CODE,
+            message: PLAIN_NOT_SENT.to_owned(),
+            details: None,
+        };
+        // A peer's A2A error, a refusal, as in milestone 1.
+        let refused = Failure::Refused(PLAIN_NOT_SENT.to_owned());
+        assert_eq!(Failure::of(&code), refused);
+        assert_eq!(failure_on(&code, false), refused);
+        // The gateway's own, where the client reads no HTTP status.
+        assert_eq!(
+            failure_on(&code, true),
+            Failure::Transport(PLAIN_NOT_SENT.to_owned())
+        );
+        // Any other error reads the same on both.
+        for err in [
+            A2AError::invalid_params("messageId reused"),
+            A2AError {
+                code: crate::gateway::plain::REFUSED_CODE,
+                message: "bearer env var not set".to_owned(),
+                details: None,
+            },
+            A2AError::internal("plain agent answered 429"),
+        ] {
+            assert_eq!(failure_on(&err, true), Failure::of(&err), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn only_the_sends_own_nonce_says_nothing_was_sent() {
+        let (nonce, other) = (new_nonce(), new_nonce());
+        assert_ne!(nonce, other);
+        assert_eq!(nonce.len(), NONCE_HEX_LEN);
+        assert!(
+            nonce
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        );
+        let rpc = |message: String| A2AError {
+            code: NOT_SENT_CODE,
+            message,
+            details: None,
+        };
+        let rest = |message: &str| {
+            A2AError::internal(format!(
+                "HTTP 502 Bad Gateway: {}",
+                serde_json::json!({ "error": message })
+            ))
+        };
+        // The gateway's refusal, as the pinned client reports it on each
+        // binding, with the send's nonce.
+        let said = crate::gateway::plain::not_sent_message(Some(&nonce));
+        for err in [rest(&said), rpc(said.clone())] {
+            assert!(never_sent(&err, false, Some(&nonce)), "{}", err.message);
+            // Another send's nonce, or no nonce drawn for this one.
+            assert!(!never_sent(&err, false, Some(&other)), "{}", err.message);
+            assert!(!never_sent(&err, false, None), "{}", err.message);
+        }
+        // The gateway's text, word for word, in any shape, without the
+        // send's nonce.
+        let bare = crate::gateway::plain::not_sent_message(None);
+        let other_said = crate::gateway::plain::not_sent_message(Some(&other));
+        for err in [
+            rest(&bare),
+            rpc(bare.clone()),
+            A2AError::internal(bare.clone()),
+            rest(&other_said),
+            rpc(other_said.clone()),
+        ] {
+            assert!(!never_sent(&err, false, Some(&nonce)), "{}", err.message);
+        }
+        // No connection to the gateway: the client's own error, and the
+        // connector's word for it.
+        let failed = A2AError::internal("HTTP request failed: error sending request");
+        assert!(never_sent(&failed, true, None));
+        assert!(!never_sent(&failed, false, Some(&nonce)));
+        // An answer is never unsent for a connection that failed before.
+        assert!(!never_sent(&rest(&bare), true, None));
+    }
+
+    #[tokio::test]
+    async fn every_send_draws_a_nonce_of_its_own_and_nothing_else_does() {
+        use a2a::jsonrpc::methods::{
+            CANCEL_TASK, GET_TASK, SEND_STREAMING_MESSAGE, SUBSCRIBE_TO_TASK,
+        };
+        let nonce = Nonce::default();
+        let extensions = Extensions {
+            inventory: false,
+            bearer: None,
+            nonce: Some(nonce.clone()),
+        };
+        let mut drawn = Vec::new();
+        for _ in 0..3 {
+            let mut params = ServiceParams::new();
+            extensions
+                .before(SEND_STREAMING_MESSAGE, &mut params)
+                .await
+                .unwrap();
+            let sent = params[NOT_SENT_NONCE_HEADER].clone();
+            // Kept as the send's.
+            assert_eq!(sent, vec![nonce.get().unwrap()]);
+            drawn.push(sent[0].clone());
+        }
+        drawn.sort();
+        drawn.dedup();
+        assert_eq!(drawn.len(), 3);
+        for method in [GET_TASK, SUBSCRIBE_TO_TASK, CANCEL_TASK] {
+            let mut params = ServiceParams::new();
+            extensions.before(method, &mut params).await.unwrap();
+            assert!(!params.contains_key(NOT_SENT_NONCE_HEADER), "{method}");
+        }
+        nonce.clear();
+        assert_eq!(nonce.get(), None);
+        // To a PALS peer, or to an agent that declares idempotency: none.
+        let without = Extensions {
+            inventory: false,
+            bearer: None,
+            nonce: None,
+        };
+        let mut params = ServiceParams::new();
+        without
+            .before(SEND_STREAMING_MESSAGE, &mut params)
+            .await
+            .unwrap();
+        assert!(!params.contains_key(NOT_SENT_NONCE_HEADER));
     }
 
     #[test]
