@@ -26,6 +26,8 @@ Es el registro de la comparación acotada del backend, la tarea 1 del hito 3 en 
 3. **Las versiones fijadas.** El adaptador va en su propio módulo, con las pruebas de transporte de la prueba como puerta, y `libp2p` e `iroh` fijados con `=`. Si una versión que haya que adoptar lo rompe y arreglarlo cuesta más que la segunda pila, se vuelve a decidir.
 4. **El cambio respecto al spec.** El plan de la fase 2 lo anota en su tabla de cambios: el §6.2 sin vínculo de dos identidades, el contacto del §5.2 y el adaptador que el §6.1 no presuponía.
 
+**Veredicto de la repetición (tarea 7 de la fase 2): sigue `kad-iroh`.** No se da ninguna condición de cambio: ningún `fail` en S3 ni S7 en las cuatro ejecuciones de cada candidato, y en reposo con intervalos de producción un router de `kad-iroh` está a 1,34 veces uno de `kad-libp2p`, aunque esa medida no marcó del todo una sola vez a cada par ([repetición](hito-3-backend/repeticion.md)).
+
 **Coste si es errónea**, además del que dice [Coste si es errónea](#coste-si-es-errónea): si la red ya está desplegada cuando se descubre, cambiar de backend obliga a arrancar una DHT nueva.
 
 Lo que sigue es la recomendación tal como la escribió la tarea 6, con su razonamiento.

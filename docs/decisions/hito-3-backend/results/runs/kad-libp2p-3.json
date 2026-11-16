@@ -1,0 +1,203 @@
+{
+  "backend": "kad-libp2p",
+  "commit": "dada503",
+  "date": "2026-11-16T15:34:27Z",
+  "params": {
+    "TTL_S": 120,
+    "REPUBLISH_S": 40,
+    "IDLE_S": 300,
+    "SEARCHES": 10,
+    "SEARCH_LIMIT": 8,
+    "NET_A": "pals-spike-net-a",
+    "NET_B": "pals-spike-net-b",
+    "CPUS": 1,
+    "MEMORY": "512m",
+    "LISTEN_PORT": 4433,
+    "ROUTERS": "r1 r2 r3 r4",
+    "OPERATOR_1": "r1 r2",
+    "OPERATOR_2": "r3 r4",
+    "PROVIDERS_A": "p1 p2",
+    "PROVIDERS_B": "p3 p4",
+    "CLIENTS_A": "c1 c2",
+    "CLIENTS_B": "c3 c4",
+    "BOOTSTRAP": "r1",
+    "SAVED_CONTACT": "r3",
+    "S0_NODE": "c0",
+    "S0_NET": "a",
+    "S2_NODE": "c5",
+    "S2_NET": "a",
+    "S5_NODE": "rogue",
+    "S5_NET": "b",
+    "S3_NODE": "p1",
+    "S7_NODE": "p3",
+    "S4_NODES": "r2 r4",
+    "NET_A_SUBNET": "10.213.71.0/24",
+    "NET_B_SUBNET": "10.213.72.0/24",
+    "IP_r1": "10.213.71.11 10.213.72.11",
+    "IP_r2": "10.213.71.12 10.213.72.12",
+    "IP_r3": "10.213.71.13 10.213.72.13",
+    "IP_r4": "10.213.71.14 10.213.72.14",
+    "IP_p1": "10.213.71.21",
+    "IP_p2": "10.213.71.22",
+    "IP_p3": "10.213.72.23",
+    "IP_p4": "10.213.72.24",
+    "IP_c1": "10.213.71.31",
+    "IP_c2": "10.213.71.32",
+    "IP_c3": "10.213.72.33",
+    "IP_c4": "10.213.72.34",
+    "IP_c0": "10.213.71.40",
+    "IP_c5": "10.213.71.45",
+    "IP_rogue": "10.213.72.50",
+    "S7_IP": "10.213.71.23",
+    "CAPABILITY_PREFIX": "agentnet:capability:v1:",
+    "CAPABILITIES": "vision.ocr code.rust.review knowledge.documentation vision.defect-detection",
+    "CAPS_p1": "vision.ocr knowledge.documentation",
+    "CAPS_p2": "code.rust.review vision.defect-detection",
+    "CAPS_p3": "vision.ocr vision.defect-detection",
+    "CAPS_p4": "code.rust.review knowledge.documentation",
+    "CAPS_rogue": "vision.ocr",
+    "POLL_S": 3,
+    "SETTLE_STABLE_POLLS": 3,
+    "SETTLE_MAX_S": 80,
+    "S0_GRACE_S": 10,
+    "IDLE_SAMPLE_S": 60,
+    "HEALTH_TIMEOUT_S": 180,
+    "SEARCH_TIMEOUT_S": 120
+  },
+  "scenarios": {
+    "S0": {
+      "status": "pass",
+      "metrics": {
+        "searches": 4,
+        "candidates": 0,
+        "backend_errors": 0,
+        "routing_peers": 0,
+        "connections": 0
+      },
+      "notes": "c0, sin lista de arranque, buscó cada capacidad tras 10 s en la red A con los proveedores anunciados: no encontró ningún candidato."
+    },
+    "S1": {
+      "status": "pass",
+      "metrics": {
+        "searches": 160,
+        "with_valid_pct": 100.0,
+        "complete_pct": 100.0,
+        "first_valid_ms_p50": 2,
+        "first_valid_ms_p95": 3,
+        "first_valid_backend_pct": 100.0,
+        "elapsed_ms_p50": 5,
+        "elapsed_ms_p95": 9,
+        "requests_p50": 20,
+        "requests_p95": 20,
+        "candidates_p50": 2,
+        "candidates_max": 2,
+        "bytes_raw_p50": 31620,
+        "bytes_p50": 31616,
+        "bytes_p95": 32125,
+        "backend_errors": 0
+      },
+      "notes": "Cada búsqueda devolvió los dos proveedores, verificados. 160 búsquedas: 4 clientes, 4 capacidades, 10 veces cada una. first_valid_ms es el found_ms más temprano de un candidato válido, si el backend lo da (first_valid_backend_pct), o el final de la búsqueda si no. Bytes por búsqueda: los de la interfaz del cliente menos su tráfico en reposo de S6 en el mismo tiempo."
+    },
+    "S2": {
+      "status": "pass",
+      "metrics": {
+        "connected_complete_pct": 100.0,
+        "connected_first_valid_ms_p50": 2,
+        "connected_first_valid_ms_p95": 6,
+        "connected_first_valid_backend_pct": 100.0,
+        "connected_elapsed_ms_p50": 5000,
+        "connected_elapsed_ms_p95": 10000,
+        "newcomer_first_valid_s": 15.4,
+        "newcomer_complete": true,
+        "newcomer_searches": 4
+      },
+      "notes": "Parado r1, cada cliente buscó cada capacidad una vez; después arrancó c5 con [r1, r3] y buscó hasta encontrar a los dos proveedores de cada capacidad, 80 s como mucho. newcomer_first_valid_s cuenta desde que arrancó su contenedor. connected_first_valid_ms y connected_elapsed_ms son de las búsquedas de los clientes con r1 parado: cuándo tuvo el backend el primer candidato válido y cuándo terminó la búsqueda. connected_first_valid_backend_pct es la parte de las que tienen candidato válido cuyo primero fechó el backend (found_ms), y no el final de la búsqueda."
+    },
+    "S3": {
+      "status": "pass",
+      "metrics": {
+        "stored_before": 12,
+        "routers_forget_s": 111.6,
+        "searches_forget_s": 104.5,
+        "limit_s": 160,
+        "polls": 29
+      },
+      "notes": "Parado p1 sin aviso (docker kill). Cada 3 s, las estadísticas de los routers (lo que guardan de p1) y una búsqueda por cliente de una capacidad de p1, hasta que los routers no guardan nada de p1 y una ronda entera contesta 200 sin devolverlo. routers_forget_s cuenta en el primer sondeo a 0 después del último que guardaba algo, y searches_forget_s en la primera búsqueda contestada después de la última que lo devolvió."
+    },
+    "S4": {
+      "status": "pass",
+      "metrics": {
+        "immediate_coverage": 1.0,
+        "full_coverage_s": 0.0,
+        "degraded_first_valid_ms_p50": 2,
+        "degraded_first_valid_ms_p95": 5,
+        "degraded_first_valid_backend_pct": 100.0,
+        "degraded_elapsed_ms_p50": 5001,
+        "degraded_elapsed_ms_p95": 10000,
+        "rounds": 1,
+        "limit_s": 80
+      },
+      "notes": "Parados r2 r4. Rondas seguidas en que cada cliente busca cada capacidad, hasta una ronda completa; la cobertura es la fracción de los proveedores esperados que se encuentran. La cobertura completa cuenta en la primera búsqueda completa, del mismo cliente y capacidad, después de la última incompleta, y es 0 si ninguna lo fue. degraded_first_valid_ms y degraded_elapsed_ms son de todas las búsquedas de S4, hechas con los routers parados: cuándo tuvo el backend el primer candidato válido y cuándo terminó la búsqueda. degraded_first_valid_backend_pct es la parte de las que tienen candidato válido cuyo primero fechó el backend (found_ms), y no el final de la búsqueda."
+    },
+    "S5": {
+      "status": "pass",
+      "metrics": {
+        "routers_rejecting": 4,
+        "records_rejected_delta": 4,
+        "routers_storing_rogue_contact": 0,
+        "records_stored_unexplained_max": 0,
+        "clients_rogue_valid": 0,
+        "clients_rogue_returned": 4,
+        "searches": 4
+      },
+      "notes": "El nodo rogue anunció vision.ocr con un contacto de firma alterada en un byte. Ningún router debe atribuirle un contacto, y records_stored no puede crecer más de lo que explica stored_by_agent (los registros de los demás agentes y los de rogue que no son un contacto): lo que sobra cuenta como su contacto. Motivos con que lo devolvieron los clientes: bad_contact."
+    },
+    "S6": {
+      "status": "measured",
+      "metrics": {
+        "router_rss_kib_p50": 22932,
+        "router_rss_kib_max": 25744,
+        "router_connections_p50": 0,
+        "router_connections_max": 4,
+        "router_routing_peers_p50": 3,
+        "router_routing_peers_max": 3,
+        "router_bytes_per_min_p50": 250338,
+        "router_bytes_per_min_max": 274087,
+        "router_sent_bytes_per_min_p50": 126530,
+        "router_sent_bytes_per_min_max": 140623,
+        "provider_rss_kib_p50": 24356,
+        "provider_rss_kib_max": 24620,
+        "provider_connections_p50": 0,
+        "provider_connections_max": 4,
+        "provider_routing_peers_p50": 4,
+        "provider_routing_peers_max": 4,
+        "provider_bytes_per_min_p50": 180988,
+        "provider_bytes_per_min_max": 199306,
+        "provider_sent_bytes_per_min_p50": 88758,
+        "provider_sent_bytes_per_min_max": 97685,
+        "client_rss_kib_p50": 22992,
+        "client_rss_kib_max": 23076,
+        "client_connections_p50": 0,
+        "client_connections_max": 0,
+        "client_routing_peers_p50": 4,
+        "client_routing_peers_max": 4,
+        "client_bytes_per_min_p50": 18187,
+        "client_bytes_per_min_max": 20421,
+        "client_sent_bytes_per_min_p50": 8954,
+        "client_sent_bytes_per_min_max": 9562
+      },
+      "notes": "300 s sin búsquedas, con los 12 nodos de la topología. Memoria, conexiones y tabla de rutas muestreadas cada 60 s; bytes por minuto, de los contadores de todas las interfaces del contenedor menos lo, al empezar y al acabar: recibidos y enviados (bytes), y solo enviados (sent_bytes), porque un contenedor que no envía nada también recibe el tráfico de fondo del puente de Docker. p50 y máximo por papel."
+    },
+    "S7": {
+      "status": "pass",
+      "metrics": {
+        "clients_resolved": 4,
+        "resolved_s_p50": 1.3,
+        "resolved_s_max": 1.4,
+        "limit_s": 80,
+        "searches": 4
+      },
+      "notes": "p3 salió de la red B y entró en la A, con la IP 10.213.71.23, y anunció de nuevo sus registros (POST /announce). Cada cliente busca una capacidad suya por ronda; se resuelve cuando un candidato válido de p3 lleva la IP nueva. El tiempo cuenta desde la desconexión."
+    }
+  }
+}
