@@ -136,7 +136,8 @@ total_budget_ms = 15000
 # mode = "client"
 # Routers to enter the network through: the tickets `pals id --ticket`
 # prints on each of them, with at least one direct IP address. If none of
-# them answers, the agent tries up to 8 of its saved contacts, by name.
+# them answers, the agent dials up to 8 of its saved contacts, by name, and
+# enters through those that turn out to be routers.
 # bootstrap = []
 # A router's addresses as others dial them, when they are not the ones it
 # is bound to (behind a port forward, or `listen = "0.0.0.0:<port>"`); its

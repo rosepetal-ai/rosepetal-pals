@@ -234,12 +234,12 @@ Lo que guarda un router caduca con el mecanismo de `libp2p-kad`, sin barridos pr
 ### Entrada en la red
 
 1. Cada ticket de `[dht] bootstrap` da sus direcciones IP directas, que el nodo da a Kademlia en la forma router de la sección 4, y el nodo arranca (`bootstrap` de Kademlia).
-2. Si al terminar ese arranque no contestó ningún router, el nodo lo intenta igual con sus contactos guardados que tienen ticket: los 8 primeros por nombre.
+2. Si al terminar ese arranque no contestó ningún router, el nodo marca sus contactos guardados que tienen ticket, los 8 primeros por nombre. La mayoría son agentes que no son routers, así que ninguno entra en la tabla de rutas ni en las direcciones que el nodo recuerda hasta que muestra que sirve `/agentnet/kad/1.0.0`, como un router (más abajo, `identify`). El nodo arranca a través del primero que lo muestra.
 3. Un nodo sin `bootstrap` arranca solo: un router espera a que lo marquen, y un cliente no conoce a nadie.
 
 `libp2p-kad` deja en la tabla de rutas a un par que no pudo marcar, con su última dirección, así que la tabla no se queda vacía aunque no conteste nadie. Por eso el paso 2 mira si contestó algún router, no si la tabla está vacía.
 
-Tras un marcado fallido a un router, `libp2p-kad` le quita todas las direcciones menos la última, aunque el fallo fuera pasajero. El nodo le devuelve todas las que conoce de ese router, así que uno que se paró un momento vuelve a marcarse en todas.
+Tras un marcado fallido a un router, `libp2p-kad` le quita todas las direcciones menos la última, aunque el fallo fuera pasajero. El nodo le devuelve todas las que recuerda de ese router, así que uno que se paró un momento vuelve a marcarse en todas. El nodo solo recuerda las direcciones de los tickets de `bootstrap` y de los pares de la tabla de rutas: a un par que nunca fue router no le devuelve nada.
 
 Un ticket de `bootstrap` tiene que leerse, nombrar otro endpoint que el propio y llevar al menos una dirección IP directa. Si no, el nodo no arranca.
 
@@ -271,7 +271,7 @@ La conexión va autenticada con la clave del agente, así que cada búsqueda en 
 | Campo | Qué es |
 |-|-|
 | `mode` | el modo de `libp2p-kad`: `router` (servidor) o `client` |
-| `routing_peers` | los routers en la tabla de rutas |
+| `routing_peers` | los routers en la tabla de rutas, también un router de `bootstrap` que no contestó: `libp2p-kad` lo deja con su última dirección |
 | `connections` | las conexiones de `agentnet-kad/0` abiertas ahora |
 | `connections_accepted` | las conexiones entrantes establecidas desde el arranque |
 | `refused` | lo que el nodo rechazó desde el arranque: `connections`, `streams` (por las cuotas) e `idle_streams` (por ociosos), sección 5 |

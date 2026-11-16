@@ -53,12 +53,20 @@
 //!   time.
 //! - **Entry.** Each `[dht] bootstrap` ticket gives its direct IP
 //!   addresses, which go to Kademlia and to the [`AddressBook`], and the
-//!   node bootstraps. If no router answered by the end of it, the node tries
-//!   the same with its saved contacts that have a ticket, the first
-//!   [`ENTRY_CONTACTS`] by name. A node with no bootstrap starts alone.
-//!   `libp2p-kad` drops a peer's addresses after a failed dial to it, but
-//!   the last; the node gives it back every one it knows of that server, so
-//!   that a router that stopped a moment is dialed at all of them again.
+//!   node bootstraps. If no router answered by the end of it, the node
+//!   dials its saved contacts that have a ticket, the first
+//!   [`ENTRY_CONTACTS`] by name, and tells neither Kademlia nor the book of
+//!   them: most are agents that are no router. One enters the routing table
+//!   only once it shows it serves [`KAD_PROTOCOL`], through `identify`, and
+//!   the node bootstraps through the first that does. A node with no
+//!   bootstrap starts alone.
+//! - **What the node remembers of a router.** The [`AddressBook`] holds the
+//!   addresses of the bootstrap tickets and of the peers in the routing
+//!   table, and of nothing else. `libp2p-kad` drops a peer's addresses after
+//!   a failed dial to it, but the last; the node gives it back every one the
+//!   book has of that server, so that a router that stopped a moment is
+//!   dialed at all of them again, and a peer that never was a router gets
+//!   nothing back.
 //! - **What a node declares.** `libp2p-kad` returns no provider record
 //!   without addresses, so every node declares one: a router its
 //!   `[dht] external_addrs` or, with none, its endpoint's direct addresses,
@@ -87,6 +95,7 @@ use libp2p::kad::{
     self, Caching, GetProvidersOk, InboundRequest, Mode, ProviderRecord, QueryId, QueryResult,
     QueryStats, Record, RecordKey, StoreInserts,
 };
+use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::{
     ConnectionDenied, ConnectionId, FromSwarm, NetworkBehaviour, SwarmEvent, THandler,
     THandlerInEvent, THandlerOutEvent, ToSwarm, dummy,
@@ -326,6 +335,8 @@ struct Entry {
     answered: bool,
     /// Whether the saved contacts are still to be tried.
     contacts_left: bool,
+    /// The saved contacts dialed, none of them a router yet.
+    trying: HashSet<PeerId>,
 }
 
 /// The task that owns the swarm.
@@ -487,7 +498,7 @@ impl Task {
                     None => break,
                 },
                 event = self.swarm.select_next_some() => self.on_swarm_event(event),
-                Some(contacts) = read(&mut self.reading) => self.enter_through_contacts(contacts),
+                Some(contacts) = read(&mut self.reading) => self.try_contacts(contacts),
                 Some(()) = address_changes.next() => self.declare(),
             }
         }
@@ -592,12 +603,30 @@ impl Task {
         });
     }
 
-    fn enter_through_contacts(&mut self, contacts: Routers) {
+    /// Dials `contacts`, the saved contacts read when no bootstrap router
+    /// answered, and tells neither Kademlia nor the address book of them:
+    /// one enters the routing table only once it shows it is a router
+    /// ([`Task::on_identify`], or `libp2p-kad`'s own check of the protocol
+    /// on the connection it was dialed on), and the node bootstraps through
+    /// the first that does ([`Task::on_routing_updated`]).
+    fn try_contacts(&mut self, contacts: Routers) {
         tracing::info!(
             contacts = contacts.len(),
-            "entering the DHT through saved contacts"
+            "dialing the saved contacts, to find a DHT router among them"
         );
-        self.enter(contacts);
+        for (agent, ips) in contacts {
+            let peer = peer_id(&agent);
+            let addrs = ips.into_iter().map(|ip| multiaddr_of(&peer, ip)).collect();
+            match self
+                .swarm
+                .dial(DialOpts::peer_id(peer).addresses(addrs).build())
+            {
+                Ok(()) => {
+                    self.entry.trying.insert(peer);
+                }
+                Err(error) => tracing::debug!(%peer, %error, "a saved contact not dialed"),
+            }
+        }
     }
 
     fn on_swarm_event(&mut self, event: SwarmEvent<BehaviourEvent>) {
@@ -694,10 +723,34 @@ impl Task {
             } => self.on_query(id, result, &stats, step.last),
             kad::Event::RoutingUpdated {
                 peer,
-                is_new_peer: true,
+                is_new_peer,
+                addresses,
                 ..
-            } => tracing::debug!(%peer, "a DHT router in the routing table"),
+            } => self.on_routing_updated(peer, is_new_peer, &addresses),
             _ => {}
+        }
+    }
+
+    /// `peer` is in the routing table at `addresses`: the address book
+    /// learns them, and when it is the first saved contact to show it is a
+    /// router, the node bootstraps through it.
+    fn on_routing_updated(&mut self, peer: PeerId, is_new_peer: bool, addresses: &kad::Addresses) {
+        if is_new_peer {
+            tracing::debug!(%peer, "a DHT router in the routing table");
+        }
+        for addr in addresses.iter() {
+            if let Some((named, socket)) = dial_target(addr)
+                && named == peer
+            {
+                self.book.learn(peer, socket);
+            }
+        }
+        if self.entry.trying.remove(&peer) {
+            self.entry.trying.clear();
+            tracing::info!(%peer, "a saved contact is a DHT router: entering through it");
+            if let Err(error) = self.kad().bootstrap() {
+                tracing::debug!(%error, "cannot bootstrap through the saved contact");
+            }
         }
     }
 

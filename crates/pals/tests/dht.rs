@@ -233,49 +233,47 @@ async fn a_router_with_no_bootstrap_learns_the_others() {
     wait_for_routers(&r3, 2).await;
 }
 
+/// Waits until `node` has no connection open, after it had one: then it
+/// dealt with what came over each, `identify` included, since a
+/// connection stays open while a stream of it is.
+async fn wait_for_idle(node: &TestNode) -> DhtStatus {
+    wait_for(node, "every connection closed", |s| s.connections == 0).await
+}
+
 #[tokio::test]
 async fn clients_never_enter_a_routing_table() {
-    let r1 = spawn_dht_node(DhtMode::Router, &[], timing()).await;
-    let r2 = spawn_dht_node(DhtMode::Router, &[&r1], timing()).await;
-    let r3 = spawn_dht_node(DhtMode::Router, &[&r1], timing()).await;
+    let short = idle_after(Duration::from_secs(1));
+    let r1 = spawn_dht_node(DhtMode::Router, &[], short).await;
+    let r2 = spawn_dht_node(DhtMode::Router, &[&r1], short).await;
+    let r3 = spawn_dht_node(DhtMode::Router, &[&r1], short).await;
     for router in [&r1, &r2, &r3] {
         wait_for_routers(router, 2).await;
     }
-    let c1 = spawn_dht_node(DhtMode::Client, &[&r1], timing()).await;
-    let c2 = spawn_dht_node(DhtMode::Client, &[&r1], timing()).await;
+    let c1 = spawn_dht_node(DhtMode::Client, &[&r1], short).await;
+    let c2 = spawn_dht_node(DhtMode::Client, &[&r1], short).await;
     // Each client reached every router: each has it in its table.
     wait_for_routers(&c1, 3).await;
     wait_for_routers(&c2, 3).await;
-    // A router that arrives after the clients is in every table once each
-    // router has dealt with the clients' connections, which came first.
-    let r4 = spawn_dht_node(DhtMode::Router, &[&r1], timing()).await;
-    for router in [&r1, &r2, &r3, &r4] {
-        wait_for_routers(router, 3).await;
-    }
-    for router in [&r1, &r2, &r3, &r4] {
-        let now = status(router).await;
-        assert_eq!(now.routing_peers, 3, "only routers: {now:?}");
+    // Once the clients' connections closed, each router dealt with them.
+    for router in [&r1, &r2, &r3] {
+        let now = wait_for_idle(router).await;
+        assert_eq!(now.routing_peers, 2, "only routers: {now:?}");
     }
 }
 
 #[tokio::test]
 async fn a_client_stays_a_client() {
-    let r1 = spawn_dht_node(DhtMode::Router, &[], timing()).await;
-    let c = spawn_dht_node(DhtMode::Client, &[&r1], timing()).await;
+    let short = idle_after(Duration::from_secs(1));
+    let r1 = spawn_dht_node(DhtMode::Router, &[], short).await;
+    let c = spawn_dht_node(DhtMode::Client, &[&r1], short).await;
     wait_for(&r1, "the client connected", |s| s.connections_accepted >= 1).await;
-    // A router that arrives later orders R1's events: once R1 has it, it
-    // dealt with the client's connection.
-    let r2 = spawn_dht_node(DhtMode::Router, &[&r1], timing()).await;
-    wait_for_routers(&r1, 1).await;
-    wait_for_routers(&r2, 1).await;
+    // Once the client's connection closed, R1 dealt with it.
+    let now = wait_for_idle(&r1).await;
+    assert_eq!(now.routing_peers, 0, "the client is in the table: {now:?}");
     // The client declares an external address, which in libp2p-kad's
     // automatic mode would make it a server.
     let now = status(&c).await;
     assert_eq!(now.mode, DhtMode::Client, "{now:?}");
-    for router in [&r1, &r2] {
-        let now = status(router).await;
-        assert_eq!(now.routing_peers, 1, "the client is in a table: {now:?}");
-    }
 }
 
 #[tokio::test]
@@ -285,25 +283,13 @@ async fn a_newcomer_joins_through_a_saved_contact_when_the_bootstrap_is_down() {
     wait_for_routers(&r1, 1).await;
     wait_for_routers(&r2, 1).await;
     let r1_ticket = r1.node.ticket();
-    let r2_ticket = r2.node.ticket();
-    let r2_id = r2.id();
+    let (r2_id, r2_ticket) = (r2.id(), r2.node.ticket());
     let TestNode { node: r1_node, .. } = r1;
     shut_down(r1_node).await;
     let accepted_before = status(&r2).await.connections_accepted;
 
     // A newcomer that knows R2 only as a saved contact.
-    let dir = tempfile::tempdir().unwrap();
-    let key = key_in(dir.path());
-    let store = Store::open(&dir.path().join(STORE_FILE), key.id()).unwrap();
-    store
-        .contact_put(&Contact {
-            name: "r2".to_owned(),
-            agent_id: r2_id,
-            ticket: Some(r2_ticket),
-            added_at: now_unix(),
-        })
-        .unwrap();
-    drop(store);
+    let dir = with_contacts(&[("r2", r2_id, r2_ticket)]);
     let n = spawn_dht_node_in(
         dir,
         DhtMode::Client,
@@ -322,6 +308,68 @@ async fn a_newcomer_joins_through_a_saved_contact_when_the_bootstrap_is_down() {
     // R2 is in its table, and R1 with it: libp2p-kad keeps a peer it
     // could not dial, with its last address.
     wait_for_routers(&n, 2).await;
+}
+
+/// A fresh data directory whose store already holds `contacts`, by name,
+/// agent and ticket.
+fn with_contacts(contacts: &[(&str, AgentId, String)]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let key = key_in(dir.path());
+    let store = Store::open(&dir.path().join(STORE_FILE), key.id()).unwrap();
+    for (name, agent_id, ticket) in contacts {
+        store
+            .contact_put(&Contact {
+                name: (*name).to_owned(),
+                agent_id: *agent_id,
+                ticket: Some(ticket.clone()),
+                added_at: now_unix(),
+            })
+            .unwrap();
+    }
+    dir
+}
+
+#[tokio::test]
+async fn saved_contacts_enter_the_table_only_as_routers() {
+    let r1 = spawn_dht_node(DhtMode::Router, &[], timing()).await;
+    let r2 = spawn_dht_node(DhtMode::Router, &[&r1], timing()).await;
+    wait_for_routers(&r1, 1).await;
+    wait_for_routers(&r2, 1).await;
+    // A DHT client, which serves agentnet-kad/0 but not Kademlia.
+    let client = spawn_dht_node(DhtMode::Client, &[&r2], timing()).await;
+    wait_for(&r2, "the client connected", |s| s.connections_accepted >= 1).await;
+    let r1_ticket = r1.node.ticket();
+    let TestNode { node: r1_node, .. } = r1;
+    shut_down(r1_node).await;
+
+    // A router whose bootstrap is down, and whose saved contacts, the
+    // first 8 by name, are the client and R2.
+    let dir = with_contacts(&[
+        ("a-client", client.id(), client.node.ticket()),
+        ("b-router", r2.id(), r2.node.ticket()),
+    ]);
+    let n = spawn_dht_node_in(
+        dir,
+        DhtMode::Router,
+        &[],
+        NodeOptions {
+            dht_timing: Some(idle_after(Duration::from_secs(1))),
+            ..NodeOptions::default()
+        },
+        |cfg| cfg.dht.bootstrap = vec![r1_ticket],
+    )
+    .await;
+    wait_for(&client, "the newcomer dialed the client", |s| {
+        s.connections_accepted >= 1
+    })
+    .await;
+    wait_for_routers(&n, 2).await;
+    // Once its connections closed, it dealt with both contacts: only R2
+    // entered its table, beside R1, kept from its bootstrap ticket.
+    let now = wait_for_idle(&n).await;
+    assert_eq!(now.routing_peers, 2, "{now:?}");
+    // And R2 has R1 and the newcomer, never the client.
+    wait_for_routers(&r2, 2).await;
 }
 
 #[tokio::test]
@@ -774,55 +822,95 @@ async fn holders(router: &TestNode, capability: &str) -> Vec<AgentId> {
         .collect()
 }
 
+/// Runs `publishers` until `router` holds, for each capability of `want`,
+/// the provider records of exactly those agents.
+async fn wait_for_holders(
+    router: &TestNode,
+    publishers: &mut [&mut Publisher],
+    want: &[(&str, &[AgentId])],
+) {
+    let deadline = Instant::now() + CONVERGES;
+    loop {
+        let mut held = true;
+        for (capability, agents) in want {
+            let mut holding = holders(router, capability).await;
+            holding.sort();
+            let mut agents = agents.to_vec();
+            agents.sort();
+            held &= holding == agents;
+        }
+        if held {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("the router never held {want:?}: {:?}", status(router).await);
+        }
+        for publisher in publishers.iter_mut() {
+            publisher.run_for(Duration::from_millis(25)).await;
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_newer_announce_drops_the_providers_it_no_longer_lists() {
     let r1 = spawn_dht_node(DhtMode::Router, &[], timing()).await;
-    let key = AgentKey::generate();
-    let mut publisher = Publisher::new(&key, &r1).await;
-    let agent = key.id();
-    publisher
-        .put(
-            announce_key(&agent),
-            announce(&key, 1, &["vision.ocr", "code.rust.review"]),
-        )
+    let (a_key, b_key) = (AgentKey::generate(), AgentKey::generate());
+    let (a, b) = (a_key.id(), b_key.id());
+    let mut pa = Publisher::new(&a_key, &r1).await;
+    let mut pb = Publisher::new(&b_key, &r1).await;
+    let (ocr, review) = ("vision.ocr", "code.rust.review");
+    pa.put(announce_key(&a), announce(&a_key, 1, &[ocr, review]))
         .await;
-    publisher.provide("vision.ocr").await;
-    publisher.provide("code.rust.review").await;
-    let deadline = Instant::now() + CONVERGES;
-    while holders(&r1, "code.rust.review").await != vec![agent]
-        || holders(&r1, "vision.ocr").await != vec![agent]
-    {
-        if Instant::now() >= deadline {
-            panic!("the router never held them: {:?}", status(&r1).await);
-        }
-        publisher.run_for(Duration::from_millis(25)).await;
-    }
+    pa.provide(ocr).await;
+    pa.provide(review).await;
+    pb.put(announce_key(&b), announce(&b_key, 1, &[review]))
+        .await;
+    pb.provide(review).await;
+    wait_for_holders(
+        &r1,
+        &mut [&mut pa, &mut pb],
+        &[(ocr, &[a]), (review, &[a, b])],
+    )
+    .await;
     let held = status(&r1).await;
     assert_eq!(
         held.stored_by_agent,
-        BTreeMap::from([(agent, 3)]),
+        BTreeMap::from([(a, 3), (b, 2)]),
         "{held:?}"
     );
 
-    // The new announce lists only one of the two.
-    publisher
-        .put(announce_key(&agent), announce(&key, 2, &["vision.ocr"]))
-        .await;
-    let deadline = Instant::now() + CONVERGES;
-    while !holders(&r1, "code.rust.review").await.is_empty() {
-        if Instant::now() >= deadline {
-            panic!("the router kept the old one: {:?}", status(&r1).await);
-        }
-        publisher.run_for(Duration::from_millis(25)).await;
-    }
-    assert_eq!(holders(&r1, "vision.ocr").await, vec![agent]);
+    // A's new announce lists only one of the two: A's other provider
+    // record goes, and B's under the same key stays.
+    pa.put(announce_key(&a), announce(&a_key, 2, &[ocr])).await;
+    wait_for_holders(&r1, &mut [&mut pa, &mut pb], &[(ocr, &[a]), (review, &[b])]).await;
     let held = status(&r1).await;
     assert_eq!(
         held.stored_by_agent,
-        BTreeMap::from([(agent, 2)]),
+        BTreeMap::from([(a, 2), (b, 2)]),
         "{held:?}"
     );
-    assert_eq!(held.provider_records_stored, 1, "{held:?}");
-    assert_eq!(held.records_stored, 1, "{held:?}");
+    assert_eq!(held.provider_records_stored, 2, "{held:?}");
+    assert_eq!(held.records_stored, 2, "{held:?}");
     assert!(held.rejected.values().all(|n| *n == 0), "{held:?}");
+
+    // An older announce of A's, and one under A's key that B signed, each
+    // listing only the other capability: the first is kept out as stale,
+    // the second refused, and neither drops anything. A put ends once the
+    // router answered, which it does after it dealt with the record.
+    pa.put(announce_key(&a), announce(&a_key, 1, &[review]))
+        .await;
+    pb.put(announce_key(&a), announce(&b_key, 3, &[review]))
+        .await;
+    let held = wait_for(&r1, "the forged announce refused", |s| {
+        s.rejected["wrong_key"] == 1
+    })
+    .await;
+    assert_eq!(holders(&r1, ocr).await, vec![a]);
+    assert_eq!(holders(&r1, review).await, vec![b]);
+    assert_eq!(
+        held.stored_by_agent,
+        BTreeMap::from([(a, 2), (b, 2)]),
+        "{held:?}"
+    );
+    assert_eq!(held.rejected.values().sum::<u64>(), 1, "{held:?}");
 }
