@@ -15,11 +15,14 @@
 //! `libp2p` or `iroh` versions. [`validate`] is what a router stores under
 //! those keys, and the reason for each refusal. [`swarm`] runs them: the
 //! node's swarm, its mode, how it enters the network and what it declares,
-//! on a task of its own that a [`Dht`] talks to.
+//! on a task of its own that a [`Dht`] talks to. [`publish`] is what that
+//! task publishes and how it finds others: the rounds that put the node's
+//! [`PublishedRecords`] in the DHT, and the lookups of [`Dht::providers`].
 //!
 //! The DHT is off unless `[dht] enabled`: then the node serves
 //! `agentnet-kad/0` and runs its swarm, as a client unless `[dht] mode =
-//! "router"` (H3-D3).
+//! "router"` (H3-D3). It publishes only with `[dht] announce`, and then only
+//! the capabilities of the public services (H3-D4).
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -31,6 +34,8 @@ use libp2p::Multiaddr;
 use libp2p::kad::store::MemoryStoreConfig;
 use pals_core::clock::Clock;
 use pals_core::identity::{AgentId, AgentKey};
+use pals_core::records::{AnnounceRecord, ContactRecord};
+use pals_core::signed::Signed;
 use pals_core::store::Store;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
@@ -40,10 +45,12 @@ use crate::config::{DhtCfg, DhtMode};
 
 pub mod keys;
 pub mod muxer;
+pub mod publish;
 pub mod swarm;
 pub mod transport;
 pub mod validate;
 
+pub use self::publish::{PublicationStatus, PublishedRecords};
 use self::swarm::Command;
 use self::transport::{IrohListener, KadQuotas, RefusedCounts};
 
@@ -104,6 +111,9 @@ pub struct DhtParts {
     /// The node's store: its saved contacts, entered through when no
     /// bootstrap router answers.
     pub store: Arc<Store>,
+    /// What the node publishes: `Some` with `[dht] announce`, and then the
+    /// node's own records; none publishes nothing, not even the contact.
+    pub published: Option<Arc<dyn PublishedRecords>>,
 }
 
 /// The node's DHT: its swarm, running on a task of its own. Cloning is
@@ -152,6 +162,38 @@ pub struct DhtStatus {
     /// The records refused since the node started, by
     /// [`validate::Rejection::as_str`]; every reason, zero included.
     pub rejected: BTreeMap<&'static str, u64>,
+    /// What the node publishes, with `[dht] announce`.
+    pub publication: Option<PublicationStatus>,
+}
+
+/// What a lookup of a capability's providers found ([`Dht::providers`]).
+#[derive(Debug, Clone, Default)]
+pub struct DhtLookup {
+    /// The providers with a valid contact and a valid announce that lists
+    /// the capability, in the order they arrived.
+    pub found: Vec<DhtCandidate>,
+    /// The providers that were not candidates by the end, each with why:
+    /// `capability_not_announced` when its valid announce does not list the
+    /// capability; else the name of the last refusal of a copy of its
+    /// records ([`validate::Rejection::as_str`]), or, with none refused,
+    /// `no valid contact` or `no valid announce`.
+    pub discarded: Vec<(AgentId, String)>,
+    /// The requests its queries sent to the network.
+    pub requests: u64,
+    /// Whether its deadline ended it, before its queries did.
+    pub cut: bool,
+}
+
+/// A provider found in the DHT: its newest valid contact and announce, as
+/// they were verified and as they arrived. Untrusted all the same: a search
+/// checks them again before it uses them.
+#[derive(Debug, Clone)]
+pub struct DhtCandidate {
+    pub agent_id: AgentId,
+    pub contact: Signed<ContactRecord>,
+    pub contact_json: Vec<u8>,
+    pub announce: Signed<AnnounceRecord>,
+    pub announce_json: Vec<u8>,
 }
 
 /// Why the DHT did not answer.
@@ -203,6 +245,30 @@ impl Dht {
             return Ok(Vec::new());
         };
         self.ask(|reply| Command::HeldProviders(key, reply)).await
+    }
+
+    /// Looks for `capability`'s providers, up to `limit` of them, as
+    /// [`publish`] says: what it has at `deadline`, with
+    /// [`DhtLookup::cut`], if its queries did not end before.
+    /// [`DhtError::NoRouters`] when its queries ended with no router
+    /// having answered. Nothing is found for a string that is not a
+    /// capability.
+    pub async fn providers(
+        &self,
+        capability: &str,
+        limit: usize,
+        deadline: tokio::time::Instant,
+    ) -> Result<DhtLookup, DhtError> {
+        let Ok(key) = keys::provider_key(capability) else {
+            return Ok(DhtLookup::default());
+        };
+        self.ask(|reply| Command::Providers {
+            key,
+            limit,
+            deadline,
+            reply,
+        })
+        .await?
     }
 
     /// A router's `[dht] external_addrs`, which its ticket and its contact

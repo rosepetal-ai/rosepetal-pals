@@ -4,7 +4,7 @@ Especificación de la DHT con la que un agente PALS encuentra a los proveedores 
 
 Los valores de este documento son los del código, `crates/pals/src/dht/`, y el vector `crates/pals-core/tests/vectors/kad-v0.json` congela la identidad, las claves y las formas de dirección. El backend es `kad-iroh`, ratificado en el [registro del backend](../decisions/2026-11-16-hito-3-backend-dht.md#decisión) (H3-D1).
 
-Este documento crece con el código de la fase 2 del hito 3. Hoy describe la identidad, las claves, las formas de dirección, la conexión con sus límites, lo que guarda un router y el swarm del daemon, con sus modos y su entrada en la red. La publicación y la búsqueda se añaden con su código.
+Este documento crece con el código de la fase 2 del hito 3. Hoy describe la identidad, las claves, las formas de dirección, la conexión con sus límites, lo que guarda un router, el swarm del daemon, con sus modos y su entrada en la red, y lo que un nodo publica, cuándo caduca y cómo se busca en la DHT. La DHT como fuente de la búsqueda de servicios se añade con su código.
 
 ## 1. Identificación
 
@@ -191,7 +191,7 @@ Los nombres no cambian: son los que llevan los registros del daemon y `pals dht 
 | `not_an_agent` | un provider record cuyo `PeerId` no es el de un agente |
 | `provider_without_announce` | un provider record de un agente cuyo anuncio el router no guarda |
 | `capability_not_announced` | un provider record de una capacidad que el anuncio de su agente no lista |
-| `store_full` | un registro válido que ya no cabe en la tienda. No lo da ninguna comprobación: lo cuenta el swarm |
+| `store_full` | un registro válido que no cabe en la tienda ni después de borrar de ella lo caducado (sección 8). No lo da ninguna comprobación: lo cuenta el swarm |
 
 ## 7. El swarm del daemon
 
@@ -217,7 +217,7 @@ Con `relay = true`, un marcado a un router puede buscar además su endpoint en e
 | Protocolo | `/agentnet/kad/1.0.0` (sección 1) |
 | Vida de un valor o un provider record en un router | `[dht] record_ttl_s`: 3600 s por defecto, de 60 a 86 400 |
 | Replicación de lo que guarda un router | cada `[dht] republish_s`: 1200 s por defecto, al menos 20 y como mucho la mitad de `record_ttl_s` |
-| Publicación propia por los temporizadores de `libp2p-kad` | ninguna: la hacen las vueltas de publicación del nodo, que se describen con su código |
+| Publicación propia por los temporizadores de `libp2p-kad` | ninguna: la hacen las vueltas de publicación del nodo (sección 8) |
 | Lo que llega | todo `PutRecord` y `AddProvider` pasa por las comprobaciones de la sección 6 (`StoreInserts::FilterBoth`) |
 | Caché de lo encontrado | ninguna |
 | Una consulta | 20 s como mucho |
@@ -229,7 +229,7 @@ Con `relay = true`, un marcado a un router puede buscar además su endpoint en e
 
 Un cliente no gasta tráfico en reposo: sus conexiones se cierran a los 10 s, y cada búsqueda después de un reposo paga un apretón de manos de Iroh con los routers.
 
-Lo que guarda un router caduca con el mecanismo de `libp2p-kad`, sin barridos propios: un valor caducado se borra cuando se lee o en la vuelta de replicación, y un provider record caducado, cuando se leen los proveedores de su clave. El estado del nodo cuenta solo lo que no ha caducado.
+Lo que guarda un router caduca con el mecanismo de `libp2p-kad`, sin barridos propios (sección 8). El estado del nodo cuenta solo lo que no ha caducado.
 
 ### Entrada en la red
 
@@ -251,6 +251,8 @@ Un ticket de `bootstrap` tiene que leerse, nombrar otro endpoint que el propio y
 - **Un cliente** declara solo `/p2p/<peer_id>`, que no es ninguna ubicación.
 
 `external_addrs` solo vale en un router, y ninguna puede tener una IP sin especificar ni el puerto 0.
+
+Los provider records propios llevan esas direcciones y ninguna más. `libp2p-kad` guarda el suyo sin direcciones y, al contestar por él, pone las direcciones en las que el nodo escucha: con `[net] listen = "0.0.0.0:<puerto>"`, `0.0.0.0`. Por eso el nodo guarda su provider record con las direcciones que declara, y lo actualiza cuando cambian. Un router que también anuncia contesta por él con sus `external_addrs` o con sus direcciones directas, nunca con una IP sin especificar.
 
 ### Cómo conoce un router a los que lo marcan: `identify`
 
@@ -279,3 +281,85 @@ La conexión va autenticada con la clave del agente, así que cada búsqueda en 
 | `provider_records_stored` | los provider records de otros que guarda y no han caducado |
 | `stored_by_agent` | de esos valores y provider records, cuántos tiene cada agente |
 | `rejected` | los registros rechazados desde el arranque, por cada motivo de la sección 6, también los que van a cero |
+| `publication` | con `[dht] announce`, lo que el nodo publica (sección 8); sin él, `null` |
+
+## 8. Publicación, caducidad y búsqueda
+
+El código es `crates/pals/src/dht/publish.rs`, y sus pruebas, `crates/pals/tests/dht_publish.rs`: nodos reales sobre Iroh en loopback.
+
+### Qué se publica
+
+Un nodo publica solo con `[dht] announce = true`, y entonces solo las capacidades de los servicios del inventario con `visibility = "public"` (H3-D4). Son las mismas que lista su `agentnet.announce/1` y su card pública. Publica tres cosas:
+
+- su contacto firmado, bajo `/agentnet/contact/<peer_id>`;
+- su anuncio firmado, bajo `/agentnet/announce/<peer_id>`;
+- un provider record de cada capacidad pública, bajo la clave de la sección 3, con las direcciones que declara (sección 7): las de un router, o `/p2p/<peer_id>` en un cliente.
+
+Sin `announce`, no publica nada, tampoco el contacto. Un servicio privado o de proyecto nunca llega a la DHT. Al parar, el nodo no envía nada: las copias de los routers caducan solas.
+
+### Las vueltas de publicación
+
+Un nodo publica en vueltas:
+
+| Cuándo | Para qué |
+|-|-|
+| Al entrar en la red: cuando termina el arranque de la sección 7, o al empezar, sin `bootstrap` | la primera publicación |
+| Cada `[dht] republish_s`, 1200 s por defecto | que las copias de los routers no caduquen: se pueden perder dos vueltas antes de que caduque nada |
+| Cada vez que el nodo vuelve a emitir uno de sus registros: un cambio de direcciones, o la renovación de las 12 h | que el contacto nuevo llegue a los routers en cuanto se emite, no en la vuelta siguiente |
+| 30 s después de una vuelta que no llegó a ningún router | entrar cuanto antes, por ejemplo tras arrancar con los routers caídos |
+
+Una vuelta nueva cierra las consultas que quedaban de la anterior. Cada vuelta:
+
+1. Deja de anunciar las capacidades que el anuncio ya no lista. Después guarda en la tienda del nodo el provider record propio de cada una de las demás, en el orden del inventario. Una capacidad que no cabe falla sola, por ejemplo en un router que también anuncia y tiene llenas sus 1024 claves de proveedores: va a `failed_capabilities` y se intenta en la vuelta siguiente. Las demás siguen, y no se deshace nada.
+2. Pone el contacto y el anuncio en los routers más cercanos a sus claves, con quórum de todos ellos. Un registro llegó cuando al menos un router contestó que lo guardó.
+3. Cuando ha terminado el `put` del anuncio, para cada capacidad, busca los routers más cercanos a su clave, les pone el anuncio, con quórum de uno, y después les envía el provider record. Así el anuncio viaja con cada provider record: el router que guarda uno tiene el anuncio que pide la sección 6, aunque con muchos routers los más cercanos a la clave del anuncio y a la de la capacidad no sean los mismos.
+
+Una vuelta en la que ningún router contestó que guardaba algo termina con `last_error`, y la siguiente llega a los 30 s. Con `libp2p-kad` 0.49, un router contesta así también a lo que rechaza (sección 6): si lo guardó o no, lo dicen el estado del router y sus rechazos.
+
+### Caducidad
+
+Un router guarda un valor o un provider record `[dht] record_ttl_s` desde que lo recibe: 3600 s por defecto. Esa vida es la de `libp2p-kad`, que la mide con su propio reloj, no con el `Clock` del nodo. La replicación entre routers no la alarga: una copia replicada lleva la caducidad del original. Un registro firmado deja además de valer a las 24 h de emitirse (`RECORD_TTL_S`), y un router no lo sirve caducado por cualquiera de las dos.
+
+No hay barridos propios. `libp2p-kad` borra un valor caducado cuando se lee o en la vuelta de replicación, y un provider record caducado cuando se leen los proveedores de su clave. Hasta entonces ocupa su sitio en la tienda, así que un router con la tienda llena borra lo caducado antes de rechazar un registro con `store_full`, y lo intenta otra vez.
+
+Un proveedor que se para sin avisar sale de la DHT en `record_ttl_s` desde la última vuelta que llegó a los routers.
+
+### La búsqueda en la DHT
+
+Una búsqueda pide los proveedores de una capacidad, hasta un límite y con un plazo:
+
+1. Pide los proveedores de la clave de la capacidad.
+2. Según llega cada proveedor, hasta el límite, pide su contacto y su anuncio. Al llegar al límite, deja de pedir proveedores.
+3. Comprueba cada copia como un router (sección 6), al `Clock` del nodo, y se queda con la válida de mayor `seq`.
+4. Un proveedor es candidato cuando tiene un contacto y un anuncio válidos y el anuncio lista la capacidad.
+
+El nodo nunca se encuentra a sí mismo. Un proveedor que no es candidato se descarta con su motivo:
+
+| Motivo | Cuándo |
+|-|-|
+| `capability_not_announced` | su anuncio válido no lista la capacidad |
+| el de la sección 6 | el último rechazo de una copia de su contacto o de su anuncio, por ejemplo `bad_contact` |
+| `no valid contact`, `no valid announce` | no llegó ninguna copia de su contacto, o de su anuncio |
+
+Una búsqueda termina de una de tres formas:
+
+| Resultado | Cuándo |
+|-|-|
+| Lo que encontró | sus consultas terminaron |
+| Lo que tiene, marcado como cortado (`cut`) | llegó su plazo antes: cierra sus consultas |
+| El error `no DHT router answered` | sus consultas terminaron sin que contestara ningún router |
+
+Las peticiones de una búsqueda (`requests`) son las que sus consultas mandaron a la red. `libp2p-kad` añade a la consulta cada proveedor que encuentra, como un nodo más al que preguntar, pero a un proveedor que no es router no se le marca por Kademlia (sección 4): el nodo rechaza ese marcado antes de empezarlo, y no cuenta como petición. Cada rechazo se cuenta en la consulta que lo pidió, así que dos búsquedas a la vez que encuentran el mismo proveedor no se restan las peticiones de la otra.
+
+El estado de cada vuelta y de cada búsqueda va por consulta: el nodo hace a la vez cualquier número de búsquedas y vueltas. Lo que llega de la DHT son datos que no son de fiar: quien usa lo encontrado vuelve a comprobarlo.
+
+### El estado de la publicación
+
+Con `[dht] announce`, `pals dht status --json` y `GET /dht` llevan `publication`:
+
+| Campo | Qué es |
+|-|-|
+| `capabilities` | las capacidades públicas de la última vuelta; antes de que termine la primera, las del anuncio en vigor |
+| `last_round_unix` | cuándo terminó la última vuelta, por el reloj del nodo |
+| `last_error` | por qué se quedó corta la última vuelta: no contestó ningún router, o la tienda del propio nodo no tenía sitio para sus registros |
+| `failed_capabilities` | las capacidades que la última vuelta no pudo anunciar por falta de sitio en la tienda del nodo |

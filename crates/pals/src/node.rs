@@ -41,7 +41,7 @@ use crate::blobs::{BLOBS_DIR, BlobService};
 use crate::config::{Config, DataDirLock, DhtMode, WorkerCfg};
 use crate::dht::swarm::STORE_LIMITS;
 use crate::dht::transport::{ALPN_KAD, IrohListener, KadQuotas};
-use crate::dht::{Dht, DhtParts, DhtTiming};
+use crate::dht::{Dht, DhtParts, DhtTiming, PublishedRecords};
 use crate::discovery::{
     ContactSource, DiscoveryClient, DiscoveryHook, DiscoveryLimits, DiscoveryServer, Quotas,
     Records, Searcher, announced_capabilities, iroh_contact, renew_on_change,
@@ -216,9 +216,11 @@ impl Node {
     /// endpoint uses Iroh's N0 preset and its public relays; without it, it
     /// has no relay and is bound to 127.0.0.1 only. With `net.listen`, it is
     /// bound to that address alone, relay or not. With `[dht] enabled`, it
-    /// starts the DHT on the endpoint before it serves, failing on a
-    /// bootstrap ticket that is not one or is its own ([`Dht::spawn`]), and
-    /// serves [`ALPN_KAD`] with the rest. While it runs, the node
+    /// starts the DHT on the endpoint before it serves, once its records
+    /// are in force, failing on a bootstrap ticket that is not one or is its
+    /// own ([`Dht::spawn`]), and serves [`ALPN_KAD`] with the rest; with
+    /// `[dht] announce` too, the DHT publishes those records, and again each
+    /// time one is renewed ([`crate::dht::publish`]). While it runs, the node
     /// purges the dedup rows, the expired pages of peers' views and the
     /// expired offers again and renews its records every hour, renews them
     /// too whenever the endpoint's addresses change, and runs the inventory
@@ -522,23 +524,6 @@ impl Opened {
             Arc::clone(&key),
         )
         .await?;
-        let dht = if cfg.dht.enabled {
-            let parts = DhtParts {
-                endpoint: endpoint.clone(),
-                key: Arc::clone(&key),
-                cfg: cfg.dht.clone(),
-                timing: opts
-                    .dht_timing
-                    .unwrap_or_else(|| DhtTiming::from_config(&cfg.dht)),
-                quotas: opts.kad_quotas,
-                store_limits: opts.kad_store.clone(),
-                clock: Arc::clone(&opts.clock),
-                store: Arc::clone(&store),
-            };
-            Some(Dht::spawn(parts).context("cannot start the DHT")?)
-        } else {
-            None
-        };
         let records = {
             let id = key.id();
             let dialed = endpoint.clone();
@@ -553,6 +538,29 @@ impl Opened {
             })
             .await?
             .context("cannot issue this agent's signed records")?
+        };
+        let dht = if cfg.dht.enabled {
+            let parts = DhtParts {
+                endpoint: endpoint.clone(),
+                key: Arc::clone(&key),
+                cfg: cfg.dht.clone(),
+                timing: opts
+                    .dht_timing
+                    .unwrap_or_else(|| DhtTiming::from_config(&cfg.dht)),
+                quotas: opts.kad_quotas,
+                store_limits: opts.kad_store.clone(),
+                clock: Arc::clone(&opts.clock),
+                store: Arc::clone(&store),
+                // Only the public capabilities, which the records list
+                // (H3-D4); nothing at all without `announce`.
+                published: cfg
+                    .dht
+                    .announce
+                    .then(|| Arc::new(records.clone()) as Arc<dyn PublishedRecords>),
+            };
+            Some(Dht::spawn(parts).context("cannot start the DHT")?)
+        } else {
+            None
         };
         Ok(Self {
             lock,

@@ -31,11 +31,14 @@ use pals_core::records::{
 };
 use pals_core::signed::{Signed, SignedDoc};
 use pals_core::store::Store;
+use tokio::sync::watch;
 
 pub use cards::{CardFetchError, PeerCards, signed_card_json};
 pub use client::{DiscoveryClient, DiscoveryError, Reply};
 pub use search::{Chosen, DiscoveryLimits, SearchError, Searcher, SearcherParts};
 pub use server::{DiscoveryHook, DiscoveryServer, Quotas};
+
+use crate::dht::PublishedRecords;
 
 /// The ALPN of the discovery protocol, [`ALPN_DISCOVERY`] as text, which the
 /// announce record and the card's inventory extension name.
@@ -113,7 +116,9 @@ pub fn iroh_contact(id: AgentId, addr: &EndpointAddr) -> IrohContact {
 /// again ([`Records::renew`]) when what it says changes or when less than
 /// [`RECORD_RENEW_BEFORE_S`] are left of it; every record is issued with
 /// the next `seq` of its kind ([`Store::own_seq_next`]) and the whole
-/// [`RECORD_TTL_S`] from its `issued_at`, the time it is issued at.
+/// [`RECORD_TTL_S`] from its `issued_at`, the time it is issued at. Each
+/// renewal that issues something raises [`Records::changes`], which the
+/// DHT publishes at once with `[dht] announce`.
 #[derive(Clone)]
 pub struct Records {
     inner: Arc<Inner>,
@@ -129,6 +134,8 @@ struct Inner {
     /// Held while records are issued, so that renewals never interleave.
     renewing: Mutex<()>,
     current: RwLock<Current>,
+    /// Rises with every renewal that issued a record.
+    changes: watch::Sender<u64>,
 }
 
 /// The records in force.
@@ -185,6 +192,7 @@ impl Records {
                 capabilities,
                 renewing: Mutex::new(()),
                 current: RwLock::new(Current { contact, announce }),
+                changes: watch::channel(0).0,
             }),
         })
     }
@@ -197,6 +205,18 @@ impl Records {
             .read()
             .unwrap_or_else(PoisonError::into_inner);
         (current.contact.json.clone(), current.announce.json.clone())
+    }
+
+    /// The capabilities the announce record lists: those of the public
+    /// services ([`announced_capabilities`]), fixed while the node runs.
+    pub fn capabilities(&self) -> Vec<String> {
+        self.inner.capabilities.clone()
+    }
+
+    /// A count that rises each time [`Records::renew`] issues a record, the
+    /// contact or the announce.
+    pub fn changes(&self) -> watch::Receiver<u64> {
+        self.inner.changes.subscribe()
     }
 
     /// Issues again, at `now_unix`, each record whose content changed (the
@@ -234,8 +254,24 @@ impl Records {
             if let Some(announce) = announce {
                 current.announce = announce;
             }
+            drop(current);
+            inner.changes.send_modify(|count| *count += 1);
         }
         Ok(renewed)
+    }
+}
+
+impl PublishedRecords for Records {
+    fn current(&self) -> (Vec<u8>, Vec<u8>) {
+        Records::current(self)
+    }
+
+    fn capabilities(&self) -> Vec<String> {
+        Records::capabilities(self)
+    }
+
+    fn changes(&self) -> watch::Receiver<u64> {
+        Records::changes(self)
     }
 }
 
