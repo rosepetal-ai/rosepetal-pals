@@ -433,7 +433,10 @@ pub fn test_config(data_dir: &Path, worker: WorkerCfg) -> Config {
         worker,
         projects: BTreeMap::new(),
         limits: LimitsCfg::default(),
-        net: NetCfg { relay: false },
+        net: NetCfg {
+            relay: false,
+            listen: None,
+        },
         mcp: McpCfg {
             download_dir: Some(std::env::temp_dir().join("pals-test-downloads")),
         },

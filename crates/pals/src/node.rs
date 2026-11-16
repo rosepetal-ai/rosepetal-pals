@@ -195,7 +195,8 @@ impl Node {
     /// first run of the inventory adapters, which delays none of it
     /// ([`InventoryState::startup_refresh_done`]). With `net.relay` the
     /// endpoint uses Iroh's N0 preset and its public relays; without it, it
-    /// has no relay and is bound to 127.0.0.1 only. While it runs, the node
+    /// has no relay and is bound to 127.0.0.1 only. With `net.listen`, it is
+    /// bound to that address alone, relay or not. While it runs, the node
     /// purges the dedup rows, the expired pages of peers' views and the
     /// expired offers again and renews its records every hour, renews them
     /// too whenever the endpoint's addresses change, and runs the inventory
@@ -831,26 +832,36 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// The agent's Iroh endpoint, with the agent's key as its identity.
+/// The agent's Iroh endpoint, with the agent's key as its identity: bound
+/// to `net.listen` alone when it is set, with the relay or without it;
+/// otherwise as in milestone 2, the N0 preset's sockets with the relay and
+/// a free port of 127.0.0.1 without it.
 async fn bind_endpoint(cfg: &Config, key: &AgentKey) -> anyhow::Result<Endpoint> {
     let secret_key = SecretKey::from_bytes(&key.to_bytes());
-    let endpoint = if cfg.net.relay {
-        Endpoint::builder(presets::N0)
-            .secret_key(secret_key)
-            .bind()
-            .await
+    let builder = if cfg.net.relay {
+        Endpoint::builder(presets::N0).secret_key(secret_key)
     } else {
         Endpoint::builder(presets::Minimal)
             .secret_key(secret_key)
             .relay_mode(RelayMode::Disabled)
             .portmapper_config(PortmapperConfig::Disabled)
-            .clear_ip_transports()
-            .bind_addr((Ipv4Addr::LOCALHOST, 0))
-            .context("invalid bind address")?
-            .bind()
-            .await
     };
-    endpoint.context("cannot bind the Iroh endpoint")
+    let bind_addr = match cfg.net.listen {
+        Some(listen) => Some(listen),
+        None if !cfg.net.relay => Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        None => None,
+    };
+    let builder = match bind_addr {
+        Some(addr) => builder
+            .clear_ip_transports()
+            .bind_addr(addr)
+            .with_context(|| format!("invalid bind address {addr}"))?,
+        None => builder,
+    };
+    builder
+        .bind()
+        .await
+        .context("cannot bind the Iroh endpoint")
 }
 
 /// The A2A server the node serves to its peers, checking again with

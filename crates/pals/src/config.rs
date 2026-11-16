@@ -67,10 +67,15 @@ adapter = "echo"
 
 [net]
 # true: Iroh's public relays (the N0 preset), so that peers on other
-# machines and networks can reach this agent. false: no relay, and the agent
-# listens on 127.0.0.1 only: no other machine can reach it (local runs and
-# tests).
+# machines and networks can reach this agent. false: no relay, and unless
+# `listen` says otherwise the agent listens on 127.0.0.1 only: no other
+# machine can reach it (local runs and tests).
 relay = true
+# The one UDP address the agent's Iroh endpoint binds to, with the relay or
+# without it: a fixed port, which a DHT router needs so that other agents
+# can dial it. Without it: free ports on every interface with the relay, a
+# free port of 127.0.0.1 without it.
+# listen = "0.0.0.0:4433"
 
 [mcp]
 # The only directory pals_fetch writes the files of peers' answers to,
@@ -442,14 +447,23 @@ pub struct ProjectCfg {
 #[serde(default, deny_unknown_fields)]
 pub struct NetCfg {
     /// `true`: Iroh's N0 preset with its public relays; `false`: no relay,
-    /// and the endpoint bound to 127.0.0.1 only, so that no other machine
-    /// reaches the node (local runs and tests).
+    /// and, unless [`NetCfg::listen`] says otherwise, the endpoint bound to
+    /// 127.0.0.1 only, so that no other machine reaches the node (local runs
+    /// and tests).
     pub relay: bool,
+    /// The one UDP socket address the endpoint binds to, with the relay or
+    /// without it: the fixed port a DHT router is dialed at. `None`: with
+    /// the relay, the N0 preset's free ports on every interface; without
+    /// it, a free port of 127.0.0.1.
+    pub listen: Option<SocketAddr>,
 }
 
 impl Default for NetCfg {
     fn default() -> Self {
-        Self { relay: true }
+        Self {
+            relay: true,
+            listen: None,
+        }
     }
 }
 

@@ -8,6 +8,12 @@
 //! [`keys`] fixes what the network is addressed by, frozen by the vector
 //! `crates/pals-core/tests/vectors/kad-v0.json`: the agent's `PeerId`, the
 //! keys of its signed contact and announce, and the key of a capability's
-//! provider records.
+//! provider records. [`transport`] and [`muxer`] are libp2p's transport
+//! over the node's Iroh endpoint, with the address forms and the limits of
+//! `agentnet-kad/0`'s connections and streams; their tests,
+//! `crates/pals/tests/dht_transport.rs`, are the gate of any change of the
+//! `libp2p` or `iroh` versions.
 
 pub mod keys;
+pub mod muxer;
+pub mod transport;
