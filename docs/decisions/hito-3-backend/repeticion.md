@@ -26,7 +26,7 @@ python3 spikes/hito-3/harness/repeat.py --runs $R/kad-{iroh,libp2p}.json $R/runs
     --production $R/runs/kad-iroh-production-dial-once.json $R/runs/kad-libp2p-production.json
 ```
 
-Los JSON nuevos están en [`results/runs/`](results/runs/). Los registros de cada ejecución (`spikes/hito-3/harness/logs/<id>-<etiqueta>/`) no van en git. Las tablas de [Estado](#estado-de-s0-a-s7-por-ejecución), [Variación](#variación-entre-ejecuciones), [S6 con intervalos de producción](#s6-con-intervalos-de-producción) y el texto de [Veredicto de `repeat.py`](#veredicto-de-repeatpy) son su salida, tal cual.
+Los JSON nuevos están en [`results/runs/`](results/runs/). Los registros de cada ejecución (`spikes/hito-3/harness/logs/<id>-<etiqueta>/`) no van en git. Las tablas de [Estado](#estado-de-s0-a-s7-por-ejecución), [Variación](#variación-entre-ejecuciones), [S6 con intervalos de producción](#s6-con-intervalos-de-producción) y el texto de [Veredicto de `repeat.py`](#veredicto-de-repeatpy) son su salida, con las filas ordenadas por candidato y las medianas redondeadas a una décima.
 
 ### Lo medido es lo de la fase 1
 
@@ -152,7 +152,7 @@ Son las líneas de los cuatro routers juntos, de toda la ejecución (los registr
 - **Queda otra marcación abandonada.** Las 24 de la segunda columna llegan cada una 5,0 s después de que arranque un nodo, el plazo de marcado del transporte (`DIAL_TIMEOUT`). Por ejemplo, `p1` arranca a las 16:44:51,38 y `r2` y `r4` registran una a las 16:44:56,38. Los nodos de la red A las dejan en `r2` y `r4`, y los de la red B, en `r1` y `r3`. `p3` y `p4` dejan una en `r1` a los 5 s y otra en `r3` a los 10 s, y anuncian justo después. Diecisiete son del arranque, antes del reposo. Las otras siete caen en el reposo, entre las 16:50:01 y las 16:50:07, unos 5 minutos después del arranque, cuando toca el arranque periódico de `libp2p-kad`.
 
   Así que el router ve, de algunos pares, una marcación que no termina y se abandona a los 5 s, y después otra que sí termina, una detrás de otra. El reparto por redes apunta a la marcación a la dirección que el router tiene en la otra red, que el par prueba primero. No se comprobó, ni por qué entonces su apretón de manos llega al router y no termina.
-- **Lo que esto dice de la condición 2.** Siete apretones abandonados, en 2402 s y repartidos entre cuatro routers, solo suman bytes al reposo de `kad-iroh`. Marcando de verdad una sola vez, `router_bytes_per_min_p50` no sería mayor que 90 908 B/min, que ya no llega al doble de 67 950. Es una inferencia, no una medida: la medida exacta que pide la condición no se tiene.
+- **Lo que esto dice de la condición 2.** Siete apretones abandonados, en 2402 s y repartidos entre tres routers (5 en `r4`, 1 en `r2`, 1 en `r3` y ninguno en `r1`), solo suman bytes al reposo de `kad-iroh`. Marcando de verdad una sola vez, `router_bytes_per_min_p50` no sería mayor que 90 908 B/min, que ya no llega al doble de 67 950. Es una inferencia, no una medida: la medida exacta que pide la condición no se tiene. La respaldan los routers uno a uno: `r1`, sin ningún apretón abandonado en el reposo, mueve 89 716 B/min (1,32 veces), y ningún router pasa de 1,50 veces (`r3`, 102 127). Las tablas de rutas siguieron llenas en todas las muestras de S6, así que ningún apretón quitó tráfico al sacar un par de una tabla.
 
 ## Veredicto de `repeat.py`
 
@@ -165,11 +165,11 @@ Son las líneas de los cuatro routers juntos, de toda la ejecución (los registr
 
 **Veredicto: sigue `kad-iroh`.** No se da ninguna condición de cambio.
 
-La condición 1 se lee al pie de la letra: `kad-iroh` en `fail` en S3 o en S7 en alguna ejecución, y `kad-libp2p` en ninguno de los dos en ninguna. Leída escenario por escenario daría lo mismo aquí, porque no hay ningún `fail`. `repeat.py` avisa cuando las dos lecturas no coinciden. La condición 2 se juzga sobre la medida de arriba, con su salvedad.
+La condición 1 se lee al pie de la letra: `kad-iroh` en `fail` en S3 o en S7 en alguna ejecución, y `kad-libp2p` en ninguno de los dos en ninguna. Leída escenario por escenario daría lo mismo aquí, porque no hay ningún `fail`. `repeat.py` avisa cuando las dos lecturas no coinciden. La condición 2 se da por no cumplida con la medida de arriba como cota superior: los apretones abandonados solo suman bytes, y la cota ya no llega al doble.
 
 ## Lo que no se midió
 
-- **El reposo de `kad-iroh` con intervalos de producción marcando de verdad una sola vez.** La medida tuvo 24 apretones abandonados en los routers, 7 en el reposo ([arriba](#marcando-una-sola-vez)). No se investigó la causa ni se cambió `kad-iroh` para evitarlos: la condición se juzga sobre lo medido.
+- **El reposo de `kad-iroh` con intervalos de producción marcando de verdad una sola vez.** La medida tuvo 24 apretones abandonados en los routers, 7 en el reposo ([arriba](#marcando-una-sola-vez)). No se investigó la causa ni se cambió `kad-iroh` para evitarlos: la condición se juzga sobre lo medido, como cota superior.
 - **El reposo de `kad-iroh` con intervalos de producción y el factor por defecto.** Sin esa medida no se separa cuánto aportan las marcaciones dobles, ni con los intervalos de la prueba ni con los de producción.
 - **Variación con intervalos de producción.** Hay una sola medida de S6 por candidato.
 - **S0 a S5 y S7 con intervalos de producción.** Solo se midió el reposo. La caducidad con `TTL_S` = 3600 s y la recuperación con `REPUBLISH_S` = 1200 s no se comprueban: S3 tardaría más de una hora por ejecución.
