@@ -1,7 +1,7 @@
 {
   "backend": "kad-libp2p",
-  "commit": "331d85c",
-  "date": "2026-11-16T04:49:06Z",
+  "commit": "420a7e1",
+  "date": "2026-11-16T09:25:04Z",
   "params": {
     "TTL_S": 120,
     "REPUBLISH_S": 40,
@@ -83,17 +83,17 @@
         "with_valid_pct": 100.0,
         "complete_pct": 100.0,
         "first_valid_ms_p50": 2,
-        "first_valid_ms_p95": 3,
+        "first_valid_ms_p95": 5,
         "first_valid_backend_pct": 100.0,
         "elapsed_ms_p50": 7,
-        "elapsed_ms_p95": 7,
-        "requests_p50": 22,
-        "requests_p95": 22,
+        "elapsed_ms_p95": 13,
+        "requests_p50": 20,
+        "requests_p95": 20,
         "candidates_p50": 2,
         "candidates_max": 2,
-        "bytes_raw_p50": 31622,
-        "bytes_p50": 31617,
-        "bytes_p95": 32130,
+        "bytes_raw_p50": 31603,
+        "bytes_p50": 31599,
+        "bytes_p95": 32195,
         "backend_errors": 0
       },
       "notes": "Cada búsqueda devolvió los dos proveedores, verificados. 160 búsquedas: 4 clientes, 4 capacidades, 10 veces cada una. first_valid_ms es el found_ms más temprano de un candidato válido, si el backend lo da (first_valid_backend_pct), o el final de la búsqueda si no. Bytes por búsqueda: los de la interfaz del cliente menos su tráfico en reposo de S6 en el mismo tiempo."
@@ -103,20 +103,23 @@
       "metrics": {
         "connected_complete_pct": 100.0,
         "connected_first_valid_ms_p50": 2,
+        "connected_first_valid_ms_p95": 16,
+        "connected_elapsed_ms_p50": 5000,
+        "connected_elapsed_ms_p95": 10000,
         "newcomer_first_valid_s": 15.2,
         "newcomer_complete": true,
         "newcomer_searches": 4
       },
-      "notes": "Parado r1, cada cliente buscó cada capacidad una vez; después arrancó c5 con [r1, r3] y buscó hasta encontrar a los dos proveedores de cada capacidad, 80 s como mucho. newcomer_first_valid_s cuenta desde que arrancó su contenedor."
+      "notes": "Parado r1, cada cliente buscó cada capacidad una vez; después arrancó c5 con [r1, r3] y buscó hasta encontrar a los dos proveedores de cada capacidad, 80 s como mucho. newcomer_first_valid_s cuenta desde que arrancó su contenedor. connected_first_valid_ms y connected_elapsed_ms son de las búsquedas de los clientes con r1 parado: cuándo tuvo el backend el primer candidato válido y cuándo terminó la búsqueda."
     },
     "S3": {
       "status": "pass",
       "metrics": {
         "stored_before": 16,
-        "routers_forget_s": 114.2,
-        "searches_forget_s": 110.8,
+        "routers_forget_s": 111.4,
+        "searches_forget_s": 107.9,
         "limit_s": 160,
-        "polls": 31
+        "polls": 29
       },
       "notes": "Parado p1 sin aviso (docker kill). Cada 3 s, las estadísticas de los routers (lo que guardan de p1) y una búsqueda por cliente de una capacidad de p1, hasta que los routers no guardan nada de p1 y una ronda entera contesta 200 sin devolverlo. routers_forget_s cuenta en el primer sondeo a 0 después del último que guardaba algo, y searches_forget_s en la primera búsqueda contestada después de la última que lo devolvió."
     },
@@ -125,10 +128,14 @@
       "metrics": {
         "immediate_coverage": 1.0,
         "full_coverage_s": 0.0,
+        "degraded_first_valid_ms_p50": 2,
+        "degraded_first_valid_ms_p95": 6,
+        "degraded_elapsed_ms_p50": 5001,
+        "degraded_elapsed_ms_p95": 8361,
         "rounds": 1,
         "limit_s": 80
       },
-      "notes": "Parados r2 r4. Rondas seguidas en que cada cliente busca cada capacidad, hasta una ronda completa; la cobertura es la fracción de los proveedores esperados que se encuentran. La cobertura completa cuenta en la primera búsqueda completa, del mismo cliente y capacidad, después de la última incompleta, y es 0 si ninguna lo fue."
+      "notes": "Parados r2 r4. Rondas seguidas en que cada cliente busca cada capacidad, hasta una ronda completa; la cobertura es la fracción de los proveedores esperados que se encuentran. La cobertura completa cuenta en la primera búsqueda completa, del mismo cliente y capacidad, después de la última incompleta, y es 0 si ninguna lo fue. degraded_first_valid_ms y degraded_elapsed_ms son de todas las búsquedas de S4, hechas con los routers parados: cuándo tuvo el backend el primer candidato válido y cuándo terminó la búsqueda."
     },
     "S5": {
       "status": "pass",
@@ -146,36 +153,36 @@
     "S6": {
       "status": "measured",
       "metrics": {
-        "router_rss_kib_p50": 23200,
-        "router_rss_kib_max": 25292,
+        "router_rss_kib_p50": 23240,
+        "router_rss_kib_max": 25420,
         "router_connections_p50": 0,
-        "router_connections_max": 5,
+        "router_connections_max": 1,
         "router_routing_peers_p50": 3,
         "router_routing_peers_max": 3,
-        "router_bytes_per_min_p50": 250894,
-        "router_bytes_per_min_max": 275995,
-        "router_sent_bytes_per_min_p50": 126775,
-        "router_sent_bytes_per_min_max": 141532,
-        "provider_rss_kib_p50": 22372,
-        "provider_rss_kib_max": 22784,
+        "router_bytes_per_min_p50": 249735,
+        "router_bytes_per_min_max": 271964,
+        "router_sent_bytes_per_min_p50": 126338,
+        "router_sent_bytes_per_min_max": 139238,
+        "provider_rss_kib_p50": 22764,
+        "provider_rss_kib_max": 22912,
         "provider_connections_p50": 0,
-        "provider_connections_max": 0,
+        "provider_connections_max": 4,
         "provider_routing_peers_p50": 4,
         "provider_routing_peers_max": 4,
-        "provider_bytes_per_min_p50": 181426,
-        "provider_bytes_per_min_max": 199550,
-        "provider_sent_bytes_per_min_p50": 88697,
-        "provider_sent_bytes_per_min_max": 97544,
-        "client_rss_kib_p50": 22828,
-        "client_rss_kib_max": 23216,
+        "provider_bytes_per_min_p50": 180386,
+        "provider_bytes_per_min_max": 199567,
+        "provider_sent_bytes_per_min_p50": 88376,
+        "provider_sent_bytes_per_min_max": 97707,
+        "client_rss_kib_p50": 22748,
+        "client_rss_kib_max": 24916,
         "client_connections_p50": 0,
-        "client_connections_max": 4,
+        "client_connections_max": 0,
         "client_routing_peers_p50": 4,
         "client_routing_peers_max": 4,
-        "client_bytes_per_min_p50": 18661,
-        "client_bytes_per_min_max": 20733,
-        "client_sent_bytes_per_min_p50": 9068,
-        "client_sent_bytes_per_min_max": 9577
+        "client_bytes_per_min_p50": 18262,
+        "client_bytes_per_min_max": 20406,
+        "client_sent_bytes_per_min_p50": 8997,
+        "client_sent_bytes_per_min_max": 9551
       },
       "notes": "300 s sin búsquedas, con los 12 nodos de la topología. Memoria, conexiones y tabla de rutas muestreadas cada 60 s; bytes por minuto, de los contadores de todas las interfaces del contenedor menos lo, al empezar y al acabar: recibidos y enviados (bytes), y solo enviados (sent_bytes), porque un contenedor que no envía nada también recibe el tráfico de fondo del puente de Docker. p50 y máximo por papel."
     },
@@ -183,8 +190,8 @@
       "status": "pass",
       "metrics": {
         "clients_resolved": 4,
-        "resolved_s_p50": 0.7,
-        "resolved_s_max": 0.9,
+        "resolved_s_p50": 1.9,
+        "resolved_s_max": 2.1,
         "limit_s": 80,
         "searches": 4
       },

@@ -12,11 +12,12 @@ El spec (§6.1) deja como candidato inicial un módulo de `rust-libp2p` para Kad
 
 - **Integración.** Iroh 1.4.1 y libp2p 0.57.1 compilan juntos, también con la MSRV 1.91, cada pila en su puerto UDP. El vínculo firmado por las dos claves deja resolver el endpoint Iroh de un proveedor sin conectar antes con él por libp2p (§6.2). En la ejecución del arnés, S0 a S5 y S7 quedan en `pass` y S6 en `measured`, sin ningún `error`.
 - **Ajustes.** Hubo que sortear cinco comportamientos de `libp2p-kad` y de libp2p para que funcionara en una red privada con dos subredes ([API de `libp2p` usadas](#api-de-libp2p-usadas)). Sin dos de ellos, la red se degradaba después del primer router parado: S4 acababa en `fail` con una cobertura de 0,812 (ver [Direcciones de los routers](#direcciones-de-los-routers)).
-- **Coste, frente a la línea base:**
-  - dependencias: 370 crates frente a 300, por el recuento de `compat.sh` sobre `cargo tree`; la tarea 6 lo vuelve a medir, con el tiempo de compilación y el tamaño del binario;
-  - memoria en reposo: unos 22 a 23 MiB por nodo frente a 14 a 15 MiB;
-  - tráfico en reposo, con la republicación de la prueba cada 40 s: un router mueve unos 250 KB por minuto (127 KB enviados), un proveedor 181 KB y un cliente 19 KB, frente a menos de 0,5 KB;
-  - por búsqueda: 22 peticiones y unos 31,6 KB, porque cada `get_record` pide el valor a los cuatro routers.
+- **Coste, frente a la línea base.** Las cifras son las de `results/kad-libp2p.json` y `results/baseline.json`, salvo las dependencias:
+  - memoria en reposo (S6, p50 por papel): de 22 748 a 23 240 KiB por nodo, frente a 14 396 a 14 824;
+  - tráfico en reposo (S6, p50), con la republicación de la prueba cada 40 s: 249 735 bytes por minuto en un router (126 338 enviados), 180 386 en un proveedor y 18 262 en un cliente, frente a 444, 222 y 222;
+  - por búsqueda (S1, p50): 20 peticiones y 31 599 bytes netos. Cada `get_record` pide el valor a los cuatro routers;
+  - con routers caídos (S2 y S4), una búsqueda tiene su primer candidato válido a los 2 ms (p50 en los dos), pero no termina hasta los 5000 ms (p50 de S2) o 5001 ms (p50 de S4);
+  - dependencias: 370 crates frente a 300. Es una observación, no una cifra del JSON: el recuento de `compat.sh` hecho a mano sobre `cargo tree --locked -e normal --prefix none`. La tarea 6 lo vuelve a medir, con el tiempo de compilación y el tamaño del binario.
 
 El detalle está en [Resultados](#resultados).
 
@@ -180,30 +181,30 @@ Las pruebas (`tests/link.rs`) son de dos clases:
 
 ## Resultados
 
-Ejecución del arnés del 2026-11-16, sobre el commit `331d85c`, con los parámetros comunes de `params.env`: `TTL_S` = 120 s, `REPUBLISH_S` = 40 s, `IDLE_S` = 300 s, 10 búsquedas por cliente y capacidad y `SEARCH_LIMIT` = 8. Duró 12 minutos, con el anfitrión de 32 CPU a una carga media de 16 a 22. Las cifras completas están en [`results/kad-libp2p.json`](results/kad-libp2p.json).
+Las cifras de esta sección son las de [`results/kad-libp2p.json`](results/kad-libp2p.json): la ejecución del arnés del 2026-11-16 sobre el commit `420a7e1`, con los parámetros comunes de `params.env` (`TTL_S` = 120 s, `REPUBLISH_S` = 40 s, `IDLE_S` = 300 s, 10 búsquedas por cliente y capacidad y `SEARCH_LIMIT` = 8). Las de la línea base son las de [`results/baseline.json`](results/baseline.json). Según `harness.log`, que git ignora, la ejecución duró 13 min 43 s, en un anfitrión de 32 CPU con una carga media al empezar de 22,6.
 
 | Escenario | Estado | Cifras |
 |-|-|-|
 | S0 | `pass` | 4 búsquedas, ningún candidato. `c0` acaba con 0 pares en la tabla de rutas y 0 conexiones |
-| S1 | `pass` | 160 búsquedas, todas con los dos proveedores verificados. Primer candidato válido a los 2 ms (p50) y 3 ms (p95), y búsqueda entera en 7 ms (p50 y p95). 22 peticiones por búsqueda. 31 617 bytes netos por búsqueda (p50), 32 130 (p95) |
-| S2 | `pass` | Con `r1` parado, todas las búsquedas de los clientes están completas, con el primer candidato a los 2 ms (p50), aunque cada una dura unos 5 s esperando a `r1`. `c5` tiene su primer candidato válido 15,2 s después de arrancar su contenedor, y encuentra a todos los proveedores |
-| S3 | `pass` | Los routers dejan de guardar lo de `p1` a los 114,2 s de pararlo, y ninguna búsqueda lo devuelve desde los 110,8 s. El límite es 160 s |
-| S4 | `pass` | Cobertura inmediata 1,0, porque `r1` y `r3` lo guardan todo. Cada búsqueda dura unos 5 s por los dos routers caídos, con el primer candidato a los 2 a 5 ms |
+| S1 | `pass` | 160 búsquedas, todas con los dos proveedores verificados. Primer candidato válido a los 2 ms (p50) y 5 ms (p95). Búsqueda entera en 7 ms (p50) y 13 ms (p95). 20 peticiones por búsqueda. 31 599 bytes netos por búsqueda (p50), 32 195 (p95) |
+| S2 | `pass` | Con `r1` parado, todas las búsquedas de los clientes están completas. Su primer candidato válido llega a los 2 ms (p50) y 16 ms (p95), pero la búsqueda termina a los 5000 ms (p50) y 10 000 ms (p95). `c5` tiene su primer candidato válido 15,2 s después de arrancar su contenedor, y encuentra a todos los proveedores |
+| S3 | `pass` | Los routers dejan de guardar lo de `p1` a los 111,4 s de pararlo, y ninguna búsqueda lo devuelve desde los 107,9 s. El límite es 160 s |
+| S4 | `pass` | Cobertura inmediata 1,0, completa desde el principio (0 s). Con `r2` y `r4` parados, el primer candidato válido llega a los 2 ms (p50) y 6 ms (p95), pero la búsqueda termina a los 5001 ms (p50) y 8361 ms (p95) |
 | S5 | `pass` | Los cuatro routers rechazan el vínculo de `rogue` (4 rechazos), ninguno guarda su contacto y `records_stored` no crece sin explicación. Los clientes lo reciben las 4 veces como `bad_contact`, nunca como válido |
 | S6 | `measured` | Ver la tabla siguiente |
-| S7 | `pass` | Los cuatro clientes reciben el contacto nuevo de `p3`, con su IP en la red A, a los 0,7 s (p50) y 0,9 s (máximo) de la desconexión. El límite es 80 s |
+| S7 | `pass` | Los cuatro clientes reciben el contacto nuevo de `p3`, con su IP en la red A, a los 1,9 s (p50) y 2,1 s (máximo) de la desconexión. El límite es 80 s |
 
-En S2, los 15,2 s de `c5` suman el arranque del contenedor, su primer bootstrap, que espera 5 s la conexión imposible a `r1`, y su primera búsqueda, que espera lo mismo.
+En S2 y S4, la diferencia entre el primer candidato y el final de la búsqueda es la espera a los routers parados ([Direcciones de los routers](#direcciones-de-los-routers)). En S2, los 15,2 s de `c5` se explican así, aunque el JSON no los desglosa: el arranque del contenedor, su primer bootstrap, que espera la conexión imposible a `r1`, y su primera búsqueda, que espera lo mismo.
 
 En reposo (S6), por papel, con la cifra de la línea base entre paréntesis. Todas son p50, salvo las conexiones, que van como p50 / máximo:
 
 | Papel | RSS (KiB) | Conexiones | Tabla de rutas | Bytes por minuto | Enviados por minuto |
 |-|-|-|-|-|-|
-| Router | 23 200 (14 396) | 0 / 5 (0 / 0) | 3 (1) | 250 894 (444) | 126 775 (0) |
-| Proveedor | 22 372 (14 612) | 0 / 0 (0 / 0) | 4 (1) | 181 426 (222) | 88 697 (0) |
-| Cliente | 22 828 (14 824) | 0 / 4 (0 / 0) | 4 (2) | 18 661 (222) | 9 068 (0) |
+| Router | 23 240 (14 396) | 0 / 1 (0 / 0) | 3 (1) | 249 735 (444) | 126 338 (0) |
+| Proveedor | 22 764 (14 612) | 0 / 4 (0 / 0) | 4 (1) | 180 386 (222) | 88 376 (0) |
+| Cliente | 22 748 (14 824) | 0 / 0 (0 / 0) | 4 (2) | 18 262 (222) | 8 997 (0) |
 
-Las conexiones están casi siempre cerradas: `libp2p-swarm` cierra una conexión a los 10 s sin uso. Por eso cada republicación, cada 40 s, abre conexiones QUIC nuevas con su apretón de manos TLS, y eso, con las consultas iterativas de cada `put` y de cada `start_providing`, es casi todo el tráfico de proveedores y routers. Los clientes solo hacen el arranque periódico de Kademlia, cada 5 minutos. Con los intervalos de producción, de horas, el tráfico en reposo bajaría en proporción. Pero aquí se mide con los de la prueba, los mismos para todos los candidatos.
+Las conexiones están casi siempre cerradas: `libp2p-swarm` cierra una conexión a los 10 s sin uso. El JSON no desglosa el tráfico, pero se explica por lo que hace cada papel. Cada republicación, cada 40 s, abre conexiones QUIC nuevas con su apretón de manos TLS, y además están las consultas iterativas de cada `put` y de cada `start_providing`; de eso vive el tráfico de proveedores y routers. Los clientes solo hacen el arranque periódico de Kademlia, cada 5 minutos. Con los intervalos de producción, de horas, el tráfico en reposo bajaría en proporción. Pero aquí se mide con los de la prueba, los mismos para todos los candidatos.
 
 ## Lo que no se pudo medir
 
