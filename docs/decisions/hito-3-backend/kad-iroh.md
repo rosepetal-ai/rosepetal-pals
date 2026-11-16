@@ -8,7 +8,18 @@ No es código del producto. El ALPN `agentnet-kad/0` es provisional.
 
 `kad-libp2p` respondió que `libp2p-kad` convive con Iroh en el mismo nodo, cada uno con su pila, su puerto UDP y su clave, unidas por un vínculo firmado. La duda de este candidato es si `libp2p-kad` puede ir sobre las propias conexiones Iroh del daemon, con una sola identidad (el `PeerId` es el `AgentId`), un solo puerto UDP y ninguna segunda pila de red, y qué cuesta.
 
-El resumen y las cifras están en [Resultados](#resultados), que salen de la ejecución del arnés sobre el commit del código.
+**Sí: `libp2p-kad` funciona sobre las conexiones Iroh del nodo, con una sola identidad, un solo puerto UDP y sin pila de red de libp2p, y cumple los escenarios comunes con la misma configuración de Kademlia que `kad-libp2p`. El adaptador es pequeño, pero sobre Iroh hubo que acotar el plazo del anuncio, y el tráfico en reposo es mayor.**
+
+- **Integración.** No hay ningún transporte publicado que sirva ([Paso 1](#paso-1-un-transporte-ya-publicado)), así que se escribió uno. El adaptador son 509 líneas, 381 sin comentarios ni vacías, lejos del límite de unas 1000 del plan. El `PeerId` es la clave del agente, así que sobra el vínculo de identidades, y libp2p no firma nada con ella ([Reutilizar la clave del agente](#reutilizar-la-clave-del-agente-como-identidad-libp2p)). En la ejecución del arnés, S0 a S5 y S7 quedan en `pass` y S6 en `measured`, sin ningún `error`.
+- **Ajustes.** Se mantienen los cinco de `kad-libp2p`, y hubo que añadir uno: el anuncio contesta en su plazo aunque haya un `put` en curso. Sin él, una ejecución de prueba acabó con S7 en `error` ([Los ajustes de `kad-libp2p`](#los-ajustes-de-kad-libp2p)).
+- **Coste, frente a `kad-libp2p` y a la línea base.** Las cifras son las de `results/kad-iroh.json`, `results/kad-libp2p.json` y `results/baseline.json`, salvo las dependencias:
+  - memoria en reposo (S6, p50 por papel): de 20 372 a 21 128 KiB por nodo, frente a 22 748 a 23 240 de `kad-libp2p` y 14 396 a 14 824 de la línea base;
+  - tráfico en reposo (S6, p50), con la republicación de la prueba cada 40 s: 355 418 bytes por minuto en un router, 218 700 en un proveedor y 27 142 en un cliente, frente a 249 735, 180 386 y 18 262 de `kad-libp2p` y 444, 222 y 222 de la línea base;
+  - por búsqueda (S1, p50): 20 peticiones, como en `kad-libp2p`, y 27 841 bytes netos, frente a 31 599;
+  - con routers caídos (S2 y S4), el primer candidato válido llega a los 2 y 3 ms (p50), pero la búsqueda no termina hasta los 5001 ms (p50 de los dos), el plazo de marcado del transporte, como en `kad-libp2p`;
+  - dependencias: 337 crates, frente a 370 de `kad-libp2p` y 300 de la línea base. Es una observación, no una cifra del JSON ([Código](#código)).
+
+El detalle está en [Resultados](#resultados).
 
 ## Paso 1: un transporte ya publicado
 
@@ -36,7 +47,7 @@ Cada nodo tiene una sola pila de red: un endpoint de Iroh, arrancado como en el 
 - **Escucha.** El endpoint ya está ligado a su puerto. El transporte crea un `IrohListener`, el manejador de protocolo que el `Router` sirve en `agentnet-kad/0`, y este le pasa cada conexión ya autenticada. `listen_on` solo nombra el socket del endpoint para que libp2p lo conozca. Sin escucha, una conexión entrante se cierra.
 - **`IrohMuxer`** implementa `StreamMuxer`: cada substream es un stream bidireccional QUIC de la conexión, `open_bi` al abrirlo y `accept_bi` al aceptarlo, como hace `libp2p-quic` con las suyas. Cerrar un substream termina su mitad de envío (`finish`). Cuando la otra parte o Iroh cierran la conexión, el `accept_bi` pendiente falla y libp2p la da por cerrada.
 - **Una conexión por ALPN, varias rutas por par.** Iroh guarda por cada `EndpointId` las direcciones que conoce y las rutas que ha probado, y una conexión nueva suma su dirección a ese conjunto (`RemoteStateActor::handle_msg_resolve_remote` en `iroh` 1.4.1). Así, una marcación de libp2p hacia una dirección concreta puede acabar yendo por otra que Iroh ya conocía de ese par. Es una observación del código de Iroh, no algo que la prueba mida aparte.
-- **Dos marcaciones por router.** libp2p marca a la vez todas las direcciones de un par (`dial_concurrency_factor`, 8 por defecto, sin cambiar), y los routers tienen dos, una en cada red. Cada una es una conexión Iroh aparte, y como Iroh puede llevar las dos por la ruta que funciona, a menudo las dos llegan al router. libp2p se queda con la primera y abandona la otra a mitad del apretón de manos. Los routers lo registran como `WARN … Accepting incoming connection ended with error: aborted by peer` cada pocos segundos mientras hay actividad (registros de los nodos, que git ignora). Es tráfico de apretones de manos que `kad-libp2p` no tiene: allí, la marcación a la dirección de la otra red no llega a ninguna parte.
+- **Dos marcaciones por router.** libp2p marca a la vez todas las direcciones de un par (`dial_concurrency_factor`, 8 por defecto, sin cambiar), y los routers tienen dos, una en cada red. Cada una es una conexión Iroh aparte, y como Iroh puede llevar las dos por la ruta que funciona, a menudo las dos llegan al router. libp2p se queda con la primera y abandona la otra a mitad del apretón de manos. Los routers lo registran como `WARN … Accepting incoming connection ended with error: aborted by peer`, varias veces por minuto mientras hay actividad (registros de los nodos, que git ignora). Es tráfico de apretones de manos que `kad-libp2p` no tiene: allí, la marcación a la dirección de la otra red no llega a ninguna parte.
 
 **Identidad.** El `PeerId` es el de la clave pública Ed25519 del agente: `identity::PublicKey::from(ed25519::PublicKey::try_from_bytes(agent_id))`. Esa clave es también el `EndpointId` de Iroh. Son los mismos 32 bytes con dos escrituras distintas: el `PeerId` en base58 (`12D3KooW…`) y el `AgentId` en hexadecimal. No hace falta vínculo de identidades ni segunda clave (prueba `peer_id_is_the_agent_key`).
 
@@ -57,7 +68,7 @@ Cada nodo tiene una sola pila de red: un endpoint de Iroh, arrancado como en el 
 - libp2p no lleva transportes: solo las features `kad`, `tokio`, `macros`, `identify` y `ed25519`. Ni QUIC ni TCP de libp2p, ni mDNS, relay, AutoNAT, UPnP o DCUtR. Iroh no tiene relays ni búsqueda de direcciones (`presets::Minimal`, `RelayMode::Disabled`).
 - Un nodo con la lista de arranque vacía no conoce a nadie (S0 y la prueba `a_node_with_no_bootstrap_finds_no_one`).
 
-**Se usa `identify`,** con la misma configuración que en `kad-libp2p`, por dos cosas que `kad::Mode` no da. La primera: el modo propio de un nodo dice si acepta peticiones de Kademlia, pero no le dice si el par es servidor. `libp2p-kad` 0.49 lo sabe por la lista de protocolos que publica `identify` (`ConnectionEvent::RemoteProtocolsChange` en `handler.rs`). Sin ella, toma por servidor a cualquier par que le abre un stream de Kademlia, también a los clientes. La segunda: un router solo mete en su tabla de rutas, con dirección, a los pares a los que él marcó. En una conexión entrante, `libp2p-kad` no usa la dirección del otro (`ConnectedPoint::Listener` en `on_connection_handler_event` de `behaviour.rs`), y `r1`, que no arranca desde nadie, solo recibe conexiones entrantes. Sin `identify`, su tabla se quedaría vacía. Sobre Iroh, la dirección de origen de una conexión entrante sí es la de escucha del par, porque cada nodo usa un solo socket para todo. Eso podría sustituir las direcciones de `identify`, pero no su lista de protocolos. Todo esto sale de leer el código de `libp2p-kad`: no se probó una versión sin `identify`.
+**Se usa `identify`,** con la misma configuración que en `kad-libp2p`, por dos cosas que `kad::Mode` no da. La primera: el modo propio de un nodo dice si acepta peticiones de Kademlia, pero no le dice si el par es servidor. `libp2p-kad` 0.49 lo sabe por la lista de protocolos que publica `identify` (`ConnectionEvent::RemoteProtocolsChange` en `handler.rs`). Sin ella, toma por servidor a cualquier par que le abre un stream de Kademlia, también a los clientes. La segunda: `libp2p-kad` solo mete en la tabla de rutas a un par cuya dirección conoce, y en una conexión entrante no usa la del otro (`ConnectedPoint::Listener` en `on_connection_handler_event` de `behaviour.rs`). `r1`, que no arranca desde nadie, solo recibe conexiones entrantes, y nadie más le da las direcciones de los otros routers. Sin `identify`, su tabla se quedaría vacía. Sobre Iroh, la dirección de origen de una conexión entrante sí es la de escucha del par, porque cada nodo usa un solo socket para todo. Eso podría sustituir las direcciones de `identify`, pero no su lista de protocolos. Todo esto sale de leer el código de `libp2p-kad`: no se probó una versión sin `identify`.
 
 ### Los ajustes de `kad-libp2p`
 
@@ -96,7 +107,7 @@ Con `rogue` (S5), los routers rechazan su contacto, y guardan su anuncio y su pr
 
 ### Caducidad, republicación y límites
 
-Son los de `kad-libp2p`, copiados: `set_record_ttl` y `set_provider_record_ttl` a `TTL_S`, `set_publication_interval`, `set_provider_publication_interval` y `set_replication_interval` a `REPUBLISH_S`, y un barrido cada segundo de lo que la propia biblioteca marca como caducado. Los límites de `MemoryStoreConfig` (1024 valores de 8 KiB como mucho, 20 proveedores por clave y 1024 claves de proveedores) y los plazos (consulta de 20 s, búsqueda de 30 s, reintentos de anuncio durante 25 s) son los mismos. Dos cambian o se añaden:
+Son los de `kad-libp2p`, copiados: `set_record_ttl` y `set_provider_record_ttl` a `TTL_S`, `set_publication_interval`, `set_provider_publication_interval` y `set_replication_interval` a `REPUBLISH_S`, y un barrido cada segundo de lo que la propia biblioteca marca como caducado. Los límites de `MemoryStoreConfig` (1024 valores de 8 KiB como mucho, 20 proveedores por clave y 1024 claves de proveedores) y los plazos (consulta de 20 s, búsqueda de 30 s, reintentos de anuncio durante 25 s) son los mismos. Cambia el tamaño de un valor, y el resto de la tabla es del transporte:
 
 | Límite | Valor | Por qué |
 |-|-|-|
@@ -132,7 +143,7 @@ El daemon tendría que servir `agentnet-kad/0` en su `Router` de Iroh, junto a `
 
 - **Dentro de cada conexión** va libp2p tal cual. Cada stream QUIC negocia su protocolo con multistream-select: `/agentnet/kad/1.0.0` para Kademlia, con los mensajes protobuf de `libp2p-kad` (16 KiB como mucho), e `/ipfs/id/1.0.0` para `identify`, cuyo nombre fija la biblioteca.
 - **Una conexión más por par.** El ALPN se negocia por conexión, así que dos daemons que hablan A2A y Kademlia tienen dos conexiones QUIC. Comparten el socket UDP y el estado de rutas que Iroh guarda de cada par.
-- **Todos los nodos lo sirven en la prueba,** también clientes y proveedores, que están en modo cliente de Kademlia y rechazan sus peticiones. Lo sirven porque `identify` corre en las dos direcciones de cada conexión.
+- **Todos los nodos lo sirven en la prueba,** porque todos escuchan, como en `kad-libp2p`. También los clientes y los proveedores, aunque en modo cliente de Kademlia rechacen sus peticiones.
 - **Cuotas.** El daemon pone cuotas a `agentnet-discovery/0` (4 streams y 60 peticiones por minuto y par, 64 streams en total). Para `agentnet-kad/0` habría que decidir las suyas. La prueba solo tiene los límites de la biblioteca: 32 streams entrantes de Kademlia por conexión y los streams concurrentes que admite el QUIC de Iroh. No configura límites de conexiones del swarm ni mide abusos.
 
 ## API de `libp2p` e Iroh usadas
@@ -183,7 +194,35 @@ Las pruebas son de tres clases:
 
 ## Resultados
 
-Las cifras están en [`results/kad-iroh.json`](results/kad-iroh.json), que se añade con la ejecución del arnés sobre el commit del código.
+Las cifras de esta sección son las de [`results/kad-iroh.json`](results/kad-iroh.json): la ejecución del arnés del 2026-11-16 sobre el commit `c954836`, con los parámetros comunes de `params.env` (`TTL_S` = 120 s, `REPUBLISH_S` = 40 s, `IDLE_S` = 300 s, 10 búsquedas por cliente y capacidad y `SEARCH_LIMIT` = 8). Las de `kad-libp2p` y la línea base son las de [`results/kad-libp2p.json`](results/kad-libp2p.json) y [`results/baseline.json`](results/baseline.json). Según `harness.log`, que git ignora, la ejecución duró 12 min 56 s, en un anfitrión de 32 CPU con una carga media al empezar de 25,0.
+
+| Escenario | Estado | Cifras |
+|-|-|-|
+| S0 | `pass` | 4 búsquedas, ningún candidato. `c0` acaba con 0 pares en la tabla de rutas y 0 conexiones |
+| S1 | `pass` | 160 búsquedas, todas con los dos proveedores verificados. Primer candidato válido a los 2 ms (p50) y 5 ms (p95), siempre fechado por el backend. Búsqueda entera en 5 ms (p50) y 10 ms (p95). 20 peticiones por búsqueda. 27 841 bytes netos por búsqueda (p50), 28 183 (p95) |
+| S2 | `pass` | Con `r1` parado, todas las búsquedas de los clientes están completas. Su primer candidato válido llega a los 2 ms (p50) y 11 ms (p95), siempre fechado por el backend, pero la búsqueda termina a los 5001 ms (p50) y 10 013 ms (p95). `c5` tiene su primer candidato válido 16,0 s después de arrancar su contenedor, y encuentra a todos los proveedores |
+| S3 | `pass` | Los routers guardaban 12 registros de `p1` antes de pararlo. Dejan de guardarlos a los 106,6 s, y ninguna búsqueda lo devuelve desde los 99,3 s. El límite es 160 s |
+| S4 | `pass` | Cobertura inmediata 1,0, completa desde el principio (0 s). Con `r2` y `r4` parados, el primer candidato válido llega a los 3 ms (p50) y 7 ms (p95), siempre fechado por el backend, pero la búsqueda termina a los 5001 ms (p50) y 5006 ms (p95) |
+| S5 | `pass` | Los cuatro routers rechazan el contacto de `rogue` (4 rechazos), ninguno lo guarda y `records_stored` no crece sin explicación. Los clientes lo reciben las 4 veces como `bad_contact`, nunca como válido |
+| S6 | `measured` | Ver la tabla siguiente |
+| S7 | `pass` | Los cuatro clientes reciben el contacto nuevo de `p3`, con su IP en la red A, a los 1,5 s (p50) y 1,8 s (máximo) de la desconexión. El límite es 80 s |
+
+En reposo (S6), por papel, con la cifra de `kad-libp2p` y la de la línea base entre paréntesis, en ese orden. Todas son p50, salvo las conexiones, que van como p50 / máximo:
+
+| Papel | RSS (KiB) | Conexiones | Tabla de rutas | Bytes por minuto | Enviados por minuto |
+|-|-|-|-|-|-|
+| Router | 21 128 (23 240; 14 396) | 1 / 4 (0 / 1; 0 / 0) | 3 (3; 1) | 355 418 (249 735; 444) | 174 690 (126 338; 0) |
+| Proveedor | 20 372 (22 764; 14 612) | 0 / 4 (0 / 4; 0 / 0) | 4 (4; 1) | 218 700 (180 386; 222) | 112 145 (88 376; 0) |
+| Cliente | 20 400 (22 748; 14 824) | 0 / 0 (0 / 0; 0 / 0) | 4 (4; 2) | 27 142 (18 262; 222) | 14 162 (8 997; 0) |
+
+Lo que explica las cifras, sin que el JSON lo desglose:
+
+- **Memoria.** Entre 2,1 y 2,3 MiB menos por nodo que `kad-libp2p`, que lleva dos pilas QUIC, y entre 5,4 y 6,6 MiB más que la línea base, que solo tiene Iroh.
+- **Tráfico en reposo.** Es mayor que en `kad-libp2p` en los tres papeles: un 42 % en los routers, un 21 % en los proveedores y un 49 % en los clientes. El JSON no dice de dónde sale. Hay al menos una fuente que `kad-libp2p` no tiene: las marcaciones dobles a cada router, cuya perdedora se abandona en pleno apretón de manos. En el registro de `r2`, que git ignora, son 26 en los 5 min de S6, unas 5 por minuto ([El transporte](#el-transporte)). Otras posibles, que no se separaron: lo que Iroh hace en cada conexión además de QUIC, como mantenerla viva o probar las otras direcciones del par.
+- **Por búsqueda,** en cambio, gasta un 12 % menos de bytes que `kad-libp2p` (27 841 frente a 31 599, p50). Una explicación posible, que no se comprobó: el apretón de manos TLS de Iroh lleva claves públicas en bruto, y el de libp2p un certificado X.509 con su extensión.
+- **Routers parados (S2 y S4).** Como en `kad-libp2p`, la búsqueda espera a los routers parados hasta el plazo de marcado del transporte, 5 s, aunque sus candidatos lleguen en milisegundos. Los 16,0 s de `c5` en S2 se explican igual: el arranque del contenedor, su primer bootstrap, que espera la conexión imposible a `r1`, y su primera búsqueda.
+- **S3: 12 registros antes, no 16.** `r1`, que el arnés vuelve a arrancar al final de S2, todavía no guardaba nada al empezar S3, y los otros tres routers guardaban 4 registros de `p1` cada uno. Lo dicen los ficheros `raw/` de la ejecución, que git ignora, y en S5 pasó lo mismo con `r2` y `r4`, arrancados de nuevo al final de S4. En `kad-libp2p`, `stored_before` de S3 es 16: allí los routers vueltos a arrancar ya tenían los registros cuando empezó el escenario siguiente. Aquí los recibieron más tarde: en la ejecución de prueba, nadie conectó con `r1` hasta 14 s después de que arrancara, y la primera búsqueda que lo hizo tardó 62 ms. No cambia ningún estado, porque el arnés espera solo a que lo guardado deje de cambiar, y no se averiguó la causa.
+- **S7 depende del momento.** Aquí `p3` volvió a anunciarse a los 1,3 s del cambio de red (registro de `p3`, que git ignora). En la ejecución de prueba sin commit, el anuncio tardó 32,5 s y los clientes no vieron el contacto nuevo hasta unos 34 s después de la desconexión, según su `raw/S7.jsonl`. Aquella vez, el registro de `p3` muestra que Iroh intentaba cerrar rutas de sus conexiones a los cuatro routers entre 19 y 21 s después del cambio (`noq_proto … failed closing path`). Esta vez no aparece nada de eso. Con una sola ejecución buena no se sabe con qué frecuencia pasa cada cosa. Iroh 1.4.1 retrasa hasta 5 s el aviso a QUIC de un cambio de red cuando no hay ruta por defecto (`has_usable_network` y `PendingNetworkChangeNotify` en `socket.rs`), y las redes `--internal` de la prueba no la tienen. Eso no basta para explicar de 19 a 21 s.
 
 ## Lo que no se pudo medir
 
@@ -193,10 +232,12 @@ Las cifras están en [`results/kad-iroh.json`](results/kad-iroh.json), que se a�
 - **El contacto en uso.** Nadie conecta al endpoint que nombra el contacto con otro ALPN: S7 comprueba que el cliente recibe la dirección nueva, no que conecte con ella. Aquí, al menos, el endpoint del contacto es el mismo al que conectan los demás nodos para Kademlia.
 - **Sin `identify` y sin los dos últimos ajustes.** No se probó si hacen falta sobre Iroh. Lo que dice este documento sobre `identify` sale de leer el código de `libp2p-kad`.
 - **La convivencia con el daemon.** La prueba sirve solo `agentnet-kad/0`. No mide el endpoint compartido con A2A, blobs y descubrimiento, ni las cuotas que harían falta.
+- **La variación de S7 y de los routers vueltos a arrancar.** Una sola ejecución que cuenta no dice cuánto varía S7 tras un cambio de red con conexiones abiertas, ni por qué un router que vuelve tarda más en recibir registros que en `kad-libp2p` ([Resultados](#resultados)).
+- **De dónde sale el tráfico en reposo.** Los bytes son los de la interfaz del contenedor, y no se separan los de Kademlia, los de `identify` y los propios de Iroh.
 
 ## Metadatos que ve un router
 
-- **Quién busca.** Cada búsqueda llega por una conexión Iroh autenticada. El router ve la clave del agente que busca, que es a la vez su `PeerId` y su `AgentId`, y su IP y puerto. `identify` le da además sus direcciones externas, sus protocolos y la versión de `rust-libp2p`. En `kad-libp2p`, el `PeerId` de un cliente no llevaba a su agente. Aquí el router sabe qué agente busca, y puede juntar sus búsquedas con el resto de lo que hace ese agente, por ejemplo sus contactos y sus grants.
+- **Quién busca.** Cada búsqueda llega por una conexión Iroh autenticada. El router ve la clave del agente que busca, que es a la vez su `PeerId` y su `AgentId`, y su IP y puerto. `identify` le da además sus direcciones externas, sus protocolos y la versión de `rust-libp2p`. En `kad-libp2p`, el `PeerId` de un cliente no llevaba a su agente. Aquí el router sabe qué agente busca, y puede juntar sus búsquedas con lo que ese mismo agente publica en la DHT o hace por Iroh con él.
 - **Qué busca.** La clave de `GET_PROVIDERS` es el SHA-256 de la cadena de la capacidad, que con un vocabulario público se recupera con un diccionario. Después ve los `GET_VALUE` de `/agentnet/contact/<P>` y `/agentnet/announce/<P>`: qué proveedores mira quien busca.
 - **Quién ofrece.** Cada 40 s, cada proveedor le envía su contacto, con su agente y sus IP, su anuncio, con sus capacidades, y un provider record por capacidad. El router sabe quién ofrece qué, dónde está y si sigue vivo.
 
