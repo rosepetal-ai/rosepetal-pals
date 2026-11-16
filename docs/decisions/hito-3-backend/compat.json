@@ -1,15 +1,14 @@
 {
-  "date": "2026-11-16T01:37:30Z",
+  "date": "2026-11-16T12:51:23Z",
   "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
   "rustc_msrv": "rustc 1.91.1 (ed61e7d7e 2025-11-07)",
-  "commit": "9783107",
+  "commit": "3a5693a",
   "host_cpus": 32,
-  "provisional": "binaries are link-only stubs until Tasks 2 to 5; Task 6 remeasures",
   "candidates": {
     "baseline": {
       "msrv_1_91": "pass",
       "msrv_error": null,
-      "crates": 277,
+      "crates": 300,
       "duplicates": [
         "base64 v0.22.1, v0.23.1",
         "cpufeatures v0.2.17, v0.3.1",
@@ -20,23 +19,33 @@
         "netlink-sys v0.8.8, v0.9.0",
         "syn v2.0.119, v3.0.10"
       ],
-      "release_build_s": 46.9,
+      "release_build_s": 68.7,
       "release_build_samples_s": [
-        46.9
+        68.7,
+        72.8,
+        68.8
       ],
       "release_build_load_1m": [
         [
-          14.7,
-          18.47
+          20.44,
+          27.11
+        ],
+        [
+          28.33,
+          31.02
+        ],
+        [
+          27.78,
+          28.74
         ]
       ],
-      "binary_bytes": null,
-      "binary_bytes_over_baseline": null
+      "binary_bytes": 25863520,
+      "binary_bytes_over_baseline": 0
     },
     "kad-libp2p": {
       "msrv_1_91": "pass",
       "msrv_error": null,
-      "crates": 348,
+      "crates": 370,
       "duplicates": [
         "base64 v0.22.1, v0.23.1",
         "cpufeatures v0.2.17, v0.3.1",
@@ -51,23 +60,33 @@
         "thiserror-impl v1.0.69, v2.0.21",
         "yasna v0.5.2, v0.6.0"
       ],
-      "release_build_s": 50.3,
+      "release_build_s": 74.8,
       "release_build_samples_s": [
-        50.3
+        82.3,
+        74.8,
+        78.5
       ],
       "release_build_load_1m": [
         [
-          18.47,
-          19.05
+          27.11,
+          35.01
+        ],
+        [
+          27.18,
+          32.83
+        ],
+        [
+          28.74,
+          32.18
         ]
       ],
-      "binary_bytes": null,
-      "binary_bytes_over_baseline": null
+      "binary_bytes": 35567696,
+      "binary_bytes_over_baseline": 9704176
     },
     "kad-iroh": {
       "msrv_1_91": "pass",
       "msrv_error": null,
-      "crates": 313,
+      "crates": 337,
       "duplicates": [
         "base64 v0.22.1, v0.23.1",
         "cpufeatures v0.2.17, v0.3.1",
@@ -78,23 +97,33 @@
         "netlink-sys v0.8.8, v0.9.0",
         "syn v2.0.119, v3.0.10"
       ],
-      "release_build_s": 49.9,
+      "release_build_s": 62.9,
       "release_build_samples_s": [
-        49.9
+        71.9,
+        72.1,
+        62.9
       ],
       "release_build_load_1m": [
         [
-          19.05,
-          23.52
+          35.01,
+          30.33
+        ],
+        [
+          32.83,
+          30.05
+        ],
+        [
+          31.02,
+          27.9
         ]
       ],
-      "binary_bytes": null,
-      "binary_bytes_over_baseline": null
+      "binary_bytes": 29270056,
+      "binary_bytes_over_baseline": 3406536
     },
     "mainline": {
       "msrv_1_91": "pass",
       "msrv_error": null,
-      "crates": 297,
+      "crates": 306,
       "duplicates": [
         "base64 v0.22.1, v0.23.1",
         "cpufeatures v0.2.17, v0.3.1",
@@ -104,21 +133,30 @@
         "netlink-packet-core v0.8.2, v0.9.0",
         "netlink-packet-route v0.31.0, v0.33.0",
         "netlink-sys v0.8.8, v0.9.0",
-        "spin v0.9.9, v0.10.1",
         "syn v2.0.119, v3.0.10"
       ],
-      "release_build_s": 50.2,
+      "release_build_s": 65.3,
       "release_build_samples_s": [
-        50.2
+        65.3,
+        72.3,
+        80.6
       ],
       "release_build_load_1m": [
         [
-          23.52,
-          26.89
+          30.33,
+          27.18
+        ],
+        [
+          30.05,
+          28.33
+        ],
+        [
+          27.9,
+          27.78
         ]
       ],
-      "binary_bytes": null,
-      "binary_bytes_over_baseline": null
+      "binary_bytes": 27487136,
+      "binary_bytes_over_baseline": 1623616
     }
   }
 }
