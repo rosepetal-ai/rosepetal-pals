@@ -45,11 +45,16 @@ pub(crate) const SHA2_256: [u8; 2] = [0x12, 0x20];
 
 /// The agent's `PeerId`: its own Ed25519 public key.
 pub fn peer_id(agent: &AgentId) -> PeerId {
+    public_key(agent).to_peer_id()
+}
+
+/// The agent's Ed25519 public key, as libp2p holds it.
+pub fn public_key(agent: &AgentId) -> identity::PublicKey {
     // libp2p checks the key with ed25519-dalek 3, the same check that
     // `AgentId` passed when it was parsed or derived.
     let key = ed25519::PublicKey::try_from_bytes(agent.as_bytes())
         .expect("an agent id is a valid Ed25519 public key");
-    identity::PublicKey::from(key).to_peer_id()
+    identity::PublicKey::from(key)
 }
 
 /// The agent `peer` is, if it is the `PeerId` of an Ed25519 key, in the one

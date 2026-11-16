@@ -26,6 +26,7 @@ use libp2p::core::{Endpoint as Role, Transport};
 use libp2p::futures::{AsyncReadExt, AsyncWriteExt};
 use libp2p::{Multiaddr, PeerId};
 use pals::config::{Config, WorkerCfg};
+use pals::dht::IDLE_TIMEOUT;
 use pals::dht::keys::{agent_of, peer_id};
 use pals::dht::transport::{
     self, ALPN_KAD, AddressBook, IrohListener, IrohTransport, KadQuotas, REFUSED, Refusals,
@@ -102,7 +103,7 @@ async fn node_with(
     let socket = socket_of(&endpoint);
     let peer = peer_id(&agent.id());
     let (mut transport, listener, refusals) =
-        IrohTransport::new(endpoint.clone(), quotas, clock, book);
+        IrohTransport::new(endpoint.clone(), quotas, clock, book, IDLE_TIMEOUT);
     let router = Router::builder(endpoint).accept(ALPN_KAD, listener).spawn();
     // Port 0 names whatever port the endpoint is bound to.
     let wanted = quic_addr(&peer, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
@@ -348,6 +349,7 @@ async fn listen_on_wakes_a_waiting_swarm() {
         KadQuotas::default(),
         Arc::new(SystemClock),
         AddressBook::default(),
+        IDLE_TIMEOUT,
     );
     let _router = Router::builder(endpoint).accept(ALPN_KAD, listener).spawn();
     let transport = Arc::new(Mutex::new(transport));
@@ -459,6 +461,7 @@ async fn a_full_accept_queue_refuses_instead_of_waiting() {
         quotas,
         Arc::new(SystemClock),
         AddressBook::default(),
+        IDLE_TIMEOUT,
     );
     let (returned, mut accepts) = mpsc::unbounded_channel();
     let _router = Router::builder(b.clone())

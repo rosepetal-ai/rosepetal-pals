@@ -27,7 +27,8 @@
 //!   listener, an incoming connection is closed with [`REFUSED`] too.
 //! - **Muxer.** Each connection is an [`IrohMuxer`]: QUIC multiplexes, so
 //!   there is no muxer protocol; the streams the other side opens are held
-//!   to the stream quotas of [`KadQuotas`].
+//!   to the stream quotas of [`KadQuotas`], and reset when idle for the
+//!   transport's idle timeout.
 //!
 //! [`Refusals`] counts what the listener and the muxers refused since the
 //! transport was made.
@@ -176,6 +177,7 @@ pub struct Refusals {
 struct Counts {
     connections: AtomicU64,
     streams: AtomicU64,
+    idle_streams: AtomicU64,
 }
 
 /// [`Refusals`] at one moment.
@@ -186,6 +188,9 @@ pub struct RefusedCounts {
     pub connections: u64,
     /// Incoming streams reset with [`REFUSED`], beyond the stream quotas.
     pub streams: u64,
+    /// Incoming streams reset with [`REFUSED`] after the idle timeout with
+    /// no read or write.
+    pub idle_streams: u64,
 }
 
 impl Refusals {
@@ -194,6 +199,7 @@ impl Refusals {
         RefusedCounts {
             connections: self.inner.connections.load(Ordering::Relaxed),
             streams: self.inner.streams.load(Ordering::Relaxed),
+            idle_streams: self.inner.idle_streams.load(Ordering::Relaxed),
         }
     }
 
@@ -211,6 +217,11 @@ impl Refusals {
     /// Counts a stream refused.
     pub(crate) fn stream(&self) {
         self.inner.streams.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a stream reset for being idle.
+    pub(crate) fn idle_stream(&self) {
+        self.inner.idle_streams.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -265,21 +276,24 @@ pub enum Error {
 
 impl IrohTransport {
     /// The transport over `endpoint`, within `quotas` at the time `clock`
-    /// says, dialing each peer at every address `book` knows of it; the
-    /// handler the endpoint's router must serve at [`ALPN_KAD`] for it to
-    /// get incoming connections; and what both refuse.
+    /// says, resetting an incoming stream with no read or write for
+    /// `idle_timeout`, dialing each peer at every address `book` knows of
+    /// it; the handler the endpoint's router must serve at [`ALPN_KAD`] for
+    /// it to get incoming connections; and what both refuse.
     pub fn new(
         endpoint: Endpoint,
         quotas: KadQuotas,
         clock: Arc<dyn Clock>,
         book: AddressBook,
+        idle_timeout: Duration,
     ) -> (Self, IrohListener, Refusals) {
         let refusals = Refusals::default();
         let (connections, incoming) = mpsc::channel(quotas.accept_queue.max(1));
+        let streams = StreamQuotas::new(quotas, clock, refusals.clone(), idle_timeout);
         let transport = Self {
             endpoint,
             book,
-            streams: Arc::new(StreamQuotas::new(quotas, clock, refusals.clone())),
+            streams: Arc::new(streams),
             refusals: refusals.clone(),
             incoming,
             listener: None,
@@ -492,8 +506,9 @@ fn endpoint_of(peer: &PeerId) -> Option<EndpointId> {
     agent_of(peer).map(|agent| endpoint_id_of(&agent))
 }
 
-/// `/ip4/<ip>/udp/<port>/quic-v1`, or `/ip6/…`.
-fn quic_addr(addr: SocketAddr) -> Multiaddr {
+/// `/ip4/<ip>/udp/<port>/quic-v1`, or `/ip6/…`: the router form without
+/// its `/p2p/`, as [`Transport::listen_on`] takes the endpoint's socket.
+pub(crate) fn quic_addr(addr: SocketAddr) -> Multiaddr {
     let ip = match addr.ip() {
         IpAddr::V4(ip) => Protocol::Ip4(ip),
         IpAddr::V6(ip) => Protocol::Ip6(ip),

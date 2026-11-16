@@ -17,15 +17,28 @@
 //!   accepted, without reading it, and counted in [`Refusals`]; libp2p never
 //!   sees it. A stream counts until libp2p drops its substream. The streams
 //!   this side opens count in no quota.
+//! - **Idle streams.** A stream the other side opened that goes the idle
+//!   timeout with no read or write through it is reset with [`REFUSED`] and
+//!   counted in [`Refusals`], and libp2p drops it, which frees its place in
+//!   the quotas. `libp2p-kad` 0.49 waits for the next request on an
+//!   incoming stream with no deadline of its own, so without this one peer
+//!   could hold its quota of streams for as long as it liked.
+//! - **Stream credit.** Each connection grants the other side credit for
+//!   [`KadQuotas::peer_streams`] streams at a time, plus
+//!   [`STREAM_HEADROOM`], so that one past the quota is refused, not left
+//!   waiting, as the daemon's other ALPNs do. QUIC never takes back the
+//!   credit of the handshake: the lower one applies as streams close.
 //! - **Closing.** The connection closes when libp2p closes it
 //!   ([`StreamMuxer::poll_close`]); when the other side or Iroh closes it,
 //!   the pending `accept_bi` fails and libp2p drops it.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream, VarInt};
 use libp2p::PeerId;
@@ -49,6 +62,9 @@ const PEERS_KEPT: usize = 1024;
 /// Streams refused in one poll before the muxer yields, so that a peer
 /// opening streams as fast as it can does not hold the task that polls.
 const REFUSALS_PER_POLL: usize = 16;
+/// The stream credit a connection grants beyond [`KadQuotas::peer_streams`]:
+/// room for the streams past the quota to arrive and be refused.
+pub const STREAM_HEADROOM: usize = 4;
 
 /// The stream quotas of every connection of one transport, and what they
 /// refused.
@@ -56,6 +72,8 @@ pub(crate) struct StreamQuotas {
     quotas: KadQuotas,
     clock: Arc<dyn Clock>,
     refusals: Refusals,
+    /// How long an admitted stream may go with no read or write.
+    idle_timeout: Duration,
     used: Mutex<Used>,
 }
 
@@ -87,13 +105,19 @@ impl PeerUse {
 }
 
 impl StreamQuotas {
-    /// `quotas` at the time `clock` says, counting what they refuse in
-    /// `refusals`.
-    pub(crate) fn new(quotas: KadQuotas, clock: Arc<dyn Clock>, refusals: Refusals) -> Self {
+    /// `quotas` at the time `clock` says, with streams idle after
+    /// `idle_timeout`, counting what they refuse in `refusals`.
+    pub(crate) fn new(
+        quotas: KadQuotas,
+        clock: Arc<dyn Clock>,
+        refusals: Refusals,
+        idle_timeout: Duration,
+    ) -> Self {
         Self {
             quotas,
             clock,
             refusals,
+            idle_timeout,
             used: Mutex::new(Used::default()),
         }
     }
@@ -184,8 +208,14 @@ pub struct IrohMuxer {
 }
 
 impl IrohMuxer {
-    /// `connection` to `peer`, whose streams count in `quotas`.
+    /// `connection` to `peer`, whose streams count in `quotas`, granting
+    /// the other side credit for [`KadQuotas::peer_streams`] streams plus
+    /// [`STREAM_HEADROOM`].
     pub(crate) fn new(connection: Connection, peer: PeerId, quotas: Arc<StreamQuotas>) -> Self {
+        let credit = quotas.quotas.peer_streams.saturating_add(STREAM_HEADROOM);
+        connection.set_max_concurrent_bi_streams(
+            VarInt::from_u64(u64::try_from(credit).unwrap_or(u64::MAX)).unwrap_or(VarInt::MAX),
+        );
         Self {
             connection,
             peer,
@@ -272,8 +302,20 @@ pub struct IrohSubstream {
     recv: RecvStream,
     /// How closing went, once it was asked: libp2p may ask again.
     closed: Option<Result<(), io::ErrorKind>>,
-    /// Its place in the quotas, for a stream the other side opened.
-    _slot: Option<Slot>,
+    /// Its place in the quotas and its idle deadline, for a stream the
+    /// other side opened.
+    inbound: Option<Inbound>,
+}
+
+/// What a stream the other side opened holds: its place in the quotas, and
+/// the deadline of its next read or write.
+struct Inbound {
+    slot: Slot,
+    /// Made when the stream first waits, so that a substream needs a timer
+    /// only once it is polled; `None` again once it passed.
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// Whether the deadline passed and the stream was reset.
+    expired: bool,
 }
 
 impl IrohSubstream {
@@ -282,9 +324,61 @@ impl IrohSubstream {
             send,
             recv,
             closed: None,
-            _slot: slot,
+            inbound: slot.map(|slot| Inbound {
+                slot,
+                deadline: None,
+                expired: false,
+            }),
         }
     }
+
+    /// A read or a write went through: the idle deadline starts again.
+    fn active(&mut self) {
+        if let Some(Inbound {
+            slot,
+            deadline: Some(deadline),
+            ..
+        }) = &mut self.inbound
+        {
+            let next = tokio::time::Instant::now() + slot.quotas.idle_timeout;
+            deadline.as_mut().reset(next);
+        }
+    }
+
+    /// A read or a write waits: once the idle deadline passes, the stream
+    /// is reset with [`REFUSED`] and counted, and fails.
+    fn waiting<T>(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<T>> {
+        let Some(inbound) = &mut self.inbound else {
+            return Poll::Pending;
+        };
+        let idle_timeout = inbound.slot.quotas.idle_timeout;
+        let deadline = inbound
+            .deadline
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(idle_timeout)));
+        std::task::ready!(deadline.as_mut().poll(cx));
+        inbound.expired = true;
+        inbound.deadline = None;
+        // Either fails only when the stream is already closed: nothing to
+        // do then.
+        let _ = self.send.reset(VarInt::from_u32(REFUSED));
+        let _ = self.recv.stop(VarInt::from_u32(REFUSED));
+        inbound.slot.quotas.refusals.idle_stream();
+        tracing::debug!(
+            peer = %inbound.slot.peer,
+            "an idle agentnet-kad/0 stream reset"
+        );
+        Poll::Ready(Err(idle()))
+    }
+
+    /// Whether the stream was reset for being idle.
+    fn expired(&self) -> bool {
+        self.inbound.as_ref().is_some_and(|inbound| inbound.expired)
+    }
+}
+
+/// The error of a stream reset for being idle.
+fn idle() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "an idle stream, reset")
 }
 
 impl AsyncRead for IrohSubstream {
@@ -293,7 +387,17 @@ impl AsyncRead for IrohSubstream {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        self.get_mut().recv.poll_read(cx, buf).map_err(Into::into)
+        let this = self.get_mut();
+        if this.expired() {
+            return Poll::Ready(Err(idle()));
+        }
+        match this.recv.poll_read(cx, buf) {
+            Poll::Ready(read) => {
+                this.active();
+                Poll::Ready(read.map_err(Into::into))
+            }
+            Poll::Pending => this.waiting(cx),
+        }
     }
 }
 
@@ -303,9 +407,17 @@ impl AsyncWrite for IrohSubstream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().send)
-            .poll_write(cx, buf)
-            .map_err(Into::into)
+        let this = self.get_mut();
+        if this.expired() {
+            return Poll::Ready(Err(idle()));
+        }
+        match Pin::new(&mut this.send).poll_write(cx, buf) {
+            Poll::Ready(written) => {
+                this.active();
+                Poll::Ready(written.map_err(Into::into))
+            }
+            Poll::Pending => this.waiting(cx),
+        }
     }
 
     /// QUIC sends what was written without being asked.

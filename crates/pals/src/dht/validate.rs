@@ -32,11 +32,12 @@
 //!    record's key ([`Rejection::CapabilityNotAnnounced`]).
 //!
 //! A router therefore admits an agent's provider records only for the
-//! capabilities of its signed announce, at most
-//! [`MAX_ANNOUNCED_CAPABILITIES`], and the publisher sends the announce
-//! before its provider records. The check is made as each provider record
-//! arrives: those already held outlive an announce that replaces the one
-//! they were checked against, until they expire.
+//! capabilities of its signed announce, and the publisher sends the
+//! announce before its provider records. The check is made as each provider
+//! record arrives; when the router stores a newer announce of an agent, the
+//! swarm drops that agent's provider records of the capabilities it no
+//! longer lists. So an agent has at most [`MAX_ANNOUNCED_CAPABILITIES`]
+//! provider records at a router at any time.
 //!
 //! A [`Verdict::Stale`] record is kept out, so that a replicated copy never
 //! takes a newer one's place, and is not counted as rejected: nothing in it

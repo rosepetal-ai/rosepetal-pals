@@ -4,7 +4,7 @@ Especificación de la DHT con la que un agente PALS encuentra a los proveedores 
 
 Los valores de este documento son los del código, `crates/pals/src/dht/`, y el vector `crates/pals-core/tests/vectors/kad-v0.json` congela la identidad, las claves y las formas de dirección. El backend es `kad-iroh`, ratificado en el [registro del backend](../decisions/2026-11-16-hito-3-backend-dht.md#decisión) (H3-D1).
 
-Este documento crece con el código de la fase 2 del hito 3. Hoy describe la identidad, las claves, las formas de dirección, la conexión con sus límites y lo que guarda un router. El swarm y la publicación se añaden con su código.
+Este documento crece con el código de la fase 2 del hito 3. Hoy describe la identidad, las claves, las formas de dirección, la conexión con sus límites, lo que guarda un router y el swarm del daemon, con sus modos y su entrada en la red. La publicación y la búsqueda se añaden con su código.
 
 ## 1. Identificación
 
@@ -113,6 +113,8 @@ Una conexión de `agentnet-kad/0` es una conexión de Iroh con ese ALPN, en el m
 
 El endpoint entrega cada conexión de `agentnet-kad/0`, una vez autenticada, a una cola de 32 conexiones para libp2p. **La cola nunca espera:** si está llena, la conexión se cierra al momento con el código `1` y el motivo `busy`. Se cierra igual, con el motivo `not listening`, una conexión que llega cuando libp2p no escucha.
 
+Ya en libp2p, el swarm admite como mucho 2 conexiones establecidas con cada par, entrantes y salientes juntas, y 256 conexiones entrantes en total (`connection_limits` de libp2p). Una conexión de más se cierra al establecerla, con el código `0`, sin que Kademlia la vea.
+
 ### Streams entrantes
 
 Antes de entregar a libp2p un stream que abrió el otro lado, el nodo comprueba estas cuotas:
@@ -125,7 +127,11 @@ Antes de entregar a libp2p un stream que abrió el otro lado, el nodo comprueba 
 
 Un stream que pasa de una cuota se resetea al aceptarlo, sin leerlo: el nodo cierra sus dos mitades con el código `1` (`RESET_STREAM` y `STOP_SENDING`), y libp2p no llega a verlo. Un stream cuenta mientras libp2p lo tiene abierto, y uno rechazado no cuenta en el minuto. Los streams que abre el propio nodo no cuentan en ninguna cuota.
 
-El nodo cuenta desde el arranque las conexiones y los streams que rechaza.
+**Streams ociosos.** Un stream que abrió el otro lado y pasa 10 s (el plazo de conexión ociosa de la sección 7) sin que se lea ni se escriba nada en él se resetea igual, con el código `1`, y libp2p lo suelta: deja su sitio en las cuotas. `libp2p-kad` 0.49 espera la petición siguiente en un stream entrante sin plazo propio, así que sin este un par podría quedarse con sus 8 streams para siempre, y 32 identidades con los 256 del nodo.
+
+**Crédito de streams.** En cada conexión de `agentnet-kad/0`, el nodo da al otro lado crédito de QUIC para 12 streams bidireccionales a la vez: los 8 de su cuota y 4 más, para que uno de más llegue y se rechace en lugar de quedarse esperando. Es lo que hacen `agentnet-discovery/0` y el túnel de A2A. QUIC no retira el crédito que dio el handshake (100 streams): el nuevo límite vale según se cierran los streams.
+
+El nodo cuenta desde el arranque las conexiones y los streams que rechaza, y aparte los streams que resetea por ociosos.
 
 ### El puerto: `[net] listen`
 
@@ -164,7 +170,7 @@ Un provider record solo dice un `PeerId` bajo una clave, y la clave es un hash. 
 3. El router guarda un anuncio válido de ese agente, bajo la clave de su anuncio (`provider_without_announce`).
 4. Ese anuncio lista una capacidad cuya clave de la sección 3 es la del provider record (`capability_not_announced`). El anuncio lista las capacidades como las escribe el inventario, `vision.ocr` o `example:metal-plates`, y su clave sale de la cadena completa, la de `capability_tag`.
 
-Así, un router solo admite de un agente provider records de las capacidades de su anuncio firmado, como mucho 32 (`MAX_ANNOUNCED_CAPABILITIES`). Por eso quien publica envía su anuncio antes que sus provider records. La comprobación se hace al recibir cada provider record: si un anuncio nuevo sustituye al que el router guardaba, los provider records que ya tenía siguen hasta que caducan, aunque el anuncio nuevo no liste su capacidad.
+Así, un router solo admite de un agente provider records de las capacidades de su anuncio firmado. Por eso quien publica envía su anuncio antes que sus provider records. La comprobación se hace al recibir cada provider record, y cuando el router guarda un anuncio nuevo de un agente, borra los provider records de ese agente de las capacidades que el anuncio nuevo ya no lista. Así un agente tiene en un router, en todo momento, como mucho 32 provider records (`MAX_ANNOUNCED_CAPABILITIES`).
 
 Con el anuncio del vector `announce-v1`, que lista `vision.ocr` y `example:metal-plates`, un router guarda los provider records de su agente bajo `122092485626d851a455cd10cd7ae3800eb76ff67220722638435d3ae050e92c8463` y `12202a561a2441f0cc4eba6d49bc3d437b467d69cb6c640d213337a81b4826b173b6`. Rechaza con `capability_not_announced` el de `code.rust.review` y el del SHA-256 de `vision.ocr` sin el prefijo `agentnet:capability:v1:`.
 
@@ -186,3 +192,90 @@ Los nombres no cambian: son los que llevan los registros del daemon y `pals dht 
 | `provider_without_announce` | un provider record de un agente cuyo anuncio el router no guarda |
 | `capability_not_announced` | un provider record de una capacidad que el anuncio de su agente no lista |
 | `store_full` | un registro válido que ya no cabe en la tienda. No lo da ninguna comprobación: lo cuenta el swarm |
+
+## 7. El swarm del daemon
+
+El código es `crates/pals/src/dht/swarm.rs` y `crates/pals/src/dht/mod.rs`, y sus pruebas, `crates/pals/tests/dht.rs`: nodos reales sobre Iroh en loopback.
+
+### Activación y modos
+
+La DHT está apagada por defecto, y el binario no lleva puntos de arranque. Sin `[dht] enabled = true`, el nodo no sirve `agentnet-kad/0` ni abre ninguna conexión con ese ALPN. Encendida, el nodo sirve el ALPN en su endpoint de siempre y mueve un swarm de libp2p sobre él, en una tarea propia.
+
+| Modo | Configuración | Qué hace |
+|-|-|-|
+| Cliente | por defecto, `mode = "client"` | Solo marca hacia los routers. No acepta peticiones de Kademlia y no entra en ninguna tabla de rutas |
+| Router | `mode = "router"` | Guarda y contesta para los demás (sección 6). Lo marcan directamente: necesita un puerto fijo, `[net] listen` (sección 5) |
+
+El modo de `libp2p-kad` se fija siempre: servidor en un router y cliente en un cliente (H3-D3). Nunca es automático: en el modo automático, `libp2p-kad` pasa a servidor a un nodo en cuanto declara una dirección externa, y todo nodo declara una (más abajo).
+
+Con `relay = true`, un marcado a un router puede buscar además su endpoint en el DNS de n0, como cualquier marcado del daemon desde el hito 1. No es una DHT pública. Pero Kademlia solo conoce a un router por una dirección IP directa, la de su ticket o la que declara él mismo, así que un router tiene que tenerlas.
+
+### Kademlia
+
+| Parámetro | Valor |
+|-|-|
+| Protocolo | `/agentnet/kad/1.0.0` (sección 1) |
+| Vida de un valor o un provider record en un router | `[dht] record_ttl_s`: 3600 s por defecto, de 60 a 86 400 |
+| Replicación de lo que guarda un router | cada `[dht] republish_s`: 1200 s por defecto, al menos 20 y como mucho la mitad de `record_ttl_s` |
+| Publicación propia por los temporizadores de `libp2p-kad` | ninguna: la hacen las vueltas de publicación del nodo, que se describen con su código |
+| Lo que llega | todo `PutRecord` y `AddProvider` pasa por las comprobaciones de la sección 6 (`StoreInserts::FilterBoth`) |
+| Caché de lo encontrado | ninguna |
+| Una consulta | 20 s como mucho |
+| Conexión ociosa | se cierra a los 10 s sin streams. Nada mantiene una conexión abierta |
+| Arranque periódico | cada 5 min, el de `libp2p-kad` |
+| Marcados a la vez a un par | 1: un router con dos direcciones es una conexión, que el transporte marca en todas (sección 5) |
+| Tienda de un router | 1024 valores de 8 KiB como mucho, 20 proveedores por clave y 1024 claves de proveedores |
+| Conexiones | las de la sección 5: 2 establecidas por par y 256 entrantes |
+
+Un cliente no gasta tráfico en reposo: sus conexiones se cierran a los 10 s, y cada búsqueda después de un reposo paga un apretón de manos de Iroh con los routers.
+
+Lo que guarda un router caduca con el mecanismo de `libp2p-kad`, sin barridos propios: un valor caducado se borra cuando se lee o en la vuelta de replicación, y un provider record caducado, cuando se leen los proveedores de su clave. El estado del nodo cuenta solo lo que no ha caducado.
+
+### Entrada en la red
+
+1. Cada ticket de `[dht] bootstrap` da sus direcciones IP directas, que el nodo da a Kademlia en la forma router de la sección 4, y el nodo arranca (`bootstrap` de Kademlia).
+2. Si al terminar ese arranque no contestó ningún router, el nodo lo intenta igual con sus contactos guardados que tienen ticket: los 8 primeros por nombre.
+3. Un nodo sin `bootstrap` arranca solo: un router espera a que lo marquen, y un cliente no conoce a nadie.
+
+`libp2p-kad` deja en la tabla de rutas a un par que no pudo marcar, con su última dirección, así que la tabla no se queda vacía aunque no conteste nadie. Por eso el paso 2 mira si contestó algún router, no si la tabla está vacía.
+
+Tras un marcado fallido a un router, `libp2p-kad` le quita todas las direcciones menos la última, aunque el fallo fuera pasajero. El nodo le devuelve todas las que conoce de ese router, así que uno que se paró un momento vuelve a marcarse en todas.
+
+Un ticket de `bootstrap` tiene que leerse, nombrar otro endpoint que el propio y llevar al menos una dirección IP directa. Si no, el nodo no arranca.
+
+### Lo que declara un nodo
+
+`libp2p-kad` 0.49 no devuelve un provider record sin direcciones de un par que no está en la tabla de rutas (sección 4), así que todo nodo declara alguna:
+
+- **Un router** declara sus `[dht] external_addrs` o, si no tiene, las direcciones directas de su endpoint, en la forma router. Nunca declara una IP sin especificar: con `[net] listen = "0.0.0.0:<puerto>"`, esa dirección no es de nadie, y un router así necesita `external_addrs`. Su ticket (`pals id --ticket`), que es la invitación a la red, y su contacto llevan también las `external_addrs`.
+- **Un cliente** declara solo `/p2p/<peer_id>`, que no es ninguna ubicación.
+
+`external_addrs` solo vale en un router, y ninguna puede tener una IP sin especificar ni el puerto 0.
+
+### Cómo conoce un router a los que lo marcan: `identify`
+
+`libp2p-kad` 0.49 mete a un par en la tabla de rutas solo con la dirección a la que lo marcó el propio nodo. De un par que lo marcó a él, no sabe ninguna dirección, y lo da por inalcanzable. Por eso el swarm lleva también `identify` de libp2p (`/ipfs/id/1.0.0`), y es la única razón:
+
+- **La prueba lo pidió.** Sin `identify`, un router sin `bootstrap` nunca tuvo a otro en su tabla. En `a_router_with_no_bootstrap_learns_the_others`, R1 aceptó las conexiones de R2 y R3 y siguió con 0 pares en la tabla, y fallaron igual todas las pruebas en que los routers se conocen a través de R1, `clients_never_enter_a_routing_table` entre ellas. Es la causa que daba el registro del backend: las direcciones de una conexión entrante.
+- **Qué se usa.** Con `identify`, cada lado de una conexión dice al otro los protocolos que sirve y las direcciones que declara. Si el otro sirve `/agentnet/kad/1.0.0`, el nodo da a Kademlia sus direcciones en la forma router que lo nombran a él y que se pueden marcar desde aquí: ni una IP sin especificar ni de multidifusión, y loopback solo si el propio nodo está en loopback. Solo sirve ese protocolo un router, en modo servidor, así que un cliente nunca entra en una tabla de rutas.
+- **Qué no se usa.** `identify` envía solo las direcciones declaradas (`with_hide_listen_addrs`), nunca los sockets del endpoint, y no guarda lo que dicen los pares (`with_cache_size(0)`), que añadiría a cada marcado. Solo tiene la clave pública del agente, así que no firma ningún registro de pares. Envía además la versión de protocolo `agentnet/0`, la de libp2p como nombre del agente (`rust-libp2p/<versión>`) y la dirección por la que vio al otro, que el nodo no usa.
+
+### Lo que ven los routers de cada búsqueda
+
+La conexión va autenticada con la clave del agente, así que cada búsqueda en la DHT dice a los routers a los que pregunta qué agente busca qué capacidad (H3-D4). La plantilla de `pals init` lo dice junto a `[dht]`.
+
+### El estado: `pals dht status` y `GET /dht`
+
+`pals dht status` pide el estado al daemon por su gateway. Con `--json`, lo escribe tal como lo da `GET /dht` del gateway, que contesta `404` si la DHT está apagada.
+
+| Campo | Qué es |
+|-|-|
+| `mode` | el modo de `libp2p-kad`: `router` (servidor) o `client` |
+| `routing_peers` | los routers en la tabla de rutas |
+| `connections` | las conexiones de `agentnet-kad/0` abiertas ahora |
+| `connections_accepted` | las conexiones entrantes establecidas desde el arranque |
+| `refused` | lo que el nodo rechazó desde el arranque: `connections`, `streams` (por las cuotas) e `idle_streams` (por ociosos), sección 5 |
+| `records_stored` | los valores de otros que guarda y no han caducado |
+| `provider_records_stored` | los provider records de otros que guarda y no han caducado |
+| `stored_by_agent` | de esos valores y provider records, cuántos tiene cada agente |
+| `rejected` | los registros rechazados desde el arranque, por cada motivo de la sección 6, también los que van a cero |

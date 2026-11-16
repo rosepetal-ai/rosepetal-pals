@@ -12,9 +12,12 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use iroh_tickets::endpoint::EndpointTicket;
 use pals_core::discovery::MAX_OFFER_VALID_FOR_MS;
 use pals_core::identity::AgentId;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+use crate::net::agent_id_of;
 
 use crate::path_policy::lexically_normal;
 
@@ -116,6 +119,38 @@ max_candidates = 8
 max_concurrent_queries = 3
 per_candidate_timeout_ms = 3000
 total_budget_ms = 15000
+
+# The DHT (agentnet-kad/0): a private Kademlia network over this agent's
+# own Iroh endpoint, where it finds the providers of a capability it has no
+# contact with. Off by default, and with no bootstrap points: nothing is
+# dialed or served for it until `enabled = true`. Every lookup in the DHT
+# tells the routers it asks which agent looks for which capability: the
+# connection is authenticated with this agent's own key.
+# [dht]
+# enabled = true
+# "client" (the default) only dials out, to the routers. "router" also
+# stores and answers for the others: only on a stable host that other
+# agents reach directly, at a fixed `[net] listen` port. With `relay =
+# true`, a dial to a router may also look it up in n0's address lookup, as
+# every dial of this daemon does, but a router must have direct addresses.
+# mode = "client"
+# Routers to enter the network through: the tickets `pals id --ticket`
+# prints on each of them, with at least one direct IP address. If none of
+# them answers, the agent tries up to 8 of its saved contacts, by name.
+# bootstrap = []
+# A router's addresses as others dial them, when they are not the ones it
+# is bound to (behind a port forward, or `listen = "0.0.0.0:<port>"`); its
+# ticket carries them too. Only for a router.
+# external_addrs = ["203.0.113.10:4433"]
+# false: nothing of this agent goes to the DHT. true: its public
+# capabilities only (visibility = "public" in the inventory), never a
+# private or a project one.
+# announce = false
+# How long the routers keep a record, in seconds (60 to 86400), and how
+# often this agent publishes its own again (at least 20, and at most half
+# of record_ttl_s).
+# record_ttl_s = 3600
+# republish_s = 1200
 
 [limits]
 max_body_bytes = 1048576      # 1 MiB
@@ -304,6 +339,8 @@ pub struct Config {
     pub inventory: InventoryCfg,
     #[serde(default)]
     pub discovery: DiscoveryCfg,
+    #[serde(default)]
+    pub dht: DhtCfg,
     /// Issuers whose grants this agent accepts, besides itself.
     #[serde(default)]
     pub trusted_issuers: Vec<AgentId>,
@@ -565,6 +602,131 @@ impl Default for DiscoveryCfg {
     }
 }
 
+/// What a node is in the DHT ([`crate::dht`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DhtMode {
+    /// Dials the routers, and stores and answers for no one: in no routing
+    /// table.
+    #[default]
+    Client,
+    /// Stores and answers for the others, who dial it directly.
+    Router,
+}
+
+/// The DHT, `agentnet-kad/0` ([`crate::dht`]): off unless `enabled`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DhtCfg {
+    /// Whether the node serves `agentnet-kad/0` and runs its swarm.
+    pub enabled: bool,
+    pub mode: DhtMode,
+    /// Iroh endpoint tickets of routers (`pals id --ticket`), each of
+    /// another endpoint and with a direct IP address: where the node enters
+    /// the network.
+    pub bootstrap: Vec<String>,
+    /// A router's addresses as others dial it, which it declares besides
+    /// any it is bound to; none of them unspecified or with port 0. Only
+    /// for a router.
+    pub external_addrs: Vec<SocketAddr>,
+    /// Whether the node publishes its public capabilities in the DHT.
+    pub announce: bool,
+    /// How long the routers keep a record, from [`MIN_RECORD_TTL_S`] to
+    /// [`MAX_RECORD_TTL_S`].
+    pub record_ttl_s: u64,
+    /// How often the node publishes its own records again: at least
+    /// [`MIN_REPUBLISH_S`], at most half of `record_ttl_s`.
+    pub republish_s: u64,
+}
+
+/// The shortest life of a record in the DHT that may be configured.
+pub const MIN_RECORD_TTL_S: u64 = 60;
+/// The longest life of a record in the DHT that may be configured: the
+/// life of a signed record.
+pub const MAX_RECORD_TTL_S: u64 = 86_400;
+/// The shortest interval of republication that may be configured.
+pub const MIN_REPUBLISH_S: u64 = 20;
+
+impl Default for DhtCfg {
+    /// Off, a client, with no bootstrap and announcing nothing; records
+    /// last an hour, republished every 20 minutes.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: DhtMode::Client,
+            bootstrap: Vec::new(),
+            external_addrs: Vec::new(),
+            announce: false,
+            record_ttl_s: 3600,
+            republish_s: 1200,
+        }
+    }
+}
+
+impl DhtCfg {
+    /// Each bootstrap ticket's agent and direct IP addresses, in order;
+    /// fails, naming `dht.bootstrap`, on one that is not a ticket or has no
+    /// direct IP address.
+    pub fn bootstrap_peers(&self) -> anyhow::Result<Vec<(AgentId, Vec<SocketAddr>)>> {
+        self.bootstrap
+            .iter()
+            .map(|text| {
+                let ticket: EndpointTicket = text.trim().parse().map_err(|err| {
+                    anyhow::anyhow!(
+                        "dht.bootstrap: {text:?} is not a ticket ({err}): `pals id --ticket` \
+                         prints one on the router"
+                    )
+                })?;
+                let addr = ticket.endpoint_addr();
+                let ips: Vec<SocketAddr> = addr.ip_addrs().copied().collect();
+                if ips.is_empty() {
+                    bail!(
+                        "dht.bootstrap: the ticket of {} has no direct IP address, which a \
+                         router needs",
+                        agent_id_of(&addr.id)
+                    );
+                }
+                Ok((agent_id_of(&addr.id), ips))
+            })
+            .collect()
+    }
+
+    /// Why this section cannot run, if it cannot: what [`Config::load`]
+    /// checks.
+    fn problem(&self) -> Option<String> {
+        if let Err(err) = self.bootstrap_peers() {
+            return Some(format!("{err:#}"));
+        }
+        if !(MIN_RECORD_TTL_S..=MAX_RECORD_TTL_S).contains(&self.record_ttl_s) {
+            return Some(format!(
+                "dht.record_ttl_s must be from {MIN_RECORD_TTL_S} to {MAX_RECORD_TTL_S}"
+            ));
+        }
+        if self.republish_s < MIN_REPUBLISH_S || self.republish_s > self.record_ttl_s / 2 {
+            return Some(format!(
+                "dht.republish_s must be at least {MIN_REPUBLISH_S} and at most half of \
+                 dht.record_ttl_s, so that a record is republished twice before it expires"
+            ));
+        }
+        if !self.external_addrs.is_empty() && self.mode != DhtMode::Router {
+            return Some(
+                "dht.external_addrs is only for a router: a client declares no address".to_owned(),
+            );
+        }
+        if let Some(addr) = self
+            .external_addrs
+            .iter()
+            .find(|addr| addr.ip().is_unspecified() || addr.port() == 0)
+        {
+            return Some(format!(
+                "dht.external_addrs: {addr} is no address to dial: neither an unspecified IP \
+                 nor port 0"
+            ));
+        }
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsCfg {
@@ -677,6 +839,9 @@ impl Config {
         if let WorkerCfg::Exec(exec) = &cfg.worker
             && let Some(problem) = exec.problem()
         {
+            bail!("invalid {}: {problem}", path.display());
+        }
+        if let Some(problem) = cfg.dht.problem() {
             bail!("invalid {}: {problem}", path.display());
         }
         Ok(cfg)
@@ -1182,6 +1347,53 @@ max_output_bytes = 10
         assert!(!inventory.information.is_empty());
         assert!(inventory.hardware.is_some());
         assert!(inventory.network.is_some());
+    }
+
+    #[test]
+    fn init_template_documents_the_dht() {
+        // Uncommenting the section's settings turns the DHT on, as a client
+        // with the defaults but for the example's external address, which
+        // only a router may have.
+        let is_setting = |line: &str| {
+            line == "[dht]"
+                || line.split_once(" = ").is_some_and(|(key, _)| {
+                    !key.is_empty() && key.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+                })
+        };
+        let mut text = String::new();
+        let mut in_dht = false;
+        for line in INIT_TEMPLATE.lines() {
+            if line.starts_with('[') || line == "# [dht]" {
+                in_dht = line == "# [dht]";
+            }
+            let line = match line.strip_prefix("# ") {
+                Some(setting) if in_dht && is_setting(setting) => setting,
+                _ => line,
+            };
+            text.push_str(line);
+            text.push('\n');
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let err = Config::load(&write_config(dir.path(), &text)).unwrap_err();
+        assert!(format!("{err:#}").contains("dht.external_addrs"), "{err:#}");
+        let text = text.replace("mode = \"client\"", "mode = \"router\"");
+        let cfg = Config::load(&write_config(dir.path(), &text)).unwrap();
+        assert_eq!(
+            cfg.dht,
+            DhtCfg {
+                enabled: true,
+                mode: DhtMode::Router,
+                external_addrs: vec!["203.0.113.10:4433".parse().unwrap()],
+                ..DhtCfg::default()
+            }
+        );
+        // What the template says of every lookup and of the relay.
+        let flat = INIT_TEMPLATE.replace("\n# ", " ");
+        assert!(
+            flat.contains("tells the routers it asks which agent looks for which capability"),
+            "{flat}"
+        );
+        assert!(flat.contains("n0's address lookup"), "{flat}");
     }
 
     #[test]

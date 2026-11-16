@@ -6,8 +6,9 @@
 //! reads the plain agent's card itself. `pals ask`, `pals task
 //! resume|cancel`, `pals card show <peer>`, `pals inventory get`, `pals
 //! query` and `pals discover` reach peers through the running daemon's
-//! gateway; `pals ask --offer` reads the offer it names from the store
-//! first, and sends nothing when it expired.
+//! gateway, and `pals dht status` asks it for its DHT's; `pals ask
+//! --offer` reads the offer it names from the store first, and sends nothing
+//! when it expired.
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -167,6 +168,9 @@ enum Command {
     /// their visibility lets them; reading one never measures anything
     #[command(subcommand)]
     Benchmark(BenchmarkCommand),
+    /// The DHT (agentnet-kad/0) of the running daemon
+    #[command(subcommand)]
+    Dht(DhtCommand),
     /// Ask a peer whether it can serve a case, over agentnet-discovery/0
     /// through the running daemon's gateway, which keeps its offer: print
     /// the offer as the peer signed it for this agent, then `verified:
@@ -235,6 +239,19 @@ enum InventoryCommand {
     /// operational. The daemon also checks them when it starts and every
     /// [inventory] refresh_interval_s
     Refresh,
+}
+
+#[derive(Subcommand)]
+enum DhtCommand {
+    /// Print the state of the running daemon's DHT, asked through its
+    /// gateway: its mode, the routers in its routing table, its
+    /// connections, what it refused, and, as a router, what it holds for
+    /// the others and the records it rejected, by reason
+    Status {
+        /// Print it as the JSON of the gateway's GET /dht instead
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -459,6 +476,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             benchmark_import(&home, &file, &visibility)
         }
         Command::Benchmark(BenchmarkCommand::Ls) => benchmark_ls(&home),
+        Command::Dht(DhtCommand::Status { json }) => dht_status(&home, json),
         Command::Query {
             peer,
             capability,
@@ -804,6 +822,56 @@ fn inventory_refresh(home: &Path) -> anyhow::Result<()> {
         }
         Ok(())
     })
+}
+
+/// Prints the running daemon's DHT status, as `GET /dht` of its gateway
+/// gives it: its JSON with `json`, else one line per figure.
+fn dht_status(home: &Path, json: bool) -> anyhow::Result<()> {
+    let (cfg, key) = load_agent(home)?;
+    let (listen, own) = (cfg.gateway.listen, key.id());
+    let status = runtime(false)?.block_on(async move {
+        this_daemon(listen, &own).await?;
+        let (status, _, body) = gateway_call(listen, http::Method::GET, "/dht", None).await?;
+        gateway_json(status, &body)
+    })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+        return Ok(());
+    }
+    let number = |field: &str| status[field].as_u64().unwrap_or(0);
+    println!("mode: {}", status["mode"].as_str().unwrap_or("unknown"));
+    println!("routing peers: {}", number("routing_peers"));
+    println!(
+        "connections: {} open, {} accepted since start",
+        number("connections"),
+        number("connections_accepted")
+    );
+    let refused = &status["refused"];
+    println!(
+        "refused: {} connections, {} streams, {} idle streams",
+        refused["connections"].as_u64().unwrap_or(0),
+        refused["streams"].as_u64().unwrap_or(0),
+        refused["idle_streams"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "stored: {} records, {} provider records",
+        number("records_stored"),
+        number("provider_records_stored")
+    );
+    if let Some(agents) = status["stored_by_agent"].as_object() {
+        for (agent, count) in agents {
+            println!("  {} {}", shown(agent), count.as_u64().unwrap_or(0));
+        }
+    }
+    if let Some(reasons) = status["rejected"].as_object() {
+        for (reason, count) in reasons {
+            let count = count.as_u64().unwrap_or(0);
+            if count > 0 {
+                println!("rejected: {} {count}", shown(reason));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The largest file `pals benchmark import` reads: a signed report is at

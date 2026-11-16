@@ -8,7 +8,8 @@
 //!
 //! | Route | Behavior |
 //! |-|-|
-//! | `GET /healthz` | `200 {"agent_id", "name", "ticket"}` |
+//! | `GET /healthz` | `200 {"agent_id", "name", "ticket"}`; a DHT router's ticket carries its `[dht] external_addrs` |
+//! | `GET /dht` | `200` with the DHT's [`DhtStatus`]; `404` when the DHT is off, `503` when it stopped |
 //! | `GET /peers/{peer}/.well-known/agent-card.json` | the peer's card, verified, as [`gateway_view`], with `Cache-Control: max-age=300` and an `ETag`; `304` when `If-None-Match` names it |
 //! | `GET /peers/{peer}/signed-agent-card.json` | the peer's card, verified, as the peer signed it ([`signed_card_json`]): signatures and `iroh://` interfaces included, for tools that check the signature themselves |
 //! | `POST /peers/{peer}/jsonrpc`, or `/jsonrpc/` | the peer's `/jsonrpc` |
@@ -196,6 +197,9 @@ use crate::a2a::gateway_view;
 use crate::a2a::is_safe_task_id;
 use crate::blobs::{BLOB_META_KEY, BLOB_SHARE_TTL_S, BlobError, BlobRef, BlobService, parse_hash};
 use crate::config::LimitsCfg;
+use crate::dht::Dht;
+#[cfg(doc)]
+use crate::dht::DhtStatus;
 use crate::discovery::cards::PUBLIC_CONTEXT;
 use crate::discovery::{
     CardFetchError, DiscoveryClient, DiscoveryError, DiscoveryLimits, PeerCards, SearchError,
@@ -302,6 +306,8 @@ struct Inner {
     /// This agent's inventory, whose adapters `POST /inventory/refresh`
     /// runs.
     inventory: InventoryState,
+    /// The DHT, when it is on.
+    dht: Option<Dht>,
     /// Cancelled when the gateway stops: ends the MCP sessions.
     stopping: CancellationToken,
 }
@@ -329,6 +335,8 @@ pub struct GatewayParts {
     pub download_dir: Option<PathBuf>,
     /// This agent's inventory.
     pub inventory: InventoryState,
+    /// The DHT, when it is on: `GET /dht`.
+    pub dht: Option<Dht>,
 }
 
 impl GatewayState {
@@ -348,6 +356,7 @@ impl GatewayState {
             data_dir,
             download_dir,
             inventory,
+            dht,
         } = parts;
         let outbox =
             Outbox::new(Arc::clone(&store), base_url(&local_addr)).with_data_dir(&data_dir);
@@ -381,6 +390,7 @@ impl GatewayState {
                 clock,
                 download_dir,
                 inventory,
+                dht,
                 stopping: CancellationToken::new(),
             }),
         }
@@ -427,13 +437,15 @@ impl GatewayState {
     }
 
     /// This agent: `{"agent_id", "name", "ticket"}`, the ticket with the
-    /// addresses it is reachable at now.
+    /// addresses it is reachable at now, a DHT router's `[dht]
+    /// external_addrs` among them.
     pub(crate) fn identity(&self) -> Value {
         let inner = &self.inner;
+        let external = inner.dht.as_ref().map_or(&[][..], Dht::external_addrs);
         json!({
             "agent_id": inner.id.to_string(),
             "name": inner.name,
-            "ticket": ticket_of(&inner.endpoint),
+            "ticket": ticket_of(&inner.endpoint, external),
         })
     }
 
@@ -781,6 +793,7 @@ enum Resolved {
 pub fn router(state: GatewayState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/dht", get(dht_status))
         .route("/peers/{peer}/.well-known/agent-card.json", get(peer_card))
         .route(
             "/peers/{peer}/signed-agent-card.json",
@@ -867,6 +880,20 @@ fn is_local_host(headers: &HeaderMap, uri: &Uri, port: u16) -> bool {
 
 async fn healthz(State(state): State<GatewayState>) -> Response {
     Json(state.identity()).into_response()
+}
+
+/// The DHT's status; `404` when it is off, `503` when it stopped.
+async fn dht_status(State(state): State<GatewayState>) -> Response {
+    let Some(dht) = &state.inner.dht else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "the DHT is off: [dht] enabled = true turns it on",
+        );
+    };
+    match dht.status().await {
+        Ok(status) => Json(status).into_response(),
+        Err(err) => error(StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
+    }
 }
 
 /// The peer's card as [`gateway_view`], read from the peer and verified as

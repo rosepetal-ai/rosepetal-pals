@@ -53,10 +53,11 @@ libc = "0.2"
 # (`crates/pals/src/dht/`), with the agent's key as the `PeerId`. No
 # transport of libp2p's own: libp2p has no default features, so only these
 # come in: `kad`, the swarm on `tokio` and its behaviour derive (`macros`),
-# and `ed25519` for the `PeerId`. Never mdns, relay, autonat, upnp or
-# dcutr. Bumping it reruns the adapter's transport tests (H3-D1, condition
-# 3).
-libp2p = { version = "=0.57.1", features = ["kad", "tokio", "macros", "ed25519"] }
+# `ed25519` for the `PeerId`, and `identify`, with which a router learns the
+# addresses of the routers that dial it (`dht/swarm.rs` says why). Never
+# mdns, relay, autonat, upnp or dcutr. Bumping it reruns the adapter's
+# transport tests (H3-D1, condition 3).
+libp2p = { version = "=0.57.1", features = ["kad", "tokio", "macros", "ed25519", "identify"] }
 # Decodes path parameters as axum does: unpinned, to be axum's.
 percent-encoding = "2"
 # The frames of agentnet-discovery/0, protobuf messages written by hand with

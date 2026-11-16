@@ -9,8 +9,9 @@
 //! ([`stub_discovery_peer`]), and serve a signed card too
 //! ([`stub_discovery_peer_with_card`]), stock A2A agents with
 //! no PALS behind them, served over plain HTTP on loopback ([`echo_app_at`],
-//! [`serve_at`]), and a plain HTTP client for a node's loopback gateway
-//! ([`gateway_request`]).
+//! [`serve_at`]), a plain HTTP client for a node's loopback gateway
+//! ([`gateway_request`]), and nodes with the DHT on, entering it through
+//! other nodes' tickets ([`spawn_dht_node`]).
 
 // Each test binary uses a different subset of these helpers.
 #![allow(dead_code)]
@@ -46,9 +47,10 @@ use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 use iroh_tickets::endpoint::EndpointTicket;
 use pals::config::{
-    AgentCfg, Config, DiscoveryCfg, GatewayCfg, INVENTORY_FILE, InventoryCfg, KEY_FILE, LimitsCfg,
-    McpCfg, NetCfg, WorkerCfg,
+    AgentCfg, Config, DhtCfg, DhtMode, DiscoveryCfg, GatewayCfg, INVENTORY_FILE, InventoryCfg,
+    KEY_FILE, LimitsCfg, McpCfg, NetCfg, WorkerCfg,
 };
+use pals::dht::DhtTiming;
 use pals::net::{ALPN_A2A_HTTP, PEER_HEADER, PeerHttp, TunnelLimits, TunnelServer, agent_id_of};
 use pals::node::{Node, NodeOptions};
 use pals::worker::echo::EchoExecutor;
@@ -445,6 +447,7 @@ pub fn test_config(data_dir: &Path, worker: WorkerCfg) -> Config {
             ..InventoryCfg::default()
         },
         discovery: DiscoveryCfg::default(),
+        dht: DhtCfg::default(),
         trusted_issuers: Vec::new(),
     }
 }
@@ -537,6 +540,51 @@ pub async fn spawn_node_in_configured(
         dir,
         downloads,
     }
+}
+
+/// A node with the DHT on, in `mode`, entering it through the tickets of
+/// `bootstrap` ([`Node::ticket`]), on loopback with no relay, with the DHT's
+/// times `timing` and an echo worker, on a fresh data directory.
+pub async fn spawn_dht_node(mode: DhtMode, bootstrap: &[&TestNode], timing: DhtTiming) -> TestNode {
+    let opts = NodeOptions {
+        dht_timing: Some(timing),
+        ..NodeOptions::default()
+    };
+    spawn_dht_node_with(mode, bootstrap, opts, |_| {}).await
+}
+
+/// [`spawn_dht_node`], with `opts` (its DHT's times among them) and its
+/// configuration changed by `edit` after the DHT's section is written.
+pub async fn spawn_dht_node_with(
+    mode: DhtMode,
+    bootstrap: &[&TestNode],
+    opts: NodeOptions,
+    edit: impl FnOnce(&mut Config),
+) -> TestNode {
+    let dir = tempfile::tempdir().expect("create a data directory");
+    spawn_dht_node_in(dir, mode, bootstrap, opts, edit).await
+}
+
+/// [`spawn_dht_node_with`] on `dir`, which may already hold a key and a
+/// store.
+pub async fn spawn_dht_node_in(
+    dir: tempfile::TempDir,
+    mode: DhtMode,
+    bootstrap: &[&TestNode],
+    opts: NodeOptions,
+    edit: impl FnOnce(&mut Config),
+) -> TestNode {
+    let tickets: Vec<String> = bootstrap.iter().map(|node| node.node.ticket()).collect();
+    spawn_node_in_configured(dir, EchoExecutor, opts, |cfg| {
+        cfg.dht = DhtCfg {
+            enabled: true,
+            mode,
+            bootstrap: tickets,
+            ..DhtCfg::default()
+        };
+        edit(cfg);
+    })
+    .await
 }
 
 /// A node whose work `executor` does and whose worker reports `load` to the
