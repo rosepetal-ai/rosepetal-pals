@@ -5,7 +5,7 @@ Este documento recoge dos ejecuciones de los casos del criterio de salida del hi
 1. **[Ejecución con Docker en el papel de la segunda máquina](#ejecución-con-docker-en-el-papel-de-la-segunda-máquina-2026-11-14)** (2026-11-14, por la tarde). Los ocho casos, con red real entre dos espacios de red, cortes de red reales con `iptables`, los relays públicos de Iroh y Claude Code en el caso 1. La ejecuta el arnés [`tests/exit/`](../../../tests/exit/README.md).
 2. **[El ensayo anterior en una sola máquina](#ensayo-anterior-en-una-sola-máquina-2026-11-14-1038-a-1057-utc)** (2026-11-14, por la mañana): loopback, sin relay y con los cortes simulados congelando un daemon.
 
-**Ninguna de las dos es la prueba en dos máquinas físicas.** En la ejecución con Docker, A y B comparten kernel, reloj e IP pública, y el camino por relay se fuerza descartando UDP (ver [«Lo que no cubre»](#lo-que-no-cubre)). La prueba en dos máquinas, en redes distintas, sigue pendiente del responsable del proyecto. Él decide si esta ejecución basta para cerrar el hito 1.
+**Ninguna de las dos es la prueba en dos máquinas físicas.** En la ejecución con Docker, A y B comparten kernel, reloj e IP pública, y el camino por relay se fuerza descartando UDP (ver [«Lo que no cubre»](#lo-que-no-cubre)). La ejecución con Docker cierra el hito 1, y repetirla en dos máquinas, en redes distintas, es un extra opcional ([registro de decisión](../../decisions/2026-11-16-cierre-hitos-1-y-2.md#d2-las-pruebas-de-salida-con-docker-cierran-los-hitos-1-y-2), 2026-11-16).
 
 ## Ejecución con Docker en el papel de la segunda máquina (2026-11-14)
 

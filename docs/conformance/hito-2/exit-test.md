@@ -2,7 +2,7 @@
 
 Este documento recoge la ejecución de los casos del criterio de salida del hito 2 (spec §14), siguiendo el runbook [`docs/runbooks/hito-2-consulta-de-servicios.md`](../../runbooks/hito-2-consulta-de-servicios.md), con un contenedor Docker por agente. La ejecuta el arnés [`tests/exit/hito-2.sh`](../../../tests/exit/README.md#prueba-de-salida-del-hito-2-con-docker).
 
-**No es una prueba en varias máquinas físicas.** Los agentes comparten kernel, reloj y máquina, y entre ellos solo hay el bridge de Docker (ver [«Lo que no cubre»](#lo-que-no-cubre)).
+**No es una prueba en varias máquinas físicas.** Los agentes comparten kernel, reloj y máquina, y entre ellos solo hay el bridge de Docker (ver [«Lo que no cubre»](#lo-que-no-cubre)). Esta ejecución cierra el hito 2, y repetirla en máquinas físicas es un extra opcional ([registro de decisión](../../decisions/2026-11-16-cierre-hitos-1-y-2.md#d2-las-pruebas-de-salida-con-docker-cierran-los-hitos-1-y-2), 2026-11-16).
 
 ## Resultado (2026-11-15)
 

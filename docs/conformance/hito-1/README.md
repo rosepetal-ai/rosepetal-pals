@@ -2,7 +2,7 @@
 
 Evidencia de la compatibilidad con A2A v1.0 del intercambio final de PALS: el TCK oficial ejecutado a través del gateway local, y un cliente independiente hecho con el SDK oficial de Python. Este documento dice qué queda respaldado y qué no.
 
-**Resultado en una línea:** el TCK no deja **ningún requisito MUST automatizado fallido** en `jsonrpc` ni en `http_json` (72 superados; los saltados lo son por capacidades que PALS no declara o por ser de gRPC), y el SDK oficial de Python completa sus 4 comprobaciones por los dos bindings. Queda pendiente un requisito `MANUAL` de nivel MUST, `AUTH-TLS-001`, que necesita la aceptación expresa del responsable.
+**Resultado en una línea:** el TCK no deja **ningún requisito MUST automatizado fallido** en `jsonrpc` ni en `http_json` (72 superados; los saltados lo son por capacidades que PALS no declara o por ser de gRPC), y el SDK oficial de Python completa sus 4 comprobaciones por los dos bindings. El requisito `MANUAL` de nivel MUST `AUTH-TLS-001` quedó aceptado el 2026-11-16 ([registro de decisión](../../decisions/2026-11-16-cierre-hitos-1-y-2.md#d1-auth-tls-001-se-acepta)).
 
 ## Ejecución
 
@@ -62,7 +62,7 @@ El TCK no los puede comprobar desde fuera; no cuentan como superados.
 |-|-|-|
 | `CARD-CLIENT-001` (el cliente usa el *tenant* de la interfaz elegida) | MUST | Ninguna interfaz declara *tenant* y el cliente de PALS no lo envía. Sin verificación independiente |
 | `CARD-SIGN-001` a `CARD-SIGN-004` (firma JWS de la card) | MUST | No aplica en el hito 1: la card no está firmada (sin `signatures`). La firma llega en el hito 2 |
-| `AUTH-TLS-001` (tráfico cifrado en producción) | MUST | **Pendiente de aceptación del responsable.** Entre pares, QUIC de Iroh (TLS 1.3). El gateway local es HTTP sin TLS y solo escucha en loopback: el tráfico no sale de la máquina |
+| `AUTH-TLS-001` (tráfico cifrado en producción) | MUST | **Aceptado** el 2026-11-16 ([registro de decisión](../../decisions/2026-11-16-cierre-hitos-1-y-2.md#d1-auth-tls-001-se-acepta)). Entre pares, QUIC de Iroh (TLS 1.3). El gateway local es HTTP sin TLS y solo escucha en loopback: el tráfico no sale de la máquina |
 | `AUTH-TLS-002` (TLS moderno) | SHOULD | Entre pares, TLS 1.3 de QUIC. No aplica al gateway de loopback |
 | `AUTH-SERVER-001` (el cliente valida el certificado contra CA de confianza) | SHOULD | Desviación deliberada: la identidad del par es su clave Ed25519, comprobada en el handshake de QUIC, no un certificado de una CA |
 | `BIND-CUSTOM-002` (un cambio incompatible del binding usa URI nueva) | MUST | Comprometido en la [especificación de los bindings](../../bindings/http-over-iroh-v1.md#1-identificación): las URI de `v1` no cambian de significado; un cambio incompatible será `v2` |
@@ -107,4 +107,4 @@ Rodeos de defectos del SDK oficial de Rust fijado, cada uno en una capa propia d
 
 > **A2A v1.0 con los bindings JSON-RPC y HTTP+JSON a través del gateway local; entre pares, el binding propio `http-over-iroh/v1` (`…/v1/jsonrpc` y `…/v1/http-json`), que transporta esos mismos bindings.**
 
-En concreto: todos los requisitos MUST que el TCK en `104a7b4ae0d8` comprueba de forma automática para esos dos bindings se superan, salvo los de capacidades que la card no declara (notificaciones *push*, card extendida) y los de gRPC, que PALS no ofrece; y el SDK oficial de Python opera con PALS por los dos bindings. No queda respaldado: los 16 requisitos MUST sin prueba automática en el TCK, los `MANUAL` (entre ellos `AUTH-TLS-001`, pendiente de aceptación) y el SHOULD `HTTP_JSON-SVC-001`.
+En concreto: todos los requisitos MUST que el TCK en `104a7b4ae0d8` comprueba de forma automática para esos dos bindings se superan, salvo los de capacidades que la card no declara (notificaciones *push*, card extendida) y los de gRPC, que PALS no ofrece; y el SDK oficial de Python opera con PALS por los dos bindings. No queda respaldado: los 16 requisitos MUST sin prueba automática en el TCK, los `MANUAL` (`AUTH-TLS-001` está aceptado, pero no lo comprueba el TCK) y el SHOULD `HTTP_JSON-SVC-001`.

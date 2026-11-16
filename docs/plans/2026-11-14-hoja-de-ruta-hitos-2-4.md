@@ -10,8 +10,8 @@ Aquí queda fijado lo que ya se puede decidir: qué implica para cada hito el re
 
 | Hito | Estado | Plan | PR | Evidencia de salida |
 |-|-|-|-|-|
-| 1. Flujo básico | Implementado y revisado. Prueba de salida: 8 de 8 casos con un contenedor Docker en el papel de la segunda máquina. Pendiente del responsable: aceptar `AUTH-TLS-001`, decidir si esa ejecución basta o se repite en dos máquinas físicas, y unir la PR con `dev` | [Hito 1](2026-11-14-hito-1-flujo-basico-a2a.md) | [#1](https://github.com/rosepetal-ai/rosepetal-pals/pull/1), borrador contra `dev`, CI en verde | [Conformidad](../conformance/hito-1/README.md), [prueba de salida](../conformance/hito-1/exit-test.md), arnés [`tests/exit/`](../../tests/exit/README.md) |
-| 2. Consulta de servicios e inventario | Implementado: las 13 tareas del plan, en `feat/hito-2`. Prueba de salida: 8 de 8 casos con un contenedor Docker por agente, en una sola máquina, y el caso 9, la conformidad repetida, sin regresión. Pendiente del responsable: decidir si esa ejecución basta o se repite en máquinas físicas, y unir la PR con `dev` | [Hito 2](2026-11-14-hito-2-consulta-de-servicios.md) | [#2](https://github.com/rosepetal-ai/rosepetal-pals/pull/2), borrador apilado sobre `feat/hito-1` | [Conformidad](../conformance/hito-2/README.md), [prueba de salida](../conformance/hito-2/exit-test.md), [firmas de la card](../conformance/hito-2/card-signatures.md), arnés [`tests/exit/hito-2.sh`](../../tests/exit/README.md#prueba-de-salida-del-hito-2-con-docker) |
+| 1. Flujo básico | Cerrado y unido con `dev`. Prueba de salida: 8 de 8 casos con un contenedor Docker en el papel de la segunda máquina, que cierra el hito; `AUTH-TLS-001` aceptado ([registro de decisión](../decisions/2026-11-16-cierre-hitos-1-y-2.md)) | [Hito 1](2026-11-14-hito-1-flujo-basico-a2a.md) | [#1](https://github.com/rosepetal-ai/rosepetal-pals/pull/1), unida con `dev` | [Conformidad](../conformance/hito-1/README.md), [prueba de salida](../conformance/hito-1/exit-test.md), arnés [`tests/exit/`](../../tests/exit/README.md) |
+| 2. Consulta de servicios e inventario | Cerrado y unido con `dev`: las 13 tareas del plan. Prueba de salida: 8 de 8 casos con un contenedor Docker por agente, en una sola máquina, que cierra el hito, y el caso 9, la conformidad repetida, sin regresión ([registro de decisión](../decisions/2026-11-16-cierre-hitos-1-y-2.md)) | [Hito 2](2026-11-14-hito-2-consulta-de-servicios.md) | [#2](https://github.com/rosepetal-ai/rosepetal-pals/pull/2), unida con `dev` | [Conformidad](../conformance/hito-2/README.md), [prueba de salida](../conformance/hito-2/exit-test.md), [firmas de la card](../conformance/hito-2/card-signatures.md), arnés [`tests/exit/hito-2.sh`](../../tests/exit/README.md#prueba-de-salida-del-hito-2-con-docker) |
 | 3. Descubrimiento con Kademlia | Sin plan; se escribe con el hito 2 construido | — | — | — |
 | 4. Colaboración privada con P2panda | Solo si aparece un caso real; sin plan | — | — | — |
 
@@ -140,6 +140,8 @@ La tarea 8 cubre los escenarios del §14 de este hito: card sin vínculo válido
 - **Alcanzabilidad:** los routers deben ser estables y alcanzables, y un nodo nuevo necesita un contacto alcanzable (§6.3); la prueba del hito 1 no cubrió NAT de operador ni redes físicas distintas.
 
 ### Decisiones para el responsable
+
+El responsable las delegó el 2026-11-16 ([registro de decisión](../decisions/2026-11-16-cierre-hitos-1-y-2.md#decisiones-del-hito-3)): se toman con los datos de cada tarea y se registran en `docs/decisions/`.
 
 | Id | Decisión | Recomendación |
 |-|-|-|
