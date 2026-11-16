@@ -8,6 +8,13 @@ publish.workspace = true
 
 [dependencies]
 spike-common.workspace = true
+pals-core.workspace = true
 iroh.workspace = true
-# No transports of its own: they are Iroh's.
-libp2p = { workspace = true, features = ["kad", "tokio", "macros"] }
+# No transport of libp2p's own: its connections are Iroh's (`transport.rs`).
+# `identify`, as in kad-libp2p, and `ed25519` for the PeerId made of the
+# agent's public key; no mdns, relay, autonat, upnp or dcutr.
+libp2p = { workspace = true, features = ["kad", "tokio", "macros", "identify", "ed25519"] }
+anyhow.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true

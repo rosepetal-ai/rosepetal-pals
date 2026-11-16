@@ -162,6 +162,16 @@ def coverage(ctx, searches):
     return found / expected if expected else None
 
 
+def backend_pct(answers):
+    """Of the answers with a valid candidate, the percentage whose first one
+    the backend timed (first_valid_source "backend") rather than the end of
+    the search ("completion"); None when none has a valid candidate."""
+    with_valid = [a for a in answers if a.get("first_valid_ms") is not None]
+    if not with_valid:
+        return None
+    return rnd(100 * sum(1 for a in with_valid if a.get("first_valid_source") == "backend") / len(with_valid))
+
+
 def harness_failures(searches):
     return [f"{s['node']}: {s['error'] or 'HTTP ' + str(s['http'])}" for s in searches if failed(s)]
 
@@ -230,9 +240,7 @@ def s1(ctx, lines, by_design=None):
         "complete_pct": rnd(100 * sum(1 for s in searches if complete(ctx, s)) / n) if n else None,
         "first_valid_ms_p50": pct([s["answer"]["first_valid_ms"] for s in with_valid], 0.5),
         "first_valid_ms_p95": pct([s["answer"]["first_valid_ms"] for s in with_valid], 0.95),
-        "first_valid_backend_pct": rnd(100 * sum(
-            1 for s in with_valid if s["answer"].get("first_valid_source") == "backend") / len(with_valid))
-        if with_valid else None,
+        "first_valid_backend_pct": backend_pct([s["answer"] for s in answered]),
         "elapsed_ms_p50": pct([s["answer"]["elapsed_ms"] for s in answered], 0.5),
         "elapsed_ms_p95": pct([s["answer"]["elapsed_ms"] for s in answered], 0.95),
         "requests_p50": pct([s["answer"].get("requests") for s in answered], 0.5),
@@ -277,6 +285,7 @@ def s2(ctx, lines):
         if connected else None,
         "connected_first_valid_ms_p50": pct([a["first_valid_ms"] for a in connected_answers], 0.5),
         "connected_first_valid_ms_p95": pct([a["first_valid_ms"] for a in connected_answers], 0.95),
+        "connected_first_valid_backend_pct": backend_pct(connected_answers),
         "connected_elapsed_ms_p50": pct([a["elapsed_ms"] for a in connected_answers], 0.5),
         "connected_elapsed_ms_p95": pct([a["elapsed_ms"] for a in connected_answers], 0.95),
         "newcomer_first_valid_s": rnd(first["t1"] - start["t"]) if first is not None and start else None,
@@ -292,7 +301,9 @@ def s2(ctx, lines):
              f"de cada capacidad, {2 * ctx.p['REPUBLISH_S']} s como mucho. "
              f"newcomer_first_valid_s cuenta desde que arrancó su contenedor. connected_first_valid_ms y "
              f"connected_elapsed_ms son de las búsquedas de los clientes con {ctx.p['BOOTSTRAP']} parado: cuándo "
-             "tuvo el backend el primer candidato válido y cuándo terminó la búsqueda.")
+             "tuvo el backend el primer candidato válido y cuándo terminó la búsqueda. "
+             "connected_first_valid_backend_pct es la parte de las que tienen candidato válido cuyo primero "
+             "fechó el backend (found_ms), y no el final de la búsqueda.")
     ok = all(complete(ctx, s) for s in connected) and newcomer_complete
     return outcome("pass" if ok else "fail", metrics, notes, reached)
 
@@ -380,6 +391,7 @@ def s4(ctx, lines):
         "full_coverage_s": rnd(full - t) if full is not None and t is not None else None,
         "degraded_first_valid_ms_p50": pct([a["first_valid_ms"] for a in answers], 0.5),
         "degraded_first_valid_ms_p95": pct([a["first_valid_ms"] for a in answers], 0.95),
+        "degraded_first_valid_backend_pct": backend_pct(answers),
         "degraded_elapsed_ms_p50": pct([a["elapsed_ms"] for a in answers], 0.5),
         "degraded_elapsed_ms_p95": pct([a["elapsed_ms"] for a in answers], 0.95),
         "rounds": len(groups),
@@ -392,7 +404,9 @@ def s4(ctx, lines):
              "La cobertura completa cuenta en la primera búsqueda completa, del mismo cliente y capacidad, "
              "después de la última incompleta, y es 0 si ninguna lo fue. degraded_first_valid_ms y "
              "degraded_elapsed_ms son de todas las búsquedas de S4, hechas con los routers parados: cuándo tuvo "
-             "el backend el primer candidato válido y cuándo terminó la búsqueda.")
+             "el backend el primer candidato válido y cuándo terminó la búsqueda. "
+             "degraded_first_valid_backend_pct es la parte de las que tienen candidato válido cuyo primero "
+             "fechó el backend (found_ms), y no el final de la búsqueda.")
     ok = metrics["full_coverage_s"] is not None and metrics["full_coverage_s"] < limit
     return outcome("pass" if ok else "fail", metrics, notes, reached)
 

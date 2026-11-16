@@ -212,6 +212,21 @@ class S2(Case):
         # The 500 found no one: not complete.
         self.assertEqual(result["status"], "fail")
 
+    def test_who_timed_the_first_valid_of_the_connected_clients(self):
+        # Of the 16 searches with a valid candidate, 12 timed by the backend
+        # and 4 at completion; the one that finds no one counts in neither.
+        connected = [search(c, cap, "connected", k, found=providers_of(cap), first_valid_ms=k,
+                            source="completion" if c == CLIENTS[0] else "backend")
+                     for k, (c, cap) in enumerate(((c, cap) for c in CLIENTS for cap in CAPS), 1)]
+        connected.append(search(CLIENTS[1], CAPS[0], "connected", 17))
+        metrics = self.judge("S2", self.lines(connected))["metrics"]
+        self.assertEqual(metrics["connected_first_valid_backend_pct"], 75)
+
+    def test_no_valid_candidate_has_no_backend_share(self):
+        connected = [search(c, CAPS[0], "connected", k) for k, c in enumerate(CLIENTS, 1)]
+        metrics = self.judge("S2", self.lines(connected))["metrics"]
+        self.assertIsNone(metrics["connected_first_valid_backend_pct"])
+
 
 class S4(Case):
     def round(self, i, t, short=None):
@@ -247,6 +262,17 @@ class S4(Case):
         metrics = self.judge("S4", lines)["metrics"]
         self.assertEqual((metrics["degraded_first_valid_ms_p50"], metrics["degraded_first_valid_ms_p95"]), (8, 16))
         self.assertEqual((metrics["degraded_elapsed_ms_p50"], metrics["degraded_elapsed_ms_p95"]), (1008, 5000))
+
+    def test_who_timed_the_first_valid_while_the_routers_are_down(self):
+        # 16 searches with a valid candidate, the first 4 timed at completion,
+        # and one more that finds no one and counts in neither.
+        lines = [event("begin", -1), event("stop", 0)]
+        lines += [search(c, cap, "round=0", 1 + k, found=providers_of(cap), first_valid_ms=k + 1,
+                         source="completion" if k < 4 else "backend")
+                  for k, (c, cap) in enumerate((c, cap) for c in CLIENTS for cap in CAPS)]
+        lines.append(search(CLIENTS[0], CAPS[0], "round=1", 20))
+        metrics = self.judge("S4", lines)["metrics"]
+        self.assertEqual(metrics["degraded_first_valid_backend_pct"], 75)
 
 
 class S5(Case):

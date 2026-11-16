@@ -4663,9 +4663,14 @@ dependencies = [
 name = "spike-kad-iroh"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "iroh",
  "libp2p",
+ "pals-core",
+ "sha2",
  "spike-common",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -26,8 +26,8 @@ base64 = "=0.23.1"
 clap = { version = "=4.6.7", features = ["derive"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
-# The provider key of a capability, and the libp2p key derived from the
-# agent seed (kad-libp2p).
+# The provider key of a capability (kad-libp2p, kad-iroh), and the libp2p
+# key derived from the agent seed (kad-libp2p).
 sha2 = "=0.11.0"
 tokio = { version = "=1.54.1", features = ["macros", "net", "rt-multi-thread", "sync", "time", "io-util"] }
 tracing = "=0.1.44"

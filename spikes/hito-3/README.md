@@ -16,7 +16,7 @@ No es código del producto. El daemon no usa nada de aquí, y esta fase no toca 
 | `spike-kad-iroh` | `kad-iroh/` | `libp2p-kad` sobre un transporte de libp2p hecho con conexiones Iroh (tarea 4) |
 | `spike-mainline` | `mainline/` | Iroh más una DHT Mainline privada, con el contacto resuelto por pkarr (tarea 5) |
 
-`spike-common` y `spike-baseline` están escritos (tarea 2), y `spike-kad-libp2p` también (tarea 3). Los otros dos binarios todavía solo nombran un elemento de cada dependencia para enlazarlas; las tareas 4 y 5 escriben sus nodos sobre el contrato de [más abajo](#el-contrato-de-nodo).
+`spike-common` y `spike-baseline` están escritos (tarea 2), `spike-kad-libp2p` (tarea 3) y `spike-kad-iroh` (tarea 4) también. `spike-mainline` todavía solo nombra un elemento de cada dependencia para enlazarlas; la tarea 5 escribe su nodo sobre el contrato de [más abajo](#el-contrato-de-nodo).
 
 ## Dependencias
 
@@ -25,12 +25,12 @@ Todas van fijadas con `=` en [`Cargo.toml`](Cargo.toml):
 | Crate | Versión | Quién la usa |
 |-|-|-|
 | `iroh` | `=1.4.1`, la del daemon | Todos los binarios |
-| `libp2p` | `=0.57.1`, que trae `libp2p-kad 0.49.0` | `kad-libp2p`, con `kad`, `quic`, `tokio`, `macros`, `identify` y `ed25519`; `kad-iroh`, sin transportes propios: `kad`, `tokio` y `macros` |
+| `libp2p` | `=0.57.1`, que trae `libp2p-kad 0.49.0` | `kad-libp2p`, con `kad`, `quic`, `tokio`, `macros`, `identify` y `ed25519`; `kad-iroh`, sin transportes de libp2p, porque los suyos son los de Iroh: `kad`, `tokio`, `macros`, `identify` y `ed25519` |
 | `mainline` | `=8.0.1` | `mainline` |
 | `pkarr` | `=9.0.0`, con sus features por defecto (`full-client`: `dht` y `relays`) | `mainline` |
 | `iroh-mainline-address-lookup` | `=0.6.1` | `mainline` |
 
-El contrato de nodo usa además, con las versiones que ya fija el `Cargo.lock` de la raíz: `axum =0.8.9` y `tokio =1.54.1` (la API de control, como la pasarela del daemon), `clap =4.6.7` (la línea de órdenes), `serde =1.0.229`, `serde_json =1.0.154`, `anyhow =1.0.104`, `base64 =0.23.1` (la firma que altera `--rogue`), `tracing =0.1.44` y `tracing-subscriber =0.3.23` (el registro de cada nodo). `kad-libp2p` usa también `sha2 =0.11.0`, para la clave de los provider records y la clave libp2p que deriva de la semilla del agente.
+El contrato de nodo usa además, con las versiones que ya fija el `Cargo.lock` de la raíz: `axum =0.8.9` y `tokio =1.54.1` (la API de control, como la pasarela del daemon), `clap =4.6.7` (la línea de órdenes), `serde =1.0.229`, `serde_json =1.0.154`, `anyhow =1.0.104`, `base64 =0.23.1` (la firma que altera `--rogue`), `tracing =0.1.44` y `tracing-subscriber =0.3.23` (el registro de cada nodo). `kad-libp2p` usa también `sha2 =0.11.0`, para la clave de los provider records y la clave libp2p que deriva de la semilla del agente, y `kad-iroh`, para la clave de los provider records.
 
 El `Cargo.lock` de aquí partió de una copia del de la raíz. Así, los crates que el daemon ya usa conservan sus versiones, y solo se resolvieron los nuevos.
 
@@ -135,9 +135,9 @@ Entre escenarios, la topología vuelve a su estado. Los nodos que para un escena
 |-|-|-|
 | S0 | Arranca `c0` en la red A sin lista de arranque. Espera `S0_GRACE_S`, por si un descubrimiento local (mDNS, difusión) llegara a los proveedores de la red A, y busca cada capacidad | No hay ningún candidato. Un error del backend cuenta como búsqueda sin candidatos |
 | S1 | Cada cliente busca cada capacidad, `SEARCHES` rondas | Cada búsqueda devuelve los dos proveedores, verificados. Declarado `by-design`, no debe haber ningún candidato válido, y si lo hay el escenario queda en `error` |
-| S2 | Para `r1` (`docker kill`). Cada cliente busca cada capacidad una vez. Arranca `c5` con `[r1, r3]` y busca hasta encontrar a los dos proveedores de cada capacidad, `2 × REPUBLISH_S` como mucho. Mide además, en las búsquedas de los clientes con `r1` parado, cuándo tuvo el backend el primer candidato válido (`connected_first_valid_ms_p50` y `_p95`) y cuándo terminó la búsqueda (`connected_elapsed_ms_p50` y `_p95`) | Las búsquedas de los clientes están completas y `c5` encuentra a todos. El tiempo de `c5` cuenta desde que arranca su contenedor |
+| S2 | Para `r1` (`docker kill`). Cada cliente busca cada capacidad una vez. Arranca `c5` con `[r1, r3]` y busca hasta encontrar a los dos proveedores de cada capacidad, `2 × REPUBLISH_S` como mucho. Mide además, en las búsquedas de los clientes con `r1` parado, cuándo tuvo el backend el primer candidato válido (`connected_first_valid_ms_p50` y `_p95`), cuándo terminó la búsqueda (`connected_elapsed_ms_p50` y `_p95`) y, de las que tienen candidato válido, qué parte tiene el primero fechado por el backend y no por el final de la búsqueda (`connected_first_valid_backend_pct`, como `first_valid_backend_pct` en S1) | Las búsquedas de los clientes están completas y `c5` encuentra a todos. El tiempo de `c5` cuenta desde que arranca su contenedor |
 | S3 | Mide lo que los routers guardan de `p1` y lo para (`docker kill`). Cada `POLL_S`, las estadísticas de los routers y una búsqueda por cliente de una capacidad de `p1`, hasta que el último sondeo de los routers está a 0 y la última ronda está limpia (todas sus búsquedas contestan 200 y ninguna lo devuelve), `TTL_S + 2 × REPUBLISH_S` como mucho | Antes de pararlo los routers guardaban algo de `p1`, y en menos de `TTL_S + REPUBLISH_S` dejan de guardarlo y ninguna búsqueda lo devuelve, ni como inválido. Los routers cuentan en el primer sondeo a 0 después del último que guardaba algo; las búsquedas, en la primera contestada con 200 después de la última que lo devolvió, en toda la observación |
-| S4 | Para `r2` y `r4`. Rondas seguidas en que cada cliente busca cada capacidad, hasta una ronda completa, `3 × REPUBLISH_S` como mucho. Mide además, en todas sus búsquedas, que se hacen con `r2` y `r4` parados, cuándo tuvo el backend el primer candidato válido (`degraded_first_valid_ms_p50` y `_p95`) y cuándo terminó la búsqueda (`degraded_elapsed_ms_p50` y `_p95`) | La cobertura (proveedores esperados encontrados) vuelve a 1 en menos de `2 × REPUBLISH_S`. Cuenta la primera búsqueda completa, del mismo cliente y capacidad, después de la última incompleta, y es 0 si ninguna lo fue |
+| S4 | Para `r2` y `r4`. Rondas seguidas en que cada cliente busca cada capacidad, hasta una ronda completa, `3 × REPUBLISH_S` como mucho. Mide además, en todas sus búsquedas, que se hacen con `r2` y `r4` parados, cuándo tuvo el backend el primer candidato válido (`degraded_first_valid_ms_p50` y `_p95`), cuándo terminó la búsqueda (`degraded_elapsed_ms_p50` y `_p95`) y qué parte de las que tienen candidato válido tiene el primero fechado por el backend (`degraded_first_valid_backend_pct`) | La cobertura (proveedores esperados encontrados) vuelve a 1 en menos de `2 × REPUBLISH_S`. Cuenta la primera búsqueda completa, del mismo cliente y capacidad, después de la última incompleta, y es 0 si ninguna lo fue |
 | S5 | Arranca `rogue` en la red B con `--rogue`, que anuncia `vision.ocr`. Sondea los routers hasta que alguno cuente un rechazo, `2 × REPUBLISH_S` como mucho; después, cada cliente busca `vision.ocr` | Algún router sube `records_rejected`, ninguno atribuye a `rogue` un contacto (`stored_by_agent`), `records_stored` no crece en ningún router más de lo que explica `stored_by_agent` (los registros de los demás agentes y los de `rogue` que no son un contacto: lo que sobra cuenta como su contacto) y ningún cliente lo devuelve como válido. Si las estadísticas de los routers no atribuyen registros a los cuatro proveedores honrados, no prueban nada sobre `rogue` y S5 queda en `error` |
 | S6 | `IDLE_S` sin búsquedas, con las estadísticas de los 12 nodos muestreadas cada `IDLE_SAMPLE_S` y los contadores al principio y al final | Siempre `measured`. Se dan los bytes recibidos más enviados y, aparte, los enviados, porque un contenedor que no envía nada recibe igualmente el tráfico de fondo del puente de Docker |
 | S7 | Saca `p3` de la red B y lo mete en la A con la IP `S7_IP` (`docker network disconnect` y `connect --ip`), comprueba que está ahí, y le pide `POST /announce`. Cada cliente busca una capacidad de `p3` por ronda, hasta `3 × REPUBLISH_S` | Todos los clientes reciben un contacto válido de `p3` con su IP nueva en menos de `2 × REPUBLISH_S`, contando desde la desconexión |
@@ -166,6 +166,10 @@ Resultado esperado: S0 `pass`, S1 `by-design` sin candidatos, S2 a S5 y S7 `not-
 
 Iroh, como en la línea base, más `libp2p-kad` sobre QUIC de libp2p en el puerto siguiente, con un vínculo de identidades `agentnet.spike-kadlink/0` que lleva el contacto. Su `bootstrap_addr` son las multiaddrs de libp2p del router, terminadas en `/p2p/<PeerId>` y separadas por comas. Cómo está hecho, qué valida cada router y sus resultados están en [`docs/decisions/hito-3-backend/kad-libp2p.md`](../../docs/decisions/hito-3-backend/kad-libp2p.md).
 
+### `kad-iroh`
+
+Una sola pila: el endpoint de Iroh del nodo, con la clave del agente y en el puerto de `--listen`, sirve el ALPN `agentnet-kad/0`, y `libp2p-kad` va sobre sus conexiones con un transporte de libp2p hecho de conexiones Iroh. El `PeerId` es la clave pública del agente, así que no hay vínculo de identidades: el contacto firmado va en `/agentnet/contact/<PeerId>`. La configuración de Kademlia es la de `kad-libp2p`, copiada. Su `bootstrap_addr` tiene la misma forma, `/ip4/<ip>/udp/<puerto>/quic-v1/p2p/<PeerId>` por cada dirección del router, separadas por comas, y el transporte la traduce a un `EndpointId` de Iroh con su dirección directa. Cómo está hecho y sus resultados están en [`docs/decisions/hito-3-backend/kad-iroh.md`](../../docs/decisions/hito-3-backend/kad-iroh.md).
+
 ## Comprobaciones
 
 Dentro de `spikes/hito-3/`:
@@ -174,7 +178,7 @@ Dentro de `spikes/hito-3/`:
 cargo build --release --locked
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked -p spike-common -p spike-baseline -p spike-kad-libp2p
+cargo test --locked -p spike-common -p spike-baseline -p spike-kad-libp2p -p spike-kad-iroh
 (cd harness && python3 -m unittest -v)    # evaluate.py, con observaciones sintéticas
 ```
 
