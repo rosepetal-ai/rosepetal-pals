@@ -34,6 +34,12 @@
 //! 4. that announce lists a capability `c` whose [`provider_key`] is the
 //!    record's key ([`Rejection::CapabilityNotAnnounced`]).
 //!
+//! Of a provider record it stores, a router keeps only the addresses
+//! [`provider_addrs`] keeps: at most [`MAX_PROVIDER_ADDRS`], each in one of
+//! the two address forms naming its provider. Nothing it reads needs
+//! more: a searcher reaches a provider through its contact record, and
+//! never dials one by Kademlia unless it is a router.
+//!
 //! A router therefore admits an agent's provider records only for the
 //! capabilities of its signed announce, and the publisher sends the
 //! announce before its provider records. The check is made as each provider
@@ -51,13 +57,17 @@
 //! [`CLOCK_SKEW_S`]: pals_core::grant::CLOCK_SKEW_S
 //! [`MAX_ANNOUNCED_CAPABILITIES`]: pals_core::records::MAX_ANNOUNCED_CAPABILITIES
 
-use libp2p::PeerId;
 use libp2p::kad::RecordKey;
+use libp2p::{Multiaddr, PeerId};
 use pals_core::identity::AgentId;
 use pals_core::records::{AnnounceRecord, ContactRecord, MAX_RECORD_BYTES};
 use pals_core::signed::{Signed, SignedDoc, SignedError, check_validity};
 
 use super::keys::{SHA2_256, Slot, agent_of, provider_key, slot};
+use super::transport::{dial_target, located_nowhere};
+
+/// The most addresses of a provider record a router keeps.
+pub const MAX_PROVIDER_ADDRS: usize = 8;
 
 /// What a router does with a record offered to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +147,26 @@ impl Rejection {
             Self::StoreFull => "store_full",
         }
     }
+}
+
+/// The addresses a router keeps of `provider`'s record, of the `sent`
+/// ones: those in the router form or the client form that name
+/// `provider`, each once, in the order they came, at most
+/// [`MAX_PROVIDER_ADDRS`]; the rest go.
+pub fn provider_addrs(provider: &PeerId, sent: Vec<Multiaddr>) -> Vec<Multiaddr> {
+    let nowhere = located_nowhere(provider);
+    let mut kept: Vec<Multiaddr> = Vec::new();
+    for addr in sent {
+        let names_it =
+            addr == nowhere || dial_target(&addr).is_some_and(|(peer, _)| peer == *provider);
+        if names_it && !kept.contains(&addr) {
+            kept.push(addr);
+            if kept.len() == MAX_PROVIDER_ADDRS {
+                break;
+            }
+        }
+    }
+    kept
 }
 
 /// The verdict on a `PutRecord` of `value` under `key` at `now_unix`;

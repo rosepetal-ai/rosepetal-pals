@@ -66,7 +66,8 @@
 //!   newer announce of an agent, it drops that agent's provider records of
 //!   the capabilities the announce no longer lists: an agent has at most
 //!   [`MAX_ANNOUNCED_CAPABILITIES`] provider records at a router at any
-//!   time.
+//!   time, each with at most [`validate::MAX_PROVIDER_ADDRS`] addresses
+//!   that name it.
 //! - **Entry.** Each `[dht] bootstrap` ticket gives its direct IP
 //!   addresses, which go to Kademlia and to the [`AddressBook`], and the
 //!   node bootstraps. If no router answered by the end of it, the node
@@ -154,7 +155,9 @@ pub const KAD_PROTOCOL: StreamProtocol = StreamProtocol::new("/agentnet/kad/1.0.
 ///   ([`MAX_RECORD_BYTES`](pals_core::records::MAX_RECORD_BYTES));
 /// - `K` (20) providers per key; further ones are ignored, as
 ///   `libp2p-kad` does against floods;
-/// - 1024 keys with providers, the node's own among them.
+/// - 1024 keys with providers, the node's own among them;
+/// - and, outside this configuration, [`validate::MAX_PROVIDER_ADDRS`]
+///   addresses per provider record ([`validate::provider_addrs`]).
 pub const STORE_LIMITS: MemoryStoreConfig = MemoryStoreConfig {
     max_records: 1024,
     max_value_bytes: 8 * 1024,
@@ -1173,8 +1176,9 @@ impl Task {
     }
 
     /// An `AddProvider` to this node: stored only if
-    /// [`validate::check_provider`] says so.
-    fn on_provider(&mut self, record: ProviderRecord) {
+    /// [`validate::check_provider`] says so, with the addresses
+    /// [`validate::provider_addrs`] keeps.
+    fn on_provider(&mut self, mut record: ProviderRecord) {
         let now = self.clock.now_unix();
         let max_keys = self.store_limits.max_provided_keys;
         let held_announce = agent_of(&record.provider)
@@ -1184,6 +1188,7 @@ impl Task {
         let (key, provider) = (record.key.clone(), record.provider);
         match verdict {
             Verdict::Store => {
+                record.addresses = validate::provider_addrs(&provider, record.addresses);
                 if let Err(error) =
                     self.with_room(|kad| kad.store_mut().add_provider(record.clone()))
                 {
@@ -1753,6 +1758,54 @@ pub(super) mod tests {
             })
         });
         assert_eq!(unspecified, None, "{addrs:?}");
+    }
+
+    #[tokio::test]
+    async fn a_router_keeps_eight_addresses_of_a_provider_that_name_it() {
+        let router_key = AgentKey::generate();
+        let router_endpoint = endpoint(&router_key).await;
+        let (mut router, _listener) =
+            task(router_key, router_endpoint, DhtMode::Router, Vec::new());
+        // The agent's announce, which its provider record needs.
+        let agent = AgentKey::generate();
+        let (_, announce) = Fixed::of(&agent, &["vision.ocr"]).current();
+        router.on_put(
+            PeerId::random(),
+            Record::new(announce_key(&agent.id()), announce),
+        );
+        let peer = peer_id(&agent.id());
+        let other = peer_id(&AgentKey::generate().id());
+        let at = |n: u8| multiaddr_of(&peer, SocketAddr::from(([192, 0, 2, n], 4433)));
+        let dns: Multiaddr = format!("/dns4/example.org/udp/4433/quic-v1/p2p/{peer}")
+            .parse()
+            .unwrap();
+        // Among what it sends, ten addresses in the router form and the
+        // client form name it; the others name another agent, have more
+        // after `/p2p/`, no `/p2p/`, or no IP, and one comes twice.
+        let mut sent = vec![
+            multiaddr_of(&other, SocketAddr::from(([192, 0, 2, 99], 4433))),
+            located_nowhere(&peer),
+            dns,
+            at(1),
+            quic_addr(SocketAddr::from(([192, 0, 2, 98], 4433))),
+            at(2),
+            at(2),
+            at(3).with(libp2p::multiaddr::Protocol::P2pCircuit),
+        ];
+        sent.extend((4..=10).map(at));
+        let capability = provider_key("vision.ocr").unwrap();
+        router.on_provider(ProviderRecord {
+            key: capability.clone(),
+            provider: peer,
+            expires: None,
+            addresses: sent,
+        });
+        let held = router.kad().store_mut().providers(&capability);
+        assert_eq!(held.len(), 1, "{held:?}");
+        // The first eight that name it, each once, in the order they came.
+        let mut kept = vec![located_nowhere(&peer), at(1), at(2)];
+        kept.extend((4..=8).map(at));
+        assert_eq!(held[0].addresses, kept);
     }
 
     #[test]

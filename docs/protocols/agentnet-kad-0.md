@@ -185,6 +185,8 @@ Un provider record solo dice un `PeerId` bajo una clave, y la clave es un hash. 
 3. El router guarda un anuncio válido de ese agente, bajo la clave de su anuncio (`provider_without_announce`).
 4. Ese anuncio lista una capacidad cuya clave de la sección 3 es la del provider record (`capability_not_announced`). El anuncio lista las capacidades como las escribe el inventario, `vision.ocr` o `example:metal-plates`, y su clave sale de la cadena completa, la de `capability_tag`.
 
+De un provider record que guarda, el router se queda con 8 direcciones como mucho (`MAX_PROVIDER_ADDRS`): las que están en una de las dos formas de la sección 4 y nombran al propio proveedor, cada una una vez y en el orden en que llegaron. Las demás las descarta (`validate::provider_addrs`). A quien busca no le hace falta más: llega a un proveedor por su contacto (sección 9), y no lo marca por Kademlia si no es un router (sección 8). Lo prueba `a_router_keeps_eight_addresses_of_a_provider_that_name_it`, en `swarm.rs`.
+
 Así, un router solo admite de un agente provider records de las capacidades de su anuncio firmado. Por eso quien publica envía su anuncio antes que sus provider records. La comprobación se hace al recibir cada provider record, y cuando el router guarda un anuncio nuevo de un agente, borra los provider records de ese agente de las capacidades que el anuncio nuevo ya no lista. Así un agente tiene en un router, en todo momento, como mucho 32 provider records (`MAX_ANNOUNCED_CAPABILITIES`).
 
 Con el anuncio del vector `announce-v1`, que lista `vision.ocr` y `example:metal-plates`, un router guarda los provider records de su agente bajo `122092485626d851a455cd10cd7ae3800eb76ff67220722638435d3ae050e92c8463` y `12202a561a2441f0cc4eba6d49bc3d437b467d69cb6c640d213337a81b4826b173b6`. Rechaza con `capability_not_announced` el de `code.rust.review` y el del SHA-256 de `vision.ocr` sin el prefijo `agentnet:capability:v1:`.
@@ -239,7 +241,7 @@ Con `relay = true`, un marcado a un router puede buscar además su endpoint en e
 | Conexión ociosa | se cierra a los 10 s sin streams. Nada mantiene una conexión abierta |
 | Arranque periódico | cada 5 min, el de `libp2p-kad` |
 | Marcados a la vez a un par | 1: un router con dos direcciones es una conexión, que el transporte marca en todas (sección 5) |
-| Tienda de un router | 1024 valores de 8 KiB como mucho, 20 proveedores por clave y 1024 claves de proveedores |
+| Tienda de un router | 1024 valores de 8 KiB como mucho, 20 proveedores por clave, 1024 claves de proveedores y 8 direcciones por provider record (sección 6) |
 | Conexiones | las de la sección 5: 2 establecidas por par y 256 entrantes |
 
 Un cliente no gasta tráfico en reposo: sus conexiones se cierran a los 10 s, y cada búsqueda después de un reposo paga un apretón de manos de Iroh con los routers.
