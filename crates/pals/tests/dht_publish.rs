@@ -18,46 +18,29 @@
 mod common;
 
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{
-    TestNode, loopback_endpoint, now_unix, shut_down, spawn_dht_node, spawn_dht_node_in,
-    spawn_dht_node_with,
+    CONVERGES, LOOKUP_PAUSE, Publisher, TestNode, TestRecords, announce, any_card_hash, contact,
+    dht, held, loopback_endpoint, now_unix, pals, shut_down, somewhere, spawn_dht_node,
+    spawn_dht_node_in, spawn_dht_node_with, wait_for, wait_for_dht,
 };
-use iroh::endpoint::{Connection, PortmapperConfig, presets};
+use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, TransportAddr};
+use iroh::{EndpointAddr, TransportAddr};
 use iroh_tickets::endpoint::EndpointTicket;
 use libp2p::kad::store::MemoryStoreConfig;
 use pals::config::{CONFIG_FILE, DhtCfg, DhtMode, INVENTORY_FILE};
 use pals::dht::keys::peer_id;
 use pals::dht::swarm::STORE_LIMITS;
-use pals::dht::transport::{ALPN_KAD, KadQuotas, located_nowhere};
-use pals::dht::{
-    Dht, DhtLookup, DhtParts, DhtStatus, DhtTiming, PublicationStatus, PublishedRecords,
-};
+use pals::dht::transport::{ALPN_KAD, located_nowhere};
+use pals::dht::{Dht, DhtLookup, DhtStatus, DhtTiming, PublicationStatus};
 use pals::node::NodeOptions;
-use pals_core::card_jws::CardHash;
-use pals_core::clock::{Clock, ManualClock, SystemClock};
-use pals_core::grant::format_timestamp;
+use pals_core::clock::{ManualClock, SystemClock};
 use pals_core::identity::{AgentId, AgentKey};
-use pals_core::records::{
-    ANNOUNCE_SCHEMA, AnnounceRecord, CONTACT_SCHEMA, ContactRecord, IrohContact,
-    MAX_ANNOUNCED_CAPABILITIES, RECORD_TTL_S,
-};
+use pals_core::records::{AnnounceRecord, ContactRecord, MAX_ANNOUNCED_CAPABILITIES};
 use pals_core::signed::Signed;
-use pals_core::store::Store;
-use tokio::sync::watch;
-
-/// How long a test waits for the network to reach the state it needs: past
-/// it, the test fails.
-const CONVERGES: Duration = Duration::from_secs(60);
-
-/// The pause between two lookups of [`wait_for_lookup`]: well under a
-/// router's 600 streams a minute from one peer, beside the rest of the
-/// test's traffic.
-const LOOKUP_PAUSE: Duration = Duration::from_secs(2);
 
 /// P1's inventory: two public services.
 const P1_INVENTORY: &str = r#"
@@ -129,33 +112,9 @@ fn with_timing(timing: DhtTiming) -> NodeOptions {
     }
 }
 
-/// `node`'s DHT.
-fn dht(node: &TestNode) -> &Dht {
-    node.node.dht().expect("the node's DHT is on")
-}
-
 /// `node`'s DHT status now.
 async fn status(node: &TestNode) -> DhtStatus {
     dht(node).status().await.expect("the node's DHT runs")
-}
-
-/// Polls `dht`'s status until `done`, and returns it; fails, saying `what`,
-/// after [`CONVERGES`].
-async fn wait_for_dht(dht: &Dht, what: &str, done: impl Fn(&DhtStatus) -> bool) -> DhtStatus {
-    let deadline = Instant::now() + CONVERGES;
-    loop {
-        let now = dht.status().await.expect("the DHT runs");
-        if done(&now) {
-            return now;
-        }
-        assert!(Instant::now() < deadline, "{what}: {now:?}");
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
-/// [`wait_for_dht`] on `node`'s DHT.
-async fn wait_for(node: &TestNode, what: &str, done: impl Fn(&DhtStatus) -> bool) -> DhtStatus {
-    wait_for_dht(dht(node), what, done).await
 }
 
 /// Waits until `dht`'s publication is as `done` wants it.
@@ -166,12 +125,6 @@ async fn wait_for_publication(
 ) -> PublicationStatus {
     let status = wait_for_dht(dht, what, |s| s.publication.as_ref().is_some_and(&done)).await;
     status.publication.expect("it publishes")
-}
-
-/// How many values and provider records of `agent` a router's `status`
-/// counts.
-fn held(status: &DhtStatus, agent: AgentId) -> u32 {
-    status.stored_by_agent.get(&agent).copied().unwrap_or(0)
 }
 
 /// The agents whose provider records of `capability` `router` holds.
@@ -271,159 +224,6 @@ async fn router_on(
         cfg.net.listen = Some(listen);
     })
     .await
-}
-
-/// `key`'s contact with `seq`, valid now, naming `direct`.
-fn contact(key: &AgentKey, seq: u64, direct: &[SocketAddr]) -> Vec<u8> {
-    let issued_at = now_unix() - 60;
-    let doc = ContactRecord {
-        schema: CONTACT_SCHEMA.to_owned(),
-        agent_id: key.id(),
-        iroh: IrohContact {
-            endpoint_id: key.id(),
-            relay_url: None,
-            direct_addrs: direct.iter().map(ToString::to_string).collect(),
-        },
-        seq,
-        issued_at: format_timestamp(issued_at).unwrap(),
-        expires_at: format_timestamp(issued_at + RECORD_TTL_S).unwrap(),
-    };
-    Signed::issue(key, doc).unwrap().to_json()
-}
-
-/// `key`'s announce with `seq`, listing `capabilities`, valid now.
-fn announce(key: &AgentKey, seq: u64, capabilities: &[&str]) -> Vec<u8> {
-    let issued_at = now_unix() - 60;
-    let doc = AnnounceRecord {
-        schema: ANNOUNCE_SCHEMA.to_owned(),
-        agent_id: key.id(),
-        seq,
-        agent_card_hash: format!("blake3:{}", "ab".repeat(32))
-            .parse::<CardHash>()
-            .unwrap(),
-        capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
-        discovery_alpn: "agentnet-discovery/0".to_owned(),
-        issued_at: format_timestamp(issued_at).unwrap(),
-        expires_at: format_timestamp(issued_at + RECORD_TTL_S).unwrap(),
-    };
-    Signed::issue(key, doc).unwrap().to_json()
-}
-
-/// Where a [`TestRecords`] says its agent is.
-fn somewhere() -> SocketAddr {
-    SocketAddr::from(([192, 0, 2, 10], 4433))
-}
-
-/// Records a test publishes as it likes: what [`TestRecords::set`] gives,
-/// each time a new change.
-struct TestRecords {
-    current: Mutex<(Vec<u8>, Vec<u8>)>,
-    capabilities: Vec<String>,
-    changes: watch::Sender<u64>,
-}
-
-impl TestRecords {
-    fn new(contact: Vec<u8>, announce: Vec<u8>, capabilities: &[&str]) -> Arc<Self> {
-        Arc::new(Self {
-            current: Mutex::new((contact, announce)),
-            capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
-            changes: watch::channel(0).0,
-        })
-    }
-
-    /// `key`'s contact and announce of `seq` 1, listing `capabilities`.
-    fn of(key: &AgentKey, capabilities: &[&str]) -> Arc<Self> {
-        Self::new(
-            contact(key, 1, &[somewhere()]),
-            announce(key, 1, capabilities),
-            capabilities,
-        )
-    }
-
-    /// Puts `contact` in force, as a record issued again.
-    fn set_contact(&self, contact: Vec<u8>) {
-        self.current
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .0 = contact;
-        self.bump();
-    }
-
-    /// Says the records changed.
-    fn bump(&self) {
-        self.changes.send_modify(|n| *n += 1);
-    }
-}
-
-impl PublishedRecords for TestRecords {
-    fn current(&self) -> (Vec<u8>, Vec<u8>) {
-        self.current
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-    }
-
-    fn capabilities(&self) -> Vec<String> {
-        self.capabilities.clone()
-    }
-
-    fn changes(&self) -> watch::Receiver<u64> {
-        self.changes.subscribe()
-    }
-}
-
-/// A DHT client of its own, with no node around it, that publishes
-/// `records` under `key`.
-struct Publisher {
-    dht: Dht,
-    _router: Router,
-}
-
-impl Publisher {
-    /// Starts it on a loopback endpoint with `key`, entering through
-    /// `routers`, with `timing` and `clock`.
-    async fn spawn(
-        key: &AgentKey,
-        records: Arc<TestRecords>,
-        routers: &[&TestNode],
-        timing: DhtTiming,
-        clock: Arc<dyn Clock>,
-    ) -> Self {
-        let endpoint = Endpoint::builder(presets::Minimal)
-            .secret_key(SecretKey::from_bytes(&key.to_bytes()))
-            .relay_mode(RelayMode::Disabled)
-            .portmapper_config(PortmapperConfig::Disabled)
-            .clear_ip_transports()
-            .bind_addr((Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .bind()
-            .await
-            .unwrap();
-        let cfg = DhtCfg {
-            enabled: true,
-            mode: DhtMode::Client,
-            bootstrap: routers.iter().map(|router| router.node.ticket()).collect(),
-            announce: true,
-            ..DhtCfg::default()
-        };
-        let (dht, listener) = Dht::spawn(DhtParts {
-            endpoint: endpoint.clone(),
-            key: Arc::new(AgentKey::from_bytes(&key.to_bytes())),
-            cfg,
-            timing,
-            quotas: KadQuotas::default(),
-            store_limits: STORE_LIMITS,
-            clock,
-            store: Arc::new(Store::open_in_memory(key.id()).unwrap()),
-            published: Some(records),
-        })
-        .unwrap();
-        let router = Router::builder(endpoint).accept(ALPN_KAD, listener).spawn();
-        Self {
-            dht,
-            _router: router,
-        }
-    }
 }
 
 #[tokio::test]
@@ -969,7 +769,7 @@ async fn a_provider_with_a_tampered_contact_is_discarded() {
     assert!(Signed::<ContactRecord>::from_json(&tampered).is_err());
     let records = TestRecords::new(
         tampered,
-        announce(&key, 1, &["vision.ocr"]),
+        announce(&key, 1, &any_card_hash(), &["vision.ocr"]),
         &["vision.ocr"],
     );
     let _t = Publisher::spawn(&key, records, &[&r1, &r2], short(), Arc::new(SystemClock)).await;
@@ -1036,25 +836,6 @@ async fn a_round_of_32_capabilities_fits_the_routers_quotas() {
             );
         }
     }
-}
-
-/// Runs `pals --home <home> <args>`, off the async threads: its exit code,
-/// stdout and stderr.
-async fn pals(home: &std::path::Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("pals");
-    cmd.env_remove("PALS_HOME")
-        .env_remove("RUST_LOG")
-        .arg("--home")
-        .arg(home)
-        .args(args);
-    let output = tokio::task::spawn_blocking(move || cmd.output().expect("run pals"))
-        .await
-        .unwrap();
-    (
-        output.status.code().expect("an exit code"),
-        String::from_utf8(output.stdout).unwrap(),
-        String::from_utf8(output.stderr).unwrap(),
-    )
 }
 
 /// Points a configuration in `node`'s data directory at its gateway, so

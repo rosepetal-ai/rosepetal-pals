@@ -17,29 +17,24 @@
 mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{Ipv4Addr, SocketAddr};
-use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use a2a_server::AgentExecutor;
 use common::{
-    CountingExecutor, StubMode, TestNode, grant, key_in, now_unix, shut_down,
-    spawn_node_in_configured, stub_card, stub_discovery_peer_with_card,
+    CONVERGES, CountingExecutor, LOOKUP_PAUSE, Publisher, StubMode, TestNode, TestRecords,
+    announce, contact, dht, grant, held, key_in, now_unix, pals, shut_down,
+    spawn_node_in_configured, stub_card, stub_discovery_peer_with_card, wait_for,
 };
 use futures::future::BoxFuture;
-use iroh::endpoint::{PortmapperConfig, presets};
-use iroh::protocol::Router;
-use iroh::{Endpoint, RelayMode, SecretKey};
 use pals::config::{CONFIG_FILE, Config, DhtCfg, DhtMode, INVENTORY_FILE};
-use pals::dht::swarm::STORE_LIMITS;
-use pals::dht::transport::{ALPN_KAD, KadQuotas};
-use pals::dht::{Dht, DhtLookup, DhtParts, DhtStatus, DhtTiming, PublishedRecords};
+use pals::dht::{DhtLookup, DhtTiming};
 use pals::discovery::{DiscoveryHook, DiscoveryLimits};
 use pals::node::NodeOptions;
 use pals::outbox::AskRequest;
 use pals_core::benchmark::Wanted;
-use pals_core::card_jws::{CardHash, SignatureStatus};
+use pals_core::card_jws::SignatureStatus;
 use pals_core::clock::SystemClock;
 use pals_core::discovery::query::{
     InventoryRequirements, OfferStatus, RequirementSet, Requirements, ServiceQuery,
@@ -48,29 +43,17 @@ use pals_core::discovery::selection::{Candidate, Coverage, SearchOutcome, Search
 use pals_core::discovery::wire::{self, ErrorCode, request, response};
 use pals_core::discovery::{DISCOVERY_VERSION, server_limits};
 use pals_core::grant::Operation::{TaskCancel, TaskRead, TaskSend};
-use pals_core::grant::{format_timestamp, parse_timestamp};
+use pals_core::grant::parse_timestamp;
 use pals_core::identity::{AgentId, AgentKey};
-use pals_core::records::{
-    ANNOUNCE_SCHEMA, AnnounceRecord, CONTACT_SCHEMA, ContactRecord, IrohContact, RECORD_TTL_S,
-};
+use pals_core::records::ContactRecord;
 use pals_core::signed::Signed;
-use pals_core::store::{RecordAccept, Store};
+use pals_core::store::RecordAccept;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ClientConfig};
 use rmcp::service::RunningService;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{Value, json};
-use tokio::sync::watch;
-
-/// How long a test waits for the network to reach the state it needs: past
-/// it, the test fails.
-const CONVERGES: Duration = Duration::from_secs(60);
-
-/// The pause between two lookups of [`wait_found`]: well under a router's
-/// 600 streams a minute from one peer, beside the rest of the test's
-/// traffic.
-const LOOKUP_PAUSE: Duration = Duration::from_secs(2);
 
 /// The capability P1 and P2 announce, and A looks for.
 const CAPABILITY: &str = "vision.ocr";
@@ -146,36 +129,6 @@ async fn dht_node(
         edit(cfg);
     })
     .await
-}
-
-/// `node`'s DHT.
-fn dht(node: &TestNode) -> &Dht {
-    node.node.dht().expect("the node's DHT is on")
-}
-
-/// Polls `dht`'s status until `done`, and returns it; fails, saying `what`,
-/// after [`CONVERGES`].
-async fn wait_for_dht(dht: &Dht, what: &str, done: impl Fn(&DhtStatus) -> bool) -> DhtStatus {
-    let deadline = Instant::now() + CONVERGES;
-    loop {
-        let now = dht.status().await.expect("the DHT runs");
-        if done(&now) {
-            return now;
-        }
-        assert!(Instant::now() < deadline, "{what}: {now:?}");
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
-/// [`wait_for_dht`] on `node`'s DHT.
-async fn wait_for(node: &TestNode, what: &str, done: impl Fn(&DhtStatus) -> bool) -> DhtStatus {
-    wait_for_dht(dht(node), what, done).await
-}
-
-/// How many values and provider records of `agent` a router's `status`
-/// counts.
-fn held(status: &DhtStatus, agent: AgentId) -> u32 {
-    status.stored_by_agent.get(&agent).copied().unwrap_or(0)
 }
 
 /// Looks [`CAPABILITY`] up from `node`'s own DHT until the lookup finds
@@ -333,123 +286,6 @@ fn socket_of(node: &TestNode) -> SocketAddr {
         .expect("a direct address")
 }
 
-/// `key`'s contact with `seq`, valid now, naming `direct`.
-fn contact(key: &AgentKey, seq: u64, direct: &[SocketAddr]) -> Vec<u8> {
-    let issued_at = now_unix() - 60;
-    let doc = ContactRecord {
-        schema: CONTACT_SCHEMA.to_owned(),
-        agent_id: key.id(),
-        iroh: IrohContact {
-            endpoint_id: key.id(),
-            relay_url: None,
-            direct_addrs: direct.iter().map(ToString::to_string).collect(),
-        },
-        seq,
-        issued_at: format_timestamp(issued_at).unwrap(),
-        expires_at: format_timestamp(issued_at + RECORD_TTL_S).unwrap(),
-    };
-    Signed::issue(key, doc).unwrap().to_json()
-}
-
-/// `key`'s announce with `seq`, of the card `card_hash`, listing
-/// `capabilities`, valid now.
-fn announce(key: &AgentKey, seq: u64, card_hash: &CardHash, capabilities: &[&str]) -> Vec<u8> {
-    let issued_at = now_unix() - 60;
-    let doc = AnnounceRecord {
-        schema: ANNOUNCE_SCHEMA.to_owned(),
-        agent_id: key.id(),
-        seq,
-        agent_card_hash: card_hash.clone(),
-        capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
-        discovery_alpn: "agentnet-discovery/0".to_owned(),
-        issued_at: format_timestamp(issued_at).unwrap(),
-        expires_at: format_timestamp(issued_at + RECORD_TTL_S).unwrap(),
-    };
-    Signed::issue(key, doc).unwrap().to_json()
-}
-
-/// Records a test publishes as it likes.
-struct TestRecords {
-    current: Mutex<(Vec<u8>, Vec<u8>)>,
-    capabilities: Vec<String>,
-    changes: watch::Sender<u64>,
-}
-
-impl TestRecords {
-    fn new(contact: Vec<u8>, announce: Vec<u8>, capabilities: &[&str]) -> Arc<Self> {
-        Arc::new(Self {
-            current: Mutex::new((contact, announce)),
-            capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
-            changes: watch::channel(0).0,
-        })
-    }
-}
-
-impl PublishedRecords for TestRecords {
-    fn current(&self) -> (Vec<u8>, Vec<u8>) {
-        self.current
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-    }
-
-    fn capabilities(&self) -> Vec<String> {
-        self.capabilities.clone()
-    }
-
-    fn changes(&self) -> watch::Receiver<u64> {
-        self.changes.subscribe()
-    }
-}
-
-/// A DHT client of its own, with no node around it, that publishes
-/// `records` under `key`.
-struct Publisher {
-    _dht: Dht,
-    _router: Router,
-}
-
-impl Publisher {
-    /// Starts it on a loopback endpoint with `key`, entering through
-    /// `routers`.
-    async fn spawn(key: &AgentKey, records: Arc<TestRecords>, routers: &[&TestNode]) -> Self {
-        let endpoint = Endpoint::builder(presets::Minimal)
-            .secret_key(SecretKey::from_bytes(&key.to_bytes()))
-            .relay_mode(RelayMode::Disabled)
-            .portmapper_config(PortmapperConfig::Disabled)
-            .clear_ip_transports()
-            .bind_addr((Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .bind()
-            .await
-            .unwrap();
-        let cfg = DhtCfg {
-            enabled: true,
-            mode: DhtMode::Client,
-            bootstrap: routers.iter().map(|router| router.node.ticket()).collect(),
-            announce: true,
-            ..DhtCfg::default()
-        };
-        let (dht, listener) = Dht::spawn(DhtParts {
-            endpoint: endpoint.clone(),
-            key: Arc::new(AgentKey::from_bytes(&key.to_bytes())),
-            cfg,
-            timing: timing(),
-            quotas: KadQuotas::default(),
-            store_limits: STORE_LIMITS,
-            clock: Arc::new(SystemClock),
-            store: Arc::new(Store::open_in_memory(key.id()).unwrap()),
-            published: Some(records),
-        })
-        .unwrap();
-        let router = Router::builder(endpoint).accept(ALPN_KAD, listener).spawn();
-        Self {
-            _dht: dht,
-            _router: router,
-        }
-    }
-}
-
 /// A stub mode that keeps every request in `kept` and refuses it.
 fn refusing(kept: Arc<Mutex<Vec<wire::Request>>>) -> StubMode {
     StubMode::Record(
@@ -494,24 +330,6 @@ impl Recorder {
             })
             .collect()
     }
-}
-
-/// Runs `pals --home <home> <args>`, off the async threads; its exit code,
-/// stdout and stderr.
-async fn pals(home: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("pals");
-    cmd.env_remove("PALS_HOME")
-        .arg("--home")
-        .arg(home)
-        .args(args);
-    let output = tokio::task::spawn_blocking(move || cmd.output().expect("run pals"))
-        .await
-        .expect("the command's thread");
-    (
-        output.status.code().expect("an exit code"),
-        String::from_utf8(output.stdout).expect("utf-8 stdout"),
-        String::from_utf8(output.stderr).expect("utf-8 stderr"),
-    )
 }
 
 type Client = RunningService<RoleClient, ClientConfig>;
@@ -768,7 +586,14 @@ async fn a_tampered_card_is_discarded_even_with_a_valid_dht_announce() {
         announce(&key, 1, &card_hash, &[CAPABILITY]),
         &[CAPABILITY],
     );
-    let _publisher = Publisher::spawn(&key, records, &[&net.r1, &net.r2]).await;
+    let _publisher = Publisher::spawn(
+        &key,
+        records,
+        &[&net.r1, &net.r2],
+        timing(),
+        Arc::new(SystemClock),
+    )
+    .await;
     for router in [&net.r1, &net.r2] {
         wait_for(router, "the stub's records", |s| held(s, stub.id) == 3).await;
     }
