@@ -526,6 +526,86 @@ async fn a_dial_carries_every_known_address() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_peer_down_costs_one_dial_whatever_its_addresses() {
+    // A router that is down at its two addresses: sockets that never
+    // answer. Each dial carries both, so one dial says it all.
+    let mute = [
+        UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+        UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+    ];
+    let [first_addr, second_addr] = mute.each_ref().map(|socket| socket.local_addr().unwrap());
+    let book = AddressBook::default();
+    let mut a = node_with(
+        &agent(1),
+        KadQuotas::default(),
+        Arc::new(SystemClock),
+        book.clone(),
+    )
+    .await;
+    let down = peer_id(&agent(2).id());
+    book.learn(down, first_addr);
+    book.learn(down, second_addr);
+
+    // As libp2p does: the dials of both addresses made at once, and polled
+    // one after the other, the second once the first failed.
+    let first = a
+        .transport
+        .dial(multiaddr_of(&down, first_addr), dialer())
+        .unwrap();
+    let mut second = a
+        .transport
+        .dial(multiaddr_of(&down, second_addr), dialer())
+        .unwrap();
+    match timeout(PROMPTLY, first).await.expect("the dial hangs") {
+        Err(transport::Error::Timeout) => {}
+        Err(other) => panic!("not a timeout: {other}"),
+        Ok(_) => panic!("a dial to nobody connected"),
+    }
+    // The second fails at once, without waiting for its own timeout: the
+    // first carried its address.
+    let mut cx = Context::from_waker(Waker::noop());
+    match second.as_mut().poll(&mut cx) {
+        Poll::Ready(Err(transport::Error::Covered)) => {}
+        Poll::Ready(Err(other)) => panic!("not covered by the first: {other}"),
+        Poll::Ready(Ok(_)) => panic!("a dial to nobody connected"),
+        Poll::Pending => panic!("the second dial waits its own timeout"),
+    }
+    // A dial made after the failure tries again.
+    let mut third = a
+        .transport
+        .dial(multiaddr_of(&down, first_addr), dialer())
+        .unwrap();
+    assert!(
+        third.as_mut().poll(&mut cx).is_pending(),
+        "a later dial does not try"
+    );
+
+    // Of a peer the book knows only at the first address, the first dial
+    // does not carry the second: the dial of the second still tries.
+    let half_known = peer_id(&agent(3).id());
+    book.learn(half_known, first_addr);
+    let first = a
+        .transport
+        .dial(multiaddr_of(&half_known, first_addr), dialer())
+        .unwrap();
+    let mut second = a
+        .transport
+        .dial(multiaddr_of(&half_known, second_addr), dialer())
+        .unwrap();
+    assert!(
+        timeout(PROMPTLY, first)
+            .await
+            .expect("the dial hangs")
+            .is_err(),
+        "a dial to nobody connected"
+    );
+    assert!(
+        second.as_mut().poll(&mut cx).is_pending(),
+        "a dial of an address the failed one did not carry does not try"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_peer_beyond_its_stream_quota_is_reset() {
     // Two at once: the third is reset, and the two work.
     let quotas = KadQuotas {

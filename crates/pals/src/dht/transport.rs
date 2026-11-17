@@ -17,7 +17,11 @@
 //!   [`DIAL_TIMEOUT`], to an `EndpointAddr` that carries the dialed address
 //!   and every other one the [`AddressBook`] knows of that peer: Iroh picks
 //!   the path, so a peer with two addresses is one connection, not two. A
-//!   dial that reaches another endpoint fails in Iroh's handshake.
+//!   dial that reaches another endpoint fails in Iroh's handshake. libp2p
+//!   tries a peer's addresses one after another, a dial each; when one that
+//!   carried the address of another of the same attempt fails, that other
+//!   fails at once ([`Error::Covered`]): a peer that is down at addresses
+//!   the book knows costs one [`DIAL_TIMEOUT`], not one per address.
 //! - **Listen.** The endpoint is already bound, and its router hands the
 //!   connections of [`ALPN_KAD`] to an [`IrohListener`], the protocol
 //!   handler this transport makes. The listener never waits: it queues a
@@ -39,7 +43,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iroh::endpoint::{ConnectError, Connection, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
@@ -233,6 +237,9 @@ type Output = (PeerId, StreamMuxerBox);
 pub struct IrohTransport {
     endpoint: Endpoint,
     book: AddressBook,
+    /// When the last dial of each peer failed, and the addresses it
+    /// carried, for the dials made before it ([`Error::Covered`]).
+    failed: Arc<Mutex<HashMap<PeerId, Failed>>>,
     streams: Arc<StreamQuotas>,
     refusals: Refusals,
     /// The connections the [`IrohListener`] accepted.
@@ -263,6 +270,11 @@ pub enum Error {
     /// The dial took longer than [`DIAL_TIMEOUT`].
     #[error("no connection in {} s", DIAL_TIMEOUT.as_secs())]
     Timeout,
+    /// A dial of the same peer that carried this address too failed after
+    /// this one was made and before it was polled: dialing again would only
+    /// wait as long for the same answer.
+    #[error("another dial of the peer, which carried this address, failed")]
+    Covered,
     /// The connection is to another endpoint than the one dialed, which
     /// Iroh's handshake already rules out.
     #[error("connected to another endpoint: {0}")]
@@ -294,6 +306,7 @@ impl IrohTransport {
         let transport = Self {
             endpoint,
             book,
+            failed: Arc::default(),
             streams: Arc::new(streams),
             refusals: refusals.clone(),
             incoming,
@@ -398,17 +411,23 @@ impl Transport for IrohTransport {
         };
         // Every address known of the peer, in one dial: Iroh picks the path.
         let known = self.book.of(&peer);
-        let to = EndpointAddr::from_parts(
-            id,
-            std::iter::once(socket).chain(known).map(TransportAddr::Ip),
-        );
+        let carried: Vec<SocketAddr> = std::iter::once(socket).chain(known).collect();
+        let to = EndpointAddr::from_parts(id, carried.iter().copied().map(TransportAddr::Ip));
         let endpoint = self.endpoint.clone();
         let streams = Arc::clone(&self.streams);
+        let failed = Arc::clone(&self.failed);
+        // libp2p makes the dials of all the peer's addresses at once and
+        // polls them one after another.
+        let made = Instant::now();
         Ok(async move {
+            if covered(&failed, &peer, socket, made) {
+                return Err(Error::Covered);
+            }
             let connection = tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(to, ALPN_KAD))
                 .await
-                .map_err(|_| Error::Timeout)?
-                .map_err(Error::Connect)?;
+                .map_err(|_| Error::Timeout)
+                .and_then(|connected| connected.map_err(Error::Connect))
+                .inspect_err(|_| note_failure(&failed, peer, carried))?;
             let remote = connection.remote_id();
             if remote != id {
                 connection.close(VarInt::from_u32(REFUSED), b"");
@@ -547,6 +566,37 @@ fn remote_ip(connection: &Connection) -> Option<SocketAddr> {
         TransportAddr::Ip(addr) => Some(*addr),
         _ => None,
     }
+}
+
+/// A dial that failed: when, and the addresses it carried.
+#[derive(Debug)]
+struct Failed {
+    at: Instant,
+    carried: Vec<SocketAddr>,
+}
+
+/// Whether a dial of `peer` that carried `socket` failed at `made` or
+/// later.
+fn covered(
+    failed: &Mutex<HashMap<PeerId, Failed>>,
+    peer: &PeerId,
+    socket: SocketAddr,
+    made: Instant,
+) -> bool {
+    failed
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(peer)
+        .is_some_and(|failed| failed.at >= made && failed.carried.contains(&socket))
+}
+
+/// A dial of `peer` that carried `carried` failed now. What is older than
+/// [`DIAL_TIMEOUT`] goes: no dial waits longer for its turn.
+fn note_failure(failed: &Mutex<HashMap<PeerId, Failed>>, peer: PeerId, carried: Vec<SocketAddr>) {
+    let now = Instant::now();
+    let mut failed = failed.lock().unwrap_or_else(PoisonError::into_inner);
+    failed.retain(|_, failed| now.duration_since(failed.at) <= DIAL_TIMEOUT);
+    failed.insert(peer, Failed { at: now, carried });
 }
 
 #[cfg(test)]
