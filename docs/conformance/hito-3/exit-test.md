@@ -51,6 +51,8 @@ Después del cierre del hito 3, el responsable decidió reservar huecos a la DHT
 
 Con `dht_places = 0`, como antes de reservar huecos, una búsqueda como la de `c6` no consulta la DHT: sus tres contactos llenan sus tres huecos, con `dht_requests 0` y `candidate limit`. Lo comprueba `contacts_that_fill_every_place_leave_the_dht_alone`, en `crates/pals/tests/dht_search.rs`.
 
+Los commits posteriores a `e53de05`, de la corrección tras la revisión, cambian el reparto para los contactos que la DHT da: uno posterior a los que siempre se evalúan ocupa un hueco de la DHT como el contacto que es. No se repitió esta ejecución, porque los contactos de `c6` son routers que no anuncian nada. Lo cubren las pruebas de integración `a_contact_left_out_of_its_places_can_take_one_of_the_dhts`, `the_dht_takes_its_kept_places_and_no_more_behind_enough_contacts` y `behind_few_contacts_the_dht_takes_more_than_its_kept_places`, en `crates/pals/tests/dht_search.rs`.
+
 Las líneas del arnés:
 
 ```text
