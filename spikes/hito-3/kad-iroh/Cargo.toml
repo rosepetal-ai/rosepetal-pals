@@ -1,0 +1,20 @@
+[package]
+name = "spike-kad-iroh"
+description = "Hito 3 spike: libp2p-kad over Iroh connections; not product code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+spike-common.workspace = true
+pals-core.workspace = true
+iroh.workspace = true
+# No transport of libp2p's own: its connections are Iroh's (`transport.rs`).
+# `identify`, as in kad-libp2p, and `ed25519` for the PeerId made of the
+# agent's public key; no mdns, relay, autonat, upnp or dcutr.
+libp2p = { workspace = true, features = ["kad", "tokio", "macros", "identify", "ed25519"] }
+anyhow.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true

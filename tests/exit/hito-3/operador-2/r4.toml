@@ -1,0 +1,22 @@
+# r4: a router of operator 2 on networks A and B; enters through r3.
+[agent]
+name = "r4"
+description = "Router r4 del operador 2 en la prueba de salida del hito 3"
+
+[gateway]
+listen = "127.0.0.1:7420"
+
+[worker]
+adapter = "echo"
+
+[net]
+relay = false
+listen = "0.0.0.0:4433"
+
+[dht]
+enabled = true
+mode = "router"
+bootstrap = ["@TICKET_R3@"]
+external_addrs = ["10.213.73.14:4433", "10.213.74.14:4433"]
+record_ttl_s = 120
+republish_s = 40

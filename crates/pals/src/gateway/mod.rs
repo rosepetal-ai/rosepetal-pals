@@ -4,11 +4,17 @@
 //! `<gateway>/peers/<peer>`, where `<peer>` is a contact name or an agent id,
 //! with the standard bindings; and a plain A2A contact, an agent with no
 //! PALS behind it, at `<gateway>/peers/<name>` ([`plain`]). `<peer>` is an
-//! agent id first, then a PALS contact's name, then a plain contact's:
+//! agent id first, then a PALS contact's name, then a plain contact's. A
+//! PALS peer is dialed at its saved contact's ticket; an agent id with no
+//! saved contact, such as a provider a search found in the DHT, at the
+//! direct addresses and relay of the newest contact record this agent
+//! knows of it ([`Store::peer_record`]) while that record is in force by
+//! the node's clock, else by its id alone. The routes:
 //!
 //! | Route | Behavior |
 //! |-|-|
-//! | `GET /healthz` | `200 {"agent_id", "name", "ticket"}` |
+//! | `GET /healthz` | `200 {"agent_id", "name", "ticket"}`; a DHT router's ticket carries its `[dht] external_addrs` |
+//! | `GET /dht` | `200` with the DHT's [`DhtStatus`]; `404` when the DHT is off, `503` when it stopped |
 //! | `GET /peers/{peer}/.well-known/agent-card.json` | the peer's card, verified, as [`gateway_view`], with `Cache-Control: max-age=300` and an `ETag`; `304` when `If-None-Match` names it |
 //! | `GET /peers/{peer}/signed-agent-card.json` | the peer's card, verified, as the peer signed it ([`signed_card_json`]): signatures and `iroh://` interfaces included, for tools that check the signature themselves |
 //! | `POST /peers/{peer}/jsonrpc`, or `/jsonrpc/` | the peer's `/jsonrpc` |
@@ -184,6 +190,8 @@ use pals_core::grant::{Grant, Operation, SignedGrant, parse_timestamp};
 use pals_core::identity::AgentId;
 use pals_core::inventory::Section;
 use pals_core::inventory::view::{INVENTORY_SECTIONS, ViewPage, verify_page};
+use pals_core::records::ContactRecord;
+use pals_core::signed::{Signed, check_validity};
 use pals_core::store::{A2aContact, Contact, Store};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -196,6 +204,10 @@ use crate::a2a::gateway_view;
 use crate::a2a::is_safe_task_id;
 use crate::blobs::{BLOB_META_KEY, BLOB_SHARE_TTL_S, BlobError, BlobRef, BlobService, parse_hash};
 use crate::config::LimitsCfg;
+use crate::dht::Dht;
+#[cfg(doc)]
+use crate::dht::DhtStatus;
+use crate::discovery::CONTACT;
 use crate::discovery::cards::PUBLIC_CONTEXT;
 use crate::discovery::{
     CardFetchError, DiscoveryClient, DiscoveryError, DiscoveryLimits, PeerCards, SearchError,
@@ -204,7 +216,7 @@ use crate::discovery::{
 use crate::inventory::InventoryState;
 #[cfg(doc)]
 use crate::inventory::RefreshReport;
-use crate::net::{PeerHttp, TunnelError, peer_addr};
+use crate::net::{PeerHttp, TunnelError, bound_on_loopback, contact_addr, peer_addr};
 use crate::node::ticket_of;
 use crate::outbox::{AskError, OfferLookupError, Outbox, received_offer_ref};
 
@@ -302,6 +314,8 @@ struct Inner {
     /// This agent's inventory, whose adapters `POST /inventory/refresh`
     /// runs.
     inventory: InventoryState,
+    /// The DHT, when it is on.
+    dht: Option<Dht>,
     /// Cancelled when the gateway stops: ends the MCP sessions.
     stopping: CancellationToken,
 }
@@ -329,6 +343,11 @@ pub struct GatewayParts {
     pub download_dir: Option<PathBuf>,
     /// This agent's inventory.
     pub inventory: InventoryState,
+    /// The DHT, when it is on: `GET /dht`, and where a search finds the
+    /// providers that are no contacts.
+    pub dht: Option<Dht>,
+    /// `[discovery.aliases]`, which a search translates its capability by.
+    pub aliases: BTreeMap<String, String>,
 }
 
 impl GatewayState {
@@ -348,6 +367,8 @@ impl GatewayState {
             data_dir,
             download_dir,
             inventory,
+            dht,
+            aliases,
         } = parts;
         let outbox =
             Outbox::new(Arc::clone(&store), base_url(&local_addr)).with_data_dir(&data_dir);
@@ -362,6 +383,9 @@ impl GatewayState {
             gateway_port: local_addr.port(),
             clock: Arc::clone(&clock),
             limits: discovery_limits,
+            aliases,
+            dht: dht.clone(),
+            on_loopback: bound_on_loopback(&endpoint),
         });
         Self {
             inner: Arc::new(Inner {
@@ -381,6 +405,7 @@ impl GatewayState {
                 clock,
                 download_dir,
                 inventory,
+                dht,
                 stopping: CancellationToken::new(),
             }),
         }
@@ -427,13 +452,15 @@ impl GatewayState {
     }
 
     /// This agent: `{"agent_id", "name", "ticket"}`, the ticket with the
-    /// addresses it is reachable at now.
+    /// addresses it is reachable at now, a DHT router's `[dht]
+    /// external_addrs` among them.
     pub(crate) fn identity(&self) -> Value {
         let inner = &self.inner;
+        let external = inner.dht.as_ref().map_or(&[][..], Dht::external_addrs);
         json!({
             "agent_id": inner.id.to_string(),
             "name": inner.name,
-            "ticket": ticket_of(&inner.endpoint),
+            "ticket": ticket_of(&inner.endpoint, external),
         })
     }
 
@@ -625,10 +652,14 @@ impl GatewayState {
     }
 
     /// The agent `peer` names, an agent id, a contact's name or a plain
-    /// contact's name, in that order, and where to dial a PALS peer; `None`
-    /// when it names no one.
+    /// contact's name, in that order, and where to dial a PALS peer: at its
+    /// saved contact's ticket; with no saved contact, at the newest contact
+    /// record this agent knows of it, in force by the node's clock
+    /// ([`recorded_addr`]). `None` when it names no one.
     async fn resolve(&self, peer: String) -> Result<Option<Resolved>, StoreUnavailable> {
         let store = Arc::clone(&self.inner.store);
+        let now = self.inner.clock.now_unix();
+        let on_loopback = bound_on_loopback(&self.inner.endpoint);
         blocking(move || {
             let (id, contact) = match peer.parse::<AgentId>() {
                 Ok(id) => (id, store.contact_by_id(&id)?),
@@ -637,8 +668,10 @@ impl GatewayState {
                     None => return Ok(store.a2a_contact_by_name(&peer)?.map(Resolved::Plain)),
                 },
             };
-            let ticket = contact.and_then(|contact| contact.ticket);
-            let addr = peer_addr(&id, ticket.as_deref());
+            let addr = match contact {
+                Some(contact) => peer_addr(&id, contact.ticket.as_deref()),
+                None => recorded_addr(&store, &id, now, on_loopback)?,
+            };
             Ok(Some(Resolved::Peer(Target { id, addr })))
         })
         .await
@@ -690,6 +723,30 @@ impl GatewayState {
                 .expect("a base64url token is a valid header value")
         }))
     }
+}
+
+/// Where to dial `id`, an agent with no saved contact: at the direct
+/// addresses and relay of the newest contact record `store` knows of it,
+/// those [`contact_addr`] keeps for a node bound on loopback or not
+/// (`on_loopback`), when that record verifies as `id`'s own and is in
+/// force at `now_unix`, with [`CLOCK_SKEW_S`] of tolerance; else by its id
+/// alone ([`peer_addr`]). Records come from discovery answers and the DHT,
+/// each verified and accepted when it arrived.
+///
+/// [`CLOCK_SKEW_S`]: pals_core::grant::CLOCK_SKEW_S
+fn recorded_addr(
+    store: &Store,
+    id: &AgentId,
+    now_unix: i64,
+    on_loopback: bool,
+) -> anyhow::Result<EndpointAddr> {
+    let recorded = store.peer_record(id, CONTACT)?.and_then(|(_, json)| {
+        let record = Signed::<ContactRecord>::from_json(&json).ok()?;
+        let doc = &record.doc;
+        let in_force = check_validity(&doc.issued_at, &doc.expires_at, now_unix).is_ok();
+        (doc.agent_id == *id && in_force).then(|| contact_addr(&doc.iroh, on_loopback))
+    });
+    Ok(recorded.unwrap_or_else(|| peer_addr(id, None)))
 }
 
 /// The newest grant `store` holds of `peer`'s, unexpired at `now_unix`,
@@ -781,6 +838,7 @@ enum Resolved {
 pub fn router(state: GatewayState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/dht", get(dht_status))
         .route("/peers/{peer}/.well-known/agent-card.json", get(peer_card))
         .route(
             "/peers/{peer}/signed-agent-card.json",
@@ -867,6 +925,20 @@ fn is_local_host(headers: &HeaderMap, uri: &Uri, port: u16) -> bool {
 
 async fn healthz(State(state): State<GatewayState>) -> Response {
     Json(state.identity()).into_response()
+}
+
+/// The DHT's status; `404` when it is off, `503` when it stopped.
+async fn dht_status(State(state): State<GatewayState>) -> Response {
+    let Some(dht) = &state.inner.dht else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "the DHT is off: [dht] enabled = true turns it on",
+        );
+    };
+    match dht.status().await {
+        Ok(status) => Json(status).into_response(),
+        Err(err) => error(StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
+    }
 }
 
 /// The peer's card as [`gateway_view`], read from the peer and verified as

@@ -1,0 +1,15 @@
+# p4's inventory: two public services, so two capabilities in the DHT.
+
+[[services]]
+id = "review"
+name = "Rust review"
+description = "Reviews Rust code"
+capabilities = ["code.rust.review"]
+visibility = "public"
+
+[[services]]
+id = "docs"
+name = "Documentation"
+description = "Answers from the documentation"
+capabilities = ["knowledge.documentation"]
+visibility = "public"

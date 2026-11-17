@@ -1,8 +1,8 @@
 # PALS: hoja de ruta de los hitos 2 a 4
 
-**Fecha:** 2026-11-14 · **Spec:** [`docs/plans/initial.md`](initial.md) (revisión 3) · **Planes:** [hito 1](2026-11-14-hito-1-flujo-basico-a2a.md) (implementado) y [hito 2](2026-11-14-hito-2-consulta-de-servicios.md) (implementado)
+**Fecha:** 2026-11-14 · **Spec:** [`docs/plans/initial.md`](initial.md) (revisión 3) · **Planes:** [hito 1](2026-11-14-hito-1-flujo-basico-a2a.md) (implementado), [hito 2](2026-11-14-hito-2-consulta-de-servicios.md) (implementado) y [hito 3](2026-11-16-hito-3-descubrimiento-kademlia.md) (implementado)
 
-Este documento no es un plan ejecutable. El spec cubre cuatro subsistemas que se construyen en orden y dice que «no se asignan tiempos de desarrollo o promesas de rendimiento sin construir y medir cada hito» (§14). Por eso cada hito recibe su propio plan paso a paso en `docs/plans/` cuando el anterior está construido, porque sus interfaces dependen de código que todavía no existe y, en el hito 3, de una comparación cuyo resultado no se conoce. Los hitos 1 y 2 ya tienen el suyo; el del hito 2 se escribió, a petición del responsable, antes de cerrar el hito 1.
+Este documento no es un plan ejecutable. El spec cubre cuatro subsistemas que se construyen en orden y dice que «no se asignan tiempos de desarrollo o promesas de rendimiento sin construir y medir cada hito» (§14). Por eso cada hito recibe su propio plan paso a paso en `docs/plans/` cuando el anterior está construido, porque sus interfaces dependen de código que todavía no existe y, en el hito 3, de una comparación cuyo resultado no se conocía. Los hitos 1, 2 y 3 ya tienen el suyo; el del hito 2 se escribió, a petición del responsable, antes de cerrar el hito 1, y el del hito 3 tiene dos fases: la comparación y, después, el daemon con el backend elegido.
 
 Aquí queda fijado lo que ya se puede decidir: qué implica para cada hito el requisito del 2026-11-14 («completamente compatible con A2A en su intercambio final»), qué hereda, sus tareas, su criterio de salida y las decisiones pendientes.
 
@@ -12,7 +12,7 @@ Aquí queda fijado lo que ya se puede decidir: qué implica para cada hito el re
 |-|-|-|-|-|
 | 1. Flujo básico | Cerrado y unido con `dev`. Prueba de salida: 8 de 8 casos con un contenedor Docker en el papel de la segunda máquina, que cierra el hito; `AUTH-TLS-001` aceptado ([registro de decisión](../decisions/2026-11-16-cierre-hitos-1-y-2.md)) | [Hito 1](2026-11-14-hito-1-flujo-basico-a2a.md) | [#1](https://github.com/rosepetal-ai/rosepetal-pals/pull/1), unida con `dev` | [Conformidad](../conformance/hito-1/README.md), [prueba de salida](../conformance/hito-1/exit-test.md), arnés [`tests/exit/`](../../tests/exit/README.md) |
 | 2. Consulta de servicios e inventario | Cerrado y unido con `dev`: las 13 tareas del plan. Prueba de salida: 8 de 8 casos con un contenedor Docker por agente, en una sola máquina, que cierra el hito, y el caso 9, la conformidad repetida, sin regresión ([registro de decisión](../decisions/2026-11-16-cierre-hitos-1-y-2.md)) | [Hito 2](2026-11-14-hito-2-consulta-de-servicios.md) | [#2](https://github.com/rosepetal-ai/rosepetal-pals/pull/2), unida con `dev` | [Conformidad](../conformance/hito-2/README.md), [prueba de salida](../conformance/hito-2/exit-test.md), [firmas de la card](../conformance/hito-2/card-signatures.md), arnés [`tests/exit/hito-2.sh`](../../tests/exit/README.md#prueba-de-salida-del-hito-2-con-docker) |
-| 3. Descubrimiento con Kademlia | Sin plan; se escribe con el hito 2 construido | — | — | — |
+| 3. Descubrimiento con Kademlia | Cerrado y unido con `dev` ([registro de decisión](../decisions/2026-11-17-cierre-hito-3.md): `AUTH-TLS-001` se extiende al hito 3). La fase 1 midió tres backends frente a una línea base, evaluó un cuarto sobre el papel y eligió `libp2p-kad` sobre las conexiones Iroh del daemon, ratificado con condiciones (H3-D1, [registro de decisión](../decisions/2026-11-16-hito-3-backend-dht.md)); H3-D2 a H3-D5, [decididas](../decisions/2026-11-16-hito-3-decisiones.md). La fase 2 lo lleva al daemon: la DHT `agentnet-kad/0`, apagada por defecto, como fuente de la búsqueda de servicios. Prueba de salida: los 9 casos superados con un contenedor Docker por agente, dos operadores y dos redes, en una sola máquina; conformidad repetida sin que cambie ningún requisito | [Hito 3, fases 1 y 2](2026-11-16-hito-3-descubrimiento-kademlia.md) | [#4](https://github.com/rosepetal-ai/rosepetal-pals/pull/4), unida con `dev` | [Conformidad](../conformance/hito-3/README.md), [prueba de salida](../conformance/hito-3/exit-test.md), [runbook](../runbooks/hito-3-descubrimiento-kademlia.md), arnés [`tests/exit/hito-3.sh`](../../tests/exit/README.md#prueba-de-salida-del-hito-3-con-docker) |
 | 4. Colaboración privada con P2panda | Solo si aparece un caso real; sin plan | — | — | — |
 
 ## Regla común a los tres hitos
@@ -77,20 +77,22 @@ Como se cerró el hito 1, en la última tarea de cada plan:
 
 ## Hito 3: descubrimiento con Kademlia
 
+**Plan paso a paso:** [`2026-11-16-hito-3-descubrimiento-kademlia.md`](2026-11-16-hito-3-descubrimiento-kademlia.md), en dos fases. Manda sobre este resumen, y su tabla «Cambios respecto al spec y a la hoja de ruta» dice en qué se aparta de él: por ejemplo, con `kad-iroh` el `PeerId` es la clave del agente, y la tarea 3, el vínculo de identidades, no aplica.
+
 **Objetivo:** encontrar proveedores de una capacidad sin contacto previo ni directorio central (§1, §5), y seguir con la consulta y la selección del hito 2.
 
 **Entregable (spec §14):** comparación acotada del backend, registro de capacidades y resolución de contactos.
 
 **Criterio de salida (spec §14):** justificar la implementación elegida; encontrar un proveedor sin contacto previo; funcionar sin el bootstrap original y caducar anuncios.
 
-**Lo que deja preparado el hito 2**, según su plan (nada de esto está aún en el daemon):
+**Lo que dejó preparado el hito 2**, según su plan, y hoy está en el daemon:
 
 - `agentnet.contact/1` (endpoint Iroh, relay y direcciones) y `agentnet.announce/1` (hash de la card pública, hasta 32 capacidades públicas, ALPN de descubrimiento): firmados con dominio propio, con secuencia, caducidad de 24 h, renovación y detección de regresiones. En el hito 2 viajan en las respuestas de descubrimiento; el hito 3 los publica.
 - La card firmada con `kid` igual al id del agente y su `agent_card_hash`: la verificación del paso 5 del §5.3.
 - Las etiquetas `agentnet:capability:v1:<id>` en los skills de la card.
 - `ServiceQuery`, la selección en dos etapas y los límites del §7.3. Su búsqueda parte de los contactos; la DHT añade otra fuente (pasos 3 y 4 del §5.3).
 
-**Lo que falta:** el contacto del hito 2 lo firma solo la clave del agente. Si gana `libp2p-kad`, el vínculo con el PeerId del §6.2, firmado por las dos claves, pide un esquema nuevo o un registro aparte, porque los `agentnet.*/1` están congelados.
+**Lo que faltaba**, antes de la comparación: el contacto del hito 2 lo firma solo la clave del agente. Si ganaba `libp2p-kad`, el vínculo con el PeerId del §6.2, firmado por las dos claves, pedía un esquema nuevo o un registro aparte, porque los `agentnet.*/1` están congelados. H3-D1 lo hizo innecesario: con `kad-iroh`, `libp2p-kad` va sobre las conexiones Iroh del daemon y el `PeerId` es la clave del agente, así que no hay nada que vincular, y el contacto del hito 2 se publica tal cual.
 
 ### Comparación del backend (tarea 1)
 
@@ -108,13 +110,13 @@ Como se cerró el hito 1, en la última tarea de cada plan:
 - **Pesan en contra:** tener que definir el índice de capacidades y sus mecanismos de anuncio, identificación y abuso, como con Mainline; cambiar el transporte de tareas o de ficheros, que además exige una decisión explícita (§6.1).
 - **No basta para ganar:** reducir dependencias (§6.1). Entre los que pasan, deciden las medidas.
 
-**Registro de decisión** en `docs/decisions/`: candidatos y versiones, pruebas y la duda de cada una, montaje, métricas y lo no medido, resultado justificado frente al criterio de salida y qué lo haría cambiar.
+**Registro de decisión** en `docs/decisions/`: candidatos y versiones, pruebas y la duda de cada una, montaje, métricas y lo no medido, resultado justificado frente al criterio de salida y qué lo haría cambiar. Está en [`2026-11-16-hito-3-backend-dht.md`](../decisions/2026-11-16-hito-3-backend-dht.md), con la recomendación ratificada con condiciones (H3-D1).
 
 **Gate:** si la comparación no favorece a `libp2p-kad`, el cambio de backend es una decisión explícita del responsable (spec §6.1); no se sustituye solo por reducir dependencias.
 
 ### Tareas previstas
 
-El esquema queda abierto hasta la comparación.
+Es el esquema de antes de la comparación. El plan lo convirtió en sus tareas 1 a 15, en dos fases. La tarea 1 de esta tabla, la comparación, es su fase 1 (tareas 1 a 6). Su tabla «Cómo se reparten las tareas de la hoja de ruta», en [«Cambios respecto al spec y a la hoja de ruta»](2026-11-16-hito-3-descubrimiento-kademlia.md#cambios-respecto-al-spec-y-a-la-hoja-de-ruta), dice adónde fueron en la fase 2 las tareas 2 a 9: la 3 no aplica.
 
 | Tarea | Entregable | Parte del criterio |
 |-|-|-|
@@ -132,8 +134,8 @@ La tarea 8 cubre los escenarios del §14 de este hito: card sin vínculo válido
 
 ### Riesgos
 
-- **Dos pilas de red** con `libp2p-kad`: más conexiones, configuración y mantenimiento (§2.1, §6.1).
-- **Dependencias:** libp2p tiene que compilar con la MSRV 1.91 y convivir con las versiones fijadas; no se ha comprobado.
+- **Dos pilas de red** con `libp2p-kad`: más conexiones, configuración y mantenimiento (§2.1, §6.1). `kad-iroh` lo evitó (H3-D1): una sola pila, la de Iroh, con un adaptador de libp2p sobre ella, cuyas pruebas son la puerta de cualquier cambio de versión de `libp2p` o de `iroh`.
+- **Dependencias:** libp2p tiene que compilar con la MSRV 1.91 y convivir con las versiones fijadas. Comprobado: `libp2p =0.57.1` está fijada en el `Cargo.toml` raíz junto a las demás, y la CI compila el workspace con la MSRV (`cargo +1.91 check --workspace --all-targets --locked`).
 - **Sybil:** las firmas no evitan identidades falsas en masa (§5.5, §13); la red abierta necesitará políticas de admisión.
 - **Resultados sesgados o incompletos:** claves populares saturadas; una búsqueda vacía no demuestra que no haya proveedor (§5.3, §5.5).
 - **Metadatos públicos:** lo anunciado es público, y hashear un nombre predecible no lo oculta (§11.1). Solo se anuncia lo público.
@@ -141,7 +143,7 @@ La tarea 8 cubre los escenarios del §14 de este hito: card sin vínculo válido
 
 ### Decisiones para el responsable
 
-El responsable las delegó el 2026-11-16 ([registro de decisión](../decisions/2026-11-16-cierre-hitos-1-y-2.md#decisiones-del-hito-3)): se toman con los datos de cada tarea y se registran en `docs/decisions/`.
+El responsable las delegó el 2026-11-16 ([registro de decisión](../decisions/2026-11-16-cierre-hitos-1-y-2.md#decisiones-del-hito-3)): se toman con los datos de cada tarea y se registran en `docs/decisions/`. H3-D1 está en el [registro del backend](../decisions/2026-11-16-hito-3-backend-dht.md#decisión), y H3-D2 a H3-D5, en el [de las decisiones del hito 3](../decisions/2026-11-16-hito-3-decisiones.md).
 
 | Id | Decisión | Recomendación |
 |-|-|-|

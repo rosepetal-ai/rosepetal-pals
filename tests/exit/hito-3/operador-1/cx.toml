@@ -1,0 +1,15 @@
+# cx (case 1): an agent on network A without [dht]: it never serves nor
+# dials agentnet-kad/0. Its only saved contact is c0.
+[agent]
+name = "cx"
+description = "Agente cx sin DHT en la prueba de salida del hito 3"
+
+[gateway]
+listen = "127.0.0.1:7420"
+
+[worker]
+adapter = "echo"
+
+[net]
+relay = false
+listen = "0.0.0.0:4433"

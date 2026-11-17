@@ -6,8 +6,9 @@
 //! reads the plain agent's card itself. `pals ask`, `pals task
 //! resume|cancel`, `pals card show <peer>`, `pals inventory get`, `pals
 //! query` and `pals discover` reach peers through the running daemon's
-//! gateway; `pals ask --offer` reads the offer it names from the store
-//! first, and sends nothing when it expired.
+//! gateway, and `pals dht status` asks it for its DHT's; `pals ask
+//! --offer` reads the offer it names from the store first, and sends nothing
+//! when it expired.
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -117,8 +118,10 @@ enum Command {
     /// running daemon's gateway: verify their cards, ask the PALS peers for
     /// offers over agentnet-discovery/0, within the limits of [discovery],
     /// and print the ranking, with the id and expiry of each offer, the
-    /// candidates discarded and why, the coverage and the metrics.
-    /// Searching runs nothing on any peer. With
+    /// candidates discarded and why, the coverage and the metrics. With the
+    /// DHT on, it also looks there for providers that are no contacts,
+    /// unless --peer or --no-dht: the routers it asks see which agent looks
+    /// for which capability. Searching runs nothing on any peer. With
     /// --ask, the question goes to the best candidate that takes it, with
     /// its offer, and the command exits as `pals ask` does
     Discover {
@@ -142,9 +145,13 @@ enum Command {
         #[arg(long)]
         project: Option<String>,
         /// A contact to search among, by name or agent id; repeat for more
-        /// [default: every contact]
+        /// [default: every contact]. A search that names some never looks
+        /// in the DHT
         #[arg(long = "peer", value_name = "PEER")]
         peers: Vec<String>,
+        /// Search only the contacts, never the DHT
+        #[arg(long)]
+        no_dht: bool,
         /// Ask the best candidate that takes it this question
         #[arg(long, value_name = "QUESTION")]
         ask: Option<String>,
@@ -167,6 +174,9 @@ enum Command {
     /// their visibility lets them; reading one never measures anything
     #[command(subcommand)]
     Benchmark(BenchmarkCommand),
+    /// The DHT (agentnet-kad/0) of the running daemon
+    #[command(subcommand)]
+    Dht(DhtCommand),
     /// Ask a peer whether it can serve a case, over agentnet-discovery/0
     /// through the running daemon's gateway, which keeps its offer: print
     /// the offer as the peer signed it for this agent, then `verified:
@@ -235,6 +245,19 @@ enum InventoryCommand {
     /// operational. The daemon also checks them when it starts and every
     /// [inventory] refresh_interval_s
     Refresh,
+}
+
+#[derive(Subcommand)]
+enum DhtCommand {
+    /// Print the state of the running daemon's DHT, asked through its
+    /// gateway: its mode, the routers in its routing table, its
+    /// connections, what it refused, and, as a router, what it holds for
+    /// the others and the records it rejected, by reason
+    Status {
+        /// Print it as the JSON of the gateway's GET /dht instead
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -421,6 +444,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             requirements_file,
             project,
             peers,
+            no_dht,
             ask,
             wait,
         } => {
@@ -433,6 +457,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     project,
                 },
                 peers,
+                no_dht,
             };
             return discover(&home, search, ask, &wait);
         }
@@ -459,6 +484,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             benchmark_import(&home, &file, &visibility)
         }
         Command::Benchmark(BenchmarkCommand::Ls) => benchmark_ls(&home),
+        Command::Dht(DhtCommand::Status { json }) => dht_status(&home, json),
         Command::Query {
             peer,
             capability,
@@ -806,6 +832,81 @@ fn inventory_refresh(home: &Path) -> anyhow::Result<()> {
     })
 }
 
+/// Prints the running daemon's DHT status, as `GET /dht` of its gateway
+/// gives it: its JSON with `json`, else one line per figure, and, when it
+/// publishes, its last round of publication.
+fn dht_status(home: &Path, json: bool) -> anyhow::Result<()> {
+    let (cfg, key) = load_agent(home)?;
+    let (listen, own) = (cfg.gateway.listen, key.id());
+    let status = runtime(false)?.block_on(async move {
+        this_daemon(listen, &own).await?;
+        let (status, _, body) = gateway_call(listen, http::Method::GET, "/dht", None).await?;
+        gateway_json(status, &body)
+    })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+        return Ok(());
+    }
+    let number = |field: &str| status[field].as_u64().unwrap_or(0);
+    println!("mode: {}", status["mode"].as_str().unwrap_or("unknown"));
+    println!("routing peers: {}", number("routing_peers"));
+    println!(
+        "connections: {} open, {} accepted since start",
+        number("connections"),
+        number("connections_accepted")
+    );
+    let refused = &status["refused"];
+    println!(
+        "refused: {} connections, {} streams, {} idle streams",
+        refused["connections"].as_u64().unwrap_or(0),
+        refused["streams"].as_u64().unwrap_or(0),
+        refused["idle_streams"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "stored: {} records, {} provider records",
+        number("records_stored"),
+        number("provider_records_stored")
+    );
+    if let Some(agents) = status["stored_by_agent"].as_object() {
+        for (agent, count) in agents {
+            println!("  {} {}", shown(agent), count.as_u64().unwrap_or(0));
+        }
+    }
+    if let Some(reasons) = status["rejected"].as_object() {
+        for (reason, count) in reasons {
+            let count = count.as_u64().unwrap_or(0);
+            if count > 0 {
+                println!("rejected: {} {count}", shown(reason));
+            }
+        }
+    }
+    let publication = &status["publication"];
+    if publication.is_object() {
+        let capabilities = publication["capabilities"].as_array().map_or(0, Vec::len);
+        let last_round = publication["last_round_unix"]
+            .as_i64()
+            .and_then(format_timestamp)
+            .map_or_else(
+                || "no round yet".to_owned(),
+                |at| format!("last round at {at}"),
+            );
+        println!("publication: {capabilities} capabilities, {last_round}");
+        let failed: Vec<String> = publication["failed_capabilities"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|capability| capability.as_str().map(shown))
+            .collect();
+        if !failed.is_empty() {
+            println!("  failed: {}", failed.join(" "));
+        }
+        if let Some(error) = publication["last_error"].as_str() {
+            println!("  last error: {}", shown(error));
+        }
+    }
+    Ok(())
+}
+
 /// The largest file `pals benchmark import` reads: a signed report is at
 /// most [`MAX_REPORT_BYTES`] once canonical, whatever whitespace its file
 /// has.
@@ -1017,6 +1118,8 @@ fn read_requirements(path: Option<&Path>) -> anyhow::Result<Requirements> {
 struct Searched {
     asked: Asked,
     peers: Vec<String>,
+    /// Only among the contacts, never in the DHT.
+    no_dht: bool,
 }
 
 /// The longest answer of the gateway to a search.
@@ -1032,7 +1135,11 @@ fn discover(
     wait: &str,
 ) -> anyhow::Result<ExitCode> {
     let wait = parse_wait(wait)?;
-    let Searched { asked, peers } = searched;
+    let Searched {
+        asked,
+        peers,
+        no_dht,
+    } = searched;
     let search = SearchRequest {
         requirements: read_requirements(asked.requirements_file.as_deref())?,
         capability: asked.capability,
@@ -1040,6 +1147,7 @@ fn discover(
         output_media_types: asked.outputs,
         project: asked.project,
         peers: (!peers.is_empty()).then_some(peers),
+        exclude_dht: no_dht,
         ..SearchRequest::default()
     };
     let (cfg, key) = load_agent(home)?;
@@ -1095,8 +1203,9 @@ fn discover(
 }
 
 /// Prints a search's ranking, its discards with why, its coverage and its
-/// metrics, one line each; a candidate that made an offer ends its line
-/// with `, offer <offer id> until <expires_at>`, the id `pals ask --offer`
+/// metrics, one line each; one the DHT found says `, found in the DHT`
+/// after its grant, and one that made an offer ends its line with
+/// `, offer <offer id> until <expires_at>`, the id `pals ask --offer`
 /// takes. What a peer named is printed as printable ASCII.
 fn print_search(outcome: &SearchOutcome) {
     println!("ranked:");
@@ -1129,6 +1238,11 @@ fn print_search(outcome: &SearchOutcome) {
             (Some(_), true) => "grant held",
             (Some(_), false) => "no grant held",
         };
+        let found = if candidate.from_dht {
+            ", found in the DHT"
+        } else {
+            ""
+        };
         let offer = candidate.offer.as_ref().map_or_else(String::new, |offer| {
             format!(
                 ", offer {} until {}",
@@ -1138,7 +1252,7 @@ fn print_search(outcome: &SearchOutcome) {
         });
         println!(
             "  {}. {} ({who}): {status}, skill {}, time {time}, preferred met {}, benchmark \
-             {benchmark}, completed {} failed {}, {grant}, card {}{offer}",
+             {benchmark}, completed {} failed {}, {grant}{found}, card {}{offer}",
             n + 1,
             shown(&candidate.peer),
             shown(candidate.skill_id.as_deref().unwrap_or("-")),

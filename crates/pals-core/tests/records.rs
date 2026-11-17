@@ -860,6 +860,33 @@ fn expired_peer_record_no_longer_blocks_a_lower_seq() {
 }
 
 #[test]
+fn peer_records_are_purged_once_forgotten() {
+    let store = Store::open_in_memory(AgentKey::generate().id()).unwrap();
+    let (gone, kept) = (AgentKey::generate(), AgentKey::generate());
+    let take = |peer: &AgentKey, expires_at: i64| {
+        let json = Signed::issue(peer, contact(peer.id(), 1))
+            .unwrap()
+            .to_json();
+        let accept = store
+            .peer_record_accept(&peer.id(), "contact", 1, &json, expires_at, NOW)
+            .unwrap();
+        assert_eq!(accept, RecordAccept::New);
+    };
+    take(&gone, EXPIRES_AT);
+    take(&kept, EXPIRES_AT + 1);
+    let forget_at = EXPIRES_AT + RECORD_TTL_S + CLOCK_SKEW_S;
+    // Not while the record may still stop a replayed older one...
+    assert_eq!(store.peer_records_purge(forget_at - 1).unwrap(), 0);
+    assert!(store.peer_record(&gone.id(), "contact").unwrap().is_some());
+    // ...and from when peer_record_accept forgets it, only it.
+    assert_eq!(store.peer_records_purge(forget_at).unwrap(), 1);
+    assert_eq!(store.peer_record(&gone.id(), "contact").unwrap(), None);
+    assert!(store.peer_record(&kept.id(), "contact").unwrap().is_some());
+    assert_eq!(store.peer_records_purge(forget_at + 1).unwrap(), 1);
+    assert_eq!(store.peer_record(&kept.id(), "contact").unwrap(), None);
+}
+
+#[test]
 fn record_lifetime_is_at_most_the_ttl() {
     let key = AgentKey::generate();
     let contact_for = |span: i64| ContactRecord {

@@ -8,8 +8,10 @@
 //! the files that travel outside the control channel, [`config`] the
 //! configuration file and the single-instance lock, [`inventory`] what the
 //! agent offers and with what, as it serves it, [`discovery`] peers'
-//! verified cards and the agent's own signed records, [`gateway`] the loopback
-//! entry through which standard A2A clients reach any peer, [`outbox`] the
+//! verified cards and the agent's own signed records, [`dht`] the Kademlia
+//! network over Iroh where it finds providers it has no contact with,
+//! [`gateway`] the loopback entry through which standard A2A clients reach
+//! any peer, [`outbox`] the
 //! questions this agent asks them, [`mcp`] the tools an AI application on
 //! this machine uses them with, and [`node`] puts them together into a
 //! running agent.
@@ -17,6 +19,7 @@
 pub mod a2a;
 pub mod blobs;
 pub mod config;
+pub mod dht;
 pub mod discovery;
 pub mod gateway;
 pub mod inventory;

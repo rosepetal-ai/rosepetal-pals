@@ -55,8 +55,9 @@ use crate::inventory::capability_tag;
 
 /// What a requester looks for (design §7.1): a capability and its media
 /// types, requirements, the project it is for, the contacts to ask (all
-/// when it names none), and, when it wants benchmarks to count, what they
-/// must have measured.
+/// when it names none), when it wants benchmarks to count, what they must
+/// have measured, and whether the search keeps out of the DHT. A request of
+/// milestone 2, without `exclude_dht`, reads the same.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchRequest {
@@ -83,6 +84,16 @@ pub struct SearchRequest {
     /// ([`crate::benchmark::comparable`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub benchmark: Option<Wanted>,
+    /// The search looks only among the contacts, never in the DHT, which
+    /// sees which agent looks for which capability. A request that names
+    /// `peers` never looks there either.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exclude_dht: bool,
+}
+
+/// Whether `value` is `false`: such a flag is left out of the JSON.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl SearchRequest {
@@ -234,6 +245,10 @@ pub struct Candidate {
     /// request's project when it names one. Always `false` for a plain A2A
     /// agent, which needs none.
     pub grant_held: bool,
+    /// The DHT found it, and it is no contact. Left out of the JSON when
+    /// `false`, as in milestone 2.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub from_dht: bool,
 }
 
 impl Candidate {
@@ -271,8 +286,9 @@ pub struct Discarded {
 pub enum Coverage {
     Complete,
     /// Some were left out by the limits, or cut by them: `candidate limit`,
-    /// `time budget`, `timeout` (a candidate that had its whole time and did
-    /// not finish).
+    /// `dht timeout` (the lookup in the DHT was cut), `dht unavailable` (no
+    /// DHT router answered), `time budget`, `timeout` (a candidate that had
+    /// its whole time and did not finish).
     Partial {
         reasons: Vec<String>,
     },
@@ -293,6 +309,15 @@ pub struct SearchMetrics {
     /// The time the two stages took, in microseconds.
     pub matching_us: u64,
     pub elapsed_ms: u64,
+    /// The requests the lookup in the DHT sent; 0 when there was none, or
+    /// when no router answered it. Omitted when 0, so that a search with
+    /// the DHT off writes the metrics of milestone 2 as they were.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dht_requests: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// What a search found.
@@ -645,6 +670,7 @@ mod tests {
             benchmark: None,
             experience: (0, 0),
             grant_held: true,
+            from_dht: false,
         }
     }
 
@@ -807,6 +833,52 @@ mod tests {
         };
         let (ranked, _) = stage_two(all, &wanting, NOW);
         assert_eq!(names(&ranked), ["measured", "declared", "faster"]);
+    }
+
+    #[test]
+    fn the_dht_fields_are_optional() {
+        // A request and a candidate of milestone 2 read as before, and
+        // write as before while the flags are false.
+        let req: SearchRequest =
+            serde_json::from_value(serde_json::json!({"capability": "vision.ocr"})).unwrap();
+        assert!(!req.exclude_dht);
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            serde_json::json!({"capability": "vision.ocr", "requirements": {}})
+        );
+        let excluded = SearchRequest {
+            exclude_dht: true,
+            ..req
+        };
+        assert_eq!(
+            serde_json::to_value(&excluded).unwrap()["exclude_dht"],
+            true
+        );
+        let plain = candidate("plain", None);
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("from_dht").is_none(), "{json}");
+        assert_eq!(serde_json::from_value::<Candidate>(json).unwrap(), plain);
+        let found = Candidate {
+            from_dht: true,
+            ..plain
+        };
+        assert_eq!(serde_json::to_value(&found).unwrap()["from_dht"], true);
+        // The metrics of milestone 2 read with no lookup, and write back
+        // byte for byte; a lookup's requests write when there are some.
+        let hito2 = r#"{"time_to_first_valid_ms":null,"contacted":0,"messages":0,"bytes_sent":0,"bytes_received":0,"matching_us":0,"elapsed_ms":0}"#;
+        let metrics: SearchMetrics = serde_json::from_str(hito2).unwrap();
+        assert_eq!(metrics, SearchMetrics::default());
+        assert_eq!(serde_json::to_string(&metrics).unwrap(), hito2);
+        let looked_up = SearchMetrics {
+            dht_requests: 20,
+            ..metrics
+        };
+        let json = serde_json::to_value(&looked_up).unwrap();
+        assert_eq!(json["dht_requests"], 20, "{json}");
+        assert_eq!(
+            serde_json::from_value::<SearchMetrics>(json).unwrap(),
+            looked_up
+        );
     }
 
     #[test]

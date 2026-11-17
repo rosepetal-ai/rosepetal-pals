@@ -1,0 +1,46 @@
+{
+  "description": "Frozen identity, keys and addresses of the DHT of agentnet-kad/0 (docs/protocols/agentnet-kad-0.md, docs/extensions/capabilities-v1.md). The PeerId is the agent's Ed25519 public key in libp2p's protobuf encoding under the identity multihash; values live under /agentnet/contact/<peer_id> and /agentnet/announce/<peer_id>, with the PeerId in base58; a capability's provider records under the SHA2-256 multihash (0x12 0x20) of the UTF-8 bytes of its full string. These never change meaning: an incompatible change is agentnet-kad/1.",
+  "signing_key_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+  "agent_id": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+  "peer_id": "12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5",
+  "peer_id_hex": "0024080112208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+  "contact_key": "/agentnet/contact/12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5",
+  "announce_key": "/agentnet/announce/12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5",
+  "provider_keys": [
+    {
+      "capability": "vision.ocr",
+      "string": "agentnet:capability:v1:vision.ocr",
+      "key_hex": "122092485626d851a455cd10cd7ae3800eb76ff67220722638435d3ae050e92c8463"
+    },
+    {
+      "capability": "vision.defect-detection",
+      "string": "agentnet:capability:v1:vision.defect-detection",
+      "key_hex": "1220451ff690aedc29578775b84d01a50c84babb625def0ef4c1546f409e08078f23"
+    },
+    {
+      "capability": "code.rust.review",
+      "string": "agentnet:capability:v1:code.rust.review",
+      "key_hex": "122081ce3ea1d76d68090da37bd3df0a4562e5b50e6e7daa7c5c95dbed7728dfc934"
+    },
+    {
+      "capability": "knowledge.documentation",
+      "string": "agentnet:capability:v1:knowledge.documentation",
+      "key_hex": "1220ab4d4ea5320beba8673732049203d56cac1fdae3720699a4fef8c47215345235"
+    },
+    {
+      "capability": "example:metal-plates",
+      "string": "example:metal-plates",
+      "key_hex": "12202a561a2441f0cc4eba6d49bc3d437b467d69cb6c640d213337a81b4826b173b6"
+    }
+  ],
+  "alpn": "agentnet-kad/0",
+  "protocol": "/agentnet/kad/1.0.0",
+  "addresses": {
+    "router": "/ip4/192.0.2.10/udp/4433/quic-v1/p2p/12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5",
+    "client": "/p2p/12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5"
+  },
+  "addresses_hex": {
+    "router": "04c000020a91021151cd03a503260024080112208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "client": "a503260024080112208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+  }
+}

@@ -6,7 +6,7 @@
 //! |-|-|-|
 //! | `pals_whoami` | — | `{agent_id, name, ticket}` |
 //! | `pals_contacts` | — | `[{name, kind, agent_id, has_grant, url}]` |
-//! | `pals_discover` | `capability`, `summary?`, `input_media_types?`, `output_media_types?`, `requirements?` (an object, design §7.1 and §9.9), `project?`, `peers?` | [`SearchOutcome`] |
+//! | `pals_discover` | `capability`, `summary?`, `input_media_types?`, `output_media_types?`, `requirements?` (an object, design §7.1 and §9.9), `project?`, `peers?`, `exclude_dht?` | [`SearchOutcome`] |
 //! | `pals_inventory` | `peer`, `sections?`, `cursor?` | the page verified: `{scope, seq, expires_at, entries, next_cursor}` |
 //! | `pals_ask` | `peer`, `question`, `attachments?` (absolute paths), `wait_s?` (50 by default, at most 3600), `offer_id?` | [`AskOutcome`] |
 //! | `pals_task` | `message_id`, `wait_s?` | [`AskOutcome`] |
@@ -22,9 +22,12 @@
 //! `POST /discovery/search` runs, within the limits of `[discovery]`, with
 //! the parameters as the fields of its [`SearchRequest`] (`peers`, every
 //! contact when left out or empty, as `pals discover` does): it only
-//! searches, and never asks anyone to do anything. A request whose query
-//! would be larger than 8 KiB, the search's own check, or that is no
-//! query, is a tool error that says so, before any peer is contacted.
+//! searches, and never asks anyone to do anything. With the DHT on, it
+//! also looks there, behind the contacts, unless `peers` or `exclude_dht`
+//! says otherwise; with the DHT off, `exclude_dht` is taken and changes
+//! nothing. A request whose query would be larger than 8 KiB, the search's
+//! own check, or that is no query, is a tool error that says so, before
+//! any peer is contacted.
 //! `pals_inventory` is the page `GET /discovery/inventory/{peer}` serves
 //! (the gateway's `inventory_page`, which both run), verified as the peer's
 //! page for this agent, of which it returns only what the page says: its
@@ -242,8 +245,13 @@ struct DiscoverParams {
     /// ids, and a required one counts as not met.
     project: Option<String>,
     /// The contacts to consider, by name as pals_contacts lists them or by
-    /// agent id: every contact when left out or empty.
+    /// agent id: every contact when left out or empty. A search that names
+    /// some never looks in the DHT.
     peers: Option<Vec<String>>,
+    /// true: search only the contacts, never the DHT, whose routers see
+    /// which agent looks for which capability.
+    #[serde(default)]
+    exclude_dht: bool,
 }
 
 /// `pals_inventory`'s parameters.
@@ -368,8 +376,11 @@ impl PalsMcp {
              some out or a candidate ran out of its time; and what the search took. `requirements` are mandatory, but those under \
              inventory.preferred; inventory requirements need `project`, since their ids go \
              only to candidates with a grant for it: without one, a required id counts as not \
-             met. `peers` restricts the search to those contacts. The query sent, the \
-             requirements included, is at most 8 KiB. ",
+             met. `peers` restricts the search to those contacts. When this agent runs the \
+             DHT, the search also looks there for providers that are no contacts, marked \
+             from_dht, unless `peers` or `exclude_dht` is given: a lookup in the DHT identifies \
+             this agent to the DHT routers it asks, which see the capability it looks for. The \
+             query sent, the requirements included, is at most 8 KiB. ",
             untrusted_offers!()
         )
     )]
@@ -393,6 +404,7 @@ impl PalsMcp {
             project: params.project,
             peers: params.peers.filter(|peers| !peers.is_empty()),
             benchmark: None,
+            exclude_dht: params.exclude_dht,
         };
         match self.gateway.searcher().search(search).await {
             Ok(outcome) => Ok(CallToolResult::structured(

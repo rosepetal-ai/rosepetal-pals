@@ -1,6 +1,6 @@
 # Prueba de salida del hito 1 con Docker
 
-Este directorio tiene dos arneses: `run.sh`, del hito 1, en esta sección, y `hito-2.sh`, del hito 2, en la [siguiente](#prueba-de-salida-del-hito-2-con-docker).
+Este directorio tiene tres arneses: `run.sh`, del hito 1, en esta sección; `hito-2.sh`, del hito 2, en la [siguiente](#prueba-de-salida-del-hito-2-con-docker); y `hito-3.sh`, del hito 3, en la [última](#prueba-de-salida-del-hito-3-con-docker).
 
 `run.sh` ejecuta los ocho casos del runbook [`docs/runbooks/hito-1-dos-maquinas.md`](../../docs/runbooks/hito-1-dos-maquinas.md) en una sola máquina Linux, con un contenedor Docker en el papel de la segunda máquina. Cada caso comprueba el resultado esperado del runbook e imprime `RESULTADO <caso>: superado` o `FALLIDO`. No sustituye a la prueba en dos máquinas físicas (ver «Lo que no cubre»).
 
@@ -165,3 +165,108 @@ Diferencias con el runbook:
 - Todos los agentes comparten el kernel, el reloj y la máquina; entre ellos solo hay el bridge de Docker. No hay máquinas, redes ni NAT distintos: el camino es UDP directo, y los relays solo se usan para registrarse. Los relojes nunca difieren, así que el desfase de 60 s no se ejercita aquí (lo hacen los tests).
 - F es un agente corriente sobre el SDK de Python, con un certificado de una CA de prueba; no un agente de terceros en internet.
 - **Las órdenes del runbook fuera de los ocho guiones:** son copias en `hito-2.sh`.
+
+# Prueba de salida del hito 3 con Docker
+
+[`hito-3.sh`](hito-3.sh) ejecuta los nueve casos del runbook [`docs/runbooks/hito-3-descubrimiento-kademlia.md`](../../docs/runbooks/hito-3-descubrimiento-kademlia.md) en una sola máquina Linux: la DHT de dos operadores en dos redes Docker internas, con un contenedor por agente. Cada caso comprueba el resultado esperado del runbook e imprime `RESULTADO <caso>: superado` o `FALLIDO`.
+
+## Topología
+
+Todos los contenedores salen de la imagen [`hito-3/Dockerfile`](hito-3/Dockerfile): Debian trixie fijada por su digest, con `curl`, `iproute2`, `procps` y `python3`. Están en dos redes `--internal`, sin salida a ninguna otra red ni entre ellas: `pals-exit-h3-red-a` (`10.213.73.0/24`) y `pals-exit-h3-red-b` (`10.213.74.0/24`). Cada contenedor tiene un agente, con su `PALS_HOME` en `/root/pals-h3/<agente>`, una CPU y 512 MiB.
+
+| Contenedor | Operador | Red | Qué |
+|-|-|-|-|
+| `pals-exit-h3-r1`, `-r2` | 1 | A y B | Routers. `r1` no tiene arranque, porque es el original; `r2` entra por `r1` |
+| `pals-exit-h3-r3`, `-r4` | 2 | A y B | Routers. `r3` entra en la red por `r1`; `r4`, por `r3` |
+| `pals-exit-h3-p1`, `-p2` | 1 | A | Proveedores, con `announce = true`, entran por `r1`. `p2` tiene además un servicio privado y otro de proyecto |
+| `pals-exit-h3-p3`, `-p4` | 2 | B | Proveedores, con `announce = true`, entran por `r3`. `p3` pasa a la red A en el caso 9 |
+| `pals-exit-h3-c1`, `-c2` | 1 | A | Clientes, entran por `r1` |
+| `pals-exit-h3-c3`, `-c4` | 2 | B | Clientes, entran por `r3` |
+| `pals-exit-h3-c0`, `-cx` | | A | Caso 1. `c0`, con la DHT y aislado, sin arranque ni contactos. `cx`, sin `[dht]`, con `c0` como único contacto |
+| `pals-exit-h3-c5` | 1 | A | Caso 3. Su arranque es `r1`, que está parado, y tiene guardado el ticket de `r3`, la invitación del operador 2 |
+| `pals-exit-h3-rogue` | | B | Caso 6. [`dht_rogue`](../../crates/pals/examples/dht_rogue.rs) publica `vision.ocr` con un contacto de firma alterada |
+
+Todos los daemons llevan `relay = false`, `[net] listen = "0.0.0.0:4433"`, `[dht] record_ttl_s = 120` y `republish_s = 40`, y el worker `echo`. Los routers declaran sus dos direcciones en `external_addrs`. La configuración de cada agente está en [`hito-3/operador-1/`](hito-3/operador-1) y [`hito-3/operador-2/`](hito-3/operador-2), con el inventario de cada proveedor en `<agente>-inventario.toml`. El arnés escribe en ella los tickets de los routers por los que se entra (`@TICKET_R1@`, `@TICKET_R3@`) cuando esos routers ya están en marcha.
+
+Las capacidades son las de la fase 1. Cada una tiene un proveedor en cada red:
+
+| Capacidad | Proveedores |
+|-|-|
+| `vision.ocr` | `p1` (A), `p3` (B) |
+| `code.rust.review` | `p2` (A), `p4` (B) |
+| `knowledge.documentation` | `p1` (A), `p4` (B) |
+| `vision.defect-detection` | `p2` (A), `p3` (B) |
+
+Con redes internas y sin relay, un cliente no puede conectar con un proveedor de la otra red. La DHT se lo da, y la búsqueda lo descarta en la card por inalcanzable (ver el runbook, «Dónde se aparta de la redacción del plan»).
+
+## Requisitos
+
+- Linux con Docker, con permiso para crear imágenes, redes y contenedores. Además, `bash`, `git`, `python3`, `sha256sum` y `awk`.
+- Las subredes `10.213.73.0/24` y `10.213.74.0/24` libres. `preparar` lo comprueba y se niega si alguna red de Docker se solapa con ellas.
+- `pals` y el ejemplo `dht_rogue` compilados en el anfitrión, con una glibc no más nueva que la de Debian trixie: `cargo build --release --locked -p pals` y `cargo build --release --locked -p pals --examples`. Se copian en los contenedores.
+- Salida a internet solo para construir la imagen, con los paquetes de Debian. Las redes de la prueba no tienen salida.
+- Tiempo: unos 17 min, de los que 5 son el reposo medido en `preparar`; la primera vez, uno o dos más para construir la imagen.
+
+## Uso
+
+```bash
+cargo build --release --locked -p pals
+cargo build --release --locked -p pals --examples
+export PALS_EXIT_DIR=$(mktemp -d)                 # nuevo o vacío: los registros
+tests/exit/hito-3.sh                              # todo: preparar, casos 1 a 9 y desmontar
+```
+
+Las fases también se pueden ejecutar sueltas, en orden y con el mismo `PALS_EXIT_DIR`: `preparar`, `caso1` … `caso9` y `desmontar`. Por ejemplo, `tests/exit/hito-3.sh preparar caso1 caso2`, y después `tests/exit/hito-3.sh desmontar`. Cada caso borra al empezar las búsquedas que guardó una ejecución anterior suya (`registro/busquedas/casoN-*`), así que repetirlo en el mismo `PALS_EXIT_DIR` solo juzga las suyas. Las vueltas de publicación que cuentan los casos 3 y 5 son solo las que terminaron después de parar los routers.
+
+Los casos que paran agentes los vuelven a arrancar al terminar, con el mismo directorio de datos y las mismas direcciones: `r1` en el caso 3, `p1` en el 4, y `r2` y `r4` en el 5. Después esperan a que los routers vuelvan a guardar lo de cada proveedor, y si no lo consiguen, el caso falla. El caso 9 no se deshace: es el último.
+
+Cada caso juzga con un guion de Python y solo se supera si el guion llega al final y escribe `OK`: uno que se rompe lo hace fallar. La topología (capacidades, redes y routers) se define una vez en el arnés y llega a esos guiones como JSON, en `H3_TOPO`.
+
+| Variable | Valor por defecto | Qué es |
+|-|-|-|
+| `PALS_EXIT_DIR` | (obligatoria) | Los registros (`registro/`). `preparar` solo acepta uno nuevo o vacío |
+| `PALS_EXIT_BIN` | `target/release/pals` | El binario de `pals` |
+| `PALS_EXIT_ROGUE` | `target/release/examples/dht_rogue` | El publicador del caso 6 |
+| `PALS_EXIT_REPOSO_S` | `300` | Los segundos de reposo medido en `preparar`. Menos solo sirve para un ensayo, nunca para el registro |
+| `PALS_EXIT_KEEP_IMAGE` | `1` | `0` borra también la imagen al desmontar |
+
+Todo lo de la ejecución queda en `$PALS_EXIT_DIR/registro/`:
+- el registro completo, `run.log`, y los resultados, `resultados.txt`;
+- cada búsqueda en `busquedas/<nombre>.json`, con su respuesta, sus tiempos y los bytes que pasaron por las interfaces del cliente;
+- cada muestra de un agente en `estados.jsonl`, con su `GET /dht`, su memoria y los contadores de sus interfaces;
+- el reposo en `reposo.jsonl`;
+- lo que mide cada caso en `casos/`;
+- las métricas en `metricas.txt` y `metricas.json`, que da `metricas.py informe`;
+- al desmontar, el `daemon.log` de cada agente en `nodos/`.
+
+Hay ids de agente, pero no los tickets ni los tokens de los grants: el arnés los pasa de un contenedor a otro sin imprimirlos.
+
+**Si una ejecución se interrumpe.** Con Ctrl-C o `SIGTERM`, el arnés desmonta antes de salir, en cuanto termina la orden de Docker en curso: la mayoría corren en primer plano, y una que se queda parada (un `docker cp` con el anfitrión muy cargado) retrasa el desmontaje hasta que termina o se mata. `todo` desmonta también cuando una fase falla. Después de cualquier otro final, ejecuta `tests/exit/hito-3.sh desmontar` con el mismo `PALS_EXIT_DIR`.
+
+Si ese directorio ya no existe y quedan contenedores o redes, comprueba antes su etiqueta y bórralos a mano solo si es la tuya:
+
+```bash
+docker ps -a --filter 'name=pals-exit-h3-' --format '{{.Names}} {{.Label "pals-exit.dir"}}'
+docker network ls --filter 'name=pals-exit-h3-' --format '{{.Name}} {{.Label "pals-exit.dir"}}'
+docker rm -f <contenedor>…; docker network rm pals-exit-h3-red-a pals-exit-h3-red-b
+```
+
+## Qué crea y qué toca
+
+- **Docker:**
+  - la imagen `pals-exit-h3:latest`, con la etiqueta `pals-exit.image`;
+  - las redes `pals-exit-h3-red-a` y `-red-b`;
+  - los contenedores `pals-exit-h3-*`.
+
+  Redes y contenedores llevan la etiqueta `pals-exit.dir=<PALS_EXIT_DIR>`. `preparar` se niega a empezar si existe ya algún recurso `pals-exit-h3-*`, o si alguna red de Docker se solapa con las dos subredes. `desmontar` borra solo los contenedores y las redes cuya etiqueta es este `PALS_EXIT_DIR`, y la imagen solo con `PALS_EXIT_KEEP_IMAGE=0`. Nunca hace `prune` ni toca otros recursos, ni las imágenes de los hitos 1 y 2. Al crear y borrar las redes, Docker añade y quita sus propias reglas en el anfitrión.
+- **En el anfitrión:** ningún daemon. El arnés no ejecuta `iptables`, `nft`, `tc` ni `sysctl`, ni en el anfitrión ni en los contenedores. Para parar un agente sin aviso usa `docker kill`, y para cambiarlo de red, `docker network disconnect` y `connect`.
+- **Ficheros:** los de la prueba, solo bajo `PALS_EXIT_DIR`. `preparar` lo marca con un fichero `.pals-exit`, y las demás fases se niegan a trabajar en uno sin esa marca.
+- **Lo que entra en los contenedores:** el binario `pals`, el ejemplo `dht_rogue` (solo en el del caso 6), [`hito-3/metricas.py`](hito-3/metricas.py) y la configuración de cada agente. Nunca una credencial.
+
+## Lo que no cubre
+
+- **Escala.** Hay cuatro routers y cuatro proveedores. Con 20 réplicas por clave, cada router guarda todo, y no se ejercita el encaminamiento de una red grande.
+- **Sybil.** No hay muchas identidades de un mismo atacante, ni rutas envenenadas. El caso 6 es un solo agente con un registro mal firmado.
+- **NAT de operador.** Las redes son puentes de Docker sin NAT entre ellas. Los routers son alcanzables directamente desde las dos.
+- **Máquinas físicas.** Todos los agentes comparten kernel, reloj y máquina, y los relojes nunca difieren.
+- **La búsqueda con `relay = true`.** Todos los daemons van sin relay. Por eso un cliente no alcanza a un proveedor de la otra red.

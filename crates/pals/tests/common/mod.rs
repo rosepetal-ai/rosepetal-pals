@@ -9,8 +9,13 @@
 //! ([`stub_discovery_peer`]), and serve a signed card too
 //! ([`stub_discovery_peer_with_card`]), stock A2A agents with
 //! no PALS behind them, served over plain HTTP on loopback ([`echo_app_at`],
-//! [`serve_at`]), and a plain HTTP client for a node's loopback gateway
-//! ([`gateway_request`]).
+//! [`serve_at`]), a plain HTTP client for a node's loopback gateway
+//! ([`gateway_request`]), and nodes with the DHT on, entering it through
+//! other nodes' tickets ([`spawn_dht_node`]), with what the DHT's tests
+//! share: waiting on a node's DHT ([`wait_for`]), signed records
+//! ([`contact`], [`announce`]), a DHT client of its own that publishes
+//! records a test chose ([`Publisher`], [`TestRecords`]), and the `pals`
+//! command ([`pals`]).
 
 // Each test binary uses a different subset of these helpers.
 #![allow(dead_code)]
@@ -46,12 +51,17 @@ use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 use iroh_tickets::endpoint::EndpointTicket;
 use pals::config::{
-    AgentCfg, Config, DiscoveryCfg, GatewayCfg, INVENTORY_FILE, InventoryCfg, KEY_FILE, LimitsCfg,
-    McpCfg, NetCfg, WorkerCfg,
+    AgentCfg, Config, DhtCfg, DhtMode, DiscoveryCfg, GatewayCfg, INVENTORY_FILE, InventoryCfg,
+    KEY_FILE, LimitsCfg, McpCfg, NetCfg, WorkerCfg,
 };
+use pals::dht::swarm::STORE_LIMITS;
+use pals::dht::transport::{ALPN_KAD, KadQuotas};
+use pals::dht::{Dht, DhtParts, DhtStatus, DhtTiming, PublishedRecords};
 use pals::net::{ALPN_A2A_HTTP, PEER_HEADER, PeerHttp, TunnelLimits, TunnelServer, agent_id_of};
 use pals::node::{Node, NodeOptions};
 use pals::worker::echo::EchoExecutor;
+use pals_core::card_jws::CardHash;
+use pals_core::clock::Clock;
 use pals_core::discovery::{
     ALPN_DISCOVERY, DISCOVERY_VERSION, LoadProbe, MAX_REQUEST_FRAME_BYTES, decode, encode_frame,
     frame_len, server_limits, wire,
@@ -433,7 +443,10 @@ pub fn test_config(data_dir: &Path, worker: WorkerCfg) -> Config {
         worker,
         projects: BTreeMap::new(),
         limits: LimitsCfg::default(),
-        net: NetCfg { relay: false },
+        net: NetCfg {
+            relay: false,
+            listen: None,
+        },
         mcp: McpCfg {
             download_dir: Some(std::env::temp_dir().join("pals-test-downloads")),
         },
@@ -442,6 +455,7 @@ pub fn test_config(data_dir: &Path, worker: WorkerCfg) -> Config {
             ..InventoryCfg::default()
         },
         discovery: DiscoveryCfg::default(),
+        dht: DhtCfg::default(),
         trusted_issuers: Vec::new(),
     }
 }
@@ -534,6 +548,51 @@ pub async fn spawn_node_in_configured(
         dir,
         downloads,
     }
+}
+
+/// A node with the DHT on, in `mode`, entering it through the tickets of
+/// `bootstrap` ([`Node::ticket`]), on loopback with no relay, with the DHT's
+/// times `timing` and an echo worker, on a fresh data directory.
+pub async fn spawn_dht_node(mode: DhtMode, bootstrap: &[&TestNode], timing: DhtTiming) -> TestNode {
+    let opts = NodeOptions {
+        dht_timing: Some(timing),
+        ..NodeOptions::default()
+    };
+    spawn_dht_node_with(mode, bootstrap, opts, |_| {}).await
+}
+
+/// [`spawn_dht_node`], with `opts` (its DHT's times among them) and its
+/// configuration changed by `edit` after the DHT's section is written.
+pub async fn spawn_dht_node_with(
+    mode: DhtMode,
+    bootstrap: &[&TestNode],
+    opts: NodeOptions,
+    edit: impl FnOnce(&mut Config),
+) -> TestNode {
+    let dir = tempfile::tempdir().expect("create a data directory");
+    spawn_dht_node_in(dir, mode, bootstrap, opts, edit).await
+}
+
+/// [`spawn_dht_node_with`] on `dir`, which may already hold a key and a
+/// store.
+pub async fn spawn_dht_node_in(
+    dir: tempfile::TempDir,
+    mode: DhtMode,
+    bootstrap: &[&TestNode],
+    opts: NodeOptions,
+    edit: impl FnOnce(&mut Config),
+) -> TestNode {
+    let tickets: Vec<String> = bootstrap.iter().map(|node| node.node.ticket()).collect();
+    spawn_node_in_configured(dir, EchoExecutor, opts, |cfg| {
+        cfg.dht = DhtCfg {
+            enabled: true,
+            mode,
+            bootstrap: tickets,
+            ..DhtCfg::default()
+        };
+        edit(cfg);
+    })
+    .await
 }
 
 /// A node whose work `executor` does and whose worker reports `load` to the
@@ -1499,4 +1558,223 @@ pub async fn gateway_request(
     body: Option<&Value>,
 ) -> TestResponse {
     TestResponse::read(gateway_send(base, method, path, headers, body).await).await
+}
+
+// --- The DHT: what dht_publish and dht_search share ------------------------
+
+/// How long a DHT test waits for the network to reach the state it needs:
+/// past it, the test fails.
+pub const CONVERGES: Duration = Duration::from_secs(60);
+
+/// The pause between two lookups a test repeats until one finds what it
+/// needs: well under a router's 600 streams a minute from one peer, beside
+/// the rest of the test's traffic.
+pub const LOOKUP_PAUSE: Duration = Duration::from_secs(2);
+
+/// `node`'s DHT.
+pub fn dht(node: &TestNode) -> &Dht {
+    node.node.dht().expect("the node's DHT is on")
+}
+
+/// Polls `dht`'s status until `done`, and returns it; fails, saying `what`,
+/// after [`CONVERGES`].
+pub async fn wait_for_dht(dht: &Dht, what: &str, done: impl Fn(&DhtStatus) -> bool) -> DhtStatus {
+    let deadline = std::time::Instant::now() + CONVERGES;
+    loop {
+        let now = dht.status().await.expect("the DHT runs");
+        if done(&now) {
+            return now;
+        }
+        assert!(std::time::Instant::now() < deadline, "{what}: {now:?}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// [`wait_for_dht`] on `node`'s DHT.
+pub async fn wait_for(node: &TestNode, what: &str, done: impl Fn(&DhtStatus) -> bool) -> DhtStatus {
+    wait_for_dht(dht(node), what, done).await
+}
+
+/// How many values and provider records of `agent` a router's `status`
+/// counts.
+pub fn held(status: &DhtStatus, agent: AgentId) -> u32 {
+    status.stored_by_agent.get(&agent).copied().unwrap_or(0)
+}
+
+/// `key`'s contact with `seq`, valid now, naming `direct`.
+pub fn contact(key: &AgentKey, seq: u64, direct: &[SocketAddr]) -> Vec<u8> {
+    let issued_at = now_unix() - 60;
+    let doc = ContactRecord {
+        schema: CONTACT_SCHEMA.to_owned(),
+        agent_id: key.id(),
+        iroh: IrohContact {
+            endpoint_id: key.id(),
+            relay_url: None,
+            direct_addrs: direct.iter().map(ToString::to_string).collect(),
+        },
+        seq,
+        issued_at: format_timestamp(issued_at).unwrap(),
+        expires_at: format_timestamp(issued_at + RECORD_TTL_S).unwrap(),
+    };
+    Signed::issue(key, doc).unwrap().to_json()
+}
+
+/// The card hash of an announce whose card no test reads.
+pub fn any_card_hash() -> CardHash {
+    format!("blake3:{}", "ab".repeat(32))
+        .parse::<CardHash>()
+        .unwrap()
+}
+
+/// `key`'s announce with `seq`, of the card `card_hash`, listing
+/// `capabilities`, valid now.
+pub fn announce(key: &AgentKey, seq: u64, card_hash: &CardHash, capabilities: &[&str]) -> Vec<u8> {
+    let issued_at = now_unix() - 60;
+    let doc = AnnounceRecord {
+        schema: ANNOUNCE_SCHEMA.to_owned(),
+        agent_id: key.id(),
+        seq,
+        agent_card_hash: card_hash.clone(),
+        capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
+        discovery_alpn: "agentnet-discovery/0".to_owned(),
+        issued_at: format_timestamp(issued_at).unwrap(),
+        expires_at: format_timestamp(issued_at + RECORD_TTL_S).unwrap(),
+    };
+    Signed::issue(key, doc).unwrap().to_json()
+}
+
+/// Where a [`TestRecords::of`] says its agent is.
+pub fn somewhere() -> SocketAddr {
+    SocketAddr::from(([192, 0, 2, 10], 4433))
+}
+
+/// Records a test publishes as it likes: those it gives, and each
+/// [`TestRecords::set_contact`] a new change.
+pub struct TestRecords {
+    current: Mutex<(Vec<u8>, Vec<u8>)>,
+    capabilities: Vec<String>,
+    changes: watch::Sender<u64>,
+}
+
+impl TestRecords {
+    pub fn new(contact: Vec<u8>, announce: Vec<u8>, capabilities: &[&str]) -> Arc<Self> {
+        Arc::new(Self {
+            current: Mutex::new((contact, announce)),
+            capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
+            changes: watch::channel(0).0,
+        })
+    }
+
+    /// `key`'s contact and announce of `seq` 1, listing `capabilities`.
+    pub fn of(key: &AgentKey, capabilities: &[&str]) -> Arc<Self> {
+        Self::new(
+            contact(key, 1, &[somewhere()]),
+            announce(key, 1, &any_card_hash(), capabilities),
+            capabilities,
+        )
+    }
+
+    /// Puts `contact` in force, as a record issued again.
+    pub fn set_contact(&self, contact: Vec<u8>) {
+        self.current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0 = contact;
+        self.bump();
+    }
+
+    /// Says the records changed.
+    pub fn bump(&self) {
+        self.changes.send_modify(|n| *n += 1);
+    }
+}
+
+impl PublishedRecords for TestRecords {
+    fn current(&self) -> (Vec<u8>, Vec<u8>) {
+        self.current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn capabilities(&self) -> Vec<String> {
+        self.capabilities.clone()
+    }
+
+    fn changes(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+}
+
+/// A DHT client of its own, with no node around it, that publishes
+/// `records` under `key`.
+pub struct Publisher {
+    pub dht: Dht,
+    _router: Router,
+}
+
+impl Publisher {
+    /// Starts it on a loopback endpoint with `key`, entering through
+    /// `routers`, with `timing` and `clock`.
+    pub async fn spawn(
+        key: &AgentKey,
+        records: Arc<TestRecords>,
+        routers: &[&TestNode],
+        timing: DhtTiming,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&key.to_bytes()))
+            .relay_mode(RelayMode::Disabled)
+            .portmapper_config(PortmapperConfig::Disabled)
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let cfg = DhtCfg {
+            enabled: true,
+            mode: DhtMode::Client,
+            bootstrap: routers.iter().map(|router| router.node.ticket()).collect(),
+            announce: true,
+            ..DhtCfg::default()
+        };
+        let (dht, listener) = Dht::spawn(DhtParts {
+            endpoint: endpoint.clone(),
+            key: Arc::new(AgentKey::from_bytes(&key.to_bytes())),
+            cfg,
+            timing,
+            quotas: KadQuotas::default(),
+            store_limits: STORE_LIMITS,
+            clock,
+            store: Arc::new(pals_core::store::Store::open_in_memory(key.id()).unwrap()),
+            published: Some(records),
+        })
+        .unwrap();
+        let router = Router::builder(endpoint).accept(ALPN_KAD, listener).spawn();
+        Self {
+            dht,
+            _router: router,
+        }
+    }
+}
+
+/// Runs `pals --home <home> <args>`, off the async threads: its exit code,
+/// stdout and stderr.
+pub async fn pals(home: &Path, args: &[&str]) -> (i32, String, String) {
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("pals");
+    cmd.env_remove("PALS_HOME")
+        .env_remove("RUST_LOG")
+        .arg("--home")
+        .arg(home)
+        .args(args);
+    let output = tokio::task::spawn_blocking(move || cmd.output().expect("run pals"))
+        .await
+        .unwrap();
+    (
+        output.status.code().expect("an exit code"),
+        String::from_utf8(output.stdout).unwrap(),
+        String::from_utf8(output.stderr).unwrap(),
+    )
 }

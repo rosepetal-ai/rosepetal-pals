@@ -1,0 +1,49 @@
+# The hito 3 backend comparison: one small binary per candidate, all on the
+# same node contract. Not product code: a workspace of its own, with its own
+# Cargo.lock, excluded from the root one and not built by CI.
+[workspace]
+resolver = "3"
+members = ["common", "baseline", "kad-libp2p", "kad-iroh", "mainline"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+
+[workspace.dependencies]
+# Every dependency pinned with `=`, never `latest`.
+spike-common = { path = "common" }
+# The records that travel are pals-core's, unchanged.
+pals-core = { path = "../../crates/pals-core" }
+
+# The versions the root workspace already locks.
+anyhow = "=1.0.104"
+# The control API, as the daemon's gateway.
+axum = "=0.8.9"
+# The signature `--rogue` alters.
+base64 = "=0.23.1"
+clap = { version = "=4.6.7", features = ["derive"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+# The provider key of a capability (kad-libp2p, kad-iroh), and the libp2p
+# key derived from the agent seed (kad-libp2p).
+sha2 = "=0.11.0"
+tokio = { version = "=1.54.1", features = ["macros", "net", "rt-multi-thread", "sync", "time", "io-util"] }
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+
+# The daemon's.
+iroh = "=1.4.1"
+# Brings libp2p-kad =0.49.0. Each candidate picks its own features.
+libp2p = "=0.57.1"
+# n0's Mainline DHT, the one under Iroh 1.x's own pkarr address lookup
+# (`iroh-mainline-address-lookup`); its signed peers are behind the
+# `unstable_signed_peers` feature, which the mainline candidate turns on.
+n0-mainline = "=0.7.2"
+# The versions n0-mainline already locks: the KRPC messages the mainline
+# candidate's routers read, and the SHA-1 infohash of a capability.
+serde_bencode = "=0.2.4"
+sha1_smol = "=1.0.1"
+# A GetStream of n0-mainline is a futures-core Stream.
+futures-core = "=0.3.34"

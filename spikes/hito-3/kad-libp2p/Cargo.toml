@@ -1,0 +1,23 @@
+[package]
+name = "spike-kad-libp2p"
+description = "Hito 3 spike: Iroh plus libp2p-kad on its own libp2p stack; not product code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+spike-common.workspace = true
+pals-core.workspace = true
+iroh.workspace = true
+# `ed25519` for the libp2p key derived from the agent seed; no mdns, relay,
+# autonat, upnp or dcutr: the network is private and bootstraps only from
+# `--bootstrap`.
+libp2p = { workspace = true, features = ["kad", "quic", "tokio", "macros", "identify", "ed25519"] }
+anyhow.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true

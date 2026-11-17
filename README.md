@@ -2,15 +2,16 @@
 
 A peer-to-peer network where AI agents find each other, authorize each other and work together without depending on a central directory. Each agent runs a daemon, `pals`, which connects it to other agents, controls what they may ask of it and hands it the authorized work. Messages, tasks, their states, streaming and cancellation are [A2A](https://a2a-protocol.org/) v1.0: a standard A2A client reaches any peer through the local gateway with the JSON-RPC and HTTP+JSON bindings, and between peers those same bindings travel inside PALS's own binding, `http-over-iroh/v1`. File bytes travel separately, over iroh-blobs, outside A2A; A2A messages name them with a URL.
 
-Before delegating, an agent can choose among the providers it knows: it verifies their signed Agent Cards, reads their inventories as its grants allow and asks them for offers over PALS's own discovery protocol, `agentnet-discovery/0`. No query runs any work; the chosen provider then gets the task over standard A2A, as before.
+Before delegating, an agent can choose among the providers it knows: it verifies their signed Agent Cards, reads their inventories as its grants allow and asks them for offers over PALS's own discovery protocol, `agentnet-discovery/0`. No query runs any work; the chosen provider then gets the task over standard A2A, as before. With the DHT on, it also finds providers it has no contact with, in a private Kademlia network that runs over the daemons' own Iroh connections.
 
-> **Status.** PALS is a prototype; read the known limitations of [milestone 1](#known-limitations-of-milestone-1) and [milestone 2](#known-limitations-of-milestone-2) before using it. Milestones are called *hitos* in the Spanish documentation.
+> **Status.** PALS is a prototype; read the known limitations of [milestone 1](#known-limitations-of-milestone-1), [milestone 2](#known-limitations-of-milestone-2) and [milestone 3](#known-limitations-of-milestone-3) before using it. Milestones are called *hitos* in the Spanish documentation.
 >
 > - **Works today: milestones 1 and 2 (hitos 1 and 2), merged into `dev`.** Milestone 1 is the basic flow. A2A conformance, with the exact scope set by the [conformance report](docs/conformance/hito-1/README.md#lo-que-queda-respaldado), is backed by the official conformance kit (TCK) and the official Python SDK. The [exit test](docs/conformance/hito-1/exit-test.md) passed all eight cases with a Docker container playing the second machine, with real network cuts and the public relays, but on a single physical host.
 > - **Milestone 2 (hito 2): service queries and inventory.** All 13 tasks of its plan ([PR #2](https://github.com/rosepetal-ai/rosepetal-pals/pull/2)). The [exit test](docs/conformance/hito-2/exit-test.md) passed its cases 1 to 8 with one Docker container per agent, on a single host, and case 9, the A2A conformance rerun, with no regression ([conformance report](docs/conformance/hito-2/README.md)).
 > - **Closing decisions** ([record](docs/decisions/2026-11-16-cierre-hitos-1-y-2.md)): `AUTH-TLS-001` is accepted, and the Docker runs close both milestones; repeating the exit tests on physical machines is an optional extra.
+> - **Milestone 3 (hito 3): discovery with Kademlia,** merged into `dev` ([PR #4](https://github.com/rosepetal-ai/rosepetal-pals/pull/4)). Its plan's two phases: a bounded comparison chose the backend, `libp2p-kad` over the daemon's own Iroh connections, and the daemon gained the DHT. The [exit test](docs/conformance/hito-3/exit-test.md) passed its nine cases with one Docker container per agent, two operators on two networks, on a single host, and the A2A conformance rerun changed no requirement ([conformance report](docs/conformance/hito-3/README.md)).
 
-The design document calls the protocol "Agentnet"; that is why the identifiers that travel over the network keep the `agentnet` prefix (`agentnet.grant/1`, `agentnet-a2a-http/1`, `agentnet-discovery/0`, `x-agentnet-peer`). The product, the binary and the crates are called `pals`.
+The design document calls the protocol "Agentnet"; that is why the identifiers that travel over the network keep the `agentnet` prefix (`agentnet.grant/1`, `agentnet-a2a-http/1`, `agentnet-discovery/0`, `agentnet-kad/0`, `x-agentnet-peer`). The product, the binary and the crates are called `pals`.
 
 ## What milestone 1 does
 
@@ -47,6 +48,19 @@ Service queries and inventory: before delegating, an agent chooses among several
 - **MCP inventory adapter.** For each MCP connection with an adapter, the daemon checks that the server really serves the tools offered: MCP `initialize` and `tools/list`, never `tools/call`, at start, every `refresh_interval_s` (900 s by default) and on `pals inventory refresh`. A declaration is never taken as proof that something works.
 - **Plain A2A agents as contacts,** outbound only ([below](#plain-a2a-agents-as-contacts)).
 - **Store schema 2.** A milestone 1 data directory is upgraded when it is first opened, and keeps its contacts, grants, tasks and events.
+
+## What milestone 3 adds
+
+Discovery with Kademlia: an agent finds the providers of a capability it has no contact with in a private DHT, then chooses among them as in milestone 2. Nothing changes after the search: the provider gets the task over the standard A2A bindings, and only with a grant of its own.
+
+- **The DHT, `agentnet-kad/0`.** A private Kademlia network ([protocol](docs/protocols/agentnet-kad-0.md)): `libp2p-kad` 0.49 over the daemon's own Iroh endpoint and UDP port, on the ALPN `agentnet-kad/0`, inside which libp2p speaks `/agentnet/kad/1.0.0`. One identity: the Kademlia `PeerId` is the agent's Ed25519 key, which Iroh's TLS authenticates on every connection. It never joins a public DHT, and uses none of libp2p's own transports, mDNS, relays, AutoNAT, UPnP or hole punching.
+- **Off by default: `[dht]` in `config.toml`,** which `pals init` writes commented. `enabled` (`false`). `mode`: `"client"` by default, which only dials the routers and enters no routing table, or `"router"`, which stores and answers for the others. `bootstrap`: the tickets of the routers to enter through; none ship with the binary. `external_addrs`: a router's addresses as others dial it. `announce` (`false`). `record_ttl_s`: how long the routers keep a record, 3600 by default, from 60 to 86 400. `republish_s`: how often the agent publishes its own again, 1200 by default, at least 20 and at most half of `record_ttl_s`. A router needs a fixed port, the new `[net] listen`.
+- **Entering the network.** Through the routers of `bootstrap`; if none answers, through up to 8 saved contacts, by name, that turn out to be routers. An invitation is a router's ticket (`pals id --ticket` on it), which carries its `external_addrs`.
+- **Publishing.** With `announce = true`, the agent publishes its signed contact and announce records of milestone 2, and a provider record of each public capability, under the SHA2-256 of its full name ([capability vocabulary](docs/extensions/capabilities-v1.md)). Only services with `visibility = "public"` reach the DHT, never a private or a project one. It publishes again every `republish_s`, at once when its addresses change, and 30 s after a round that reached no router. A provider that stops leaves the DHT `record_ttl_s` after its last round that reached the routers.
+- **What a router keeps.** It checks each record before storing it: a signed record of the agent its key names, valid with 60 s of clock skew, at most 4 KiB, and of a higher sequence than the one it holds, or the same record again; provider records only of capabilities that the agent's announce lists, 32 at most. It counts every refusal by reason.
+- **The DHT in a search.** `pals discover` and MCP `pals_discover` look in the DHT behind the contacts, unless they name their peers (`--peer`, `peers`) or say `--no-dht` (`exclude_dht`). The search waits for the lookup before it evaluates the contacts, at most `[discovery] per_candidate_timeout_ms` (3 s by default) and what is left of its budget, and the providers found take the places `max_candidates` (8) leaves behind the contacts. Each is verified like any peer: its contact and announce records, its signed card and its offer. Without a grant of its for the project it gets neither the project nor inventory ids. A candidate found there is printed `found in the DHT` (`from_dht` in JSON), and a search whose lookup was limited, cut or unanswered says so in its coverage: `candidate limit`, `dht timeout`, `dht unavailable` ([how](docs/protocols/agentnet-kad-0.md#9-la-dht-como-fuente-de-la-búsqueda-de-servicios)).
+- **Aliases.** `[discovery.aliases]` gives a capability other names, one step: with `ocr = "vision.ocr"`, `pals discover --capability ocr` searches `vision.ocr`. At most 256.
+- **Status.** `pals dht status` (`--json` for the JSON) and the gateway's `GET /dht`, `404` when the DHT is off: the mode, the routers in the routing table, the connections, what was refused, and, on a router, what it holds per agent and what it rejected, by reason; with `announce`, the last round of publication.
 
 ## Installation
 
@@ -106,7 +120,7 @@ More commands:
 
 Everything lives in `~/.pals`, or in the directory given by `$PALS_HOME` or `--home`: `config.toml`, `inventory.toml`, the key (`agent.key`), the store (`pals.db`), the blobs and the tasks' working directories. For two agents on the same machine, use two directories with gateways on different ports.
 
-Between two machines, `net.relay = true` is required; it is the default. The full procedure for testing it, case by case, is in the [two-machine exit-test runbook](docs/runbooks/hito-1-dos-maquinas.md). The harness in [`tests/exit/`](tests/exit/README.md) runs it on a single Linux host, with a Docker container as the second machine.
+Between two machines, `net.relay = true`, the default, is required unless the peers reach each other directly at a fixed `[net] listen` (since milestone 3); with `relay = false` and no `listen`, the daemon binds only to `127.0.0.1`. The full procedure for testing it, case by case, is in the [two-machine exit-test runbook](docs/runbooks/hito-1-dos-maquinas.md). The harness in [`tests/exit/`](tests/exit/README.md) runs it on a single Linux host, with a Docker container as the second machine.
 
 ### Choosing a provider (milestone 2)
 
@@ -132,6 +146,36 @@ pals discover --capability code.rust.review --requirements-file req.json --proje
 
 The [milestone 2 exit-test runbook](docs/runbooks/hito-2-consulta-de-servicios.md) sets up one requester and several providers, a real MCP server among them, case by case; [`tests/exit/hito-2.sh`](tests/exit/README.md#prueba-de-salida-del-hito-2-con-docker) runs it with one Docker container per agent.
 
+### Finding providers without a contact (milestone 3)
+
+The DHT is off until configured. A router runs on a stable host that the others reach directly: in its `config.toml`, a fixed port under `[net]`, such as `listen = "0.0.0.0:4433"`, and
+
+```toml
+[dht]
+enabled = true
+mode = "router"
+external_addrs = ["203.0.113.10:4433"]   # its address as the others dial it
+```
+
+`pals id --ticket` on the router prints the invitation. Every other agent adds:
+
+```toml
+[dht]
+enabled = true
+bootstrap = ["<ticket of the router>"]
+announce = true                          # providers: publish the public services
+```
+
+A requester then finds the providers in the DHT besides its contacts, with `pals discover --capability vision.ocr`. To ask one, it still needs a grant from it: the provider runs `pals grant issue --to <agent id of the requester> --project demo`, as in the quick start.
+
+| Command | What it does |
+|-|-|
+| `pals dht status [--json]` | The running daemon's DHT: its mode, the routers in its routing table, its connections and what it refused; on a router, what it holds per agent and the records it rejected, by reason; when it announces, its last round of publication |
+| `pals discover … [--no-dht]` | As above; with the DHT on, it also looks there, behind the contacts. `--no-dht`, or naming the `--peer`s, keeps the search to the contacts |
+| `pals id --ticket` | On a router: the invitation that the others put in `[dht] bootstrap` or save as a contact |
+
+The [milestone 3 exit-test runbook](docs/runbooks/hito-3-descubrimiento-kademlia.md) sets up four routers, providers and clients of two operators on two networks, case by case; [`tests/exit/hito-3.sh`](tests/exit/README.md#prueba-de-salida-del-hito-3-con-docker) runs it with one Docker container per agent.
+
 ## Connecting an MCP client
 
 The MCP server is on the gateway, at `http://127.0.0.1:7420/mcp` (Streamable HTTP). With Claude Code:
@@ -146,7 +190,7 @@ It serves eight tools; `pals_discover` and `pals_inventory`, and `offer_id` in `
 |-|-|
 | `pals_whoami` | This agent's id, name and ticket |
 | `pals_contacts` | The saved contacts, PALS peers and plain A2A agents, and whether a grant is held for each PALS peer |
-| `pals_discover` | Searches the contacts for a provider of a capability, as `pals discover` does, without asking any of them to do anything: the candidates ranked, each with its offer and `offer_id`, those discarded with the reason, the coverage and the metrics |
+| `pals_discover` | Searches the contacts for a provider of a capability, and the DHT when it is on, as `pals discover` does, without asking any of them to do anything: the candidates ranked, each with its offer and `offer_id`, those discarded with the reason, the coverage and the metrics. `exclude_dht: true` keeps it to the contacts |
 | `pals_inventory` | A page of a PALS peer's inventory, as the peer shows it to this agent, verified; `cursor` asks for the next one |
 | `pals_ask` | Asks a peer, with files if needed, and waits `wait_s` seconds: 50 by default, 3600 at most. With `offer_id`, the question names that offer of the peer's, as `pals_discover` returned it; with one that expired, nothing is sent |
 | `pals_task` | Resumes a question by its `message_id` without running it twice (to a plain A2A agent, only if it declares `idempotency/v1`) |
@@ -187,13 +231,15 @@ Limitations: files cannot be sent to a plain agent (`attachments need a PALS pee
 
 ## A2A compatibility
 
-What is backed, as established by the conformance reports of [milestone 1](docs/conformance/hito-1/README.md) and [milestone 2](docs/conformance/hito-2/README.md):
+What is backed, as established by the conformance reports of [milestone 1](docs/conformance/hito-1/README.md), [milestone 2](docs/conformance/hito-2/README.md) and [milestone 3](docs/conformance/hito-3/README.md):
 
 > **A2A v1.0 with the JSON-RPC and HTTP+JSON bindings through the local gateway; between peers, the custom binding `http-over-iroh/v1` (`…/v1/jsonrpc` and `…/v1/http-json`), which carries those same bindings.**
 
-The official TCK (`a2aproject/a2a-tck` at `104a7b4ae0d8`), run through the gateway, leaves no failed automated MUST requirement in `jsonrpc` or in `http_json` (72 passed; the skipped ones are skipped for capabilities PALS does not declare, for preconditions that do not hold or for being gRPC), and the official Python SDK completes its 4 checks over both bindings. The `MANUAL` MUST-level requirement `AUTH-TLS-001` is accepted ([decision record](docs/decisions/2026-11-16-cierre-hitos-1-y-2.md#d1-auth-tls-001-se-acepta)). Not backed: the 16 MUST requirements without an automated test in the TCK, the `MANUAL` ones and the SHOULD `HTTP_JSON-SVC-001`. The details, and the workarounds for defects of the pinned Rust SDK, are in the reports.
+The official TCK (`a2aproject/a2a-tck` at `104a7b4ae0d8`), run through the gateway, leaves no failed automated MUST requirement in `jsonrpc` or in `http_json` (72 passed; the skipped ones are skipped for capabilities PALS does not declare, for preconditions that do not hold or for being gRPC), and the official Python SDK completes its 4 checks over both bindings. The `MANUAL` MUST-level requirement `AUTH-TLS-001` is accepted for milestones 1 and 2 ([decision record](docs/decisions/2026-11-16-cierre-hitos-1-y-2.md#d1-auth-tls-001-se-acepta)). Not backed: the 16 MUST requirements without an automated test in the TCK, the `MANUAL` ones and the SHOULD `HTTP_JSON-SVC-001`. The details, and the workarounds for defects of the pinned Rust SDK, are in the reports.
 
 Milestone 2 reran both with no regression. Two requirements changed state, both because the card now declares an extended card: `CARD-EXT-001` (an authenticated `GetExtendedAgentCard` returns the extended card) now passes, and `CORE-CAP-003`, which the TCK runs only when no extended card is declared, is now skipped. The card a daemon serves its peers is signed with JWS (A2A §8.4), which the TCK leaves to manual checks (`CARD-SIGN-001` to `004`); the official Python, Go and JS SDKs verify it ([card signatures](docs/conformance/hito-2/card-signatures.md)).
+
+Milestone 3 reran the TCK, the Python client, the schema check and the card-vector check: no requirement changed, at the MUST or the SHOULD level, and the card the TCK sees is milestone 2's. The DHT adds an ALPN of its own and leaves the A2A server untouched; the TCK ran with it off, its default, and the A2A exchange after a search in the DHT is exercised by the exit test, case 2. Milestone 3 changes nothing the acceptance of `AUTH-TLS-001` rests on, and the owner extended it to milestone 3 ([closing record](docs/decisions/2026-11-17-cierre-hito-3.md), [report](docs/conformance/hito-3/README.md#requisitos-manual-del-tck)).
 
 Between peers, the Agent Card declares two interfaces, one per inner binding, specified in [`docs/bindings/http-over-iroh-v1.md`](docs/bindings/http-over-iroh-v1.md):
 
@@ -212,13 +258,13 @@ Idempotency by `messageId` is an optional A2A extension, [`idempotency/v1`](docs
 - **Worker commands run as the daemon's user** and can read its data directory, including the agent key (`agent.key`) and the database (`pals.db`). A command such as `claude -p`, which acts on what a peer asks, could read them.
 - **The asking peer receives the command's output.** Its stdout is the answer and, if the command fails, the last 4 KiB of its stderr go into the failure reason: whatever the command writes to either one (paths, traces, secrets) reaches the peer.
 - **Blobs do not expire.** Files uploaded to the gateway and those an agent sends in its answers are kept in its store with no retention policy; disk usage only grows.
-- **No TLS on the local gateway.** The gateway speaks HTTP without TLS, on loopback only; between peers, traffic is encrypted with QUIC's TLS 1.3. `AUTH-TLS-001` is accepted on that basis ([decision record](docs/decisions/2026-11-16-cierre-hitos-1-y-2.md#d1-auth-tls-001-se-acepta)).
+- **No TLS on the local gateway.** The gateway speaks HTTP without TLS, on loopback only; between peers, traffic is encrypted with QUIC's TLS 1.3. `AUTH-TLS-001` is accepted on that basis for milestones 1 and 2 ([decision record](docs/decisions/2026-11-16-cierre-hitos-1-y-2.md#d1-auth-tls-001-se-acepta)).
 - **Different waits in MCP and in the CLI.** `pals_ask` and `pals_task` wait 50 s by default (`wait_s`, at most 3600); `pals ask` and `pals task resume`, 600 s (`--wait`).
 - **Idempotency is an optional extension.** A standard A2A client that retries with the same `messageId` without activating `idempotency/v1` can run the work twice, as with the reference SDK. The PALS client always activates it.
 - **`A2A-Version` is mandatory in both bindings**, as a header or as a request parameter. Without it, the request counts as version `0.3` and is rejected with `VersionNotSupportedError`.
 - **iroh-blobs maturity.** iroh-blobs 0.105.0 states in its README that it is not yet considered production quality. It is used because the version recommended for production, 0.35, is not compatible with iroh 1.x.
 - **The worker clears the environment.** Commands only inherit `PATH`, `HOME` and `LANG` (plus the task's `PALS_*` variables), so `ANTHROPIC_API_KEY` does not get through: `claude -p` needs its credentials under `HOME`, or a wrapper script that exports the key.
-- **Two machines need `net.relay = true`.** With `relay = false` the daemon binds only to `127.0.0.1`, and its port changes on every start: the tickets its peers saved stop working.
+- **Two machines need `net.relay = true`, unless they reach each other directly.** With `relay = false` and no `[net] listen`, the daemon binds only to `127.0.0.1`, and its port changes on every start: the tickets its peers saved stop working. Since milestone 3, `[net] listen` binds the endpoint to that one address and a fixed port, with the relay or without it; without the relay, the peers must then reach that address directly.
 - **A daemon killed with `SIGKILL` can leave the commands it was running alive**, with their process group. On restart, their tasks end as `TASK_STATE_FAILED` (`interrupted: daemon restarted`), but the commands must be terminated by hand. A process that a command moves out of its group (with `setsid`) also escapes the timeout and cancellation.
 - **One grant per peer.** With several grants from the same peer, the gateway uses the most recent one: the project is not chosen question by question. Since milestone 2, an ask that names an offer presents the grant of the offer's scope instead.
 - **Minimal logging.** The daemon writes to stderr its start, its stop, pending questions and its diagnostics from the `INFO` level up (`RUST_LOG` changes it, e.g. `RUST_LOG=pals=debug`); it does not report the network path (direct or relay).
@@ -229,7 +275,7 @@ Outside milestone 1: the signed card (JWS) and the service inventory (milestone 
 
 Those of milestone 1 still hold, and:
 
-- **No DHT.** A search reaches only the agents already saved as contacts. Contact and announce records are signed, kept and sent with every discovery answer, but nothing publishes them yet: discovery of unknown peers is milestone 3.
+- **Contacts only.** In milestone 2, a search reaches only the agents already saved as contacts, and contact and announce records travel only with discovery answers. Milestone 3 publishes them in a DHT, off by default (see [what milestone 3 adds](#what-milestone-3-adds)).
 - **Discovery quotas are per agent id.** A peer's `agentnet-discovery/0` streams and requests are limited per `AgentId` (4 streams and 60 requests a minute), and to 64 streams in all; Iroh identities cost nothing, and there is no global budget for requests without a grant. Such a request writes nothing to the store: only an offer a task can name, of a `task:<project>` scope, is kept.
 - **No clarifications.** A candidate whose offer lacks the information to confirm a mandatory requirement (`needs_information`) is discarded; there is no exchange to clarify it. An unknown requirement is never met, and it discards.
 - **Plain A2A contacts are outbound only and take no files.** In automatic selection (`pals discover`) they count only when their card's signature verifies, and they are ranked by their card alone; the PALS client asks only those whose card declares streaming, though stock A2A clients reach any of them through the gateway (see [above](#plain-a2a-agents-as-contacts)).
@@ -237,7 +283,28 @@ Those of milestone 1 still hold, and:
 - **Changing `inventory.toml` needs a daemon restart.** The inventory is read once, when the daemon starts; there is no live reload. Only the observations of the MCP adapters change while it runs.
 - **MCP adapter response size.** Over `http`, rmcp 3.10 caps a plain JSON response of an MCP server at a fixed 16 MiB, which PALS cannot lower; the lines of a `stdio` server and the events of an HTTP stream are held to 1 MiB.
 
-Outside milestones 1 and 2: discovery of unknown peers (milestone 3), and *push* notifications, the gRPC binding and direct HTTPS access for clients without a PALS daemon (no milestone yet).
+Outside milestones 1 and 2: discovery of unknown peers, which milestone 3 adds, and *push* notifications, the gRPC binding and direct HTTPS access for clients without a PALS daemon (no milestone yet).
+
+## Known limitations of milestone 3
+
+Those of milestones 1 and 2 still hold, and:
+
+- **Every lookup tells the routers who looks for what (H3-D4).** The connection is authenticated with the agent's own key, so a router sees which agent asks for which capability's key; the key is the SHA-256 of the capability's name, which the [vocabulary](docs/extensions/capabilities-v1.md) lists for a common capability and which is just as easy to guess for a namespaced one, and the requests for contact and announce records that follow say which providers the agent will query. A router logs none of it at its default level; with libp2p's `debug` logging it names each agent that connects, with its IP address, and a modified router can record the agent, the capability and the time of every lookup ([observed](docs/conformance/hito-3/exit-test.md#filtraciones-de-metadatos-observadas)). `--no-dht`, `exclude_dht` or naming the peers keeps a search out of the DHT.
+- **Routers must be directly reachable.** Kademlia knows a router only by direct IP addresses, from its ticket or its `external_addrs`; there is no address form through a relay, so a router behind NAT needs a port forward. Clients only dial out, and a provider found in the DHT is reached through its contact record, which carries its relay.
+- **A provider that comes back with another data directory is not found at its new address at once.** With its key but a new store, its records start again at sequence 1. The routers keep its earlier, higher-sequence records until they expire there, at most `record_ttl_s` (an hour by default) after the last round that brought them, and take the new ones at its first round after that ([protocol](docs/protocols/agentnet-kad-0.md#6-lo-que-guarda-un-router)). A requester that already knows its earlier records discards the new ones as `record regression` for longer, as with discovery answers since milestone 2.
+- **Neither Sybil resistance nor scale is tested.** Signatures do not stop fake identities in bulk: 20 live identities that republish can fill a router's 20 provider slots for a capability, and a router admits any agent that dials it, within its quotas. The exit test ran four routers and four providers, where every router holds everything; routing across many routers is not exercised.
+- **An invitation is an Iroh ticket.** A router's `pals id --ticket`, in `[dht] bootstrap` or saved as a contact, says where the router is and nothing more: it is signed for no one, does not expire and authorizes nothing.
+- **Asking a provider found in the DHT still needs a grant of its.** The search ranks it (`no grant held`), but `pals discover --ask` never asks a PALS peer without a grant that serves tasks, and the provider refuses a task without its grant. Getting one is out of band: the provider runs `pals grant issue --to <agent id>`.
+- **An unreachable provider costs its whole time.** A provider whose contact names addresses this agent cannot reach, such as another private network with `relay = false`, is waited for `per_candidate_timeout` (3 s by default), and the coverage says `timeout` ([exit test, observations](docs/conformance/hito-3/exit-test.md#observaciones)).
+- **A router that is down slows every lookup.** `libp2p-kad` 0.49 keeps it in the routing table while the slot is not needed, so each lookup asks it and waits out its time, `dht timeout`; the providers are still found at the other routers (exit test, cases 3 and 5).
+- **A publisher does not learn of a refusal.** With `libp2p-kad` 0.49, a router answers a record it refuses as if it had stored it; only the router's `pals dht status` counts the refusal, by reason (exit test, case 6).
+- **With `max_candidates` contacts or more, a search does not look in the DHT.** The contacts come first and take every place (`[discovery] max_candidates`, 8 by default), whatever capability they offer, so the lookup is not made and the coverage says `candidate limit`. Raise `max_candidates` (up to 32) to leave places for the DHT; `--no-dht` (`exclude_dht`) and naming the peers (`--peer`, `peers`) keep a search to the contacts on purpose.
+- **A provider's own contact record says where this agent dials it.** A search dials a provider found in the DHT, and `pals ask <id>` an agent that is no saved contact, at the direct addresses and relay of the newest contact record this agent has of it, which that agent signed and chose. Within filters: any IP address but an unspecified, multicast or link-local one, and a loopback one only on a node bound to loopback, so private ranges are dialed; and a relay only by `https`.
+- **A saved contact's ticket wins over a fresher contact from the DHT.** A search evaluates a provider that is also a saved contact as the contact, and `pals ask` and the gateway dial a saved contact at its ticket's addresses: a newer contact record the DHT or a discovery answer brought is not used, so a contact whose ticket went stale is not reached at its new address until its ticket is saved again (`pals contact add`).
+- **Some paths dial an agent that is no contact by its bare id.** `pals discover --peer <id>` for an agent that is not a saved contact, and a blob fetch from such a holder, dial its id alone, not the contact record the DHT or a discovery answer brought, which `pals ask <id>` uses. With `relay = true`, Iroh's address lookup may still find it; with `relay = false`, these miss a provider that `pals ask <id>` reaches.
+- **At most 32 public capabilities per agent** are announced: the limit of its signed announce record (`MAX_ANNOUNCED_CAPABILITIES`).
+
+Outside milestones 1 to 3: an address form through a relay, admission policies for an open network, persisting a router's routing table and store, semantic search (only local aliases), *push* notifications, the gRPC binding and direct HTTPS access for clients without a PALS daemon.
 
 ## Roadmap
 
@@ -255,10 +322,11 @@ Four milestones, in the order of the [design](docs/plans/initial.md) (§14). In 
 - **Status:** the 13 tasks of the plan implemented, reviewed and merged into `dev` ([PR #2](https://github.com/rosepetal-ai/rosepetal-pals/pull/2)). The exit test passed 8 of 8 cases with one Docker container per agent, on a single host, and case 9, the conformance rerun, with no regression; it did not cover several physical machines or networks. That run closes the milestone ([decision record](docs/decisions/2026-11-16-cierre-hitos-1-y-2.md)).
 - **Links:** [plan](docs/plans/2026-11-14-hito-2-consulta-de-servicios.md), [conformance report](docs/conformance/hito-2/README.md), [exit test](docs/conformance/hito-2/exit-test.md), [runbook](docs/runbooks/hito-2-consulta-de-servicios.md), [Docker harness](tests/exit/README.md#prueba-de-salida-del-hito-2-con-docker), [independent verification of the card signature](docs/conformance/hito-2/card-signatures.md).
 
-**3. Discovery with Kademlia: planned.** Find providers without prior contact, over a backend chosen after a bounded comparison.
+**3. Discovery with Kademlia: implemented.** Find providers without prior contact, over a backend chosen after a bounded comparison.
 - **Deliverable:** a bounded comparison of the backend, a capability registry and contact resolution.
 - **Exit criterion:** justify the chosen implementation; find a provider without prior contact; work without the original bootstrap node, and expire announcements.
-- **Status:** no plan yet. It is written now that milestone 2 is built, and the backend comparison decides the rest.
+- **Status:** closed and merged into `dev` ([PR #4](https://github.com/rosepetal-ai/rosepetal-pals/pull/4); [closing record](docs/decisions/2026-11-17-cierre-hito-3.md): `AUTH-TLS-001` extended to milestone 3). Phase 1, the bounded comparison, measured three backends against a baseline with a Docker harness, and assessed a fourth on paper. The chosen backend (H3-D1, ratified with conditions) is `libp2p-kad` over the daemon's own Iroh connections: one network stack and one identity, with the agent key as the Kademlia peer id. The other milestone decisions (H3-D2 to H3-D5) are recorded too. Phase 2 brought it into the daemon: the DHT `agentnet-kad/0`, off by default, as a source of the search. The exit test passed 9 of 9 cases with one Docker container per agent, two operators on two networks, on a single host; it did not cover NAT between operators, physical machines, Sybil attacks or scale. The conformance rerun changed no requirement.
+- **Links:** [plan, phases 1 and 2](docs/plans/2026-11-16-hito-3-descubrimiento-kademlia.md), [conformance report](docs/conformance/hito-3/README.md), [exit test](docs/conformance/hito-3/exit-test.md), [runbook](docs/runbooks/hito-3-descubrimiento-kademlia.md), [Docker harness](tests/exit/README.md#prueba-de-salida-del-hito-3-con-docker), [protocol](docs/protocols/agentnet-kad-0.md), [backend decision record](docs/decisions/2026-11-16-hito-3-backend-dht.md), [H3-D2 to H3-D5](docs/decisions/2026-11-16-hito-3-decisiones.md), [comparison harness](spikes/hito-3/README.md).
 
 **4. Private collaboration with P2panda: only if a real case appears.** Several authorized nodes keep a project's private catalog in sync without publishing it, even when they are not online at the same time.
 - **Deliverable:** a bounded trial of P2panda, if there is a need for replication.
@@ -272,19 +340,25 @@ The documentation under `docs/` is in Spanish.
 - [`docs/plans/initial.md`](docs/plans/initial.md): the network design, revision 3.
 - [`docs/plans/2026-11-14-hito-1-flujo-basico-a2a.md`](docs/plans/2026-11-14-hito-1-flujo-basico-a2a.md): the step-by-step plan for milestone 1, with the changes imposed by the A2A compatibility requirement.
 - [`docs/plans/2026-11-14-hito-2-consulta-de-servicios.md`](docs/plans/2026-11-14-hito-2-consulta-de-servicios.md): the step-by-step plan for milestone 2, with its own spec-deviation table.
+- [`docs/plans/2026-11-16-hito-3-descubrimiento-kademlia.md`](docs/plans/2026-11-16-hito-3-descubrimiento-kademlia.md): the plan for milestone 3, in two phases, the backend comparison and the daemon, with its own spec-deviation table.
 - [`docs/plans/2026-11-14-hoja-de-ruta-hitos-2-4.md`](docs/plans/2026-11-14-hoja-de-ruta-hitos-2-4.md): the roadmap for milestones 2 to 4.
+- [`docs/decisions/`](docs/decisions/): the decision records: the [closing of milestones 1 and 2](docs/decisions/2026-11-16-cierre-hitos-1-y-2.md), the [milestone 3 backend](docs/decisions/2026-11-16-hito-3-backend-dht.md) (H3-D1) and [H3-D2 to H3-D5](docs/decisions/2026-11-16-hito-3-decisiones.md).
 - [`docs/bindings/http-over-iroh-v1.md`](docs/bindings/http-over-iroh-v1.md): the peer bindings.
 - [`docs/extensions/idempotency-v1.md`](docs/extensions/idempotency-v1.md): the idempotency extension.
 - [`docs/extensions/inventory-v1.md`](docs/extensions/inventory-v1.md): the inventory extension, with the JSON Schemas of its documents in [`docs/extensions/inventory-v1/`](docs/extensions/inventory-v1/).
 - [`docs/protocols/agentnet-discovery-0.md`](docs/protocols/agentnet-discovery-0.md): the discovery protocol, with its messages in [`agentnet-discovery-0.proto`](docs/protocols/agentnet-discovery-0.proto).
+- [`docs/protocols/agentnet-kad-0.md`](docs/protocols/agentnet-kad-0.md): the DHT, and how the search uses it.
+- [`docs/extensions/capabilities-v1.md`](docs/extensions/capabilities-v1.md): the common capability vocabulary, its keys in the DHT and how it grows.
 - [`docs/conformance/hito-1/README.md`](docs/conformance/hito-1/README.md): A2A conformance (TCK and Python SDK), and [`sdk-issues.md`](docs/conformance/hito-1/sdk-issues.md), the defects of the Rust SDK.
 - [`docs/runbooks/hito-1-dos-maquinas.md`](docs/runbooks/hito-1-dos-maquinas.md) and [`docs/conformance/hito-1/exit-test.md`](docs/conformance/hito-1/exit-test.md): the two-machine exit test, its run with Docker as the second machine ([`tests/exit/`](tests/exit/README.md)) and the earlier rehearsal on one machine.
 - [`docs/conformance/hito-2/README.md`](docs/conformance/hito-2/README.md): the milestone 2 conformance rerun, requirement by requirement against milestone 1, and [`card-signatures.md`](docs/conformance/hito-2/card-signatures.md), the independent verification of the card signature.
 - [`docs/runbooks/hito-2-consulta-de-servicios.md`](docs/runbooks/hito-2-consulta-de-servicios.md) and [`docs/conformance/hito-2/exit-test.md`](docs/conformance/hito-2/exit-test.md): the milestone 2 exit test and its run with one Docker container per agent.
+- [`docs/conformance/hito-3/README.md`](docs/conformance/hito-3/README.md): the milestone 3 conformance rerun, requirement by requirement against milestone 2.
+- [`docs/runbooks/hito-3-descubrimiento-kademlia.md`](docs/runbooks/hito-3-descubrimiento-kademlia.md) and [`docs/conformance/hito-3/exit-test.md`](docs/conformance/hito-3/exit-test.md): the milestone 3 exit test, its run with one Docker container per agent on two networks, the §14 metrics and the metadata leaks observed.
 
 ## Technology
 
-Rust (edition 2024, minimum version 1.91), tokio, iroh 1.4.1, iroh-blobs 0.105.0, the official A2A SDK for Rust ([`a2aproject/a2a-rs`](https://github.com/a2aproject/a2a-rs): `a2a-lf` 0.4.2, `a2a-server-lf` 0.5.3, `a2a-client-lf` 0.2.9), axum and hyper, rmcp 3.10.0 for MCP, and embedded SQLite (rusqlite 0.42). Versions are pinned with `=` in `Cargo.toml` and in `Cargo.lock`; upgrading any of them is an explicit change that requires rerunning the conformance tests.
+Rust (edition 2024, minimum version 1.91), tokio, iroh 1.4.1, iroh-blobs 0.105.0, the official A2A SDK for Rust ([`a2aproject/a2a-rs`](https://github.com/a2aproject/a2a-rs): `a2a-lf` 0.4.2, `a2a-server-lf` 0.5.3, `a2a-client-lf` 0.2.9), axum and hyper, rmcp 3.10.0 for MCP, libp2p 0.57.1 for Kademlia (`libp2p-kad` 0.49.0, over Iroh's connections, with none of libp2p's own transports), and embedded SQLite (rusqlite 0.42). Versions are pinned with `=` in `Cargo.toml` and in `Cargo.lock`; upgrading any of them is an explicit change that requires rerunning the conformance tests.
 
 ## Contributing
 
@@ -296,4 +370,4 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 ```
 
-Conformance is rerun with `tests/interop/run_tck.sh`, `tests/interop/python_client.py` and `tests/interop/check_schemas.py`; `PALS_CONFORMANCE_DIR=docs/conformance/hito-2` sends the TCK reports to the milestone 2 directory instead of `docs/conformance/hito-1` (see the [report](docs/conformance/hito-2/README.md#ejecución)). The exit tests are rerun with `tests/exit/run.sh` (milestone 1) and `tests/exit/hito-2.sh` (milestone 2), which need Linux with Docker and internet access (see [`tests/exit/README.md`](tests/exit/README.md)). Guidelines for coding agents are in [`CLAUDE.md`](CLAUDE.md).
+Conformance is rerun with `tests/interop/run_tck.sh`, `tests/interop/python_client.py`, `tests/interop/check_schemas.py` and `tests/interop/card_signatures.py`; `PALS_CONFORMANCE_DIR=docs/conformance/hito-3` sends the TCK reports to the milestone 3 directory instead of `docs/conformance/hito-1` (see the [report](docs/conformance/hito-3/README.md#ejecución)). The exit tests are rerun with `tests/exit/run.sh` (milestone 1), `tests/exit/hito-2.sh` (milestone 2) and `tests/exit/hito-3.sh` (milestone 3), which need Linux with Docker and internet access (see [`tests/exit/README.md`](tests/exit/README.md)). Upgrading `libp2p` or `iroh` also reruns the adapter's tests, `crates/pals/tests/dht_transport.rs`. Guidelines for coding agents are in [`CLAUDE.md`](CLAUDE.md).

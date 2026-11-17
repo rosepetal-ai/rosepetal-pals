@@ -1,0 +1,20 @@
+[package]
+name = "spike-mainline"
+description = "Hito 3 spike: Iroh plus a private Mainline DHT with a capability index of signed peers; not product code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+spike-common.workspace = true
+pals-core.workspace = true
+iroh.workspace = true
+# Signed peers (an Ed25519 key per infohash) are the capability index.
+n0-mainline = { workspace = true, features = ["unstable_signed_peers"] }
+serde_bencode.workspace = true
+sha1_smol.workspace = true
+futures-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true

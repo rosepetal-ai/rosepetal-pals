@@ -1,0 +1,15 @@
+# p1's inventory: two public services, so two capabilities in the DHT.
+
+[[services]]
+id = "ocr"
+name = "OCR"
+description = "Reads the text of an image"
+capabilities = ["vision.ocr"]
+visibility = "public"
+
+[[services]]
+id = "docs"
+name = "Documentation"
+description = "Answers from the documentation"
+capabilities = ["knowledge.documentation"]
+visibility = "public"

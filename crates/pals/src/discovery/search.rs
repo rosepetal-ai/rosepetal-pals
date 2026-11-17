@@ -1,14 +1,50 @@
-//! [`Searcher`]: choosing a provider among this agent's contacts before
-//! delegating to it (design §8), within the limits of design §7.3, with no
-//! candidate running any work until the one chosen is asked.
+//! [`Searcher`]: choosing a provider among this agent's contacts, and the
+//! providers the DHT finds behind them, before delegating to it (design §8,
+//! §5.3), within the limits of design §7.3, with no candidate running any
+//! work until the one chosen is asked.
+//!
+//! **The capability** goes through `[discovery.aliases]` first
+//! ([`DiscoveryCfg::aliases`]), one step: a search for an alias searches the
+//! capability it names, even when that is another alias's name.
 //!
 //! **Candidates.** Every contact, PALS peers and plain A2A agents, or those
 //! the request names; each agent once (a PALS peer by its agent id, a plain
 //! agent by its origin); first those of which this agent holds a grant that
 //! serves tasks in the request's project (in any project when it names
-//! none), then by name; this agent never. Only the first
-//! [`DiscoveryLimits::max_candidates`] are contacted: the coverage of a
-//! search that leaves some out is partial, `candidate limit`.
+//! none), then by name; this agent never.
+//!
+//! Then, behind the contacts, the providers of the capability the DHT finds
+//! ([`Dht::providers`]), in the order they arrived, named by their agent id:
+//! only when the node runs the DHT, the request names no `peers` and does
+//! not say `exclude_dht` (H3-D4), and the contacts leave room for one
+//! ([`DiscoveryLimits::max_candidates`]); when they fill every place, the
+//! lookup is not made, and the coverage is partial, `candidate limit`. Only
+//! the capability's key goes to the DHT.
+//! The lookup asks for up to [`DiscoveryLimits::max_candidates`] + 1
+//! providers within `min(per_candidate_timeout, the budget left)`: a search
+//! with the DHT on waits for it, at most `per_candidate_timeout`, before it
+//! evaluates its contacts. A provider that is a contact stays the contact,
+//! once, and the DHT never gives this agent. What the lookup discards is
+//! discarded at the card, `dht: <why>` ([`DhtLookup::discarded`]), but for a
+//! contact's.
+//!
+//! Only the first [`DiscoveryLimits::max_candidates`] of them all are
+//! contacted: the coverage of a search that leaves some out, or whose
+//! lookup took every provider it asked for and so may have left some, is
+//! partial, `candidate limit`. It is partial too, `dht timeout`, when the
+//! lookup was cut, and `dht unavailable` when no DHT router answered it:
+//! the contacts are searched all the same. The lookup's requests are
+//! counted apart ([`SearchMetrics::dht_requests`]).
+//!
+//! **A candidate from the DHT** is checked before anything is sent to it.
+//! Its contact and announce records, which the lookup verified, go through
+//! [`Store::peer_record_accept`] as a discovery answer's do: one that goes
+//! back from the newest this agent knows of the agent discards it at the
+//! card, `record regression`. Then it is dialed at its contact record's
+//! direct addresses and relay, those [`contact_addr`] keeps, and evaluated
+//! as any PALS peer, below, with the grant this agent holds of it, if any: one it holds
+//! no grant of for the project gets neither the project nor the inventory
+//! ids, and is ranked with `grant_held: false` and `from_dht: true`.
 //!
 //! **Each candidate** takes one of the [`DiscoveryLimits::max_concurrent_queries`]
 //! places of the whole daemon, waiting for it no longer than the search's
@@ -72,9 +108,11 @@
 //! [`MAX_ASKED`] candidates are asked. A PALS peer of which this agent
 //! holds no grant that serves tasks is never asked (§8, a permit checked
 //! before execution): it is set aside, `no grant held`, and does not count
-//! among them. An offer expired by this agent's clock, without skew, is
-//! renewed once if the budget allows, and the question goes with the
-//! offer it has ([`OfferRef`]). A refusal for `offer_expired` or
+//! among them. One the DHT found is asked by its agent id, which the
+//! gateway dials at the newest contact record this agent keeps of it. An
+//! offer expired by this agent's clock, without skew, is renewed once if
+//! the budget allows, and the question goes with the offer it has
+//! ([`OfferRef`]). A refusal for `offer_expired` or
 //! `offer_stale` renews it once, if the budget allows and it was not
 //! renewed already, and asks again; `offer_unknown`, another refusal of the
 //! first request, before the peer named any task, or a task `REJECTED` as
@@ -90,7 +128,7 @@
 //! get past the limits of one. Nothing here passes a query on: a candidate
 //! answers for itself.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -110,7 +148,7 @@ use pals_core::discovery::selection::{
 };
 use pals_core::grant::{SignedGrant, parse_timestamp};
 use pals_core::identity::AgentId;
-use pals_core::store::{A2aContact, PLAIN_PEER_PREFIX, PeerRef, Store};
+use pals_core::store::{A2aContact, PLAIN_PEER_PREFIX, PeerRef, RecordAccept, Store};
 use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
@@ -118,10 +156,12 @@ use tokio_util::sync::CancellationToken;
 
 use super::cards::{CardFetchError, PeerCards, signed_card_json};
 use super::client::{DiscoveryClient, DiscoveryError};
+use super::{ANNOUNCE, CONTACT};
 use crate::config::DiscoveryCfg;
+use crate::dht::{Dht, DhtCandidate, DhtLookup};
 use crate::gateway::plain::{PlainError, fetch_contact_card, keep_plain_card};
 use crate::gateway::serves_tasks;
-use crate::net::peer_addr;
+use crate::net::{contact_addr, peer_addr};
 use crate::outbox::{AskError, AskOutcome, AskRequest, INVALID_TASK_ID, Outbox};
 
 /// The most candidates [`Searcher::choose_and_ask`] asks.
@@ -132,8 +172,15 @@ pub const MAX_REPORTS_PER_CANDIDATE: usize = 4;
 const TIMEOUT: &str = "timeout";
 /// Why a candidate was cut, or never started, when the budget ended.
 const TIME_BUDGET: &str = "time budget";
-/// Why some contacts were left out.
+/// Why some contacts, or providers the DHT found, were left out.
 const CANDIDATE_LIMIT: &str = "candidate limit";
+/// Why the coverage is partial when the lookup in the DHT was cut.
+const DHT_TIMEOUT: &str = "dht timeout";
+/// Why the coverage is partial when no DHT router answered the lookup.
+const DHT_UNAVAILABLE: &str = "dht unavailable";
+/// Why a candidate whose contact or announce record goes back is
+/// discarded.
+const REGRESSION: &str = "record regression";
 /// Why a peer was not asked.
 const NO_GRANT: &str = "no grant held";
 /// Why a plain agent whose card does not declare streaming is discarded:
@@ -244,6 +291,16 @@ pub struct SearcherParts {
     /// The node's clock, which offers and reports are judged by.
     pub clock: Arc<dyn Clock>,
     pub limits: DiscoveryLimits,
+    /// `[discovery.aliases]`: another name a search may give a capability,
+    /// and the capability it searches.
+    pub aliases: BTreeMap<String, String>,
+    /// The node's DHT, when it is on: where a search finds the providers
+    /// that are no contacts.
+    pub dht: Option<Dht>,
+    /// Whether the node's endpoint is bound to loopback: only then is a
+    /// loopback address of a DHT provider's contact dialed
+    /// ([`contact_addr`]).
+    pub on_loopback: bool,
 }
 
 /// Searches this agent's contacts for a provider (see the [module](self)).
@@ -302,19 +359,48 @@ enum EntryKind {
     Plain(A2aContact),
 }
 
-/// A PALS contact, with the grant this agent would present to it.
+/// A PALS peer, a contact or one the DHT found, with the grant this agent
+/// would present to it.
 struct PalsPeer {
     id: AgentId,
     addr: EndpointAddr,
     grant: Option<SignedGrant>,
     /// The grant serves tasks in the request's project.
     grant_held: bool,
+    /// The DHT found it, and it is no contact.
+    from_dht: bool,
 }
 
 impl Entry {
     fn grant_held(&self) -> bool {
         matches!(&self.kind, EntryKind::Pals(peer) if peer.grant_held)
     }
+
+    /// A PALS peer's agent id.
+    fn agent_id(&self) -> Option<AgentId> {
+        match &self.kind {
+            EntryKind::Pals(peer) => Some(peer.id),
+            EntryKind::Plain(_) => None,
+        }
+    }
+}
+
+/// What the DHT adds to a search's candidates.
+#[derive(Default)]
+struct FromDht {
+    /// The providers found that are neither this agent nor a contact, in
+    /// the order they arrived.
+    found: Vec<DhtCandidate>,
+    /// Those the lookup discarded that are no contacts, `dht: <why>`.
+    discarded: Vec<Discarded>,
+    /// The requests the lookup sent.
+    requests: u64,
+    /// The lookup took every provider it asked for, or was not made
+    /// because the contacts fill every place: it may have left some out.
+    full: bool,
+    /// Why the DHT leaves the coverage partial: `dht timeout` or
+    /// `dht unavailable`.
+    partial: Option<&'static str>,
 }
 
 /// What evaluating one candidate cost, and where it got to.
@@ -381,6 +467,7 @@ impl Searcher {
     /// any of them.
     pub async fn search(&self, req: SearchRequest) -> Result<SearchOutcome, SearchError> {
         let _running = self.start()?;
+        let req = self.translated(req);
         Ok(self.run(&req, Instant::now()).await?.outcome)
     }
 
@@ -404,6 +491,7 @@ impl Searcher {
         wait: Duration,
     ) -> Result<(SearchOutcome, Result<Chosen, SearchError>), SearchError> {
         let started = Instant::now();
+        let req = self.translated(req);
         let searched = {
             let _running = self.start()?;
             self.run(&req, started).await?
@@ -413,6 +501,15 @@ impl Searcher {
             .choose(&req, &searched, &question, wait, budget_end)
             .await;
         Ok((searched.outcome, chosen))
+    }
+
+    /// `req` searching the capability its capability is an alias of, when
+    /// it is one: one step, even when that capability is another alias.
+    fn translated(&self, mut req: SearchRequest) -> SearchRequest {
+        if let Some(capability) = self.inner.parts.aliases.get(&req.capability) {
+            req.capability.clone_from(capability);
+        }
+        req
     }
 
     /// A search's place, or [`SearchError::TooManySearches`].
@@ -426,7 +523,25 @@ impl Searcher {
         check(req)?;
         let limits = self.limits();
         let budget_end = started + limits.total_budget;
-        let (entries, limited, mut discarded) = self.entries(req).await?;
+        let (mut entries, mut discarded) = self.entries(req).await?;
+        // Behind the contacts, those the DHT finds; then at most
+        // `max_candidates` of them all.
+        let from_dht = self.looked_up(req, &entries, budget_end).await;
+        let max = limits.max_candidates;
+        let limited = entries.len() + from_dht.found.len() > max || from_dht.full;
+        entries.truncate(max);
+        let FromDht {
+            mut found,
+            discarded: dht_discarded,
+            requests: dht_requests,
+            partial: dht_partial,
+            ..
+        } = from_dht;
+        found.truncate(max - entries.len());
+        discarded.extend(dht_discarded);
+        let (found, regressions) = self.accepted(req, found).await?;
+        discarded.extend(regressions);
+        entries.extend(found);
         let experience = self.experience().await?;
         let evaluations = entries
             .into_iter()
@@ -463,6 +578,7 @@ impl Searcher {
         if limited {
             reasons.push(CANDIDATE_LIMIT.to_owned());
         }
+        reasons.extend(dht_partial.map(str::to_owned));
         if discarded.iter().any(|d| d.reason == TIME_BUDGET) {
             reasons.push(TIME_BUDGET.to_owned());
         }
@@ -482,6 +598,7 @@ impl Searcher {
             .map(|at| millis(at.duration_since(started)));
         metrics.matching_us = u64::try_from(matching.as_micros()).unwrap_or(u64::MAX);
         metrics.elapsed_ms = millis(started.elapsed());
+        metrics.dht_requests = dht_requests;
         Ok(Searched {
             outcome: SearchOutcome {
                 ranked,
@@ -493,17 +610,15 @@ impl Searcher {
         })
     }
 
-    /// The contacts to evaluate, at most `max_candidates` of them, whether
-    /// some were left out, and the names `req.peers` gives that name no
-    /// one, discarded.
+    /// The contacts to evaluate, in their order, and the names `req.peers`
+    /// gives that name no one, discarded.
     async fn entries(
         &self,
         req: &SearchRequest,
-    ) -> Result<(Vec<Entry>, bool, Vec<Discarded>), SearchError> {
+    ) -> Result<(Vec<Entry>, Vec<Discarded>), SearchError> {
         let store = Arc::clone(&self.inner.parts.store);
         let (names, project) = (req.peers.clone(), req.project.clone());
         let now = self.inner.parts.clock.now_unix();
-        let max = self.limits().max_candidates;
         let read = tokio::task::spawn_blocking(move || {
             let mut entries = Vec::new();
             let mut unknown = Vec::new();
@@ -585,9 +700,130 @@ impl Searcher {
                 .cmp(&x.grant_held())
                 .then_with(|| x.name.cmp(&y.name))
         });
-        let limited = entries.len() > max;
-        entries.truncate(max);
-        Ok((entries, limited, unknown))
+        Ok((entries, unknown))
+    }
+
+    /// The providers of `req`'s capability the DHT finds behind
+    /// `contacts`, as the [module](self) says: nothing when the node runs
+    /// no DHT, or the request names its peers or keeps out of the DHT; and
+    /// no lookup when `contacts` fill every place, which may leave some
+    /// out.
+    async fn looked_up(
+        &self,
+        req: &SearchRequest,
+        contacts: &[Entry],
+        budget_end: Instant,
+    ) -> FromDht {
+        let Some(dht) = &self.inner.parts.dht else {
+            return FromDht::default();
+        };
+        if req.peers.is_some() || req.exclude_dht {
+            return FromDht::default();
+        }
+        let limits = self.limits();
+        // With no place left behind the contacts, the lookup would tell the
+        // routers what this agent looks for and wait for them, for
+        // providers that would all be left out.
+        if contacts.len() >= limits.max_candidates {
+            return FromDht {
+                full: true,
+                ..FromDht::default()
+            };
+        }
+        // Room for every candidate, and one more: a lookup that finds them
+        // all may have left some out.
+        let limit = limits.max_candidates.saturating_add(1);
+        let (deadline, _) = cut_at(Instant::now(), limits.per_candidate_timeout, budget_end);
+        let lookup = match dht.providers(&req.capability, limit, deadline).await {
+            Ok(lookup) => lookup,
+            // `Stopped` only while the node stops.
+            Err(error) => {
+                tracing::debug!(%error, "a search found no DHT router");
+                return FromDht {
+                    partial: Some(DHT_UNAVAILABLE),
+                    ..FromDht::default()
+                };
+            }
+        };
+        let DhtLookup {
+            found,
+            discarded,
+            requests,
+            cut,
+        } = lookup;
+        let full = found.len() + discarded.len() >= limit;
+        // Each agent once, and never this one: a contact stays the contact.
+        let known: HashSet<AgentId> = contacts
+            .iter()
+            .filter_map(Entry::agent_id)
+            .chain([*self.inner.parts.store.owner()])
+            .collect();
+        FromDht {
+            found: found
+                .into_iter()
+                .filter(|found| !known.contains(&found.agent_id))
+                .collect(),
+            discarded: discarded
+                .into_iter()
+                .filter(|(agent, _)| !known.contains(agent))
+                .map(|(agent, why)| {
+                    discard(&agent.to_string(), Stage::Card, &format!("dht: {why}"))
+                })
+                .collect(),
+            requests,
+            full,
+            partial: cut.then_some(DHT_TIMEOUT),
+        }
+    }
+
+    /// The providers the DHT `found` that this agent takes as candidates,
+    /// and those it discards: the records of each go through
+    /// [`Store::peer_record_accept`], and one that goes back discards it,
+    /// `record regression`.
+    async fn accepted(
+        &self,
+        req: &SearchRequest,
+        found: Vec<DhtCandidate>,
+    ) -> Result<(Vec<Entry>, Vec<Discarded>), SearchError> {
+        if found.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let store = Arc::clone(&self.inner.parts.store);
+        let project = req.project.clone();
+        let now = self.inner.parts.clock.now_unix();
+        let on_loopback = self.inner.parts.on_loopback;
+        let checked = tokio::task::spawn_blocking(move || {
+            let mut entries = Vec::new();
+            let mut discarded = Vec::new();
+            for found in found {
+                let name = found.agent_id.to_string();
+                if goes_back(&store, &found, now)? {
+                    tracing::warn!(
+                        peer = %found.agent_id,
+                        "a DHT record goes back: candidate discarded"
+                    );
+                    discarded.push(discard(&name, Stage::Card, REGRESSION));
+                    continue;
+                }
+                let addr = contact_addr(&found.contact.doc.iroh, on_loopback);
+                let peer = pals_peer(&store, found.agent_id, addr, &project, now, true)?;
+                entries.push(Entry {
+                    name,
+                    kind: EntryKind::Pals(Box::new(peer)),
+                });
+            }
+            anyhow::Ok((entries, discarded))
+        })
+        .await;
+        match checked {
+            Ok(Ok(checked)) => Ok(checked),
+            Ok(Err(err)) => Err(SearchError::Local(format!(
+                "cannot check the DHT's records: {err:#}"
+            ))),
+            Err(err) => Err(SearchError::Local(format!(
+                "cannot check the DHT's records: {err}"
+            ))),
+        }
     }
 
     /// The questions completed and failed with each peer, by its key.
@@ -673,6 +909,7 @@ impl Searcher {
                     addr,
                     grant,
                     grant_held,
+                    from_dht,
                 } = &**peer;
                 let cards = &self.inner.parts.cards;
                 let (public, size) = cards
@@ -729,6 +966,7 @@ impl Searcher {
                     benchmark: None,
                     experience: experience.get(&id.to_string()).copied().unwrap_or_default(),
                     grant_held: *grant_held,
+                    from_dht: *from_dht,
                 };
                 Ok((candidate, Some(target)))
             }
@@ -761,6 +999,7 @@ impl Searcher {
                     benchmark: None,
                     experience: experience.get(&key).copied().unwrap_or_default(),
                     grant_held: false,
+                    from_dht: false,
                 };
                 Ok((candidate, None))
             }
@@ -1123,11 +1362,7 @@ impl Searcher {
     }
 }
 
-/// The PALS contact `name`, `id` dialed with `ticket`, with the grant this
-/// agent holds of it that serves tasks in `project`, or its newest that
-/// serves tasks when `project` names none. A grant of another project is
-/// never presented: the query would be answered in that project's scope,
-/// which says nothing of this one.
+/// The PALS contact `name`, `id` dialed with `ticket`, as [`pals_peer`].
 fn pals_entry(
     store: &Store,
     name: String,
@@ -1136,6 +1371,27 @@ fn pals_entry(
     project: &Option<String>,
     now_unix: i64,
 ) -> anyhow::Result<Entry> {
+    let addr = peer_addr(&id, ticket.as_deref());
+    let peer = pals_peer(store, id, addr, project, now_unix, false)?;
+    Ok(Entry {
+        name,
+        kind: EntryKind::Pals(Box::new(peer)),
+    })
+}
+
+/// The PALS peer `id`, dialed at `addr`, with the grant this agent holds of
+/// it that serves tasks in `project`, or its newest that serves tasks when
+/// `project` names none; `from_dht` when the DHT found it. A grant of
+/// another project is never presented: the query would be answered in that
+/// project's scope, which says nothing of this one.
+fn pals_peer(
+    store: &Store,
+    id: AgentId,
+    addr: EndpointAddr,
+    project: &Option<String>,
+    now_unix: i64,
+    from_dht: bool,
+) -> anyhow::Result<PalsPeer> {
     let grants: Vec<SignedGrant> = store
         .grants_held_for(&id, now_unix)?
         .into_iter()
@@ -1153,15 +1409,43 @@ fn pals_entry(
         None => grants.first(),
     }
     .cloned();
-    Ok(Entry {
-        name,
-        kind: EntryKind::Pals(Box::new(PalsPeer {
-            id,
-            addr: peer_addr(&id, ticket.as_deref()),
-            grant,
-            grant_held,
-        })),
+    Ok(PalsPeer {
+        id,
+        addr,
+        grant,
+        grant_held,
+        from_dht,
     })
+}
+
+/// Whether a record of `found` goes back from the newest this agent knows
+/// of its agent: each is taken as [`Store::peer_record_accept`] says, as
+/// those of a discovery answer are.
+fn goes_back(store: &Store, found: &DhtCandidate, now_unix: i64) -> anyhow::Result<bool> {
+    // Both verified by the lookup: their expiry reads.
+    let expiry = |at: &str| parse_timestamp(at).unwrap_or(i64::MIN);
+    let (contact, announce) = (&found.contact.doc, &found.announce.doc);
+    let accepted = [
+        store.peer_record_accept(
+            &found.agent_id,
+            CONTACT,
+            contact.seq,
+            &found.contact_json,
+            expiry(&contact.expires_at),
+            now_unix,
+        )?,
+        store.peer_record_accept(
+            &found.agent_id,
+            ANNOUNCE,
+            announce.seq,
+            &found.announce_json,
+            expiry(&announce.expires_at),
+            now_unix,
+        )?,
+    ];
+    Ok(accepted
+        .iter()
+        .any(|accept| matches!(accept, RecordAccept::Regression { .. })))
 }
 
 /// Whether `req` makes a query: its own rules, and at most
@@ -1199,7 +1483,7 @@ fn failure(err: &DiscoveryError, cut: &str) -> String {
         DiscoveryError::TooLarge => "frame too large".to_owned(),
         DiscoveryError::Protocol(_) => "protocol error".to_owned(),
         DiscoveryError::BadRecord(_) => "bad record".to_owned(),
-        DiscoveryError::Regression { .. } => "record regression".to_owned(),
+        DiscoveryError::Regression { .. } => REGRESSION.to_owned(),
         DiscoveryError::Remote(refusal) => format!("refused: {:?}", refusal.code()),
         DiscoveryError::Offer(refused) => format!("offer refused: {refused}"),
         DiscoveryError::Report(why) => format!("report refused: {why}"),

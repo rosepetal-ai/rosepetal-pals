@@ -1,7 +1,7 @@
 //! [`Node`]: one running agent, the A2A server its peers reach over Iroh, the
 //! blobs it serves them, its signed cards and records, what it answers about
-//! itself on `agentnet-discovery/0`, and the local gateway standard A2A
-//! clients reach its peers through.
+//! itself on `agentnet-discovery/0`, its DHT when it is on, and the local
+//! gateway standard A2A clients reach its peers through.
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -20,6 +20,7 @@ use iroh::endpoint::{PortmapperConfig, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, Watcher};
 use iroh_tickets::endpoint::EndpointTicket;
+use libp2p::kad::store::MemoryStoreConfig;
 use pals_core::card_jws::CardSigner;
 use pals_core::clock::{Clock, SystemClock};
 use pals_core::discovery::{ALPN_DISCOVERY, DiscoveryContext, Load, LoadProbe, PUBLIC_CARD};
@@ -37,7 +38,10 @@ use crate::a2a::{
     jsonrpc_shim, rest_shim,
 };
 use crate::blobs::{BLOBS_DIR, BlobService};
-use crate::config::{Config, DataDirLock, WorkerCfg};
+use crate::config::{Config, DataDirLock, DhtMode, WorkerCfg};
+use crate::dht::swarm::STORE_LIMITS;
+use crate::dht::transport::{ALPN_KAD, IrohListener, KadQuotas};
+use crate::dht::{Dht, DhtParts, DhtTiming, PublishedRecords};
 use crate::discovery::{
     ContactSource, DiscoveryClient, DiscoveryHook, DiscoveryLimits, DiscoveryServer, Quotas,
     Records, Searcher, announced_capabilities, iroh_contact, renew_on_change,
@@ -77,8 +81,8 @@ const GATEWAY_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 /// What a node runs with besides its configuration and executor: the clock
 /// its quotas, records, pages, offers and observations follow, the load its
 /// offers report, and, for tests, a hook in its discovery server, other
-/// quotas, other limits for its searches and another time for its inventory
-/// adapter.
+/// quotas, other limits for its searches, another time for its inventory
+/// adapter, and other times, quotas and store limits for its DHT.
 pub struct NodeOptions {
     pub clock: Arc<dyn Clock>,
     /// The worker's load; none for a worker without bounds.
@@ -94,11 +98,20 @@ pub struct NodeOptions {
     /// connection, [`MCP_ADAPTER_TIMEOUT`] by default: for tests, which
     /// give up sooner on a server that hangs, or never.
     pub mcp_adapter_timeout: Duration,
+    /// The DHT's times instead of those of `[dht]` ([`DhtTiming::from_config`]):
+    /// for tests, which make them short.
+    pub dht_timing: Option<DhtTiming>,
+    /// The limits of the DHT's connections and streams.
+    pub kad_quotas: KadQuotas,
+    /// What the DHT's store holds at most, as a router.
+    pub kad_store: MemoryStoreConfig,
 }
 
 impl Default for NodeOptions {
     /// The system's clock, no load, no hook, the default quotas, the
-    /// search limits of the configuration and [`MCP_ADAPTER_TIMEOUT`].
+    /// search limits of the configuration, [`MCP_ADAPTER_TIMEOUT`], the
+    /// DHT's times of the configuration, its default quotas and
+    /// [`STORE_LIMITS`].
     fn default() -> Self {
         Self {
             clock: Arc::new(SystemClock),
@@ -107,6 +120,9 @@ impl Default for NodeOptions {
             quotas: Quotas::default(),
             search_limits: None,
             mcp_adapter_timeout: MCP_ADAPTER_TIMEOUT,
+            dht_timing: None,
+            kad_quotas: KadQuotas::default(),
+            kad_store: STORE_LIMITS,
         }
     }
 }
@@ -115,7 +131,8 @@ impl Default for NodeOptions {
 /// [`ALPN_A2A_HTTP`], its blobs, served on [`iroh_blobs::ALPN`] to the peers
 /// it shared them with, what it answers about itself on [`ALPN_DISCOVERY`]
 /// ([`DiscoveryServer`]), the clients it reaches peers with, and its local
-/// [gateway] on `gateway.listen`.
+/// [gateway] on `gateway.listen`; with `[dht] enabled`, its [`Dht`] too,
+/// served on [`ALPN_KAD`].
 ///
 /// The server is the SDK's, with the signed [public card](CardSet::public)
 /// at `/.well-known/agent-card.json` and the extended card of each request's
@@ -147,6 +164,8 @@ pub struct Node {
     cards: CardSet,
     /// The agent's own contact and announce records, current.
     records: Records,
+    /// The DHT, when `[dht] enabled`.
+    dht: Option<Dht>,
     router: Router,
     gateway: GatewayServer,
     /// Purges old dedup rows, expired pages of peers' views and expired
@@ -181,8 +200,9 @@ impl Node {
     /// progress and removes
     /// their working directories ([`TASKS_DIR`]); frees the dedup keys it
     /// left with no execution behind them, and purges the dedup rows older
-    /// than [`DEDUP_RETENTION_S`], and the expired pages of peers' views and
-    /// offers; logs how many questions of its own
+    /// than [`DEDUP_RETENTION_S`], the expired pages of peers' views and
+    /// offers, and the peers' records it no longer needs
+    /// ([`Store::peer_records_purge`]); logs how many questions of its own
     /// [outbox](Outbox) are still pending, and leaves them for
     /// [`Outbox::resume`]: it never sends them again on its own; binds the
     /// gateway's listener on `gateway.listen`, which must be a loopback
@@ -195,9 +215,16 @@ impl Node {
     /// first run of the inventory adapters, which delays none of it
     /// ([`InventoryState::startup_refresh_done`]). With `net.relay` the
     /// endpoint uses Iroh's N0 preset and its public relays; without it, it
-    /// has no relay and is bound to 127.0.0.1 only. While it runs, the node
-    /// purges the dedup rows, the expired pages of peers' views and the
-    /// expired offers again and renews its records every hour, renews them
+    /// has no relay and is bound to 127.0.0.1 only. With `net.listen`, it is
+    /// bound to that address alone, relay or not. With `[dht] enabled`, it
+    /// starts the DHT on the endpoint before it serves, once its records
+    /// are in force, failing on a bootstrap ticket that is not one or is its
+    /// own ([`Dht::spawn`]), and serves [`ALPN_KAD`] with the rest; with
+    /// `[dht] announce` too, the DHT publishes those records, and again each
+    /// time one is renewed ([`crate::dht::publish`]). While it runs, the node
+    /// purges the dedup rows, the expired pages of peers' views, the
+    /// expired offers and the peers' records it no longer needs again and
+    /// renews its records every hour, renews them
     /// too whenever the endpoint's addresses change, and runs the inventory
     /// adapters every `[inventory] refresh_interval_s`. With the `exec`
     /// worker, its offers report the worker's load
@@ -249,14 +276,26 @@ impl Node {
     }
 
     /// The address peers dial this node at: its id and the direct addresses
-    /// and relay it is reachable on.
+    /// and relay it is reachable on, a DHT router's `[dht] external_addrs`
+    /// among them.
     pub fn addr(&self) -> EndpointAddr {
-        dialable_addr(self.router.endpoint())
+        dialable_addr(self.router.endpoint(), self.external_addrs())
     }
 
-    /// [`Node::addr`] as an Iroh endpoint ticket, to hand to a peer.
+    /// [`Node::addr`] as an Iroh endpoint ticket, to hand to a peer: a DHT
+    /// router's invitation.
     pub fn ticket(&self) -> String {
-        ticket_of(self.router.endpoint())
+        ticket_of(self.router.endpoint(), self.external_addrs())
+    }
+
+    /// The node's DHT, when `[dht] enabled`.
+    pub fn dht(&self) -> Option<&Dht> {
+        self.dht.as_ref()
+    }
+
+    /// A DHT router's `[dht] external_addrs`.
+    fn external_addrs(&self) -> &[SocketAddr] {
+        self.dht.as_ref().map_or(&[], Dht::external_addrs)
     }
 
     /// The URL of the local gateway, from the address it is bound to:
@@ -305,18 +344,18 @@ impl Node {
 
     /// Stops the gateway from accepting requests and ends its MCP sessions,
     /// stops purging and renewing records and running the inventory adapters
-    /// (a server they started is killed), closes the connections to peers,
-    /// stops serving, closes the endpoint, lets the gateway's open
-    /// connections finish for up to `GATEWAY_STOP_TIMEOUT`, stops the blob
-    /// service, and only then lets go of the store and, last, of the data
-    /// directory's lock.
+    /// (a server they started is killed), stops the DHT, closes the
+    /// connections to peers, stops serving, closes the endpoint, lets the
+    /// gateway's open connections finish for up to `GATEWAY_STOP_TIMEOUT`,
+    /// stops the blob service, and only then lets go of the store and, last,
+    /// of the data directory's lock.
     ///
     /// Every task of the node's own (the purge, the record renewal, the
-    /// gateway, the blob provider's authorizer) is over when it returns, so
-    /// the store is closed then unless an execution still running or a
-    /// connection still being torn down holds it: a node started on the same
-    /// data directory in the same process opens the database alone once
-    /// those are gone too.
+    /// gateway, the blob provider's authorizer, the DHT) is over when it
+    /// returns, so the store is closed then unless an execution still
+    /// running or a connection still being torn down holds it: a node
+    /// started on the same data directory in the same process opens the
+    /// database alone once those are gone too.
     pub async fn shutdown(self) -> anyhow::Result<()> {
         let Node {
             id: _,
@@ -329,6 +368,7 @@ impl Node {
             inventory,
             cards,
             records,
+            dht,
             router,
             gateway,
             dedup_purge,
@@ -351,6 +391,9 @@ impl Node {
         records_renewal.stop().await;
         address_renewal.stop().await;
         inventory_refresh.stop().await;
+        if let Some(dht) = &dht {
+            dht.shutdown().await;
+        }
         peer_http.close_all().await;
         discovery.close_all().await;
         let stopped = router
@@ -366,7 +409,7 @@ impl Node {
         }
         blobs.shutdown().await;
         drop((
-            searcher, outbox, blobs, peer_http, discovery, inventory, cards, records,
+            searcher, outbox, blobs, peer_http, discovery, inventory, cards, records, dht,
         ));
         tracing::debug!(
             handles = Arc::strong_count(&store),
@@ -390,6 +433,8 @@ struct Opened {
     gateway_addr: SocketAddr,
     endpoint: Endpoint,
     blobs: BlobService,
+    /// The DHT, running, and the handler of [`ALPN_KAD`] to serve.
+    dht: Option<(Dht, IrohListener)>,
 }
 
 impl Opened {
@@ -448,6 +493,8 @@ impl Opened {
                 purge_inventory_cache(&store, started)
                     .context("cannot purge the expired pages of peers' views")?;
                 purge_offers(&store, started).context("cannot purge the expired offers")?;
+                purge_peer_records(&store, started)
+                    .context("cannot purge the peers' forgotten records")?;
                 let pending = store
                     .outbox_pending()
                     .context("cannot read the outbox")?
@@ -484,8 +531,9 @@ impl Opened {
         let records = {
             let id = key.id();
             let dialed = endpoint.clone();
+            let external = router_external_addrs(cfg);
             let contact_source: ContactSource =
-                Arc::new(move || iroh_contact(id, &dialable_addr(&dialed)));
+                Arc::new(move || iroh_contact(id, &dialable_addr(&dialed, &external)));
             let (key, store) = (Arc::clone(&key), Arc::clone(&store));
             let card_hash = cards.public().hash.clone();
             let now = opts.clock.now_unix();
@@ -494,6 +542,29 @@ impl Opened {
             })
             .await?
             .context("cannot issue this agent's signed records")?
+        };
+        let dht = if cfg.dht.enabled {
+            let parts = DhtParts {
+                endpoint: endpoint.clone(),
+                key: Arc::clone(&key),
+                cfg: cfg.dht.clone(),
+                timing: opts
+                    .dht_timing
+                    .unwrap_or_else(|| DhtTiming::from_config(&cfg.dht)),
+                quotas: opts.kad_quotas,
+                store_limits: opts.kad_store.clone(),
+                clock: Arc::clone(&opts.clock),
+                store: Arc::clone(&store),
+                // Only the public capabilities, which the records list
+                // (H3-D4); nothing at all without `announce`.
+                published: cfg
+                    .dht
+                    .announce
+                    .then(|| Arc::new(records.clone()) as Arc<dyn PublishedRecords>),
+            };
+            Some(Dht::spawn(parts).context("cannot start the DHT")?)
+        } else {
+            None
         };
         Ok(Self {
             lock,
@@ -506,6 +577,7 @@ impl Opened {
             gateway_addr,
             endpoint,
             blobs,
+            dht,
         })
     }
 
@@ -523,6 +595,7 @@ impl Opened {
             gateway_addr,
             endpoint,
             blobs,
+            dht,
         } = self;
         let id = key.id();
         let limits = TunnelLimits {
@@ -535,8 +608,11 @@ impl Opened {
             discovery_hook,
             quotas,
             search_limits,
-            // The inventory's adapter has it already.
+            // The inventory's adapter and the DHT have them already.
             mcp_adapter_timeout: _,
+            dht_timing: _,
+            kad_quotas: _,
+            kad_store: _,
         } = opts;
         let offers = OfferCheck {
             cards: cards.clone(),
@@ -555,8 +631,12 @@ impl Opened {
         let router = Router::builder(endpoint.clone())
             .accept(ALPN_A2A_HTTP, TunnelServer::new(app, limits))
             .accept(iroh_blobs::ALPN, blobs.protocol())
-            .accept(ALPN_DISCOVERY, discovery_server)
-            .spawn();
+            .accept(ALPN_DISCOVERY, discovery_server);
+        let (router, dht) = match dht {
+            Some((dht, listener)) => (router.accept(ALPN_KAD, listener), Some(dht)),
+            None => (router, None),
+        };
+        let router = router.spawn();
         let peer_http = PeerHttp::new(endpoint.clone());
         let discovery = DiscoveryClient::new(endpoint.clone(), Arc::clone(&store))
             .with_clock(Arc::clone(&clock));
@@ -586,6 +666,8 @@ impl Opened {
                 inventory: inventory.clone(),
                 data_dir: cfg.data_dir.clone(),
                 download_dir: cfg.mcp.download_dir.clone(),
+                dht: dht.clone(),
+                aliases: cfg.discovery.aliases.clone(),
             },
             gateway_addr,
         );
@@ -611,6 +693,7 @@ impl Opened {
             inventory,
             cards,
             records,
+            dht,
             router,
             gateway,
             dedup_purge,
@@ -664,9 +747,11 @@ fn discovery_context(
     }
 }
 
-/// The address peers dial `endpoint` at: its id and the direct addresses and
-/// relay it is reachable on.
-fn dialable_addr(endpoint: &Endpoint) -> EndpointAddr {
+/// The address peers dial `endpoint` at: its id, the direct addresses and
+/// relay it is reachable on, and `external`, a DHT router's
+/// `[dht] external_addrs`. Never an unspecified socket: one the endpoint is
+/// bound to (`listen = "0.0.0.0:<port>"`) is left out.
+pub(crate) fn dialable_addr(endpoint: &Endpoint, external: &[SocketAddr]) -> EndpointAddr {
     let mut addr = endpoint.addr();
     // The bound sockets are dialable when the endpoint is bound to a
     // specific address, as without a relay.
@@ -675,12 +760,25 @@ fn dialable_addr(endpoint: &Endpoint) -> EndpointAddr {
             addr = addr.with_ip_addr(socket);
         }
     }
+    for socket in external {
+        addr = addr.with_ip_addr(*socket);
+    }
     addr
 }
 
 /// [`dialable_addr`] as an Iroh endpoint ticket, to hand to a peer.
-pub(crate) fn ticket_of(endpoint: &Endpoint) -> String {
-    EndpointTicket::new(dialable_addr(endpoint)).to_string()
+pub(crate) fn ticket_of(endpoint: &Endpoint, external: &[SocketAddr]) -> String {
+    EndpointTicket::new(dialable_addr(endpoint, external)).to_string()
+}
+
+/// The `[dht] external_addrs` of a node that runs the DHT as a router: what
+/// its address carries besides its own; none otherwise.
+fn router_external_addrs(cfg: &Config) -> Vec<SocketAddr> {
+    if cfg.dht.enabled && cfg.dht.mode == DhtMode::Router {
+        cfg.dht.external_addrs.clone()
+    } else {
+        Vec::new()
+    }
 }
 
 /// The gateway's HTTP server, running on its own task.
@@ -764,9 +862,20 @@ fn purge_offers(store: &Store, now_unix: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// [`purge_dedup`], and [`purge_inventory_cache`] and [`purge_offers`] at
-/// `clock`'s time, every [`DEDUP_PURGE_INTERVAL`], for as long as it runs. A
-/// failed purge is logged, and the next one tries again.
+/// Deletes the records of peers that count as none any more at `now_unix`
+/// ([`Store::peer_records_purge`]).
+fn purge_peer_records(store: &Store, now_unix: i64) -> anyhow::Result<()> {
+    let purged = store.peer_records_purge(now_unix)?;
+    if purged > 0 {
+        tracing::debug!(purged, "purged peers' forgotten records");
+    }
+    Ok(())
+}
+
+/// [`purge_dedup`], and [`purge_inventory_cache`], [`purge_offers`] and
+/// [`purge_peer_records`] at `clock`'s time, every
+/// [`DEDUP_PURGE_INTERVAL`], for as long as it runs. A failed purge is
+/// logged, and the next one tries again.
 async fn purge_hourly(store: Arc<Store>, clock: Arc<dyn Clock>) {
     let start = tokio::time::Instant::now() + DEDUP_PURGE_INTERVAL;
     let mut ticks = tokio::time::interval_at(start, DEDUP_PURGE_INTERVAL);
@@ -779,7 +888,8 @@ async fn purge_hourly(store: Arc<Store>, clock: Arc<dyn Clock>) {
             purge_dedup(&store).context("cannot purge the old dedup rows")?;
             purge_inventory_cache(&store, now)
                 .context("cannot purge the expired pages of peers' views")?;
-            purge_offers(&store, now).context("cannot purge the expired offers")
+            purge_offers(&store, now).context("cannot purge the expired offers")?;
+            purge_peer_records(&store, now).context("cannot purge the peers' forgotten records")
         })
         .await;
         match purged {
@@ -831,26 +941,36 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// The agent's Iroh endpoint, with the agent's key as its identity.
+/// The agent's Iroh endpoint, with the agent's key as its identity: bound
+/// to `net.listen` alone when it is set, with the relay or without it;
+/// otherwise as in milestone 2, the N0 preset's sockets with the relay and
+/// a free port of 127.0.0.1 without it.
 async fn bind_endpoint(cfg: &Config, key: &AgentKey) -> anyhow::Result<Endpoint> {
     let secret_key = SecretKey::from_bytes(&key.to_bytes());
-    let endpoint = if cfg.net.relay {
-        Endpoint::builder(presets::N0)
-            .secret_key(secret_key)
-            .bind()
-            .await
+    let builder = if cfg.net.relay {
+        Endpoint::builder(presets::N0).secret_key(secret_key)
     } else {
         Endpoint::builder(presets::Minimal)
             .secret_key(secret_key)
             .relay_mode(RelayMode::Disabled)
             .portmapper_config(PortmapperConfig::Disabled)
-            .clear_ip_transports()
-            .bind_addr((Ipv4Addr::LOCALHOST, 0))
-            .context("invalid bind address")?
-            .bind()
-            .await
     };
-    endpoint.context("cannot bind the Iroh endpoint")
+    let bind_addr = match cfg.net.listen {
+        Some(listen) => Some(listen),
+        None if !cfg.net.relay => Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        None => None,
+    };
+    let builder = match bind_addr {
+        Some(addr) => builder
+            .clear_ip_transports()
+            .bind_addr(addr)
+            .with_context(|| format!("invalid bind address {addr}"))?,
+        None => builder,
+    };
+    builder
+        .bind()
+        .await
+        .context("cannot bind the Iroh endpoint")
 }
 
 /// The A2A server the node serves to its peers, checking again with
