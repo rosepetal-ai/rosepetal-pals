@@ -582,6 +582,47 @@ async fn places_the_dht_cannot_fill_go_back_to_the_contacts() {
 }
 
 #[tokio::test]
+async fn the_dht_takes_its_kept_places_and_no_more_behind_enough_contacts() {
+    let net = network(NodeOptions::default()).await;
+    // Three places, one kept for the DHT, and two contacts that offer
+    // nothing: the DHT has P1 and P2, but its one place takes only the one
+    // that arrives first; the other is left out.
+    let a = requester(&net, places(3, 1), |_| {}).await;
+    a.add_contact("r1", &net.r1);
+    a.add_contact("r2", &net.r2);
+
+    let outcome = a.node.searcher().search(request()).await.unwrap();
+    let from_dht: Vec<&Candidate> = outcome.ranked.iter().filter(|c| c.from_dht).collect();
+    assert_eq!(from_dht.len(), 1, "{outcome:#?}");
+    assert!(
+        [net.p1.id(), net.p2.id()]
+            .map(Some)
+            .contains(&from_dht[0].agent_id),
+        "{outcome:#?}"
+    );
+    assert_eq!(evaluated(&outcome, &["r1", "r2"]), ["r1", "r2"]);
+    assert_eq!(outcome.metrics.contacted, 3, "{outcome:#?}");
+    partial(&outcome, &["candidate limit"]);
+}
+
+#[tokio::test]
+async fn behind_few_contacts_the_dht_takes_more_than_its_kept_places() {
+    let net = network(NodeOptions::default()).await;
+    // Three places, one kept for the DHT, and one contact: the DHT may take
+    // two, and its lookup asks for three, so finding P1 and P2 leaves no
+    // one out.
+    let a = requester(&net, places(3, 1), |_| {}).await;
+    a.add_contact("r1", &net.r1);
+
+    let outcome = a.node.searcher().search(request()).await.unwrap();
+    assert!(ranked_as(&outcome, net.p1.id()).from_dht, "{outcome:#?}");
+    assert!(ranked_as(&outcome, net.p2.id()).from_dht, "{outcome:#?}");
+    assert_eq!(evaluated(&outcome, &["r1"]), ["r1"]);
+    assert_eq!(outcome.metrics.contacted, 3, "{outcome:#?}");
+    assert_eq!(outcome.coverage, Coverage::Complete, "{outcome:#?}");
+}
+
+#[tokio::test]
 async fn a_lookup_leaves_out_the_agents_it_is_told_it_knows() {
     let net = network(NodeOptions::default()).await;
     let a = plain_requester(&net).await;
