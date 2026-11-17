@@ -12,14 +12,18 @@
 //!   of its head, `408`.
 //!
 //! An agent's id is its endpoint's id ([`agent_id_of`], [`endpoint_id_of`]);
-//! [`peer_addr`] is where to dial one.
+//! [`peer_addr`] is where to dial one from its ticket, and [`contact_addr`]
+//! from its signed contact record.
 
 mod tunnel_client;
 mod tunnel_server;
 
-use iroh::{EndpointAddr, EndpointId};
+use std::net::SocketAddr;
+
+use iroh::{EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use iroh_tickets::endpoint::EndpointTicket;
 use pals_core::identity::AgentId;
+use pals_core::records::IrohContact;
 
 pub use tunnel_client::{PeerHttp, TunnelError};
 pub use tunnel_server::{TunnelLimits, TunnelServer};
@@ -77,9 +81,27 @@ pub fn peer_addr(id: &AgentId, ticket: Option<&str>) -> EndpointAddr {
     EndpointAddr::from_parts(endpoint_id, addrs)
 }
 
+/// Where to dial the endpoint of `contact`, an agent's contact record:
+/// its direct addresses and its relay, each that reads as one. The record
+/// is verified before: its endpoint is its agent's own, and the
+/// connection's handshake proves it.
+pub fn contact_addr(contact: &IrohContact) -> EndpointAddr {
+    let direct = contact
+        .direct_addrs
+        .iter()
+        .filter_map(|addr| addr.parse::<SocketAddr>().ok())
+        .map(TransportAddr::Ip);
+    let relay = contact
+        .relay_url
+        .as_deref()
+        .and_then(|url| url.parse::<RelayUrl>().ok())
+        .map(TransportAddr::Relay);
+    EndpointAddr::from_parts(endpoint_id_of(&contact.endpoint_id), direct.chain(relay))
+}
+
 #[cfg(test)]
 mod tests {
-    use iroh::{SecretKey, TransportAddr};
+    use iroh::SecretKey;
     use pals_core::identity::AgentKey;
 
     use super::*;
@@ -112,5 +134,36 @@ mod tests {
             EndpointTicket::new(EndpointAddr::new(endpoint_id_of(&other)).with_ip_addr(socket))
                 .to_string();
         assert_eq!(peer_addr(&id, Some(&other_ticket)), bare);
+    }
+
+    #[test]
+    fn contact_addr_takes_the_direct_addresses_and_the_relay() {
+        let id = AgentKey::generate().id();
+        let contact = IrohContact {
+            endpoint_id: id,
+            relay_url: Some("https://relay.example.org./".to_owned()),
+            direct_addrs: vec![
+                "192.0.2.10:4433".to_owned(),
+                "[2001:db8::10]:4433".to_owned(),
+            ],
+        };
+        let addr = contact_addr(&contact);
+        assert_eq!(addr.id, endpoint_id_of(&id));
+        let relay: RelayUrl = "https://relay.example.org./".parse().unwrap();
+        assert_eq!(
+            addr.addrs,
+            [
+                TransportAddr::Ip("192.0.2.10:4433".parse().unwrap()),
+                TransportAddr::Ip("[2001:db8::10]:4433".parse().unwrap()),
+                TransportAddr::Relay(relay),
+            ]
+            .into()
+        );
+        let bare = IrohContact {
+            relay_url: None,
+            direct_addrs: Vec::new(),
+            ..contact
+        };
+        assert_eq!(contact_addr(&bare), EndpointAddr::new(endpoint_id_of(&id)));
     }
 }

@@ -1171,6 +1171,7 @@ async fn discover_and_inventory_descriptions_warn_about_untrusted_content() {
         properties,
         BTreeSet::from([
             "capability",
+            "exclude_dht",
             "input_media_types",
             "output_media_types",
             "peers",

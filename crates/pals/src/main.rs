@@ -118,8 +118,10 @@ enum Command {
     /// running daemon's gateway: verify their cards, ask the PALS peers for
     /// offers over agentnet-discovery/0, within the limits of [discovery],
     /// and print the ranking, with the id and expiry of each offer, the
-    /// candidates discarded and why, the coverage and the metrics.
-    /// Searching runs nothing on any peer. With
+    /// candidates discarded and why, the coverage and the metrics. With the
+    /// DHT on, it also looks there for providers that are no contacts,
+    /// unless --peer or --no-dht: the routers it asks see which agent looks
+    /// for which capability. Searching runs nothing on any peer. With
     /// --ask, the question goes to the best candidate that takes it, with
     /// its offer, and the command exits as `pals ask` does
     Discover {
@@ -143,9 +145,13 @@ enum Command {
         #[arg(long)]
         project: Option<String>,
         /// A contact to search among, by name or agent id; repeat for more
-        /// [default: every contact]
+        /// [default: every contact]. A search that names some never looks
+        /// in the DHT
         #[arg(long = "peer", value_name = "PEER")]
         peers: Vec<String>,
+        /// Search only the contacts, never the DHT
+        #[arg(long)]
+        no_dht: bool,
         /// Ask the best candidate that takes it this question
         #[arg(long, value_name = "QUESTION")]
         ask: Option<String>,
@@ -438,6 +444,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             requirements_file,
             project,
             peers,
+            no_dht,
             ask,
             wait,
         } => {
@@ -450,6 +457,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     project,
                 },
                 peers,
+                no_dht,
             };
             return discover(&home, search, ask, &wait);
         }
@@ -1110,6 +1118,8 @@ fn read_requirements(path: Option<&Path>) -> anyhow::Result<Requirements> {
 struct Searched {
     asked: Asked,
     peers: Vec<String>,
+    /// Only among the contacts, never in the DHT.
+    no_dht: bool,
 }
 
 /// The longest answer of the gateway to a search.
@@ -1125,7 +1135,11 @@ fn discover(
     wait: &str,
 ) -> anyhow::Result<ExitCode> {
     let wait = parse_wait(wait)?;
-    let Searched { asked, peers } = searched;
+    let Searched {
+        asked,
+        peers,
+        no_dht,
+    } = searched;
     let search = SearchRequest {
         requirements: read_requirements(asked.requirements_file.as_deref())?,
         capability: asked.capability,
@@ -1133,6 +1147,7 @@ fn discover(
         output_media_types: asked.outputs,
         project: asked.project,
         peers: (!peers.is_empty()).then_some(peers),
+        exclude_dht: no_dht,
         ..SearchRequest::default()
     };
     let (cfg, key) = load_agent(home)?;
@@ -1188,8 +1203,9 @@ fn discover(
 }
 
 /// Prints a search's ranking, its discards with why, its coverage and its
-/// metrics, one line each; a candidate that made an offer ends its line
-/// with `, offer <offer id> until <expires_at>`, the id `pals ask --offer`
+/// metrics, one line each; one the DHT found says `, found in the DHT`
+/// after its grant, and one that made an offer ends its line with
+/// `, offer <offer id> until <expires_at>`, the id `pals ask --offer`
 /// takes. What a peer named is printed as printable ASCII.
 fn print_search(outcome: &SearchOutcome) {
     println!("ranked:");
@@ -1222,6 +1238,11 @@ fn print_search(outcome: &SearchOutcome) {
             (Some(_), true) => "grant held",
             (Some(_), false) => "no grant held",
         };
+        let found = if candidate.from_dht {
+            ", found in the DHT"
+        } else {
+            ""
+        };
         let offer = candidate.offer.as_ref().map_or_else(String::new, |offer| {
             format!(
                 ", offer {} until {}",
@@ -1231,7 +1252,7 @@ fn print_search(outcome: &SearchOutcome) {
         });
         println!(
             "  {}. {} ({who}): {status}, skill {}, time {time}, preferred met {}, benchmark \
-             {benchmark}, completed {} failed {}, {grant}, card {}{offer}",
+             {benchmark}, completed {} failed {}, {grant}{found}, card {}{offer}",
             n + 1,
             shown(&candidate.peer),
             shown(candidate.skill_id.as_deref().unwrap_or("-")),

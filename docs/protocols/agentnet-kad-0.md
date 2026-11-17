@@ -156,7 +156,7 @@ Sin `listen`, todo queda como en el hito 2: con relay, los puertos libres del pr
 
 ## 6. Lo que guarda un router
 
-El código es `crates/pals/src/dht/validate.rs`, y sus pruebas, `crates/pals/tests/dht_validate.rs`. Un router comprueba cada `PutRecord` y cada `AddProvider` que recibe antes de que llegue a su tienda (`StoreInserts::FilterBoth` de `libp2p-kad`). Quien busca lee con las mismas comprobaciones los contactos y los anuncios que recibe. Cada registro tiene uno de tres resultados:
+El código es `crates/pals/src/dht/validate.rs`, y sus pruebas, `crates/pals/tests/dht_validate.rs`. Un router comprueba cada `PutRecord` y cada `AddProvider` que recibe antes de que llegue a su tienda (`StoreInserts::FilterBoth` de `libp2p-kad`). Quien busca lee los contactos y los anuncios que recibe con las comprobaciones de los valores, el tamaño de la regla 1 y la regla 2, al `Clock` del nodo, y de varias copias de un registro se queda con la válida de mayor `seq` (sección 8). La búsqueda de servicios compara después el contacto y el anuncio de cada proveedor que encontró con los más nuevos que conoce de ese agente, como los de una respuesta de `agentnet-discovery/0` (`Store::peer_record_accept`): uno que vuelve atrás descarta al proveedor, con el motivo `record regression`. Cada registro tiene en un router uno de tres resultados:
 
 | Resultado | Qué hace el router |
 |-|-|

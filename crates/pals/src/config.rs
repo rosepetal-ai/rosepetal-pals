@@ -15,6 +15,7 @@ use anyhow::{Context, bail};
 use iroh_tickets::endpoint::EndpointTicket;
 use pals_core::discovery::MAX_OFFER_VALID_FOR_MS;
 use pals_core::identity::AgentId;
+use pals_core::inventory::capability_tag;
 use serde::{Deserialize, Serialize};
 
 use crate::net::agent_id_of;
@@ -119,13 +120,21 @@ max_candidates = 8
 max_concurrent_queries = 3
 per_candidate_timeout_ms = 3000
 total_budget_ms = 15000
+# Other names a search may give a capability: with this one, `pals
+# discover --capability ocr` searches vision.ocr. One step: what an alias
+# names is searched as it is, even when it is another alias. Each names a
+# capability; at most 256.
+# [discovery.aliases]
+# ocr = "vision.ocr"
 
 # The DHT (agentnet-kad/0): a private Kademlia network over this agent's
 # own Iroh endpoint, where it finds the providers of a capability it has no
 # contact with. Off by default, and with no bootstrap points: nothing is
 # dialed or served for it until `enabled = true`. Every lookup in the DHT
 # tells the routers it asks which agent looks for which capability: the
-# connection is authenticated with this agent's own key.
+# connection is authenticated with this agent's own key. A search (`pals
+# discover`) looks there too, behind the contacts, unless it names its
+# peers or says --no-dht.
 # [dht]
 # enabled = true
 # "client" (the default) only dials out, to the routers. "router" also
@@ -576,6 +585,10 @@ pub struct DiscoveryCfg {
     /// How long a search takes at most, from 1 to
     /// [`MAX_TOTAL_BUDGET_MS`].
     pub total_budget_ms: u64,
+    /// `[discovery.aliases]`: another name a search may give a capability,
+    /// and the capability it searches, one step. At most [`MAX_ALIASES`],
+    /// each naming a capability (`capability_tag`).
+    pub aliases: BTreeMap<String, String>,
 }
 
 /// The most candidates a search may be configured to contact.
@@ -586,6 +599,8 @@ pub const MAX_CONCURRENT_QUERIES: usize = 8;
 pub const MAX_PER_CANDIDATE_TIMEOUT_MS: u64 = 10_000;
 /// The longest a search may be configured to take.
 pub const MAX_TOTAL_BUDGET_MS: u64 = 60_000;
+/// The most aliases of capabilities that may be configured.
+pub const MAX_ALIASES: usize = 256;
 
 impl Default for DiscoveryCfg {
     /// The public view, offers valid 15 s, as the example of design §7.2,
@@ -599,6 +614,7 @@ impl Default for DiscoveryCfg {
             max_concurrent_queries: 3,
             per_candidate_timeout_ms: 3000,
             total_budget_ms: 15_000,
+            aliases: BTreeMap::new(),
         }
     }
 }
@@ -820,6 +836,24 @@ impl Config {
         {
             bail!(
                 "invalid {}: discovery.{name} must be from 1 to {max}",
+                path.display()
+            );
+        }
+        if discovery.aliases.len() > MAX_ALIASES {
+            bail!(
+                "invalid {}: discovery.aliases has {} aliases, at most {MAX_ALIASES}",
+                path.display(),
+                discovery.aliases.len()
+            );
+        }
+        if let Some((alias, capability)) = discovery
+            .aliases
+            .iter()
+            .find(|(_, capability)| capability_tag(capability).is_err())
+        {
+            bail!(
+                "invalid {}: discovery.aliases: {alias:?} names {capability:?}, which is no \
+                 capability: a common-vocabulary id, such as vision.ocr, or <namespace>:<name>",
                 path.display()
             );
         }

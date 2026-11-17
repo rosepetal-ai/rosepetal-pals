@@ -2,8 +2,11 @@
 //! (`docs/protocols/agentnet-kad-0.md`, section 6): pure validators that
 //! the swarm runs on every inbound `PutRecord` and `AddProvider`
 //! (`StoreInserts::FilterBoth`) before anything reaches its store. A
-//! searcher reads the contacts and announces it gets with [`contact_for`]
-//! and [`announce_for`].
+//! lookup (`Dht::providers`) reads the contacts and announces it gets with
+//! [`contact_for`] and [`announce_for`], and keeps the valid copy of
+//! highest `seq`; the service search then compares each provider's with the
+//! newest this agent knows of that agent (`Store::peer_record_accept`), as
+//! a discovery answer's, and discards one that goes back.
 //!
 //! A value, in this order, the first failure winning:
 //! 1. its key is [`slot`]'s, a contact's or an announce's

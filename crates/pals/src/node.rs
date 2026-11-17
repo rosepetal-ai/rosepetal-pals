@@ -663,6 +663,7 @@ impl Opened {
                 data_dir: cfg.data_dir.clone(),
                 download_dir: cfg.mcp.download_dir.clone(),
                 dht: dht.clone(),
+                aliases: cfg.discovery.aliases.clone(),
             },
             gateway_addr,
         );
