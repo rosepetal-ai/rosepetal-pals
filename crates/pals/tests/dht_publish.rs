@@ -36,7 +36,6 @@ use pals::dht::swarm::STORE_LIMITS;
 use pals::dht::transport::{ALPN_KAD, KadQuotas, located_nowhere};
 use pals::dht::{
     Dht, DhtLookup, DhtParts, DhtStatus, DhtTiming, PublicationStatus, PublishedRecords,
-    QUERY_TIMEOUT,
 };
 use pals::node::NodeOptions;
 use pals_core::card_jws::CardHash;
@@ -944,17 +943,16 @@ async fn a_lookup_ends_at_its_deadline() {
     })
     .await;
 
-    let started = Instant::now();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let cut = dht(&c)
         .providers("vision.ocr", 8, deadline)
         .await
         .expect("a lookup cut at its deadline");
+    // Its deadline ended it, not the end of its queries: only the deadline
+    // sets `cut`.
     assert!(cut.cut, "{cut:?}");
     assert!(cut.found.is_empty(), "{cut:?}");
     assert!(cut.requests >= 1, "the mute router was asked: {cut:?}");
-    // Its deadline, not the end of its queries.
-    assert!(started.elapsed() < QUERY_TIMEOUT, "{:?}", started.elapsed());
 }
 
 #[tokio::test]

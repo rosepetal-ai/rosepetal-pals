@@ -708,6 +708,40 @@ async fn dht_without_routers_leaves_the_contacts_search_intact() {
 }
 
 #[tokio::test]
+async fn dht_without_routers_within_the_default_limits_still_ranks_the_contacts() {
+    // As above, with the limits a search has by default: 3 s per
+    // candidate, which the lookup takes too.
+    let net = network(NodeOptions::default()).await;
+    let defaults = NodeOptions {
+        search_limits: Some(DiscoveryLimits::default()),
+        ..NodeOptions::default()
+    };
+    let a = requester(&net, defaults, |_| {}).await;
+    a.add_contact("p2", &net.p2);
+    let Net { r1, r2, p2, .. } = net;
+    let TestNode { node: r1_node, .. } = r1;
+    let TestNode { node: r2_node, .. } = r2;
+    shut_down(r1_node).await;
+    shut_down(r2_node).await;
+
+    // The contact is ranked; the lookup, at routers that are down, either
+    // ends with none answering or is cut at its time: the coverage says
+    // which, whatever time it took.
+    let outcome = a.node.searcher().search(request()).await.unwrap();
+    let ranked: Vec<&str> = outcome.ranked.iter().map(|c| c.peer.as_str()).collect();
+    assert_eq!(ranked, ["p2"], "{outcome:#?}");
+    assert_eq!(outcome.ranked[0].agent_id, Some(p2.id()));
+    let Coverage::Partial { reasons } = &outcome.coverage else {
+        panic!("a complete coverage without the DHT: {outcome:#?}");
+    };
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        ["dht unavailable", "dht timeout"].contains(&reasons[0].as_str()),
+        "{reasons:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_tampered_card_is_discarded_even_with_a_valid_dht_announce() {
     let net = network(NodeOptions::default()).await;
     let a = plain_requester(&net).await;
