@@ -194,7 +194,7 @@ Tras las 160 búsquedas se cuentan además las líneas del registro de cada rout
   - `a saved contact is a DHT router: entering through it peer=<PeerId de r3>`.
 - **Sus búsquedas:** los dos proveedores de cada capacidad, como en el caso 2. `r3`, su contacto, sale además entre sus descartes en la card (`no skill of <capacidad>`): es un router, sin servicios. Basta con que cada capacidad salga así en alguna de sus búsquedas.
 
-Se anota cuánto tarda desde que arranca. Mientras `r1` está parado, en cada búsqueda de `c5` se lee el estado de los proveedores: ninguna de sus vueltas de publicación puede terminar con error.
+Se anota cuánto tarda desde que arranca. Mientras `r1` está parado, en cada búsqueda de `c5` se lee el estado de los proveedores, y después hasta que cada uno muestra una vuelta terminada con `r1` parado, como mucho 300 s. Cuentan solo las vueltas que terminaron después de pararlo (`last_round_unix`): cada proveedor tiene que terminar así al menos una, y ninguna puede terminar con error.
 
 ### Caso 4. Caducar anuncios
 
@@ -224,7 +224,7 @@ El límite sale de la última vuelta de `p1`: como mucho `republish_s` antes de 
 - la cobertura completa otra vez antes de 80 s desde que se pararon;
 - la ronda de la renovación, también con cobertura completa.
 
-Se anotan las etiquetas de cobertura que aparecen (`dht timeout` o `dht unavailable`, por los routers parados) y las vueltas de publicación de los proveedores, con sus errores si los hay.
+Se anotan las etiquetas de cobertura que aparecen (`dht timeout` o `dht unavailable`, por los routers parados) y las vueltas de publicación de los proveedores que terminaron después de pararlos, con sus errores si los hay.
 
 La comprobación de la renovación no está en la tabla del plan. Sin ella, el caso pasaría siempre en la primera ronda, porque los routers que quedan guardan todavía lo de antes, como pasó en la fase 1 (cobertura inmediata 1, recuperación 0 s). La renovación es lo que dice el título del caso. Sin ella, el caso no habría visto el fallo del daemon que encontraron los ensayos: con un router caído, las vueltas de publicación de los proveedores fallaban y sus registros caducaban en la DHT ([`exit-test.md`](../conformance/hito-3/exit-test.md#correcciones-antes-de-esta-ejecución)).
 

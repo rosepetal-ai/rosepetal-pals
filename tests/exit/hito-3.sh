@@ -380,6 +380,10 @@ busca() {
     docker exec "$(ctr "$1")" python3 "$H/metricas.py" busca "$2" "$3" > "$LOGS/busquedas/$2.json" \
         2>> "$LOGS/busquedas/errores.txt"
 }
+# limpia CASE: the searches a run of CASE before this one kept
+# (registro/busquedas/CASE-* and CASEb-*) go, so that a case run again in
+# the same PALS_EXIT_DIR judges only its own.
+limpia() { rm -f -- "$LOGS/busquedas/$1"-* "$LOGS/busquedas/$1"[a-z]-*; }
 # ronda TAG "X…" "CAPABILITY…": every X searches every capability, one
 # after another; the X at the same time. Searches named TAG-X-CAPABILITY.
 ronda() {
@@ -572,15 +576,17 @@ def coverage(o):
     return "complete" if c == "complete" else "partial (" + ", ".join(c["partial"]["reasons"]) + ")"
 
 
-def rounds_seen(prefix):
+def rounds_seen(prefix, after):
     """Of each provider, the rounds of publication its samples tagged
-    `prefix…` show, each once: when it ended, its error and what failed."""
+    `prefix…` show that ended after `after` (Unix seconds), each once: when
+    it ended, its error and what failed. A round that ended before is no
+    round of what came after: its samples only show the last one."""
     out = {}
     for l in lines(LOGS / "estados.jsonl"):
         if not l["etiqueta"].startswith(prefix) or not dht(l["muestra"]):
             continue
         pub = dht(l["muestra"]).get("publication")
-        if pub and pub.get("last_round_unix"):
+        if pub and pub.get("last_round_unix") and pub["last_round_unix"] > after:
             seen = out.setdefault(l["nodo"], {})
             seen[pub["last_round_unix"]] = (pub.get("last_error"), pub.get("failed_capabilities"))
     return {node: [(t, *v) for t, v in sorted(r.items())] for node, r in sorted(out.items())}
@@ -754,6 +760,7 @@ sys.exit(1 if bad else 0)' "$SUBNET_A" "$SUBNET_B") \
 
 caso1() {
     say "Caso 1. Sin fuga"
+    limpia caso1
     local ok=ok net code out st
     FAILS=0
     note "carga: $(load)"
@@ -838,6 +845,7 @@ PY
 
 caso2() {
     say "Caso 2. Encontrar un proveedor sin contacto previo"
+    limpia caso2
     local ok=ok out st node r cap pids=()
     FAILS=0
     note "carga: $(load)"
@@ -929,6 +937,7 @@ caso3() {
     say "Caso 3. Sin el arranque original"
     local ok=ok out st t_stop t_start i start
     FAILS=0
+    limpia caso3
     note "carga: $(load)"
     T1=$(ticket r1) || die "no ticket from r1"
     T3=$(ticket r3) || die "no ticket from r3"
@@ -958,6 +967,22 @@ sys.exit(0 if len(done) == 4 else 1)
 PY
         then break; fi
         if [ $((SECONDS - start)) -ge "$FIND_MAX_S" ]; then note "c5 no los encuentra en $FIND_MAX_S s"; break; fi
+        pausa "$POLL_S"
+    done
+    # Each provider's rounds that ended with r1 stopped: until each shows
+    # one with no error, within SETTLE_MAX_S.
+    start=$SECONDS
+    until py "$t_stop" <<'PY'
+pubs = rounds_seen("caso3-proveedores-", float(sys.argv[1]))
+sys.exit(0 if all(any(not r[1] for r in pubs.get(p, [])) for p in CAPS) else 1)
+PY
+    do
+        if [ $((SECONDS - start)) -ge "$SETTLE_MAX_S" ]; then
+            note "no todos los proveedores muestran una vuelta sin error con r1 parado en $SETTLE_MAX_S s"
+            break
+        fi
+        i=$((i + 1))
+        estados "caso3-proveedores-$(printf %02d "$i")" "${PROVIDERS[@]}"
         pausa "$POLL_S"
     done
     estados caso3-c5 c5
@@ -999,12 +1024,15 @@ if unanswered(c5):
     problems_.append(f"búsquedas de c5 sin respuesta: {unanswered(c5)}")
 if not entered:
     problems_.append("c5 no dice que entra por r3")
-pubs = rounds_seen("caso3-proveedores-")
+pubs = rounds_seen("caso3-proveedores-", t_stop)
 short = {node: [r for r in rs if r[1]] for node, rs in pubs.items()}
-print(f"vueltas de publicación vistas con r1 parado: {sum(len(r) for r in pubs.values())}, "
+clean = {node: sum(1 for r in rs if not r[1]) for node, rs in pubs.items()}
+without = sorted(p for p in CAPS if not clean.get(p))
+print(f"vueltas de publicación terminadas con r1 parado: {sum(len(r) for r in pubs.values())}, "
+      f"sin error por proveedor: {dict(sorted(clean.items()))}, "
       f"con error: {sum(len(r) for r in short.values())} {dict((k, v) for k, v in short.items() if v) or ''}")
-if not pubs or any(short.values()):
-    problems_.append("vueltas de publicación con error, o ninguna vista, con r1 parado")
+if without or any(short.values()):
+    problems_.append(f"vueltas de publicación con error con r1 parado, o proveedores sin una sin error: {without}")
 for p in problems_:
     print("PROBLEMA:", p)
 save("caso3", {"vueltas_proveedores": pubs, "conectados": len(connected), "conectados_conformes": len(connected) - len(bad),
@@ -1017,7 +1045,7 @@ PY
 )
     st=$?
     echo "$out"
-    check "con r1 parado, los clientes conectados encuentran los dos proveedores de cada capacidad; c5 entra por r3 y los encuentra; ninguna vuelta de publicación de los proveedores falla" \
+    check "con r1 parado, los clientes conectados encuentran los dos proveedores de cada capacidad; c5 entra por r3 y los encuentra; cada proveedor termina con r1 parado al menos una vuelta de publicación, y ninguna falla" \
         passed "$st" "$out"
     docker stop -t 5 "$(ctr c5)" > /dev/null
     say "Restauración: r1"
@@ -1030,6 +1058,7 @@ PY
 
 caso4() {
     say "Caso 4. Caducar anuncios"
+    limpia caso4
     local ok=ok out st t_stop i start p1 limit=$((TTL_S + REPUBLISH_S))
     FAILS=0
     p1=$(agent_id p1)
@@ -1108,6 +1137,7 @@ caso5() {
     say "Caso 5. Caída de routers y renovación"
     local ok=ok out st t_stop i start limit=$((2 * REPUBLISH_S)) renewed=$((TTL_S + REPUBLISH_S))
     FAILS=0
+    limpia caso5
     note "carga: $(load)"
     t_stop=$(now)
     para r2 && para r4 || die "cannot stop r2 and r4"
@@ -1168,9 +1198,9 @@ late_cov = sum(1 for s in late if both_found(s)) / len(late) if late else None
 late_at = min((s["t0"] for s in late if s["t0"] != float("inf")), default=t_stop) - t_stop
 print(f"renovación: a los {round(late_at)} s de pararlos (todo lo de antes ya caducado a los {renewed} s), "
       f"cobertura {late_cov} en {len(late)} búsquedas; etiquetas {dict(Counter(coverage(outcome(s)) for s in late if outcome(s)))}")
-pubs = rounds_seen("caso5-proveedores-")
+pubs = rounds_seen("caso5-proveedores-", t_stop)
 short = {node: [r for r in rs if r[1]] for node, rs in pubs.items()}
-print(f"vueltas de publicación vistas con r2 y r4 parados: {sum(len(r) for r in pubs.values())}, "
+print(f"vueltas de publicación terminadas con r2 y r4 parados: {sum(len(r) for r in pubs.values())}, "
       f"con error: {sum(len(r) for r in short.values())} {dict((k, v) for k, v in short.items() if v) or ''}")
 broken = unanswered(ss + late)
 if broken:
@@ -1198,6 +1228,7 @@ PY
 
 caso6() {
     say "Caso 6. Contacto con firma inválida"
+    limpia caso6
     local ok=ok out st rogue start
     FAILS=0
     note "carga: $(load)"
@@ -1281,6 +1312,7 @@ PY
 
 caso7() {
     say "Caso 7. Búsquedas repetidas o maliciosamente amplias"
+    limpia caso7
     local ok=ok out st caps=() n node serie start
     FAILS=0
     note "carga: $(load)"
@@ -1363,6 +1395,7 @@ PY
 
 caso8() {
     say "Caso 8. Política"
+    limpia caso8
     local ok=ok out st start t0 node cap
     FAILS=0
     note "carga: $(load)"
@@ -1449,6 +1482,7 @@ PY
 
 caso9() {
     say "Caso 9. Cambio de red"
+    limpia caso9
     local ok=ok out st t_move i start limit=$((2 * REPUBLISH_S))
     FAILS=0
     note "carga: $(load)"

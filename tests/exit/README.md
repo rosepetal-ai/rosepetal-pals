@@ -216,7 +216,7 @@ export PALS_EXIT_DIR=$(mktemp -d)                 # nuevo o vacío: los registro
 tests/exit/hito-3.sh                              # todo: preparar, casos 1 a 9 y desmontar
 ```
 
-Las fases también se pueden ejecutar sueltas, en orden y con el mismo `PALS_EXIT_DIR`: `preparar`, `caso1` … `caso9` y `desmontar`. Por ejemplo, `tests/exit/hito-3.sh preparar caso1 caso2`, y después `tests/exit/hito-3.sh desmontar`.
+Las fases también se pueden ejecutar sueltas, en orden y con el mismo `PALS_EXIT_DIR`: `preparar`, `caso1` … `caso9` y `desmontar`. Por ejemplo, `tests/exit/hito-3.sh preparar caso1 caso2`, y después `tests/exit/hito-3.sh desmontar`. Cada caso borra al empezar las búsquedas que guardó una ejecución anterior suya (`registro/busquedas/casoN-*`), así que repetirlo en el mismo `PALS_EXIT_DIR` solo juzga las suyas. Las vueltas de publicación que cuentan los casos 3 y 5 son solo las que terminaron después de parar los routers.
 
 Los casos que paran agentes los vuelven a arrancar al terminar, con el mismo directorio de datos y las mismas direcciones: `r1` en el caso 3, `p1` en el 4, y `r2` y `r4` en el 5. Después esperan a que los routers vuelvan a guardar lo de cada proveedor, y si no lo consiguen, el caso falla. El caso 9 no se deshace: es el último.
 
