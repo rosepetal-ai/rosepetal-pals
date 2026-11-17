@@ -969,8 +969,9 @@ mod tests {
 
     use libp2p::kad::store::RecordStore;
     use libp2p::kad::{PeerInfo, QueryInfo};
-    use pals_core::clock::{Clock, SystemClock};
+    use pals_core::clock::{Clock, ManualClock, SystemClock};
     use pals_core::identity::AgentKey;
+    use pals_core::records::RECORD_TTL_S;
 
     use super::*;
     use crate::config::{DhtCfg, DhtMode};
@@ -979,6 +980,15 @@ mod tests {
     /// A client of `key` that publishes `published` and knows no router:
     /// its rounds' queries never leave, and the test gives their results.
     async fn publisher(key: &AgentKey, published: Arc<dyn PublishedRecords>) -> Task {
+        publisher_at(key, published, Arc::new(SystemClock)).await
+    }
+
+    /// [`publisher`], at the time `clock` says.
+    async fn publisher_at(
+        key: &AgentKey,
+        published: Arc<dyn PublishedRecords>,
+        clock: Arc<dyn Clock>,
+    ) -> Task {
         let cfg = DhtCfg {
             enabled: true,
             mode: DhtMode::Client,
@@ -987,7 +997,7 @@ mod tests {
         };
         let endpoint = endpoint(key).await;
         let key = AgentKey::from_bytes(&key.to_bytes());
-        task_with(key, endpoint, cfg, Some(published)).0
+        task_with(key, endpoint, cfg, Some(published), clock).0
     }
 
     /// The query of the round running whose step `which` wants: exactly
@@ -1258,9 +1268,13 @@ mod tests {
 
     #[tokio::test]
     async fn own_records_last_no_longer_than_their_signature() {
-        // Records whose signature has 600 s left, against the DHT's 3600 s.
+        // Records whose signature has 600 s left, against the DHT's 3600 s,
+        // by the one clock the records are issued at and the node reads:
+        // exactly 600 s from when the round sends them.
+        let clock = Arc::new(ManualClock::new(SystemClock.now_unix()));
         let key = AgentKey::generate();
-        let mut task = publisher(&key, Fixed::expiring(&key, &["vision.ocr"], 600)).await;
+        let records = Fixed::expiring(&key, &["vision.ocr"], clock.now_unix(), 600);
+        let mut task = publisher_at(&key, records, clock.clone()).await;
         assert_eq!(task.timing.record_ttl, Duration::from_secs(3600));
         let before = std::time::Instant::now();
         task.start_round();
@@ -1279,13 +1293,14 @@ mod tests {
         };
         for expires in [contact, announce, announce_at] {
             let expires = expires.expect("an expiry");
-            assert!(expires >= before + Duration::from_secs(598), "{expires:?}");
-            assert!(expires <= after + Duration::from_secs(601), "{expires:?}");
+            assert!(expires >= before + Duration::from_secs(600), "{expires:?}");
+            assert!(expires <= after + Duration::from_secs(600), "{expires:?}");
         }
 
         // Records with a whole day left go for the DHT's 3600 s.
         let key = AgentKey::generate();
-        let mut task = publisher(&key, Fixed::of(&key, &["vision.ocr"])).await;
+        let records = Fixed::expiring(&key, &["vision.ocr"], clock.now_unix(), RECORD_TTL_S - 60);
+        let mut task = publisher_at(&key, records, clock).await;
         let before = std::time::Instant::now();
         task.start_round();
         let after = std::time::Instant::now();

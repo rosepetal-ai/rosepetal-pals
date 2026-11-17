@@ -1399,12 +1399,14 @@ pub(super) mod tests {
         endpoint_on(key, Ipv4Addr::LOCALHOST).await
     }
 
-    /// A task for `key` on `endpoint` with `cfg`, publishing `published`.
+    /// A task for `key` on `endpoint` with `cfg`, publishing `published`,
+    /// at the time `clock` says.
     pub(in crate::dht) fn task_with(
         key: AgentKey,
         endpoint: Endpoint,
         cfg: DhtCfg,
         published: Option<Arc<dyn PublishedRecords>>,
+        clock: Arc<dyn Clock>,
     ) -> (Task, IrohListener) {
         let key = Arc::new(key);
         let store = Arc::new(Store::open_in_memory(key.id()).unwrap());
@@ -1415,7 +1417,7 @@ pub(super) mod tests {
             cfg,
             quotas: KadQuotas::default(),
             store_limits: STORE_LIMITS,
-            clock: Arc::new(SystemClock),
+            clock,
             store,
             published,
         })
@@ -1436,7 +1438,7 @@ pub(super) mod tests {
             bootstrap,
             ..DhtCfg::default()
         };
-        task_with(key, endpoint, cfg, None)
+        task_with(key, endpoint, cfg, None, Arc::new(SystemClock))
     }
 
     /// A ticket of `endpoint` at `addr`.
@@ -1462,16 +1464,17 @@ pub(super) mod tests {
             key: &AgentKey,
             capabilities: &[&str],
         ) -> Arc<dyn PublishedRecords> {
-            Self::expiring(key, capabilities, RECORD_TTL_S - 60)
+            Self::expiring(key, capabilities, SystemClock.now_unix(), RECORD_TTL_S - 60)
         }
 
-        /// Issued a minute ago, expiring `expires_in` seconds from now.
+        /// Issued a minute before `now`, in Unix seconds, expiring
+        /// `expires_in` seconds after it.
         pub(in crate::dht) fn expiring(
             key: &AgentKey,
             capabilities: &[&str],
+            now: i64,
             expires_in: i64,
         ) -> Arc<dyn PublishedRecords> {
-            let now = SystemClock.now_unix();
             let issued_at = format_timestamp(now - 60).unwrap();
             let expires_at = format_timestamp(now + expires_in).unwrap();
             let contact = ContactRecord {
@@ -1678,8 +1681,13 @@ pub(super) mod tests {
             ..DhtCfg::default()
         };
         let published = Fixed::of(&router_key, &["vision.ocr"]);
-        let (mut router, listener) =
-            task_with(router_key, router_endpoint.clone(), cfg, Some(published));
+        let (mut router, listener) = task_with(
+            router_key,
+            router_endpoint.clone(),
+            cfg,
+            Some(published),
+            Arc::new(SystemClock),
+        );
         router.start_round();
         let capability = provider_key("vision.ocr").unwrap();
         let own = router.kad().store_mut().providers(&capability);
