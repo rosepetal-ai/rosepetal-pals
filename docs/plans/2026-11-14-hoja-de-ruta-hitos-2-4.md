@@ -85,14 +85,14 @@ Como se cerró el hito 1, en la última tarea de cada plan:
 
 **Criterio de salida (spec §14):** justificar la implementación elegida; encontrar un proveedor sin contacto previo; funcionar sin el bootstrap original y caducar anuncios.
 
-**Lo que deja preparado el hito 2**, según su plan (nada de esto está aún en el daemon):
+**Lo que dejó preparado el hito 2**, según su plan, y hoy está en el daemon:
 
 - `agentnet.contact/1` (endpoint Iroh, relay y direcciones) y `agentnet.announce/1` (hash de la card pública, hasta 32 capacidades públicas, ALPN de descubrimiento): firmados con dominio propio, con secuencia, caducidad de 24 h, renovación y detección de regresiones. En el hito 2 viajan en las respuestas de descubrimiento; el hito 3 los publica.
 - La card firmada con `kid` igual al id del agente y su `agent_card_hash`: la verificación del paso 5 del §5.3.
 - Las etiquetas `agentnet:capability:v1:<id>` en los skills de la card.
 - `ServiceQuery`, la selección en dos etapas y los límites del §7.3. Su búsqueda parte de los contactos; la DHT añade otra fuente (pasos 3 y 4 del §5.3).
 
-**Lo que falta:** el contacto del hito 2 lo firma solo la clave del agente. Si gana `libp2p-kad`, el vínculo con el PeerId del §6.2, firmado por las dos claves, pide un esquema nuevo o un registro aparte, porque los `agentnet.*/1` están congelados.
+**Lo que faltaba**, antes de la comparación: el contacto del hito 2 lo firma solo la clave del agente. Si ganaba `libp2p-kad`, el vínculo con el PeerId del §6.2, firmado por las dos claves, pedía un esquema nuevo o un registro aparte, porque los `agentnet.*/1` están congelados. H3-D1 lo hizo innecesario: con `kad-iroh`, `libp2p-kad` va sobre las conexiones Iroh del daemon y el `PeerId` es la clave del agente, así que no hay nada que vincular, y el contacto del hito 2 se publica tal cual.
 
 ### Comparación del backend (tarea 1)
 
@@ -116,7 +116,7 @@ Como se cerró el hito 1, en la última tarea de cada plan:
 
 ### Tareas previstas
 
-El esquema queda abierto hasta la comparación.
+Es el esquema de antes de la comparación. El plan lo convirtió en sus tareas 1 a 15, en dos fases, y su tabla «Cómo se reparten las tareas de la hoja de ruta», en [«Cambios respecto al spec y a la hoja de ruta»](2026-11-16-hito-3-descubrimiento-kademlia.md#cambios-respecto-al-spec-y-a-la-hoja-de-ruta), dice adónde fue cada una de estas: la 3 no aplica.
 
 | Tarea | Entregable | Parte del criterio |
 |-|-|-|
@@ -134,8 +134,8 @@ La tarea 8 cubre los escenarios del §14 de este hito: card sin vínculo válido
 
 ### Riesgos
 
-- **Dos pilas de red** con `libp2p-kad`: más conexiones, configuración y mantenimiento (§2.1, §6.1).
-- **Dependencias:** libp2p tiene que compilar con la MSRV 1.91 y convivir con las versiones fijadas; no se ha comprobado.
+- **Dos pilas de red** con `libp2p-kad`: más conexiones, configuración y mantenimiento (§2.1, §6.1). `kad-iroh` lo evitó (H3-D1): una sola pila, la de Iroh, con un adaptador de libp2p sobre ella, cuyas pruebas son la puerta de cualquier cambio de versión de `libp2p` o de `iroh`.
+- **Dependencias:** libp2p tiene que compilar con la MSRV 1.91 y convivir con las versiones fijadas. Comprobado: `libp2p =0.57.1` está fijada en el `Cargo.toml` raíz junto a las demás, y la CI compila el workspace con la MSRV (`cargo +1.91 check --workspace --all-targets --locked`).
 - **Sybil:** las firmas no evitan identidades falsas en masa (§5.5, §13); la red abierta necesitará políticas de admisión.
 - **Resultados sesgados o incompletos:** claves populares saturadas; una búsqueda vacía no demuestra que no haya proveedor (§5.3, §5.5).
 - **Metadatos públicos:** lo anunciado es público, y hashear un nombre predecible no lo oculta (§11.1). Solo se anuncia lo público.

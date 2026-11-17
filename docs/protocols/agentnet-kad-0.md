@@ -412,11 +412,11 @@ Las peticiones de la búsqueda en la DHT se cuentan aparte, en `dht_requests` de
 
 ### Cobertura parcial
 
-La búsqueda nunca falla por la DHT. Cuando la DHT no da todo lo que podría, los contactos se buscan igual, y la cobertura es parcial con una de estas etiquetas, además de las del hito 2 (`time budget` y `timeout`):
+La búsqueda nunca falla por la DHT. Cuando la DHT no da todo lo que podría, los contactos se buscan igual, y la cobertura es parcial. Además de `time budget` y `timeout`, del hito 2, la marcan estas etiquetas. `candidate limit` ya existía en el hito 2, cuando quedaban fuera contactos; el hito 3 amplía lo que la da. Las otras dos son nuevas:
 
 | Etiqueta | Cuándo |
 |-|-|
-| `candidate limit` | quedaron fuera contactos o proveedores de la DHT por `max_candidates`, o la búsqueda en la DHT trajo tantos proveedores como pidió, así que pudo dejar alguno |
+| `candidate limit` | quedaron fuera contactos, como en el hito 2, o proveedores de la DHT por `max_candidates`; o la búsqueda en la DHT trajo tantos proveedores como pidió, así que pudo dejar alguno |
 | `dht timeout` | la búsqueda en la DHT llegó a su plazo y se cortó (`cut`, sección 8) |
 | `dht unavailable` | no contestó ningún router (`no DHT router answered`) |
 
@@ -428,7 +428,7 @@ Lo que llega de la DHT no se usa sin comprobarlo, y a un candidato no se le env�
 
 - **Los descartes de la DHT.** Un proveedor que la búsqueda en la DHT descartó (sección 8) se descarta en la etapa `Card` con el motivo `dht: <por qué>`, por ejemplo `dht: no valid contact`. Si ese agente es un contacto, cuenta solo como contacto.
 - **Sus registros.** Su contacto y su anuncio, que la búsqueda en la DHT ya verificó, pasan por `Store::peer_record_accept`, como los de una respuesta de `agentnet-discovery/0`. Uno que vuelve atrás respecto al más nuevo que este agente conoce de ese agente lo descarta en la etapa `Card`, con el motivo `record regression`.
-- **Su card y su oferta.** Se le marca en las direcciones directas y el relay de su contacto, y se evalúa como cualquier par PALS: su card, firmada con `kid` igual a su id de agente, y su oferta por `agentnet-discovery/0`.
+- **Lo que se le pide.** Se le marca en las direcciones directas y el relay de su contacto, y se evalúa como cualquier par PALS. Se le pide su card pública, firmada con `kid` igual a su id de agente, y también la extendida (`GetExtendedAgentCard`) si este agente tiene un grant suyo que sirve tareas en el proyecto de la búsqueda, o en cualquiera si no nombra ninguno. Después, una oferta por `agentnet-discovery/0`. Si la búsqueda quiere informes de benchmark y la oferta es compatible, se le piden con `GetBenchmarkReport`: los que la oferta cita del perfil pedido y siguen en vigor, 4 como mucho (`MAX_REPORTS_PER_CANDIDATE`).
 - **Sin grant, nada privado.** Va con el grant que este agente tenga de él, si tiene alguno. Si no tiene ninguno del proyecto de la búsqueda, no recibe ni el proyecto ni los ids del inventario, y entra en el ranking con `grant_held: false`. Todo candidato de la DHT lleva `from_dht: true`, y `pals discover` escribe `found in the DHT`.
 
 ### Preguntar
@@ -437,6 +437,6 @@ Como en el hito 2: a un par del que este agente no tiene un grant que sirva tare
 
 ### Lo que nunca hace
 
-Buscar en la DHT no ejecuta trabajo: ni en los routers, que contestan desde su tienda, ni en los proveedores encontrados, a los que solo se pide su card y una oferta. Lo prueba `querying_the_dht_runs_no_work`: veinte búsquedas, las más amplias con proyecto, preferencias e informes de benchmark, no ejecutan ninguna tarea en los proveedores ni en los routers, y ninguno acepta una tarea.
+Buscar en la DHT no ejecuta trabajo: ni en los routers, que contestan desde su tienda, ni en los proveedores encontrados, a los que solo se pide lo de más arriba: su card, la extendida con un grant, una oferta y, si la búsqueda los quiere, sus informes de benchmark. Lo prueba `querying_the_dht_runs_no_work`: veinte búsquedas, las más amplias con proyecto, preferencias e informes de benchmark, no ejecutan ninguna tarea en los proveedores ni en los routers, y ninguno acepta una tarea.
 
 Pruebas de esta sección, en `crates/pals/tests/dht_search.rs`: `a_provider_with_no_prior_contact_is_found`, `contacts_come_first_and_each_agent_once`, `exclude_dht_and_named_peers_never_touch_the_dht`, `dht_without_routers_leaves_the_contacts_search_intact`, `a_tampered_card_is_discarded_even_with_a_valid_dht_announce`, `a_dht_record_that_goes_back_is_discarded`, `inventory_ids_never_go_to_a_dht_candidate_without_a_grant`, `an_alias_searches_its_capability`, `aliases_to_invalid_capabilities_are_refused`, `a_dht_candidate_is_asked_once_a_grant_is_held`, `querying_the_dht_runs_no_work` y `discover_cli_and_mcp_take_exclude_dht`.
