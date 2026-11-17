@@ -274,8 +274,19 @@ Los provider records propios llevan esas direcciones y ninguna más. `libp2p-kad
 `libp2p-kad` 0.49 mete a un par en la tabla de rutas solo con la dirección a la que lo marcó el propio nodo. De un par que lo marcó a él, no sabe ninguna dirección, y lo da por inalcanzable. Por eso el swarm lleva también `identify` de libp2p (`/ipfs/id/1.0.0`), y es la única razón:
 
 - **La prueba lo pidió.** Sin `identify`, un router sin `bootstrap` nunca tuvo a otro en su tabla. En `a_router_with_no_bootstrap_learns_the_others`, R1 aceptó las conexiones de R2 y R3 y siguió con 0 pares en la tabla, y fallaron igual todas las pruebas en que los routers se conocen a través de R1, `clients_never_enter_a_routing_table` entre ellas. Es la causa que daba el registro del backend: las direcciones de una conexión entrante.
-- **Qué se usa.** Con `identify`, cada lado de una conexión dice al otro los protocolos que sirve y las direcciones que declara. Si el otro sirve `/agentnet/kad/1.0.0`, el nodo da a Kademlia sus direcciones en la forma router que lo nombran a él y que se pueden marcar desde aquí: ni una IP sin especificar ni de multidifusión, y loopback solo si el propio nodo está en loopback. Solo sirve ese protocolo un router, en modo servidor, así que un cliente nunca entra en una tabla de rutas.
+- **Qué se usa.** Con `identify`, cada lado de una conexión dice al otro los protocolos que sirve y las direcciones que declara. Si el otro sirve `/agentnet/kad/1.0.0`, el nodo da a Kademlia sus direcciones en la forma router que lo nombran a él y que se pueden marcar desde aquí: ni una IP sin especificar ni de multidifusión, y loopback solo si el propio nodo está en loopback. Solo sirve ese protocolo un router, en modo servidor, y `libp2p-kad` no mete en la tabla a nadie por su cuenta (más abajo), así que un cliente nunca entra en una tabla de rutas.
 - **Qué no se usa.** `identify` envía solo las direcciones declaradas (`with_hide_listen_addrs`), nunca los sockets del endpoint, y no guarda lo que dicen los pares (`with_cache_size(0)`), que añadiría a cada marcado. Solo tiene la clave pública del agente, así que no firma ningún registro de pares. Envía además la versión de protocolo `agentnet/0`, la de libp2p como nombre del agente (`rust-libp2p/<versión>`) y la dirección por la que vio al otro, que el nodo no usa.
+
+### La tabla de rutas
+
+Un par entra en la tabla de rutas solo por `add_address` de `libp2p-kad` (`BucketInserts::Manual`), y el nodo lo llama en tres casos:
+- un router que `identify` confirmó, con las direcciones que se pueden marcar desde aquí (arriba);
+- el router de un ticket de `bootstrap`;
+- un router cuyas direcciones el nodo recuerda y le devuelve tras un marcado fallido («Entrada en la red»).
+
+Por defecto, `libp2p-kad` metería también a cualquier par que abre un stream de Kademlia en una conexión que marcó el propio nodo, con la dirección a la que lo marcó. Un cliente lo hace: si un router lo marca como contacto guardado, la siguiente búsqueda del cliente va por esa conexión. El router daría entonces la IP del cliente en cada respuesta de pares más cercanos. Lo prueba `a_client_that_asks_over_a_routers_dial_stays_out_of_its_table`.
+
+Lo único que `libp2p-kad` sigue haciendo por su cuenta es añadir, a un par que ya está en la tabla, la dirección a la que el nodo lo marcó, cuando el par confirma el protocolo en esa conexión. El nodo la recuerda solo si se puede marcar desde aquí, con las reglas de `identify`.
 
 ### Lo que ven los routers de cada búsqueda
 

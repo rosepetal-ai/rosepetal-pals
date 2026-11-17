@@ -35,6 +35,18 @@
 //!   cache of what peers say (`with_cache_size(0)`), which it would add to
 //!   every dial of them, and gets only the public key, so it signs no peer
 //!   record.
+//! - **The routing table.** A peer enters it only through `add_address`
+//!   (`BucketInserts::Manual`): a router `identify` confirmed
+//!   ([`Task::on_identify`]), a bootstrap ticket's router ([`Task::enter`]),
+//!   and a router of the [`AddressBook`] given its addresses back
+//!   ([`Task::give_back`]). `libp2p-kad`'s default would also put in any
+//!   peer that opens a Kademlia stream on a connection this node dialed,
+//!   at the address it dialed: a client does that when this node dialed it
+//!   as a saved contact, and its next lookup goes over that connection.
+//!   What `libp2p-kad` still does by itself is add to a peer already in
+//!   the table the address this node dialed it at, once the peer confirms
+//!   the protocol on that connection; the book learns it only when it is
+//!   [routable](Task::routable).
 //! - **Kademlia.** Records and provider records live `record_ttl`; the
 //!   node publishes nothing of its own on `libp2p-kad`'s timers (the rounds
 //!   of task 12 do), and a router replicates what it holds every
@@ -65,8 +77,8 @@
 //!   the node bootstraps through the first that does. A node with no
 //!   bootstrap starts alone.
 //! - **What the node remembers of a router.** The [`AddressBook`] holds the
-//!   addresses of the bootstrap tickets and of the peers in the routing
-//!   table, and of nothing else. `libp2p-kad` drops a peer's addresses after
+//!   addresses of the bootstrap tickets and the routable addresses of the
+//!   peers in the routing table, and nothing else. `libp2p-kad` drops a peer's addresses after
 //!   a failed dial to it, but the last; the node gives it back every one the
 //!   book has of that server, so that a router that stopped a moment is
 //!   dialed at all of them again, and a peer that never was a router gets
@@ -104,8 +116,8 @@ use libp2p::futures::stream::{self, BoxStream};
 use libp2p::futures::{StreamExt, future};
 use libp2p::kad::store::{self as kad_store, MemoryStore, MemoryStoreConfig, RecordStore};
 use libp2p::kad::{
-    self, Caching, GetProvidersOk, InboundRequest, Mode, ProviderRecord, QueryId, QueryResult,
-    QueryStats, Record, RecordKey, StoreInserts,
+    self, BucketInserts, Caching, GetProvidersOk, InboundRequest, Mode, ProviderRecord, QueryId,
+    QueryResult, QueryStats, Record, RecordKey, StoreInserts,
 };
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::{
@@ -437,7 +449,11 @@ fn kad_config(timing: &DhtTiming) -> kad::Config {
         .set_replication_interval(Some(timing.republish))
         .set_record_filtering(StoreInserts::FilterBoth)
         .set_caching(Caching::Disabled)
-        .set_query_timeout(timing.query_timeout);
+        .set_query_timeout(timing.query_timeout)
+        // A peer enters the routing table only through `add_address`: never
+        // because it opened a Kademlia stream on a connection this node
+        // dialed, which a client does too.
+        .set_kbucket_inserts(BucketInserts::Manual);
     config
 }
 
@@ -869,9 +885,8 @@ impl Task {
     /// Dials `contacts`, the saved contacts read when no bootstrap router
     /// answered, and tells neither Kademlia nor the address book of them:
     /// one enters the routing table only once it shows it is a router
-    /// ([`Task::on_identify`], or `libp2p-kad`'s own check of the protocol
-    /// on the connection it was dialed on), and the node bootstraps through
-    /// the first that does ([`Task::on_routing_updated`]).
+    /// ([`Task::on_identify`]), and the node bootstraps through the first
+    /// that does ([`Task::on_routing_updated`]).
     fn try_contacts(&mut self, contacts: Routers) {
         tracing::info!(
             contacts = contacts.len(),
@@ -995,8 +1010,9 @@ impl Task {
     }
 
     /// `peer` is in the routing table at `addresses`: the address book
-    /// learns them, and when it is the first saved contact to show it is a
-    /// router, the node bootstraps through it.
+    /// learns those that are [routable](Task::routable), and when it is the
+    /// first saved contact to show it is a router, the node bootstraps
+    /// through it.
     fn on_routing_updated(&mut self, peer: PeerId, is_new_peer: bool, addresses: &kad::Addresses) {
         if is_new_peer {
             tracing::debug!(%peer, "a DHT router in the routing table");
@@ -1004,6 +1020,7 @@ impl Task {
         for addr in addresses.iter() {
             if let Some((named, socket)) = dial_target(addr)
                 && named == peer
+                && self.routable(socket)
             {
                 self.book.learn(peer, socket);
             }

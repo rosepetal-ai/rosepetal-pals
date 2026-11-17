@@ -28,7 +28,7 @@ use libp2p::futures::StreamExt;
 use libp2p::kad::store::MemoryStore;
 use libp2p::kad::{self, Mode, Quorum, Record};
 use libp2p::swarm::{self, SwarmEvent};
-use libp2p::{Swarm, Transport};
+use libp2p::{PeerId, Swarm, Transport};
 use pals::config::{CONFIG_FILE, Config, DhtCfg, DhtMode, WorkerCfg};
 use pals::dht::keys::{announce_key, peer_id, provider_key};
 use pals::dht::swarm::KAD_PROTOCOL;
@@ -370,6 +370,162 @@ async fn saved_contacts_enter_the_table_only_as_routers() {
     assert_eq!(now.routing_peers, 2, "{now:?}");
     // And R2 has R1 and the newcomer, never the client.
     wait_for_routers(&r2, 2).await;
+}
+
+/// A DHT client of `libp2p-kad` alone, over its own Iroh endpoint, that
+/// takes the connections other nodes open and asks on one of them: what a
+/// client does when a node it knows as a router dialed it, and its next
+/// lookup goes over that node's connection.
+struct Asker {
+    swarm: Swarm<kad::Behaviour<MemoryStore>>,
+    endpoint: iroh::Endpoint,
+    _router: iroh::protocol::Router,
+}
+
+impl Asker {
+    async fn new() -> Self {
+        let endpoint = loopback_endpoint().await;
+        let (transport, listener, _refusals) = IrohTransport::new(
+            endpoint.clone(),
+            KadQuotas::default(),
+            std::sync::Arc::new(SystemClock),
+            AddressBook::default(),
+            Duration::from_secs(60),
+        );
+        let local = peer_id(&pals::net::agent_id_of(&endpoint.id()));
+        let mut config = kad::Config::new(KAD_PROTOCOL);
+        config.set_periodic_bootstrap_interval(None);
+        let behaviour = kad::Behaviour::with_config(local, MemoryStore::new(local), config);
+        let mut swarm = Swarm::new(
+            transport.boxed(),
+            behaviour,
+            local,
+            swarm::Config::with_tokio_executor()
+                .with_idle_connection_timeout(Duration::from_secs(60)),
+        );
+        swarm.behaviour_mut().set_mode(Some(Mode::Client));
+        let bound = endpoint.bound_sockets()[0];
+        let listen = libp2p::Multiaddr::empty()
+            .with(libp2p::multiaddr::Protocol::from(bound.ip()))
+            .with(libp2p::multiaddr::Protocol::Udp(bound.port()))
+            .with(libp2p::multiaddr::Protocol::QuicV1);
+        swarm.listen_on(listen).expect("listen on the endpoint");
+        let router = iroh::protocol::Router::builder(endpoint.clone())
+            .accept(ALPN_KAD, listener)
+            .spawn();
+        Self {
+            swarm,
+            endpoint,
+            _router: router,
+        }
+    }
+
+    fn id(&self) -> AgentId {
+        pals::net::agent_id_of(&self.endpoint.id())
+    }
+
+    /// Its ticket, at its one direct address.
+    fn ticket(&self) -> String {
+        let bound = self.endpoint.bound_sockets()[0];
+        EndpointTicket::new(EndpointAddr::from_parts(
+            self.endpoint.id(),
+            [TransportAddr::Ip(bound)],
+        ))
+        .to_string()
+    }
+
+    /// The swarm's next event, unless `deadline` comes first.
+    async fn next(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<SwarmEvent<kad::Event>, tokio::time::error::Elapsed> {
+        tokio::time::timeout_at(deadline, self.swarm.select_next_some()).await
+    }
+
+    /// Waits until `node` dials it, and then asks `node`, over that one
+    /// connection, for the peers closest to a key, until `node` answered.
+    /// It never dials `node`: it knows it at no address it could dial.
+    async fn ask_over_the_connection_of(&mut self, node: &TestNode) {
+        let dialer = peer_id(&node.id());
+        let deadline = tokio::time::Instant::now() + CONVERGES;
+        loop {
+            match self.next(deadline).await.expect("the node dials") {
+                SwarmEvent::ConnectionEstablished {
+                    peer_id,
+                    endpoint: libp2p::core::ConnectedPoint::Listener { .. },
+                    ..
+                } if peer_id == dialer => break,
+                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                    panic!("a connection with {peer_id} this side opened")
+                }
+                _ => {}
+            }
+        }
+        let kad = self.swarm.behaviour_mut();
+        kad.add_address(&dialer, located_nowhere(&dialer));
+        let id = kad.get_closest_peers(PeerId::random());
+        loop {
+            let answered = self
+                .swarm
+                .behaviour_mut()
+                .query(&id)
+                .is_some_and(|query| query.stats().num_successes() > 0);
+            if answered {
+                return;
+            }
+            match self.next(deadline).await.expect("the node answers") {
+                SwarmEvent::Behaviour(kad::Event::OutboundQueryProgressed {
+                    id: done,
+                    stats,
+                    step,
+                    ..
+                }) if done == id && step.last => {
+                    assert!(stats.num_successes() > 0, "the node never answered");
+                    return;
+                }
+                SwarmEvent::ConnectionClosed { peer_id, .. } if peer_id == dialer => {
+                    panic!("the node's connection closed before it answered")
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_client_that_asks_over_a_routers_dial_stays_out_of_its_table() {
+    // A client, which the router knows only as a saved contact.
+    let mut client = Asker::new().await;
+    // A bootstrap router that never answers: the router then dials its
+    // saved contacts, the client among them.
+    let down = AgentKey::generate().id();
+    let down_ticket = EndpointTicket::new(
+        EndpointAddr::new(pals::net::endpoint_id_of(&down))
+            .with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, free_port()))),
+    )
+    .to_string();
+    let dir = with_contacts(&[("client", client.id(), client.ticket())]);
+    let router = spawn_dht_node_in(
+        dir,
+        DhtMode::Router,
+        &[],
+        NodeOptions {
+            dht_timing: Some(timing()),
+            ..NodeOptions::default()
+        },
+        |cfg| cfg.dht.bootstrap = vec![down_ticket],
+    )
+    .await;
+    // The client asks the router on the connection the router dialed:
+    // libp2p-kad sees the protocol confirmed on it before it answers.
+    client.ask_over_the_connection_of(&router).await;
+    // Only the bootstrap router that never answered is in its table:
+    // libp2p-kad keeps it with its last address. Never the client.
+    let now = status(&router).await;
+    assert_eq!(
+        now.routing_peers, 1,
+        "the client entered the table: {now:?}"
+    );
 }
 
 #[tokio::test]
