@@ -26,15 +26,16 @@ Una búsqueda que consulta la DHT guarda `[discovery] dht_places` de sus `max_ca
 
 - **La clave.** `dht_places` es un entero de 0 a `max_candidates`, 2 por defecto. Una configuración con `dht_places` mayor que `max_candidates` se rechaza al leerla.
 - **Cuándo.** Solo cuando la búsqueda consulta la DHT: el nodo la tiene encendida, y la búsqueda no nombra contactos (`peers`) ni dice `exclude_dht`. Si no, los contactos ocupan todos los huecos, como en el hito 2.
-- **El reparto.** Sean `max = max_candidates`, `R = min(dht_places, max)`, `C` los contactos en su orden y `D` los proveedores de la DHT que no son contactos ni el propio agente y cuyos registros pasan la comprobación (`record regression`).
-  - Los contactos ocupan `min(|C|, max − min(R, |D|))` huecos, los primeros en su orden.
-  - Los proveedores de la DHT ocupan los huecos que quedan, en el orden en que llegaron.
+- **El reparto.** Sean `max = max_candidates`, `R = min(dht_places, max)` y `C` los contactos en su orden.
+  - Los primeros `F = min(|C|, max − R)` contactos se evalúan siempre.
+  - `D` son los proveedores que da la DHT y ocupan un hueco suyo: los primeros en llegar, como mucho `max − F`, sin el propio agente ni esos `F` contactos. Uno que no es contacto entra si sus registros pasan la comprobación (`record regression`). Un contacto posterior entra sin comprobar nada y se evalúa como el contacto que es, una sola vez: con su ticket y su grant, y `from_dht: false`.
+  - Los demás contactos, en su orden y con los `F` primeros delante, ocupan `min(|C| − los de D, max − min(R, |D|))` huecos.
 
   La DHT tiene hasta `R` huecos siempre que tiene proveedores. Los que no llena vuelven a los contactos, y con pocos contactos ocupa más de `R`, como antes. Si la búsqueda en la DHT falla, se corta sin proveedores o no encuentra ninguno, los contactos ocupan todos los huecos.
-- **La búsqueda en la DHT** se hace siempre que `R > 0`, aunque los contactos llenen `max_candidates`. Pide un proveedor más de los huecos que la DHT puede ocupar, `max − min(|C|, max − R) + 1`. Si llega a ese límite, la cobertura dice `candidate limit`, como antes.
+- **La búsqueda en la DHT** se hace siempre que `R > 0`, aunque los contactos llenen `max_candidates`. Pide un proveedor más de los huecos que la DHT puede ocupar, `max − F + 1`, y deja fuera al propio agente y a los `F` primeros contactos. Si llega a ese límite, la cobertura dice `candidate limit`, como antes.
 - **El orden** no cambia. Entre los candidatos, los contactos van primero y los proveedores de la DHT después, y el ranking tras evaluarlos es el mismo.
 
-Con `dht_places = 0` todo queda como antes de esta decisión: unos contactos que llenan todos los huecos dejan fuera a la DHT, con `dht_requests` 0 y `candidate limit`.
+Con `dht_places = 0`, unos contactos que llenan todos los huecos dejan fuera a la DHT, como antes de esta decisión: la búsqueda no la consulta, con `dht_requests` 0 y `candidate limit`. El resto no vuelve del todo a como era: con menos contactos, la búsqueda en la DHT pide un proveedor más de los huecos que dejan, sin contar a los contactos, y un proveedor descartado por `record regression` devuelve su hueco al siguiente.
 
 ## Por qué reservar y no relegar
 
@@ -58,16 +59,17 @@ El [plan del hito 3](../plans/2026-11-16-hito-3-descubrimiento-kademlia.md) lo l
   - `DiscoveryCfg::dht_places`, en `crates/pals/src/config.rs`.
   - `Dht::providers_except`: la búsqueda en la DHT que deja fuera a los agentes que ya conoce.
   - Las pruebas, en `crates/pals/tests/dht_search.rs`. La prueba de salida del hito 3 lo comprueba en el caso 2 ([registro](../conformance/hito-3/exit-test.md)).
-- **`|D|` se cuenta después de comprobar los registros.** Los de cada proveedor pasan por `Store::peer_record_accept` en el orden en que llegaron, hasta llenar los huecos de la DHT. Uno que vuelve atrás se descarta y su hueco pasa al siguiente.
-- **La búsqueda en la DHT deja fuera a los contactos.** Si los contara, unos pocos contactos que también anuncian la capacidad llenarían su límite, de `R + 1` cuando hay muchos contactos, y la DHT no traería a nadie nuevo: los contactos volverían a desplazar a la DHT, ahora dentro de la búsqueda en la DHT. Dejándolos fuera, el límite cuenta solo proveedores que pueden ocupar un hueco, y no se piden sus registros.
+- **`|D|` se cuenta después de comprobar los registros.** Los de cada proveedor que no es contacto pasan por `Store::peer_record_accept` en el orden en que llegaron, hasta llenar los huecos de la DHT. Uno que vuelve atrás se descarta y su hueco pasa al siguiente.
+- **La búsqueda en la DHT deja fuera a los `F` primeros contactos.** Si los contara, unos pocos contactos que también anuncian la capacidad llenarían su límite, de `R + 1` cuando hay muchos contactos, y la DHT no traería a nadie nuevo: los contactos volverían a desplazar a la DHT, ahora dentro de la búsqueda en la DHT. Dejándolos fuera, el límite cuenta solo proveedores que pueden ocupar un hueco, y no se piden sus registros.
+- **Un contacto posterior puede volver de la búsqueda en la DHT.** La revisión del cambio vio que, si la búsqueda en la DHT dejara fuera a todos los contactos, uno posterior que anuncia la capacidad no se evaluaría por ningún camino: el reparto lo dejaría fuera como contacto, y la DHT no lo daría como proveedor. Ahora ocupa un hueco de la DHT como cualquier proveedor, en el orden en que llegó, y se evalúa como el contacto que es. No pasa por `Store::peer_record_accept`, como ningún contacto: se marca en su ticket, no en lo que trae la DHT.
 - **Sin la clave, ninguna configuración deja de valer.** Si `dht_places` no está y `max_candidates` es menor que 2, vale `max_candidates`. Así una configuración del hito 2 con `max_candidates = 1` sigue valiendo.
 
 ## Coste si es errónea
 
-- **Menos contactos evaluados.** Con muchos contactos, una búsqueda evalúa `dht_places` contactos menos mientras la DHT da proveedores: con los valores por defecto, 6 de 8. Si los que se quedan fuera, los últimos en su orden, eran los que ofrecían la capacidad, la búsqueda los pierde, y la cobertura lo dice: `candidate limit`.
+- **Menos contactos evaluados.** Con muchos contactos, una búsqueda evalúa `dht_places` contactos menos mientras la DHT da proveedores: con los valores por defecto, 6 de 8. Si los que se quedan fuera, los últimos en su orden salvo los que la DHT da, eran los que ofrecían la capacidad, la búsqueda los pierde, y la cobertura lo dice: `candidate limit`.
 - **Más búsquedas en la DHT.** Cada búsqueda que puede consultar la DHT la consulta, aunque tenga muchos contactos. Los routers ven qué capacidad busca este agente (H3-D4), y la búsqueda espera a la DHT, como mucho `per_candidate_timeout`.
 
-Volver atrás no necesita código: basta `dht_places = 0`.
+Con `dht_places = 0` vuelve, sin cambiar código, lo que más pesa: los contactos ocupan primero todos los huecos y, si los llenan, la DHT queda fuera. No vuelve todo: la búsqueda en la DHT sigue pidiendo un proveedor más de los huecos que dejan los contactos, y un proveedor descartado por `record regression` sigue devolviendo su hueco.
 
 ## Qué la haría cambiar
 
