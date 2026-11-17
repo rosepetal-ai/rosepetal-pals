@@ -187,4 +187,11 @@ Quedan anotados para no perderlos; ninguno está comprometido.
 - Notificaciones push de A2A y binding gRPC.
 - Adaptador que ponga un agente A2A ya existente detrás de un daemon PALS.
 - Lo que el spec deja fuera en §15: pagos, reputación global, subdelegación de permisos, blockchain.
-- **Deuda técnica conocida:** los menores que las revisiones del hito 1 dejaron para después, en la descripción de la [PR #1](https://github.com/rosepetal-ai/rosepetal-pals/pull/1) («Menores revisados y aplazados»). Ninguno bloquea el hito 1.
+- **Deuda técnica conocida:** los menores que las revisiones del hito 1 dejaron para después, en la descripción de la [PR #1](https://github.com/rosepetal-ai/rosepetal-pals/pull/1) («Menores revisados y aplazados»). Ninguno bloquea el hito 1. Del hito 3, los que dejaron sus revisiones y no se anotan en ningún otro sitio; ninguno lo bloquea:
+  - **Routers caídos.** No hay espera progresiva para un router caído: `libp2p-kad` 0.49 lo sigue preguntando en cada búsqueda mientras su hueco no haga falta (ver la limitación del README).
+  - **Ficheros grandes.** Dividir `crates/pals/src/discovery/search.rs` y `crates/pals/src/dht/swarm.rs`, que han crecido mucho.
+  - **`timeout_at`.** La búsqueda en la DHT de la tarea 13 calcula su plazo a mano y lo pasa a la tarea del swarm, que la corta en sus temporizadores, en lugar de usar `tokio::time::timeout_at`.
+  - **Duración de una consulta.** La §8 de `agentnet-kad-0.md` y la cabecera de `publish.rs` dicen que una consulta dura como mucho `query_timeout` (20 s), pero `put_record` y `start_providing` tienen dos fases y pueden tardar cerca del doble. Sigue acotada.
+  - **Logs.** `key_text` (`dht/swarm.rs`) cuenta los caracteres ya escapados, así que una clave corta con escapes puede salir cortada con `…`.
+  - **Prueba de salida.** El caso 4 lee `estados.jsonl` sin filtro de tiempo, así que repetirlo en el mismo `PALS_EXIT_DIR` mezcla ejecuciones. El caso 5 imprime las vueltas con error pero no falla por ellas.
+  - **Prueba sensible a la carga.** `dht_without_routers_within_the_default_limits_still_ranks_the_contacts` puede fallar con el anfitrión muy cargado: falló una vez con una carga de unos 30/83/103.
