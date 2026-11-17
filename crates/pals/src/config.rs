@@ -121,11 +121,11 @@ max_concurrent_queries = 3
 per_candidate_timeout_ms = 3000
 total_budget_ms = 15000
 # With the DHT on ([dht] below), the places of max_candidates a search keeps
-# for the providers it finds there, from 0 to max_candidates; without this
-# line, 2, or max_candidates when it is fewer. The saved contacts take the
-# others, and those the DHT cannot fill. With 0 the contacts take every
-# place first, and as many contacts as places leave the DHT out.
-dht_places = 2
+# for the providers it finds there, from 0 to max_candidates; unset, 2, or
+# max_candidates when that is fewer. The saved contacts take the others,
+# and those the DHT cannot fill. With 0 the contacts take every place
+# first, and as many contacts as places leave the DHT out.
+# dht_places = 2
 # Other names a search may give a capability: with this one, `pals
 # discover --capability ocr` searches vision.ocr. One step: what an alias
 # names is searched as it is, even when it is another alias. Each names a
@@ -594,8 +594,8 @@ pub struct DiscoveryCfg {
     /// The places of [`max_candidates`](Self::max_candidates) a search
     /// that looks in the DHT keeps for the providers it finds there, from 0
     /// to `max_candidates` ([`crate::discovery::search`]), as the
-    /// configuration says; `None` when it does not, which [`Config::load`]
-    /// makes [`DiscoveryCfg::dht_places`].
+    /// configuration says, `None` when it does not:
+    /// [`DiscoveryCfg::dht_places`] is the number that applies.
     pub dht_places: Option<usize>,
     /// `[discovery.aliases]`: another name a search may give a capability,
     /// and the capability it searches, one step. At most [`MAX_ALIASES`],
@@ -892,7 +892,6 @@ impl Config {
                 path.display()
             );
         }
-        cfg.discovery.dht_places = Some(cfg.discovery.dht_places());
         if !cfg.gateway.listen.ip().is_loopback() {
             bail!(
                 "invalid {}: gateway.listen must be a loopback address, not {}",
