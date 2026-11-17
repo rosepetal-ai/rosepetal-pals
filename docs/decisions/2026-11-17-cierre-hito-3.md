@@ -57,3 +57,5 @@ Cambiar el reparto es una decisión de diseño del responsable. Hay dos opciones
 - relegar detrás de ella a los contactos cuyo anuncio conocido no ofrece la capacidad.
 
 Si se cambia, se registrará aparte.
+
+**Decidido después:** el responsable eligió reservar huecos a la DHT ([registro](2026-11-17-huecos-dht.md)).
