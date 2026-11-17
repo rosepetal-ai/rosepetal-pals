@@ -14,27 +14,40 @@
 //! none), then by name; this agent never.
 //!
 //! Then, behind the contacts, the providers of the capability the DHT finds
-//! ([`Dht::providers`]), in the order they arrived, named by their agent id:
-//! only when the node runs the DHT, the request names no `peers` and does
-//! not say `exclude_dht` (H3-D4), and the contacts leave room for one
-//! ([`DiscoveryLimits::max_candidates`]); when they fill every place, the
-//! lookup is not made, and the coverage is partial, `candidate limit`. Only
-//! the capability's key goes to the DHT.
-//! The lookup asks for up to [`DiscoveryLimits::max_candidates`] + 1
-//! providers within `min(per_candidate_timeout, the budget left)`: a search
-//! with the DHT on waits for it, at most `per_candidate_timeout`, before it
-//! evaluates its contacts. A provider that is a contact stays the contact,
-//! once, and the DHT never gives this agent. What the lookup discards is
-//! discarded at the card, `dht: <why>` ([`DhtLookup::discarded`]), but for a
-//! contact's.
+//! ([`Dht::providers_except`]), in the order they arrived, named by their
+//! agent id: only when the node runs the DHT, the request names no `peers`
+//! and does not say `exclude_dht` (H3-D4). Only the capability's key goes
+//! to the DHT.
 //!
-//! Only the first [`DiscoveryLimits::max_candidates`] of them all are
-//! contacted: the coverage of a search that leaves some out, or whose
-//! lookup took every provider it asked for and so may have left some, is
-//! partial, `candidate limit`. It is partial too, `dht timeout`, when the
-//! lookup was cut, and `dht unavailable` when no DHT router answered it:
-//! the contacts are searched all the same. The lookup's requests are
-//! counted apart ([`SearchMetrics::dht_requests`]).
+//! **The places.** At most [`DiscoveryLimits::max_candidates`] candidates
+//! are contacted. A search that looks in the DHT keeps
+//! [`DiscoveryLimits::dht_places`] of them, at most `max_candidates`, for
+//! the providers it finds there: the contacts take the others, the first
+//! ones in their order, and every kept place the DHT does not fill; the
+//! providers take the places the contacts leave, in the order they arrived.
+//! So the DHT has up to `dht_places` places whenever it gives providers,
+//! and more when the contacts are few. A provider counts once its records
+//! pass, below: one discarded there gives its place back. A search that
+//! does not look in the DHT, or whose lookup failed or found no one, gives
+//! every place to the contacts, as in milestone 2.
+//!
+//! The lookup asks for one more provider than the places the DHT may take,
+//! `max_candidates - min(contacts, max_candidates - dht_places) + 1`, within
+//! `min(per_candidate_timeout, the budget left)`: a search with the DHT on
+//! waits for it, at most `per_candidate_timeout`, before it evaluates its
+//! contacts. It leaves out the contacts and this agent: a provider that is
+//! a contact stays the contact, once, and takes none of the DHT's places
+//! nor of the lookup's. What the lookup discards is discarded at the card,
+//! `dht: <why>` ([`DhtLookup::discarded`]). With no place for the DHT,
+//! `dht_places` 0 and as many contacts as places, it is not made.
+//!
+//! The coverage of a search that leaves out a contact or a provider the DHT
+//! found, whose lookup took every provider it asked for and so may have
+//! left some, or whose lookup was not made for want of places, is partial,
+//! `candidate limit`. It is partial too, `dht timeout`, when the lookup was
+//! cut, and `dht unavailable` when no DHT router answered it: the contacts
+//! are searched all the same. The lookup's requests are counted apart
+//! ([`SearchMetrics::dht_requests`]).
 //!
 //! **A candidate from the DHT** is checked before anything is sent to it.
 //! Its contact and announce records, which the lookup verified, go through
@@ -205,11 +218,15 @@ pub struct DiscoveryLimits {
     pub total_budget: Duration,
     /// Searches at once, for the whole daemon.
     pub max_searches: usize,
+    /// The places of `max_candidates` kept for the providers the DHT
+    /// finds, when a search looks there (see the [module](self)); more
+    /// than `max_candidates` counts as `max_candidates`.
+    pub dht_places: usize,
 }
 
 impl Default for DiscoveryLimits {
     /// Design §7.3: 8 candidates, 3 queries at once, 3 s per candidate,
-    /// 15 s in all; and 4 searches at once.
+    /// 15 s in all; 4 searches at once, and 2 places kept for the DHT.
     fn default() -> Self {
         Self {
             max_candidates: 8,
@@ -217,6 +234,7 @@ impl Default for DiscoveryLimits {
             per_candidate_timeout: Duration::from_secs(3),
             total_budget: Duration::from_secs(15),
             max_searches: 4,
+            dht_places: 2,
         }
     }
 }
@@ -229,6 +247,7 @@ impl DiscoveryLimits {
             max_concurrent_queries: cfg.max_concurrent_queries,
             per_candidate_timeout: Duration::from_millis(cfg.per_candidate_timeout_ms),
             total_budget: Duration::from_millis(cfg.total_budget_ms),
+            dht_places: cfg.dht_places(),
             ..Self::default()
         }
     }
@@ -391,12 +410,13 @@ struct FromDht {
     /// The providers found that are neither this agent nor a contact, in
     /// the order they arrived.
     found: Vec<DhtCandidate>,
-    /// Those the lookup discarded that are no contacts, `dht: <why>`.
+    /// Those the lookup discarded, `dht: <why>`.
     discarded: Vec<Discarded>,
     /// The requests the lookup sent.
     requests: u64,
     /// The lookup took every provider it asked for, or was not made
-    /// because the contacts fill every place: it may have left some out.
+    /// because no place was left for what it finds: it may have left some
+    /// out.
     full: bool,
     /// Why the DHT leaves the coverage partial: `dht timeout` or
     /// `dht unavailable`.
@@ -524,23 +544,26 @@ impl Searcher {
         let limits = self.limits();
         let budget_end = started + limits.total_budget;
         let (mut entries, mut discarded) = self.entries(req).await?;
-        // Behind the contacts, those the DHT finds; then at most
-        // `max_candidates` of them all.
-        let from_dht = self.looked_up(req, &entries, budget_end).await;
+        // Behind the contacts, those the DHT finds, in the places the
+        // contacts leave and, at least, those kept for them.
         let max = limits.max_candidates;
-        let limited = entries.len() + from_dht.found.len() > max || from_dht.full;
-        entries.truncate(max);
+        let kept = limits.dht_places.min(max);
+        let room = max - entries.len().min(max - kept);
         let FromDht {
-            mut found,
+            found,
             discarded: dht_discarded,
             requests: dht_requests,
+            full,
             partial: dht_partial,
-            ..
-        } = from_dht;
-        found.truncate(max - entries.len());
+        } = self.looked_up(req, &entries, room, budget_end).await;
         discarded.extend(dht_discarded);
-        let (found, regressions) = self.accepted(req, found).await?;
+        let (found, regressions, unchecked) = self.accepted(req, found, room).await?;
         discarded.extend(regressions);
+        // The contacts take every place but the kept ones the DHT's
+        // providers fill.
+        let contacts = entries.len().min(max - kept.min(found.len()));
+        let limited = entries.len() > contacts || unchecked || full;
+        entries.truncate(contacts);
         entries.extend(found);
         let experience = self.experience().await?;
         let evaluations = entries
@@ -704,14 +727,15 @@ impl Searcher {
     }
 
     /// The providers of `req`'s capability the DHT finds behind
-    /// `contacts`, as the [module](self) says: nothing when the node runs
-    /// no DHT, or the request names its peers or keeps out of the DHT; and
-    /// no lookup when `contacts` fill every place, which may leave some
-    /// out.
+    /// `contacts`, for the `room` places it may take, as the [module](self)
+    /// says: nothing when the node runs no DHT, or the request names its
+    /// peers or keeps out of the DHT; and no lookup when `room` is 0, which
+    /// may leave some out.
     async fn looked_up(
         &self,
         req: &SearchRequest,
         contacts: &[Entry],
+        room: usize,
         budget_end: Instant,
     ) -> FromDht {
         let Some(dht) = &self.inner.parts.dht else {
@@ -720,21 +744,31 @@ impl Searcher {
         if req.peers.is_some() || req.exclude_dht {
             return FromDht::default();
         }
-        let limits = self.limits();
-        // With no place left behind the contacts, the lookup would tell the
+        // With no place for what it finds, the lookup would tell the
         // routers what this agent looks for and wait for them, for
         // providers that would all be left out.
-        if contacts.len() >= limits.max_candidates {
+        if room == 0 {
             return FromDht {
                 full: true,
                 ..FromDht::default()
             };
         }
-        // Room for every candidate, and one more: a lookup that finds them
-        // all may have left some out.
-        let limit = limits.max_candidates.saturating_add(1);
+        // Room for every provider it may take, and one more: a lookup that
+        // finds them all may have left some out.
+        let limit = room.saturating_add(1);
+        // Each agent once, and never this one: a contact stays the
+        // contact, and the lookup neither takes nor counts it.
+        let known: HashSet<AgentId> = contacts
+            .iter()
+            .filter_map(Entry::agent_id)
+            .chain([*self.inner.parts.store.owner()])
+            .collect();
+        let limits = self.limits();
         let (deadline, _) = cut_at(Instant::now(), limits.per_candidate_timeout, budget_end);
-        let lookup = match dht.providers(&req.capability, limit, deadline).await {
+        let lookup = match dht
+            .providers_except(&req.capability, known, limit, deadline)
+            .await
+        {
             Ok(lookup) => lookup,
             // `Stopped` only while the node stops.
             Err(error) => {
@@ -752,20 +786,10 @@ impl Searcher {
             cut,
         } = lookup;
         let full = found.len() + discarded.len() >= limit;
-        // Each agent once, and never this one: a contact stays the contact.
-        let known: HashSet<AgentId> = contacts
-            .iter()
-            .filter_map(Entry::agent_id)
-            .chain([*self.inner.parts.store.owner()])
-            .collect();
         FromDht {
-            found: found
-                .into_iter()
-                .filter(|found| !known.contains(&found.agent_id))
-                .collect(),
+            found,
             discarded: discarded
                 .into_iter()
-                .filter(|(agent, _)| !known.contains(agent))
                 .map(|(agent, why)| {
                     discard(&agent.to_string(), Stage::Card, &format!("dht: {why}"))
                 })
@@ -777,16 +801,19 @@ impl Searcher {
     }
 
     /// The providers the DHT `found` that this agent takes as candidates,
-    /// and those it discards: the records of each go through
-    /// [`Store::peer_record_accept`], and one that goes back discards it,
-    /// `record regression`.
+    /// at most `room` of them, in the order they arrived; those it
+    /// discards; and whether it left some out unchecked, for want of room.
+    /// The records of each go through [`Store::peer_record_accept`], in
+    /// that order, until `room` pass: one that goes back discards it,
+    /// `record regression`, and its place goes to the next.
     async fn accepted(
         &self,
         req: &SearchRequest,
         found: Vec<DhtCandidate>,
-    ) -> Result<(Vec<Entry>, Vec<Discarded>), SearchError> {
+        room: usize,
+    ) -> Result<(Vec<Entry>, Vec<Discarded>, bool), SearchError> {
         if found.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Vec::new(), false));
         }
         let store = Arc::clone(&self.inner.parts.store);
         let project = req.project.clone();
@@ -795,7 +822,12 @@ impl Searcher {
         let checked = tokio::task::spawn_blocking(move || {
             let mut entries = Vec::new();
             let mut discarded = Vec::new();
+            let mut unchecked = false;
             for found in found {
+                if entries.len() == room {
+                    unchecked = true;
+                    break;
+                }
                 let name = found.agent_id.to_string();
                 if goes_back(&store, &found, now)? {
                     tracing::warn!(
@@ -812,7 +844,7 @@ impl Searcher {
                     kind: EntryKind::Pals(Box::new(peer)),
                 });
             }
-            anyhow::Ok((entries, discarded))
+            anyhow::Ok((entries, discarded, unchecked))
         })
         .await;
         match checked {

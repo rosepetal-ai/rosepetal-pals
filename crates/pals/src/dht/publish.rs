@@ -59,7 +59,9 @@
 //!
 //! **A lookup** ([`super::Dht::providers`]) asks for the providers of a
 //! capability's key and, for each provider as it arrives, up to its limit,
-//! for its contact and its announce. Each copy is checked with
+//! for its contact and its announce. The agents it is told it knows
+//! ([`super::Dht::providers_except`]) are left out as they arrive: neither
+//! taken nor counted, nor looked up further. Each copy is checked with
 //! [`validate::contact_for`] and [`validate::announce_for`] at the node's
 //! clock, and the valid one of highest `seq` stays. A provider with a valid
 //! contact and a valid announce that lists the capability is a candidate;
@@ -228,6 +230,8 @@ pub(crate) struct Lookups {
 /// A lookup of a capability's providers.
 struct Lookup {
     key: RecordKey,
+    /// The agents it leaves out.
+    known: HashSet<AgentId>,
     limit: usize,
     deadline: Instant,
     reply: oneshot::Sender<Result<DhtLookup, DhtError>>,
@@ -745,6 +749,7 @@ impl Task {
     pub(super) fn start_lookup(
         &mut self,
         key: RecordKey,
+        known: HashSet<AgentId>,
         limit: usize,
         deadline: Instant,
         reply: oneshot::Sender<Result<DhtLookup, DhtError>>,
@@ -762,6 +767,7 @@ impl Task {
             n,
             Lookup {
                 key,
+                known,
                 limit,
                 deadline,
                 reply,
@@ -800,9 +806,9 @@ impl Task {
         }
     }
 
-    /// Providers lookup `n`'s `get_providers` found: each new one, up to
-    /// the limit, gets the lookups of its contact and its announce. Once
-    /// the limit is reached, the `get_providers` ends.
+    /// Providers lookup `n`'s `get_providers` found: each new one that it
+    /// does not know, up to the limit, gets the lookups of its contact and
+    /// its announce. Once the limit is reached, the `get_providers` ends.
     fn take_providers(&mut self, n: u64, id: QueryId, providers: HashSet<PeerId>) {
         let local = self.local;
         let Some(lookup) = self.lookups.running.get_mut(&n) else {
@@ -817,7 +823,7 @@ impl Task {
                 tracing::debug!(%peer, "a provider that is no agent, left out");
                 continue;
             };
-            if lookup.providers.iter().any(|p| p.agent == agent) {
+            if lookup.known.contains(&agent) || lookup.providers.iter().any(|p| p.agent == agent) {
                 continue;
             }
             new.push((lookup.providers.len(), agent));

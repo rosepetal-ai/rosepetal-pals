@@ -24,7 +24,7 @@
 //! "router"` (H3-D3). It publishes only with `[dht] announce`, and then only
 //! the capabilities of the public services (H3-D4).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -271,11 +271,27 @@ impl Dht {
         limit: usize,
         deadline: tokio::time::Instant,
     ) -> Result<DhtLookup, DhtError> {
+        self.providers_except(capability, HashSet::new(), limit, deadline)
+            .await
+    }
+
+    /// [`Dht::providers`], but for the agents of `known`: none of them is
+    /// taken, counted in `limit` or looked up further, so the `limit` goes
+    /// to the others. A search leaves out its contacts this way, which it
+    /// evaluates as contacts.
+    pub async fn providers_except(
+        &self,
+        capability: &str,
+        known: HashSet<AgentId>,
+        limit: usize,
+        deadline: tokio::time::Instant,
+    ) -> Result<DhtLookup, DhtError> {
         let Ok(key) = keys::provider_key(capability) else {
             return Ok(DhtLookup::default());
         };
         self.ask(|reply| Command::Providers {
             key,
+            known,
             limit,
             deadline,
             reply,
