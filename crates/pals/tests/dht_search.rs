@@ -623,6 +623,28 @@ async fn behind_few_contacts_the_dht_takes_more_than_its_kept_places() {
 }
 
 #[tokio::test]
+async fn a_contact_left_out_of_its_places_can_take_one_of_the_dhts() {
+    let net = network(NodeOptions::default()).await;
+    // Three places, two kept for the DHT, and three contacts: C1 (R1), the
+    // only one always evaluated, then C2 (R2) and C3 (P1), which the DHT
+    // has too. The DHT gives P1, as C3, and P2: both fit in its two places,
+    // and C3 is evaluated as the contact it is. C2 is left out.
+    let a = requester(&net, places(3, 2), |_| {}).await;
+    a.add_contact("c1", &net.r1);
+    a.add_contact("c2", &net.r2);
+    a.add_contact("c3", &net.p1);
+
+    let outcome = a.node.searcher().search(request()).await.unwrap();
+    let p1 = ranked_as(&outcome, net.p1.id());
+    assert_eq!(p1.peer, "c3", "{p1:#?}");
+    assert!(!p1.from_dht, "{p1:#?}");
+    assert!(ranked_as(&outcome, net.p2.id()).from_dht, "{outcome:#?}");
+    assert_eq!(evaluated(&outcome, &["c1", "c2", "c3"]), ["c1", "c3"]);
+    assert_eq!(outcome.metrics.contacted, 3, "{outcome:#?}");
+    partial(&outcome, &["candidate limit"]);
+}
+
+#[tokio::test]
 async fn a_lookup_leaves_out_the_agents_it_is_told_it_knows() {
     let net = network(NodeOptions::default()).await;
     let a = plain_requester(&net).await;
