@@ -27,7 +27,7 @@ Tiempo: unos 17 min, de los que 5 son el reposo medido, y uno o dos más la prim
 
 ## Dónde se aparta de la redacción del plan
 
-Tres casos no comprueban exactamente lo que dice la tabla de la tarea 14 del [plan](../plans/2026-11-16-hito-3-descubrimiento-kademlia.md). Lo decidió quien dirige el hito antes de la ejecución, porque tal como estaban escritas, esas comprobaciones no se podían cumplir o no se podían observar.
+Tres desviaciones, en los casos 2, 3, 5, 7, 8 y 9, hacen que esos casos no comprueben exactamente lo que dice la tabla de la tarea 14 del [plan](../plans/2026-11-16-hito-3-descubrimiento-kademlia.md). Lo decidió quien dirige el hito antes de la ejecución, porque tal como estaban escritas, esas comprobaciones no se podían cumplir o no se podían observar.
 
 1. **Los proveedores de la otra red (casos 2, 3, 5 y 9).**
    - **El plan.** El caso 2 pide «los dos proveedores de cada una, `from_dht`, con oferta verificada».
@@ -144,6 +144,8 @@ Las búsquedas van por `POST /discovery/search` del gateway de cada cliente, com
 
 Nada espera un tiempo fijo: el arnés sondea el estado, cada 3 s, hasta que se cumple lo que espera. Un techo generoso solo sirve para fallar. Los tiempos que tienen un límite (casos 4, 5 y 9) se miden desde el cambio de estado, y se anota la carga del anfitrión.
 
+Cada caso juzga con un guion de Python sobre lo que guardó. Un caso solo se supera si el guion llega al final sin error y escribe `OK`: uno que se rompe lo hace fallar. Una búsqueda sin respuesta, o cuyo fichero no se puede leer, cuenta como un problema del caso. Si un caso que paró agentes no consigue que los routers vuelvan a guardarlo todo al restaurarlos, el que falla es ese caso, no el siguiente.
+
 ### Caso 1. Sin fuga
 
 1. Las dos redes: `docker network inspect -f '{{.Internal}}'`.
@@ -192,7 +194,7 @@ Tras las 160 búsquedas se cuentan además las líneas del registro de cada rout
   - `a saved contact is a DHT router: entering through it peer=<PeerId de r3>`.
 - **Sus búsquedas:** los dos proveedores de cada capacidad, como en el caso 2. `r3`, su contacto, sale además entre sus descartes en la card (`no skill of <capacidad>`): es un router, sin servicios. Basta con que cada capacidad salga así en alguna de sus búsquedas.
 
-Se anota cuánto tarda desde que arranca, y las vueltas de publicación de los proveedores mientras `r1` está parado.
+Se anota cuánto tarda desde que arranca. Mientras `r1` está parado, en cada búsqueda de `c5` se lee el estado de los proveedores: ninguna de sus vueltas de publicación puede terminar con error.
 
 ### Caso 4. Caducar anuncios
 
@@ -250,11 +252,11 @@ La comprobación de la renovación no está en la tabla del plan. Sin ella, el c
 
 ### Caso 7. Búsquedas repetidas o maliciosamente amplias
 
-1. `c3` empieza a buscar las cuatro capacidades, una tras otra.
+1. `c3` empieza a buscar las cuatro capacidades, una tras otra. La ráfaga empieza cuando su primera búsqueda ha contestado y la siguiente está en marcha.
 2. `c1` lanza 200 búsquedas, 8 a la vez, cada una de 24 capacidades por turno: las 4 y `example:inexistente-01` a `-20`.
 3. Cuando acaba la ráfaga, `c3` deja de buscar.
 
-Se leen antes y después el estado de los routers y el PID de su daemon.
+Se leen antes y después el estado de los routers y su daemon: el PID y la hora a la que arrancó el proceso, de `/proc/<pid>/stat`, solo si sigue vivo.
 
 **Esperado:**
 - **La ráfaga.** Al menos un `429` con `{"error":"too many searches"}`, y el resto, `200`. El daemon admite 4 búsquedas a la vez y rechaza las demás en el acto.

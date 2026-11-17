@@ -118,6 +118,21 @@ declare -A OPERATOR=(
     [r1]=1 [r2]=1 [p1]=1 [p2]=1 [c1]=1 [c2]=1 [c0]=1 [c5]=1 [cx]=1
     [r3]=2 [r4]=2 [p3]=2 [p4]=2 [c3]=2 [c4]=2
 )
+# The same topology for the checks, which read it from H3_TOPO: each
+# provider's capabilities, each agent's networks ("a", "b" or "ab") and the
+# routers.
+topologia_json() {
+    local node spec letters caps= nets= routers=
+    for node in "${!CAPS[@]}"; do caps+="\"$node\": [\"${CAPS[$node]// /\", \"}\"], "; done
+    for node in "${!ADDRS[@]}"; do
+        letters=
+        for spec in ${ADDRS[$node]}; do letters+=${spec%%=*}; done
+        nets+="\"$node\": \"$letters\", "
+    done
+    for node in "${ROUTERS[@]}"; do routers+="\"$node\", "; done
+    printf '{"caps": {%s}, "nets": {%s}, "routers": [%s]}' "${caps%, }" "${nets%, }" "${routers%, }"
+}
+TOPO_JSON=$(topologia_json)
 
 phases=("$@")
 [ ${#phases[@]} -gt 0 ] || phases=(todo)
@@ -236,14 +251,7 @@ crea() {
     fi
     # A new container is a new agent: its id is learnt again.
     unset 'ID[$node]'
-    if [ -f "$LOGS/ids.json" ]; then
-        python3 - "$LOGS/ids.json" "$node" <<'PY'
-import json, sys
-ids = json.load(open(sys.argv[1]))
-ids.pop(sys.argv[2], None)
-open(sys.argv[1], "w").write(json.dumps(ids, indent=1, sort_keys=True) + "\n")
-PY
-    fi
+    ids_set "$node"
     for spec in ${ADDRS[$node]}; do
         if [ "$first" = 1 ]; then
             docker create --init --name "$(ctr "$node")" --hostname "$node" --label "$LABEL=$WORK" \
@@ -311,21 +319,32 @@ restaura() {
         note "$node arrancado otra vez"
     done
 }
-pid_of() { en "$1" <<< 'cat "$PALS_HOME/daemon.pid"'; }
+# vivo X: "<pid>:<start time>" of X's daemon while it runs, nothing once it
+# does not: a daemon that died, or another one, never reads the same.
+vivo() {
+    en "$1" <<< 'p=$(cat "$PALS_HOME/daemon.pid") && kill -0 "$p" 2> /dev/null && echo "$p:$(cut -d" " -f22 "/proc/$p/stat")"'
+}
 
 # Agent ids, in registro/ids.json, which the checks read.
 declare -A ID
+# ids_set X [ID]: X's agent id in registro/ids.json; without one, X's goes.
+ids_set() {
+    python3 - "$LOGS/ids.json" "$1" "${2:-}" <<'PY'
+import json, sys
+from pathlib import Path
+path, node, agent = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+ids = json.loads(path.read_text()) if path.exists() else {}
+if agent:
+    ids[node] = agent
+else:
+    ids.pop(node, None)
+path.write_text(json.dumps(ids, indent=1, sort_keys=True) + "\n")
+PY
+}
 agent_id() {
     if [ -z "${ID[$1]:-}" ]; then
         ID[$1]=$(en "$1" <<< 'pals id') || return 1
-        python3 - "$LOGS/ids.json" "$1" "${ID[$1]}" <<'PY'
-import json, sys
-from pathlib import Path
-path = Path(sys.argv[1])
-ids = json.loads(path.read_text()) if path.exists() else {}
-ids[sys.argv[2]] = sys.argv[3]
-path.write_text(json.dumps(ids, indent=1, sort_keys=True) + "\n")
-PY
+        ids_set "$1" "${ID[$1]}"
     fi
     echo "${ID[$1]}"
 }
@@ -384,11 +403,16 @@ LOGS = Path(os.environ["H3_LOGS"])
 WORK = Path(os.environ["H3_WORK"])
 IDS = json.loads((LOGS / "ids.json").read_text()) if (LOGS / "ids.json").exists() else {}
 NODE_OF = {v: k for k, v in IDS.items()}
-CAPS = {"p1": ["vision.ocr", "knowledge.documentation"], "p2": ["code.rust.review", "vision.defect-detection"],
-        "p3": ["vision.ocr", "vision.defect-detection"], "p4": ["code.rust.review", "knowledge.documentation"]}
-NETS = {"p1": "a", "p2": "a", "p3": os.environ.get("H3_P3", "b"), "p4": "b",
-        "c1": "a", "c2": "a", "c3": "b", "c4": "b", "c5": "a", "c0": "a", "cx": "a"}
-ROUTERS = ["r1", "r2", "r3", "r4"]
+# The topology, as the harness's maps define it (topologia_json).
+TOPO = json.loads(os.environ["H3_TOPO"])
+CAPS = TOPO["caps"]
+NETS = dict(TOPO["nets"])
+# Case 9: p3 on network A once it moved.
+if os.environ.get("H3_P3") == "a":
+    NETS["p3"] = "a"
+ROUTERS = TOPO["routers"]
+NODES = set(TOPO["nets"])
+CAPS_ALL = sorted({c for caps in CAPS.values() for c in caps})
 # The reasons of a candidate discarded at the card because it cannot be
 # reached: no answer in its time, or no path to it.
 UNREACHABLE = ("timeout", "card: peer unreachable")
@@ -399,17 +423,23 @@ def name(agent):
 
 
 def search(path):
-    return json.loads(Path(path).read_text())
+    """A kept search. One whose file is missing, empty or not a search
+    stands as a placeholder that every check reports as a problem: its node
+    from its name, no answer, and a t1 that sorts it last."""
+    path = Path(path)
+    try:
+        doc = json.loads(path.read_text())
+        if isinstance(doc, dict) and "nodo" in doc and "t1" in doc:
+            return doc
+    except (OSError, ValueError):
+        pass
+    node = next((t for t in path.stem.split("-") if t in NODES), None)
+    return {"nombre": path.stem, "nodo": node, "cuerpo": None, "http": None, "respuesta": None,
+            "error": "no es una búsqueda legible", "t0": float("inf"), "t1": float("inf")}
 
 
 def searches(prefix):
-    out = []
-    for f in sorted((LOGS / "busquedas").glob(prefix + "*.json")):
-        try:
-            out.append(search(f))
-        except ValueError:
-            out.append({"nombre": f.stem, "http": None, "respuesta": None, "error": "no es JSON"})
-    return out
+    return [search(f) for f in sorted((LOGS / "busquedas").glob(prefix + "*.json"))]
 
 
 def lines(path):
@@ -438,8 +468,14 @@ def outcome(s):
     return o if s.get("http") == 200 and isinstance(o, dict) and "ranked" in o else None
 
 
+def unanswered(ss):
+    """Of the searches `ss`, those with no answer of the daemon's: a file
+    that is not a search, or no HTTP 200 with a search's outcome."""
+    return [s["nombre"] for s in ss if outcome(s) is None]
+
+
 def capability(s):
-    return s["cuerpo"]["search"]["capability"]
+    return ((s.get("cuerpo") or {}).get("search") or {}).get("capability", "?")
 
 
 def expected(cap):
@@ -519,7 +555,8 @@ def found(s, p):
 
 
 def both_found(s):
-    return all(found(s, p) for p in expected(capability(s)))
+    want = expected(capability(s))
+    return outcome(s) is not None and bool(want) and all(found(s, p) for p in want)
 
 
 def mentions(s, agent):
@@ -555,8 +592,11 @@ PY
 )
 py() {
     { printf '%s\n' "$PY_COMUN"; cat; } \
-        | H3_LOGS=$LOGS H3_WORK=$WORK H3_P3=${H3_P3:-b} python3 - "$@"
+        | H3_LOGS=$LOGS H3_WORK=$WORK H3_TOPO=$TOPO_JSON H3_P3=${H3_P3:-b} python3 - "$@"
 }
+# passed STATUS OUT: whether a check script ran to its end, with status 0,
+# and found nothing wrong: its line OK. A script that crashes never passes.
+passed() { [ "$1" = 0 ] && has_line "$2" OK; }
 
 # espera_tiendas TAG MAX "R…" "P…": polls the routers R until each holds, of
 # each provider P, its contact, its announce and a provider record of each
@@ -649,7 +689,7 @@ sys.exit(1 if bad else 0)' "$SUBNET_A" "$SUBNET_B") \
         || die "a Docker network overlaps $SUBNET_A or $SUBNET_B: $overlaps"
 
     note "fecha: $(date -u '+%F %T') UTC"
-    note "commit: $(git -C "$REPO" rev-parse --short HEAD)$(git -C "$REPO" diff --quiet HEAD -- . || echo ' (con cambios sin commit)')"
+    note "commit: $(git -C "$REPO" rev-parse --short HEAD)$([ -z "$(git -C "$REPO" status --porcelain)" ] || echo ' (con cambios sin commit)')"
     note "pals: $("$PALS" --version), sha256 $(sha256sum "$PALS" | cut -c1-16)…; dht_rogue: sha256 $(sha256sum "$ROGUE" | cut -c1-16)…"
     note "anfitrión: $(. /etc/os-release && echo "$PRETTY_NAME"), kernel $(uname -r), $(nproc) CPU, carga $(load)"
     note "docker: $(docker version --format '{{.Server.Version}}'); rustc: $(rustc --version 2> /dev/null || echo 'no instalado')"
@@ -714,7 +754,7 @@ sys.exit(1 if bad else 0)' "$SUBNET_A" "$SUBNET_B") \
 
 caso1() {
     say "Caso 1. Sin fuga"
-    local ok=ok net code out
+    local ok=ok net code out st
     FAILS=0
     note "carga: $(load)"
     for net in "$NET_A" "$NET_B"; do
@@ -784,11 +824,13 @@ else:
 for p in problems:
     print("PROBLEMA:", p)
 save("caso1", {"problemas": problems})
+print("OK" if not problems else "PROBLEMA")
 PY
 )
+    st=$?
     echo "$out"
     check "c0 no encuentra a nadie, 0 pares y 0 conexiones; cx: GET /dht 404, ninguna petición a la DHT, y c0 sin ninguna conexión de agentnet-kad/0 tras la búsqueda de cx" \
-        test -z "$(grep '^PROBLEMA' <<< "$out")"
+        passed "$st" "$out"
     docker stop -t 5 "$(ctr c0)" "$(ctr cx)" > /dev/null
     [ "$FAILS" = 0 ] || ok=fail
     result "caso 1" "$ok" "$(grep -E '^(c0 GET|cx GET|cx vision)' <<< "$out" | tr '\n' ';' | cut -c1-400)"
@@ -796,7 +838,7 @@ PY
 
 caso2() {
     say "Caso 2. Encontrar un proveedor sin contacto previo"
-    local ok=ok out node r cap pids=()
+    local ok=ok out st node r cap pids=()
     FAILS=0
     note "carga: $(load)"
     # Each client, 10 rounds of every capability, one after another; the
@@ -828,20 +870,25 @@ for n, p in list(bad.items())[:20]:
     print(f"PROBLEMA {n}: {p}")
 save("caso2", {"busquedas": len(all_s), "conformes": len(all_s) - len(bad), "etiquetas": dict(labels),
                "problemas": {k: v for k, v in list(bad.items())[:50]}})
+print("OK" if len(all_s) == 160 and not bad else "PROBLEMA")
 PY
 )
+    st=$?
     echo "$out"
     local summary
     summary=$(head -n 1 <<< "$out")
     check "160 búsquedas: el proveedor de la red del cliente, en el ranking desde la DHT con card y oferta verificadas; el de la otra red, descartado en la card por inalcanzable" \
-        grep -qx 'búsquedas 160, conformes 160, .*' <<< "$out"
+        passed "$st" "$out"
 
     # What the routers' logs, at their default level, say of the searches:
     # any line that names a client, by its agent id or its PeerId.
     local who node peers=() named=
     for node in "${CLIENTS[@]}"; do
         who=$(en "$node" <<< 'sed -nE "s/.*the DHT started peer_id=([^ ]+).*/\1/p" "$PALS_HOME/daemon.log" | tail -n 1')
-        peers+=("$(agent_id "$node")" "$who")
+        # An empty pattern would match every line.
+        check "el PeerId de $node, en su registro" test -n "$who"
+        [ -z "$who" ] || peers+=("$who")
+        peers+=("$(agent_id "$node")")
     done
     for node in "${ROUTERS[@]}"; do
         named="$named $node $(en "$node" <<< 'cat "$PALS_HOME/daemon.log"' | grep -cFf <(printf '%s\n' "${peers[@]}"))"
@@ -880,7 +927,7 @@ EOS
 
 caso3() {
     say "Caso 3. Sin el arranque original"
-    local ok=ok out t_stop t_start i start
+    local ok=ok out st t_stop t_start i start
     FAILS=0
     note "carga: $(load)"
     T1=$(ticket r1) || die "no ticket from r1"
@@ -915,12 +962,20 @@ PY
     done
     estados caso3-c5 c5
     note "registro de c5: $(en c5 <<< 'grep -E "no DHT bootstrap router answered|dialing the saved contacts|a saved contact is a DHT router" "$PALS_HOME/daemon.log" | sed -E "s/^[^ ]+ +//" | tr "\n" ";"')"
-    local r3_peer
+    local r3_peer entered=0
     r3_peer=$(en r3 <<< 'sed -nE "s/.*the DHT started peer_id=([^ ]+).*/\1/p" "$PALS_HOME/daemon.log" | tail -n 1')
-    out=$(py "$t_stop" "$t_start" "$r3_peer" "$(en c5 <<< 'cat "$PALS_HOME/daemon.log"' | grep -c "a saved contact is a DHT router: entering through it peer=$r3_peer")" <<'PY'
+    # With no PeerId of r3, any entry would match: none counts.
+    [ -z "$r3_peer" ] \
+        || entered=$(en c5 <<< 'cat "$PALS_HOME/daemon.log"' | grep -cF "a saved contact is a DHT router: entering through it peer=$r3_peer")
+    out=$(py "$t_stop" "$t_start" "$r3_peer" "${entered:-0}" <<'PY'
 t_stop, t_start, r3_peer, entered = float(sys.argv[1]), float(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+problems_ = []
+if not r3_peer:
+    problems_.append("sin el PeerId de r3 en su registro")
 connected = searches("caso3-conectados-")
 bad = {s["nombre"]: problems(s) for s in connected if problems(s)}
+if len(connected) != 16 or bad:
+    problems_.append(f"conectados: {len(connected)} búsquedas, {len(bad)} no conformes")
 labels = sorted({coverage(outcome(s)) for s in connected if outcome(s)})
 print(f"conectados: {len(connected)} búsquedas, conformes {len(connected) - len(bad)}, coberturas {labels}")
 for n, p in bad.items():
@@ -939,35 +994,43 @@ print(f"c5: {len(c5)} búsquedas; primer candidato a los {first and round(first,
       f"los dos proveedores de cada capacidad a los {complete_at and round(complete_at, 1)} s; "
       f"entra por r3: {'sí' if entered else 'no'}")
 if len(done) < 4:
-    print(f"PROBLEMA c5 no encuentra los de {sorted(set(['vision.ocr', 'code.rust.review', 'knowledge.documentation', 'vision.defect-detection']) - done)}")
+    problems_.append(f"c5 no encuentra los de {sorted(set(CAPS_ALL) - done)}")
+if unanswered(c5):
+    problems_.append(f"búsquedas de c5 sin respuesta: {unanswered(c5)}")
 if not entered:
-    print("PROBLEMA c5 no dice que entra por r3")
+    problems_.append("c5 no dice que entra por r3")
 pubs = rounds_seen("caso3-proveedores-")
 short = {node: [r for r in rs if r[1]] for node, rs in pubs.items()}
 print(f"vueltas de publicación vistas con r1 parado: {sum(len(r) for r in pubs.values())}, "
       f"con error: {sum(len(r) for r in short.values())} {dict((k, v) for k, v in short.items() if v) or ''}")
+if not pubs or any(short.values()):
+    problems_.append("vueltas de publicación con error, o ninguna vista, con r1 parado")
+for p in problems_:
+    print("PROBLEMA:", p)
 save("caso3", {"vueltas_proveedores": pubs, "conectados": len(connected), "conectados_conformes": len(connected) - len(bad),
                "coberturas_conectados": labels, "c5_busquedas": len(c5),
                "c5_primer_candidato_s": first and round(first, 1),
                "c5_completo_s": complete_at and round(complete_at, 1), "c5_entra_por_r3": bool(entered),
-               "problemas": bad})
+               "problemas": bad, "problemas_del_caso": problems_})
+print("OK" if not problems_ else "PROBLEMA")
 PY
 )
+    st=$?
     echo "$out"
-    check "con r1 parado, los clientes conectados encuentran los dos proveedores de cada capacidad" \
-        grep -qE '^conectados: 16 búsquedas, conformes 16,' <<< "$out"
-    check "c5 entra por r3 y encuentra los dos proveedores de cada capacidad" test -z "$(grep '^PROBLEMA c5' <<< "$out")"
+    check "con r1 parado, los clientes conectados encuentran los dos proveedores de cada capacidad; c5 entra por r3 y los encuentra; ninguna vuelta de publicación de los proveedores falla" \
+        passed "$st" "$out"
     docker stop -t 5 "$(ctr c5)" > /dev/null
     say "Restauración: r1"
     restaura r1 || die "r1 did not start again"
-    espera_tiendas restaurado-r1 "$SETTLE_MAX_S" "${ROUTERS[*]}" "${PROVIDERS[*]}" || note "AVISO: r1 no recuperó todo"
+    check "restauración: los routers vuelven a guardar lo de cada proveedor" \
+        espera_tiendas restaurado-r1 "$SETTLE_MAX_S" "${ROUTERS[*]}" "${PROVIDERS[*]}"
     [ "$FAILS" = 0 ] || ok=fail
     result "caso 3" "$ok" "$(grep -E '^(conectados|c5):' <<< "$out" | tr '\n' ';')"
 }
 
 caso4() {
     say "Caso 4. Caducar anuncios"
-    local ok=ok out t_stop i start p1 limit=$((TTL_S + REPUBLISH_S))
+    local ok=ok out st t_stop i start p1 limit=$((TTL_S + REPUBLISH_S))
     FAILS=0
     p1=$(agent_id p1)
     note "carga: $(load)"
@@ -1019,26 +1082,31 @@ print(f"antes: los routers guardaban de p1 {held_before} (contacto, anuncio y do
 print(f"los routers lo olvidan a los {routers_s and round(routers_s, 1)} s; las búsquedas dejan de devolverlo a los "
       f"{searches_s and round(searches_s, 1)} s; límite {limit} s; {len(series)} sondeos, {len(ss)} búsquedas; carga {load}")
 expired = sum(held_before.values())
+broken = unanswered(ss)
+if broken:
+    print(f"PROBLEMA: búsquedas sin respuesta: {broken}")
 ok = bool(routers_s is not None and searches_s is not None and routers_s < limit and searches_s < limit
-          and all(n == 4 for n in held_before.values()))
-print("OK" if ok else "PROBLEMA")
+          and all(n == 4 for n in held_before.values()) and not broken)
 save("caso4", {"guardado_antes": held_before, "registros_caducados": expired, "routers_olvidan_s": routers_s and round(routers_s, 1),
                "busquedas_olvidan_s": searches_s and round(searches_s, 1), "limite_s": limit, "sondeos": len(series),
                "busquedas": len(ss), "carga": load})
+print("OK" if ok else "PROBLEMA")
 PY
 )
+    st=$?
     echo "$out"
-    check "los routers olvidan a p1 y las búsquedas dejan de devolverlo antes de $limit s" has_line "$out" OK
+    check "los routers olvidan a p1 y las búsquedas dejan de devolverlo antes de $limit s" passed "$st" "$out"
     say "Restauración: p1"
     restaura p1 || die "p1 did not start again"
-    espera_tiendas restaurado-p1 "$SETTLE_MAX_S" "${ROUTERS[*]}" "${PROVIDERS[*]}" || note "AVISO: los routers no recuperaron a p1"
+    check "restauración: los routers vuelven a guardar lo de cada proveedor" \
+        espera_tiendas restaurado-p1 "$SETTLE_MAX_S" "${ROUTERS[*]}" "${PROVIDERS[*]}"
     [ "$FAILS" = 0 ] || ok=fail
     result "caso 4" "$ok" "$(grep -E '^los routers' <<< "$out")"
 }
 
 caso5() {
     say "Caso 5. Caída de routers y renovación"
-    local ok=ok out t_stop i start limit=$((2 * REPUBLISH_S)) renewed=$((TTL_S + REPUBLISH_S))
+    local ok=ok out st t_stop i start limit=$((2 * REPUBLISH_S)) renewed=$((TTL_S + REPUBLISH_S))
     FAILS=0
     note "carga: $(load)"
     t_stop=$(now)
@@ -1088,41 +1156,49 @@ if reached:
     else:
         last = max(short, key=lambda s: s["t1"])
         key = (last["nodo"], capability(last))
-        full = min(s["t1"] for s in ss if s["t1"] > last["t1"] and both_found(s)
-                   and (s["nodo"], capability(s)) == key) - t_stop
+        end = min((s["t1"] for s in ss if s["t1"] > last["t1"] and both_found(s)
+                   and (s["nodo"], capability(s)) == key), default=None)
+        full = None if end is None else end - t_stop
 labels = Counter(coverage(outcome(s)) for s in ss if outcome(s))
 print(f"rondas {len(order)}, cobertura por ronda {[round(c, 3) for c in cov]}")
 print(f"cobertura inmediata {cov[0] if cov else None}; cobertura completa a los {full if full is None else round(full, 1)} s "
       f"(límite {limit} s); etiquetas {dict(labels)}; carga {load}")
 late = searches("caso5b-renovada-")
 late_cov = sum(1 for s in late if both_found(s)) / len(late) if late else None
-late_at = min((s["t0"] for s in late), default=t_stop) - t_stop
+late_at = min((s["t0"] for s in late if s["t0"] != float("inf")), default=t_stop) - t_stop
 print(f"renovación: a los {round(late_at)} s de pararlos (todo lo de antes ya caducado a los {renewed} s), "
       f"cobertura {late_cov} en {len(late)} búsquedas; etiquetas {dict(Counter(coverage(outcome(s)) for s in late if outcome(s)))}")
 pubs = rounds_seen("caso5-proveedores-")
 short = {node: [r for r in rs if r[1]] for node, rs in pubs.items()}
 print(f"vueltas de publicación vistas con r2 y r4 parados: {sum(len(r) for r in pubs.values())}, "
       f"con error: {sum(len(r) for r in short.values())} {dict((k, v) for k, v in short.items() if v) or ''}")
-ok = reached and full is not None and full < limit and late_cov == 1 and late_at >= renewed and len(late) == 16
-print("OK" if ok else "PROBLEMA")
+broken = unanswered(ss + late)
+if broken:
+    print(f"PROBLEMA: búsquedas sin respuesta: {broken}")
+ok = (reached and full is not None and full < limit and late_cov == 1 and late_at >= renewed and len(late) == 16
+      and not broken)
 save("caso5", {"rondas": len(order), "cobertura_por_ronda": [round(c, 3) for c in cov],
                "cobertura_inmediata": cov[0] if cov else None, "cobertura_completa_s": full if full is None else round(full, 1),
                "limite_s": limit, "etiquetas": dict(labels), "carga": load,
                "renovacion_s": round(late_at), "renovacion_cobertura": late_cov, "vueltas_proveedores": pubs})
+print("OK" if ok else "PROBLEMA")
 PY
 )
+    st=$?
     echo "$out"
-    check "cobertura completa otra vez antes de $limit s, y entera aún después de $renewed s, con lo renovado sin r2 ni r4" has_line "$out" OK
+    check "cobertura completa otra vez antes de $limit s, y entera aún después de $renewed s, con lo renovado sin r2 ni r4" \
+        passed "$st" "$out"
     say "Restauración: r2 y r4"
     restaura r2 r4 || die "r2 and r4 did not start again"
-    espera_tiendas restaurado-r2-r4 "$SETTLE_MAX_S" "${ROUTERS[*]}" "${PROVIDERS[*]}" || note "AVISO: r2 y r4 no recuperaron todo"
+    check "restauración: los routers vuelven a guardar lo de cada proveedor" \
+        espera_tiendas restaurado-r2-r4 "$SETTLE_MAX_S" "${ROUTERS[*]}" "${PROVIDERS[*]}"
     [ "$FAILS" = 0 ] || ok=fail
     result "caso 5" "$ok" "$(grep -E '^(cobertura|renovación)' <<< "$out" | tr '\n' ';')"
 }
 
 caso6() {
     say "Caso 6. Contacto con firma inválida"
-    local ok=ok out rogue start
+    local ok=ok out st rogue start
     FAILS=0
     note "carga: $(load)"
     T3=$(ticket r3) || die "no ticket from r3"
@@ -1138,11 +1214,7 @@ caso6() {
     done
     [ -n "$rogue" ] || die "dht_rogue did not start: $(en rogue <<< 'cat "$PALS_HOME/rogue.log"')"
     ID[rogue]=$rogue
-    python3 - "$LOGS/ids.json" "$rogue" <<'PY'
-import json, sys
-ids = json.load(open(sys.argv[1])); ids["rogue"] = sys.argv[2]
-open(sys.argv[1], "w").write(json.dumps(ids, indent=1, sort_keys=True) + "\n")
-PY
+    ids_set rogue "$rogue"
     note "rogue: agent $rogue"
     local i=0
     while :; do
@@ -1175,7 +1247,10 @@ for r in ROUTERS:
     print(f"{r}: bad_contact +{grew}, guarda del rogue {held} (su anuncio y su provider record, sin contacto)")
     if grew < 1 or held != 2:
         problems_.append(f"{r}: bad_contact +{grew}, guarda {held}")
-for s in searches("caso6-"):
+six = searches("caso6-")
+if len(six) != 4:
+    problems_.append(f"{len(six)} búsquedas de los clientes, no 4")
+for s in six:
     o = outcome(s)
     if o is None:
         problems_.append(f"{s['nodo']}: HTTP {s['http']}")
@@ -1191,11 +1266,13 @@ for s in searches("caso6-"):
 for p in problems_:
     print("PROBLEMA:", p)
 save("caso6", {"problemas": problems_})
+print("OK" if not problems_ else "PROBLEMA")
 PY
 )
+    st=$?
     echo "$out"
     check "los routers cuentan bad_contact y ninguno guarda su contacto; ningún cliente lo pone en su ranking y su discarded lo nombra" \
-        test -z "$(grep '^PROBLEMA' <<< "$out")"
+        passed "$st" "$out"
     docker stop -t 5 "$(ctr rogue)" > /dev/null
     note "rogue parado: sus registros caducan solos"
     [ "$FAILS" = 0 ] || ok=fail
@@ -1204,19 +1281,24 @@ PY
 
 caso7() {
     say "Caso 7. Búsquedas repetidas o maliciosamente amplias"
-    local ok=ok out caps=() n node serie
+    local ok=ok out st caps=() n node serie start
     FAILS=0
     note "carga: $(load)"
     caps=("${CAPABILITIES[@]}")
     for n in $(seq -w 1 20); do caps+=("example:inexistente-$n"); done
     estados caso7-antes "${ROUTERS[@]}"
-    local pids_before=
-    for node in "${ROUTERS[@]}"; do pids_before="$pids_before $node=$(pid_of "$node")"; done
+    local alive_before=
+    for node in "${ROUTERS[@]}"; do alive_before="$alive_before $node=$(vivo "$node")"; done
     docker exec "$(ctr c3)" rm -f /tmp/parar-serie
     docker exec "$(ctr c3)" python3 "$H/metricas.py" serie /tmp/parar-serie "${CAPABILITIES[@]}" \
         > "$LOGS/busquedas/caso7-serie-c3.jsonl" 2>> "$LOGS/busquedas/errores.txt" &
     serie=$!
-    pausa 1
+    # The burst starts once c3's series runs: its first search answered,
+    # the next under way.
+    start=$SECONDS
+    until [ -s "$LOGS/busquedas/caso7-serie-c3.jsonl" ] || [ $((SECONDS - start)) -ge "$FIND_MAX_S" ]; do
+        pausa 0.2
+    done
     local t0 t1
     t0=$(now)
     docker exec "$(ctr c1)" python3 "$H/metricas.py" rafaga "$BURST" "$BURST_AT_ONCE" "${caps[@]}" \
@@ -1227,12 +1309,12 @@ caso7() {
     wait "$serie"
     note "carga: $(load)"
     estados caso7-despues "${ROUTERS[@]}"
-    local pids_after= health=
+    local alive_after= health=
     for node in "${ROUTERS[@]}"; do
-        pids_after="$pids_after $node=$(pid_of "$node")"
+        alive_after="$alive_after $node=$(vivo "$node")"
         health="$health $node=$(en "$node" <<< 'curl -sS -o /dev/null -w "%{http_code}" http://127.0.0.1:7420/healthz')"
     done
-    note "PID antes:$pids_before; después:$pids_after; healthz:$health"
+    note "daemons (PID:arranque) antes:$alive_before; después:$alive_after; healthz:$health"
     out=$(py "$t0" "$t1" <<'PY'
 from collections import Counter
 t0, t1 = float(sys.argv[1]), float(sys.argv[2])
@@ -1262,23 +1344,26 @@ for r in ROUTERS:
 print(f"refused.streams de cada router durante el caso: {refused}")
 ok = (codes.get("429", 0) >= 1 and not bad and len(burst) == 200 and during
       and all(l["http"] == 200 for l in during) and all(v is not None for v in refused.values()))
-print("OK" if ok else "PROBLEMA")
 save("caso7", {"codigos": dict(codes), "anomalas": bad, "c3_durante": len(during),
                "c3_codigos": dict(Counter(str(l["http"]) for l in during)), "refused_streams": refused,
                "segundos": round(t1 - t0, 1)})
+print("OK" if ok else "PROBLEMA")
 PY
 )
+    st=$?
     echo "$out"
-    check "al menos un too many searches, el resto 200, ninguna anómala; c3 termina sus búsquedas" has_line "$out" OK
-    check "ningún router se cae: los mismos PID y healthz 200" \
-        test "$pids_before" = "$pids_after" -a -z "$(tr ' ' '\n' <<< "$health" | grep . | grep -v '=200$')"
+    check "al menos un too many searches, el resto 200, ninguna anómala; c3 termina sus búsquedas" passed "$st" "$out"
+    # Each daemon running before and after, the same process: a daemon that
+    # died, or one started again, has no PID or another start time.
+    check "ningún router se cae: el mismo proceso en marcha y healthz 200" \
+        test "$alive_before" = "$alive_after" -a -z "$(tr ' ' '\n' <<< "$alive_after$health" | grep . | grep -vE '=[0-9]+:[0-9]+$|=200$')"
     [ "$FAILS" = 0 ] || ok=fail
     result "caso 7" "$ok" "$(grep -E '^(ráfaga|refused)' <<< "$out" | sed -E 's/; 200 de .*//' | tr '\n' ';')"
 }
 
 caso8() {
     say "Caso 8. Política"
-    local ok=ok out start t0 node cap
+    local ok=ok out st start t0 node cap
     FAILS=0
     note "carga: $(load)"
     estados caso8-antes "${ROUTERS[@]}" p2
@@ -1319,12 +1404,13 @@ for r in ROUTERS:
     held = (b["stored_by_agent"].get(p2, 0), a["stored_by_agent"].get(p2, 0))
     cna = (b["rejected"]["capability_not_announced"], a["rejected"]["capability_not_announced"])
     print(f"{r}: guarda de p2 {held[0]} -> {held[1]} (2 + sus {len(CAPS['p2'])} públicas); capability_not_announced {cna[0]} -> {cna[1]}")
-    if held != (4, 4) or cna[1] != cna[0]:
+    if held != (2 + len(CAPS["p2"]),) * 2 or cna[1] != cna[0]:
         problems_.append(f"{r}: guarda {held}, capability_not_announced {cna}")
-for s in searches("caso8-c"):
+hidden = [s for s in searches("caso8-c") if not s["nombre"].endswith("dht")]
+if len(hidden) != 8:
+    problems_.append(f"{len(hidden)} búsquedas de las capacidades ocultas, no 8")
+for s in hidden:
     o = outcome(s)
-    if s["nombre"].endswith("dht"):
-        continue
     if o is None:
         problems_.append(f"{s['nombre']}: HTTP {s['http']}")
         continue
@@ -1348,11 +1434,13 @@ for which in ("nodht", "condht"):
 for p in problems_:
     print("PROBLEMA:", p)
 save("caso8", {"problemas": problems_})
+print("OK" if not problems_ else "PROBLEMA")
 PY
 )
+    st=$?
     echo "$out"
     check "lo privado y de proyecto de p2 en ningún router; capability_not_announced igual; nadie encuentra a p2 por ello; con --no-dht, dht_requests 0" \
-        test -z "$(grep '^PROBLEMA' <<< "$out")"
+        passed "$st" "$out"
     check "pals discover --no-dht: nada encontrado en la DHT, código 0" \
         test "$(grep -c 'found in the DHT' "$LOGS/caso8-no-dht.out")" = 0 -a "$(grep -c '^código 0$' "$LOGS/caso8-no-dht.out")" = 1
     [ "$FAILS" = 0 ] || ok=fail
@@ -1361,7 +1449,7 @@ PY
 
 caso9() {
     say "Caso 9. Cambio de red"
-    local ok=ok out t_move i start limit=$((2 * REPUBLISH_S))
+    local ok=ok out st t_move i start limit=$((2 * REPUBLISH_S))
     FAILS=0
     note "carga: $(load)"
     ronda caso9-antes "c1 c2" "${CAPS[p3]}"
@@ -1412,13 +1500,19 @@ t_move, limit, load = float(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 seq_before, seq_after, moved, at_c1 = sys.argv[4], sys.argv[5], sys.argv[6], json.loads(sys.argv[7])
 p3 = IDS["p3"]
 problems_ = []
-for s in searches("caso9-antes-"):
+before_s = searches("caso9-antes-")
+if len(before_s) != 4:
+    problems_.append(f"{len(before_s)} búsquedas antes del cambio, no 4")
+for s in before_s:
     pr = problems(s, tolerated={IDS.get("rogue")})
     print(f"antes, {s['nodo']} {capability(s)}: {pr or 'p3 descartado por inalcanzable, conforme'}")
     if pr:
         problems_.append(f"antes {s['nombre']}: {pr}")
+polls = searches("caso9-0")
+if unanswered(polls):
+    problems_.append(f"búsquedas sin respuesta tras el cambio: {unanswered(polls)}")
 first = {}
-for s in sorted(searches("caso9-0"), key=lambda s: s["t1"]):
+for s in sorted(polls, key=lambda s: s["t1"]):
     o = outcome(s)
     if not o:
         continue
@@ -1450,11 +1544,13 @@ for p in problems_:
 save("caso9", {"contacto_antes": json.loads(seq_before), "contacto_despues": json.loads(seq_after), "vuelta_tras_cambio_s": round(round_after, 1),
                "contacto_emitido_s": issued, "verificado_s": first, "limite_s": limit, "carga": load,
                "problemas": problems_})
+print("OK" if not problems_ else "PROBLEMA")
 PY
 )
+    st=$?
     echo "$out"
     check "p3 emite un contacto nuevo y lo publica; c1 y c2 verifican su card y su oferta en su dirección nueva antes de $limit s" \
-        test -z "$(grep '^PROBLEMA' <<< "$out")"
+        passed "$st" "$out"
     [ "$FAILS" = 0 ] || ok=fail
     result "caso 9" "$ok" "$(grep -E '^c1 y c2' <<< "$out")"
 }

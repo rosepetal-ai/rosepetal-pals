@@ -15,7 +15,7 @@ Los nueve casos, superados en una sola ejecución completa, a la primera. Al aca
 
 Antes, los ensayos encontraron un fallo del daemon, corregido en `db4d1ee` con su prueba: con un router caído, los proveedores dejaban de publicar y sus registros caducaban en la DHT. También llevaron a varias correcciones del arnés (ver [«Correcciones»](#correcciones-antes-de-esta-ejecución)).
 
-Tres casos comprueban lo que decidió quien dirige el hito, y no la letra del plan, porque tal como estaban escritos no se podían cumplir ni observar. Son los casos 2, 3, 5 y 9 (proveedores de la otra red), el 8 (`held_providers`) y el 7 (la ráfaga). El caso 5 comprueba además la renovación (ver [«Dónde se aparta de la redacción del plan»](#dónde-se-aparta-de-la-redacción-del-plan)).
+Tres desviaciones, en los casos 2, 3, 5, 7, 8 y 9, comprueban lo que decidió quien dirige el hito y no la letra del plan, porque tal como estaba escrita no se podía cumplir ni observar: los proveedores de la otra red (casos 2, 3, 5 y 9), `held_providers` (caso 8) y la ráfaga (caso 7). El caso 5 comprueba además la renovación (ver [«Dónde se aparta de la redacción del plan»](#dónde-se-aparta-de-la-redacción-del-plan)).
 
 | Caso | Resultado | Evidencia | Tiempo |
 |-|-|-|-|

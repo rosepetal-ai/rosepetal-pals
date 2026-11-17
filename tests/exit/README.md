@@ -218,7 +218,9 @@ tests/exit/hito-3.sh                              # todo: preparar, casos 1 a 9 
 
 Las fases también se pueden ejecutar sueltas, en orden y con el mismo `PALS_EXIT_DIR`: `preparar`, `caso1` … `caso9` y `desmontar`. Por ejemplo, `tests/exit/hito-3.sh preparar caso1 caso2`, y después `tests/exit/hito-3.sh desmontar`.
 
-Los casos que paran agentes los vuelven a arrancar al terminar, con el mismo directorio de datos y las mismas direcciones: `r1` en el caso 3, `p1` en el 4, y `r2` y `r4` en el 5. Después esperan a que los routers vuelvan a guardar lo de cada proveedor. El caso 9 no se deshace: es el último.
+Los casos que paran agentes los vuelven a arrancar al terminar, con el mismo directorio de datos y las mismas direcciones: `r1` en el caso 3, `p1` en el 4, y `r2` y `r4` en el 5. Después esperan a que los routers vuelvan a guardar lo de cada proveedor, y si no lo consiguen, el caso falla. El caso 9 no se deshace: es el último.
+
+Cada caso juzga con un guion de Python y solo se supera si el guion llega al final y escribe `OK`: uno que se rompe lo hace fallar. La topología (capacidades, redes y routers) se define una vez en el arnés y llega a esos guiones como JSON, en `H3_TOPO`.
 
 | Variable | Valor por defecto | Qué es |
 |-|-|-|
@@ -239,7 +241,7 @@ Todo lo de la ejecución queda en `$PALS_EXIT_DIR/registro/`:
 
 Hay ids de agente, pero no los tickets ni los tokens de los grants: el arnés los pasa de un contenedor a otro sin imprimirlos.
 
-**Si una ejecución se interrumpe.** Con Ctrl-C o `SIGTERM`, el arnés desmonta antes de salir. Los pasos largos corren en segundo plano mientras espera, así que lo hace en el acto. `todo` desmonta también cuando una fase falla. Después de cualquier otro final, ejecuta `tests/exit/hito-3.sh desmontar` con el mismo `PALS_EXIT_DIR`.
+**Si una ejecución se interrumpe.** Con Ctrl-C o `SIGTERM`, el arnés desmonta antes de salir, en cuanto termina la orden de Docker en curso: la mayoría corren en primer plano, y una que se queda parada (un `docker cp` con el anfitrión muy cargado) retrasa el desmontaje hasta que termina o se mata. `todo` desmonta también cuando una fase falla. Después de cualquier otro final, ejecuta `tests/exit/hito-3.sh desmontar` con el mismo `PALS_EXIT_DIR`.
 
 Si ese directorio ya no existe y quedan contenedores o redes, comprueba antes su etiqueta y bórralos a mano solo si es la tuya:
 
