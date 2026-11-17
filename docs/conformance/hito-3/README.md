@@ -96,7 +96,7 @@ Lo que el hito 3 cambia en el camino de A2A, y por qué el TCK no lo ve:
 
 Son los mismos siete MUST y dos SHOULD que en el hito 2, con el mismo estado (ver su [tabla](../hito-2/README.md#requisitos-manual-del-tck)). La firma de la card (`CARD-SIGN-001` a `004`) no cambia: el vector sigue verificando con el SDK oficial de Python (más abajo).
 
-`AUTH-TLS-001` se aceptó para los hitos 1 y 2 ([registro de decisión](../../decisions/2026-11-16-cierre-hitos-1-y-2.md#d1-auth-tls-001-se-acepta)). El hito 3 no cambia nada de aquello en lo que se basa: `agentnet-kad/0` va por el mismo endpoint de Iroh, con QUIC y TLS 1.3, y `GET /dht` está en el gateway, que solo escucha en loopback. Extender la aceptación al hito 3 lo decide el responsable; ningún registro lo hace todavía.
+`AUTH-TLS-001` se aceptó para los hitos 1 y 2 ([registro de decisión](../../decisions/2026-11-16-cierre-hitos-1-y-2.md#d1-auth-tls-001-se-acepta)). El hito 3 no cambia nada de aquello en lo que se basa: `agentnet-kad/0` va por el mismo endpoint de Iroh, con QUIC y TLS 1.3, y `GET /dht` está en el gateway, que solo escucha en loopback. El responsable extendió la aceptación al hito 3 el 2026-11-17 ([registro de decisión](../../decisions/2026-11-17-cierre-hito-3.md#d1-auth-tls-001-se-extiende-al-hito-3)).
 
 ## Cliente independiente con el SDK oficial de Python
 
@@ -145,7 +145,7 @@ En concreto: todos los requisitos MUST que el TCK en `104a7b4ae0d8` comprueba de
 No queda respaldado:
 
 - los 16 requisitos MUST sin prueba automática en el TCK;
-- los `MANUAL`: `AUTH-TLS-001` está aceptado para los hitos 1 y 2, y lo que pasa con él en el hito 3 queda dicho más arriba;
+- los `MANUAL`: `AUTH-TLS-001` está aceptado para los hitos 1, 2 y 3, como queda dicho más arriba;
 - el SHOULD `HTTP_JSON-SVC-001`;
 - el TCK con la DHT encendida, que no se ejecutó. El intercambio A2A después de encontrar a un proveedor en la DHT lo ejercita el caso 2 de la [prueba de salida](exit-test.md);
 - lo que el hito 3 añade antes del intercambio A2A, que no es A2A y que el TCK no prueba: la DHT [`agentnet-kad/0`](../../protocols/agentnet-kad-0.md) y su uso como fuente de la búsqueda de servicios. Lo respaldan las pruebas (`crates/pals/tests/dht*.rs`) y la [prueba de salida](exit-test.md);
