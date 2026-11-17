@@ -1340,12 +1340,37 @@ fn held_value(store: &MemoryStore, key: &RecordKey) -> Option<Vec<u8>> {
         .map(|record| record.value.clone())
 }
 
-/// A key for the logs: the text of a value's key, the hex of a provider
-/// key.
+/// The most characters of a key the logs show, before `…`.
+const KEY_TEXT_CHARS: usize = 128;
+
+/// A key a peer sent, for the logs: the text of a value's key, with every
+/// character but printable ASCII escaped, or the hex of any other key, such
+/// as a provider key; at most [`KEY_TEXT_CHARS`] characters of it, and `…`
+/// after them when there were more.
 fn key_text(key: &RecordKey) -> String {
-    match std::str::from_utf8(key.as_ref()) {
-        Ok(text) if text.starts_with('/') => text.to_owned(),
-        _ => key.as_ref().iter().map(|b| format!("{b:02x}")).collect(),
+    let bytes = key.as_ref();
+    // One more than is shown, to know whether there was more.
+    let shown: String = match std::str::from_utf8(bytes) {
+        Ok(text) if text.starts_with('/') => text
+            .chars()
+            .take(KEY_TEXT_CHARS + 1)
+            .map(|c| {
+                if c.is_ascii_graphic() || c == ' ' {
+                    c.to_string()
+                } else {
+                    c.escape_default().to_string()
+                }
+            })
+            .collect(),
+        _ => bytes
+            .iter()
+            .take(KEY_TEXT_CHARS / 2 + 1)
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    };
+    match shown.char_indices().nth(KEY_TEXT_CHARS) {
+        Some((at, _)) => format!("{}…", &shown[..at]),
+        None => shown,
     }
 }
 
@@ -1852,6 +1877,29 @@ pub(super) mod tests {
             assert!(expires >= before + Duration::from_secs(600), "{expires:?}");
             assert!(expires <= after + Duration::from_secs(600), "{expires:?}");
         }
+    }
+
+    #[test]
+    fn a_key_is_logged_short_and_escaped() {
+        let text = |bytes: &[u8]| key_text(&RecordKey::new(&bytes));
+        assert_eq!(
+            text(b"/agentnet/announce/12D3KooW"),
+            "/agentnet/announce/12D3KooW"
+        );
+        // Control characters, and anything but printable ASCII, escaped.
+        assert_eq!(text(b"/a\nb\x1b[31m"), "/a\\nb\\u{1b}[31m");
+        assert_eq!(
+            text("/caf\u{e9}\u{202e}".as_bytes()),
+            "/caf\\u{e9}\\u{202e}"
+        );
+        // At most 128 characters, then `…`.
+        let long = format!("/{}", "a".repeat(300));
+        assert_eq!(text(long.as_bytes()), format!("{}…", &long[..128]));
+        assert_eq!(text(&long.as_bytes()[..128]), &long[..128]);
+        // Any other key in hex, as short.
+        let provider = provider_key("vision.ocr").unwrap();
+        assert_eq!(key_text(&provider).len(), 68);
+        assert_eq!(text(&[0xff; 100]), format!("{}…", "f".repeat(128)));
     }
 
     #[test]
