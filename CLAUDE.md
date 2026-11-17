@@ -17,7 +17,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 ```
 
-All three checks must be green before every commit; CI (`.github/workflows/ci.yml`) runs the same on pushes to `dev`/`main` and on pull requests, with the pinned toolchain, plus `cargo check` on the MSRV. The integration tests start real nodes with Iroh on loopback on hosts that are often heavily loaded: synchronize on state, never on elapsed time (a gated `CountingExecutor` that the test releases, waits on the provider's store, `common::shut_down` before reusing a data directory). `blobs::a_local_copy_needs_the_holder_to_prove_it_has_the_blob` has been seen flaking at load averages near 100; rerun on a quieter machine before calling a failure there real.
+All three checks must be green before every commit; CI (`.github/workflows/ci.yml`) runs the same on pushes to `dev`/`main` and on pull requests, with the pinned toolchain, plus `cargo check` on the MSRV. The integration tests start real nodes with Iroh on loopback on hosts that are often heavily loaded: synchronize on state, never on elapsed time (a gated `CountingExecutor` that the test releases, waits on the provider's store, `common::shut_down` before reusing a data directory). `blobs::a_local_copy_needs_the_holder_to_prove_it_has_the_blob` and `dht_search::dht_without_routers_within_the_default_limits_still_ranks_the_contacts` (the default 3 s per candidate) have been seen flaking at load averages near 100; rerun on a quieter machine before calling a failure there real.
 
 `pals daemon` logs to stderr from `INFO` up; `RUST_LOG` overrides (`RUST_LOG=pals=debug`).
 
@@ -170,7 +170,7 @@ Module headers (`//!`) document each component's contract in detail; read them b
 | Hito 2 plan: its spec-deviation table, decided values, Global Constraints and Review Focus | `docs/plans/2026-11-14-hito-2-consulta-de-servicios.md` |
 | Hito 3 plan, two phases: its spec-deviation table, decided values, Global Constraints (fase 2) and Review Focus | `docs/plans/2026-11-16-hito-3-descubrimiento-kademlia.md` |
 | Roadmap, hitos 2 to 4 | `docs/plans/2026-11-14-hoja-de-ruta-hitos-2-4.md` |
-| Decision records: closing of hitos 1 and 2; hito 3 backend (H3-D1) and H3-D2 to H3-D5; closing of hito 3 | `docs/decisions/2026-11-16-cierre-hitos-1-y-2.md`, `2026-11-16-hito-3-backend-dht.md`, `2026-11-16-hito-3-decisiones.md`, `2026-11-17-cierre-hito-3.md` |
+| Decision records: closing of hitos 1 and 2; hito 3 backend (H3-D1) and H3-D2 to H3-D5; closing of hito 3; places kept for the DHT among a search's candidates | `docs/decisions/2026-11-16-cierre-hitos-1-y-2.md`, `2026-11-16-hito-3-backend-dht.md`, `2026-11-16-hito-3-decisiones.md`, `2026-11-17-cierre-hito-3.md`, `2026-11-17-huecos-dht.md` |
 | Hito 3 backend comparison (phase 1), a separate workspace | `spikes/hito-3/README.md`, `docs/decisions/hito-3-backend/` |
 | Peer bindings | `docs/bindings/http-over-iroh-v1.md` |
 | Idempotency extension | `docs/extensions/idempotency-v1.md` |

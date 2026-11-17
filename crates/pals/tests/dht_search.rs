@@ -6,8 +6,10 @@
 //!
 //! A search looks in the DHT behind the contacts: only when the node runs
 //! the DHT, and the request names no peers and does not say `exclude_dht`.
-//! What it finds there is checked as any peer is, and a provider without a
-//! grant of the project gets neither the project nor the inventory ids.
+//! It keeps `dht_places` of its places for what the DHT finds, and gives
+//! the contacts those the DHT cannot fill. What it finds there is checked
+//! as any peer is, and a provider without a grant of the project gets
+//! neither the project nor the inventory ids.
 //!
 //! The tests wait for the state they need and never for time to pass: the
 //! routers hold each provider's records, and A's own lookup finds them,
@@ -25,7 +27,8 @@ use a2a_server::AgentExecutor;
 use common::{
     CONVERGES, CountingExecutor, LOOKUP_PAUSE, Publisher, StubMode, TestNode, TestRecords,
     announce, contact, dht, grant, held, key_in, now_unix, pals, shut_down,
-    spawn_node_in_configured, stub_card, stub_discovery_peer_with_card, wait_for,
+    spawn_node_in_configured, spawn_node_with_executor, stub_card, stub_discovery_peer_with_card,
+    wait_for,
 };
 use futures::future::BoxFuture;
 use pals::config::{CONFIG_FILE, Config, DhtCfg, DhtMode, INVENTORY_FILE};
@@ -96,9 +99,28 @@ fn patient() -> DiscoveryLimits {
 
 /// A search for [`CAPABILITY`], and nothing else.
 fn request() -> SearchRequest {
+    searching(CAPABILITY)
+}
+
+/// A search for `capability`, and nothing else.
+fn searching(capability: &str) -> SearchRequest {
     SearchRequest {
-        capability: CAPABILITY.to_owned(),
+        capability: capability.to_owned(),
         ..SearchRequest::default()
+    }
+}
+
+/// The options of a requester whose searches contact `max_candidates`
+/// candidates and keep `dht_places` of them for the DHT, and are otherwise
+/// [`patient`].
+fn places(max_candidates: usize, dht_places: usize) -> NodeOptions {
+    NodeOptions {
+        search_limits: Some(DiscoveryLimits {
+            max_candidates,
+            dht_places,
+            ..patient()
+        }),
+        ..NodeOptions::default()
     }
 }
 
@@ -261,6 +283,32 @@ fn names(outcome: &SearchOutcome, agent: AgentId) -> bool {
             .any(|discarded| discarded.peer == agent.to_string())
 }
 
+/// The contacts of `contacts`, by name, that `outcome` evaluated, ranked
+/// or discarded, sorted.
+fn evaluated<'a>(outcome: &SearchOutcome, contacts: &[&'a str]) -> Vec<&'a str> {
+    let mut seen: Vec<&str> = contacts
+        .iter()
+        .copied()
+        .filter(|name| {
+            outcome.ranked.iter().any(|c| c.peer == *name)
+                || outcome.discarded.iter().any(|d| d.peer == *name)
+        })
+        .collect();
+    seen.sort_unstable();
+    seen
+}
+
+/// `outcome`'s coverage, partial for `reasons` alone.
+fn partial(outcome: &SearchOutcome, reasons: &[&str]) {
+    assert_eq!(
+        outcome.coverage,
+        Coverage::Partial {
+            reasons: reasons.iter().map(|r| (*r).to_owned()).collect()
+        },
+        "{outcome:#?}"
+    );
+}
+
 /// Where `peer` was discarded, and why.
 fn discard<'a>(outcome: &'a SearchOutcome, peer: &str) -> (Stage, &'a str) {
     let found = outcome
@@ -396,14 +444,8 @@ async fn a_provider_with_no_prior_contact_is_found() {
 #[tokio::test]
 async fn contacts_come_first_and_each_agent_once() {
     let net = network(NodeOptions::default()).await;
-    let one = NodeOptions {
-        search_limits: Some(DiscoveryLimits {
-            max_candidates: 1,
-            ..patient()
-        }),
-        ..NodeOptions::default()
-    };
-    let a1 = requester(&net, one, |_| {}).await;
+    // One place, none kept for the DHT.
+    let a1 = requester(&net, places(1, 0), |_| {}).await;
     let a8 = plain_requester(&net).await;
     for a in [&a1, &a8] {
         a.add_contact("p2", &net.p2);
@@ -448,14 +490,8 @@ async fn contacts_come_first_and_each_agent_once() {
 #[tokio::test]
 async fn contacts_that_fill_every_place_leave_the_dht_alone() {
     let net = network(NodeOptions::default()).await;
-    let one = NodeOptions {
-        search_limits: Some(DiscoveryLimits {
-            max_candidates: 1,
-            ..patient()
-        }),
-        ..NodeOptions::default()
-    };
-    let a = requester(&net, one, |_| {}).await;
+    // One place, none kept for the DHT.
+    let a = requester(&net, places(1, 0), |_| {}).await;
     a.add_contact("p2", &net.p2);
 
     // One place, and one contact to fill it: the lookup is not made, so
@@ -472,6 +508,163 @@ async fn contacts_that_fill_every_place_leave_the_dht_alone() {
             reasons: vec!["candidate limit".to_owned()]
         }
     );
+}
+
+#[tokio::test]
+async fn a_search_keeps_places_for_the_dht_behind_many_contacts() {
+    let net = network(NodeOptions::default()).await;
+    // Three places, one kept for the DHT, and three contacts: P2, which the
+    // DHT has too, and the routers, which offer nothing.
+    let a = requester(&net, places(3, 1), |_| {}).await;
+    a.add_contact("p2", &net.p2);
+    a.add_contact("r1", &net.r1);
+    a.add_contact("r2", &net.r2);
+
+    // The lookup is made, and P1, whom only the DHT gives, takes the place
+    // kept for it; the first two contacts by name take the others, P2 as
+    // the contact, and R2 is left out.
+    let outcome = a.node.searcher().search(request()).await.unwrap();
+    assert!(outcome.metrics.dht_requests > 0, "{:?}", outcome.metrics);
+    let p1 = ranked_as(&outcome, net.p1.id());
+    assert!(p1.from_dht, "{p1:#?}");
+    assert_eq!(p1.skill_id.as_deref(), Some("ocr"));
+    let p2 = ranked_as(&outcome, net.p2.id());
+    assert_eq!(p2.peer, "p2");
+    assert!(!p2.from_dht, "{p2:#?}");
+    assert_eq!(evaluated(&outcome, &["p2", "r1", "r2"]), ["p2", "r1"]);
+    assert_eq!(outcome.metrics.contacted, 3, "{outcome:#?}");
+    partial(&outcome, &["candidate limit"]);
+}
+
+#[tokio::test]
+async fn places_the_dht_cannot_fill_go_back_to_the_contacts() {
+    let net = network(NodeOptions::default()).await;
+    // Three places, one kept for the DHT, and four contacts: both providers
+    // and two agents with no DHT, which stay up when the routers stop.
+    let a = requester(&net, places(3, 1), |_| {}).await;
+    let x1 = spawn_node_with_executor(CountingExecutor::new(Duration::ZERO)).await;
+    let x2 = spawn_node_with_executor(CountingExecutor::new(Duration::ZERO)).await;
+    for (name, node) in [("p1", &net.p1), ("p2", &net.p2), ("x1", &x1), ("x2", &x2)] {
+        a.add_contact(name, node);
+    }
+    let contacts = ["p1", "p2", "x1", "x2"];
+
+    // The DHT gives no provider of vision.ocr that is no contact, and none
+    // at all of another capability: the lookup is made, and the place it
+    // could not fill goes to the third contact by name. X2 is left out.
+    for capability in [CAPABILITY, "code.rust.review"] {
+        let outcome = a
+            .node
+            .searcher()
+            .search(searching(capability))
+            .await
+            .unwrap();
+        assert!(
+            outcome.metrics.dht_requests > 0,
+            "{capability}: {outcome:#?}"
+        );
+        assert!(!outcome.ranked.iter().any(|c| c.from_dht), "{outcome:#?}");
+        assert_eq!(evaluated(&outcome, &contacts), ["p1", "p2", "x1"]);
+        assert_eq!(outcome.metrics.contacted, 3, "{outcome:#?}");
+        partial(&outcome, &["candidate limit"]);
+    }
+
+    // No router answers: the contacts take every place too.
+    let Net { r1, r2, .. } = net;
+    shut_down(r1.node).await;
+    shut_down(r2.node).await;
+    let outcome = a.node.searcher().search(request()).await.unwrap();
+    let ranked: Vec<&str> = outcome.ranked.iter().map(|c| c.peer.as_str()).collect();
+    assert_eq!(ranked.len(), 2, "{outcome:#?}");
+    assert_eq!(evaluated(&outcome, &contacts), ["p1", "p2", "x1"]);
+    assert_eq!(outcome.metrics.contacted, 3, "{outcome:#?}");
+    partial(&outcome, &["candidate limit", "dht unavailable"]);
+}
+
+#[tokio::test]
+async fn the_dht_takes_its_kept_places_and_no_more_behind_enough_contacts() {
+    let net = network(NodeOptions::default()).await;
+    // Three places, one kept for the DHT, and two contacts that offer
+    // nothing: the DHT has P1 and P2, but its one place takes only the one
+    // that arrives first; the other is left out.
+    let a = requester(&net, places(3, 1), |_| {}).await;
+    a.add_contact("r1", &net.r1);
+    a.add_contact("r2", &net.r2);
+
+    let outcome = a.node.searcher().search(request()).await.unwrap();
+    let from_dht: Vec<&Candidate> = outcome.ranked.iter().filter(|c| c.from_dht).collect();
+    assert_eq!(from_dht.len(), 1, "{outcome:#?}");
+    assert!(
+        [net.p1.id(), net.p2.id()]
+            .map(Some)
+            .contains(&from_dht[0].agent_id),
+        "{outcome:#?}"
+    );
+    assert_eq!(evaluated(&outcome, &["r1", "r2"]), ["r1", "r2"]);
+    assert_eq!(outcome.metrics.contacted, 3, "{outcome:#?}");
+    partial(&outcome, &["candidate limit"]);
+}
+
+#[tokio::test]
+async fn behind_few_contacts_the_dht_takes_more_than_its_kept_places() {
+    let net = network(NodeOptions::default()).await;
+    // Three places, one kept for the DHT, and one contact: the DHT may take
+    // two, and its lookup asks for three, so finding P1 and P2 leaves no
+    // one out.
+    let a = requester(&net, places(3, 1), |_| {}).await;
+    a.add_contact("r1", &net.r1);
+
+    let outcome = a.node.searcher().search(request()).await.unwrap();
+    assert!(ranked_as(&outcome, net.p1.id()).from_dht, "{outcome:#?}");
+    assert!(ranked_as(&outcome, net.p2.id()).from_dht, "{outcome:#?}");
+    assert_eq!(evaluated(&outcome, &["r1"]), ["r1"]);
+    assert_eq!(outcome.metrics.contacted, 3, "{outcome:#?}");
+    assert_eq!(outcome.coverage, Coverage::Complete, "{outcome:#?}");
+}
+
+#[tokio::test]
+async fn a_contact_left_out_of_its_places_can_take_one_of_the_dhts() {
+    let net = network(NodeOptions::default()).await;
+    // Three places, two kept for the DHT, and three contacts: C1 (R1), the
+    // only one always evaluated, then C2 (R2) and C3 (P1), which the DHT
+    // has too. The DHT gives P1, as C3, and P2: both fit in its two places,
+    // and C3 is evaluated as the contact it is. C2 is left out.
+    let a = requester(&net, places(3, 2), |_| {}).await;
+    a.add_contact("c1", &net.r1);
+    a.add_contact("c2", &net.r2);
+    a.add_contact("c3", &net.p1);
+
+    let outcome = a.node.searcher().search(request()).await.unwrap();
+    let p1 = ranked_as(&outcome, net.p1.id());
+    assert_eq!(p1.peer, "c3", "{p1:#?}");
+    assert!(!p1.from_dht, "{p1:#?}");
+    assert!(ranked_as(&outcome, net.p2.id()).from_dht, "{outcome:#?}");
+    assert_eq!(evaluated(&outcome, &["c1", "c2", "c3"]), ["c1", "c3"]);
+    assert_eq!(outcome.metrics.contacted, 3, "{outcome:#?}");
+    partial(&outcome, &["candidate limit"]);
+}
+
+#[tokio::test]
+async fn a_lookup_leaves_out_the_agents_it_is_told_it_knows() {
+    let net = network(NodeOptions::default()).await;
+    let a = plain_requester(&net).await;
+    let (p1, p2) = (net.p1.id(), net.p2.id());
+    let lookup = |known: &[AgentId], limit: usize| {
+        let known = known.iter().copied().collect();
+        let answer = tokio::time::Instant::now() + CONVERGES;
+        dht(&a).providers_except(CAPABILITY, known, limit, answer)
+    };
+
+    // Knowing both, it finds no one, and discards no one: neither is
+    // looked up.
+    let none = lookup(&[p1, p2], 1).await.unwrap();
+    assert!(none.found.is_empty(), "{none:?}");
+    assert!(none.discarded.is_empty(), "{none:?}");
+    assert!(none.requests > 0, "{none:?}");
+    // Knowing P1, its one place goes to P2, whichever arrives first.
+    let other = lookup(&[p1], 1).await.unwrap();
+    let found: Vec<AgentId> = other.found.iter().map(|f| f.agent_id).collect();
+    assert_eq!(found, [p2], "{other:?}");
 }
 
 #[tokio::test]
@@ -761,6 +954,43 @@ fn aliases_to_invalid_capabilities_are_refused() {
     let err = load(&format!("[discovery.aliases]\n{}", many(257))).unwrap_err();
     let err = format!("{err:#}");
     assert!(err.contains("discovery.aliases"), "{err}");
+}
+
+#[test]
+fn dht_places_default_to_two_and_fit_in_max_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(CONFIG_FILE);
+    let load = |text: &str| {
+        std::fs::write(&path, text).unwrap();
+        Config::load(&path)
+    };
+    let cfg = load("").unwrap();
+    assert_eq!(cfg.discovery.dht_places(), 2);
+    assert_eq!(DiscoveryLimits::from_config(&cfg.discovery).dht_places, 2);
+    assert_eq!(DiscoveryLimits::default().dht_places, 2);
+    // None, as many as there are places, or, when the file does not say,
+    // as many as there are when fewer than two: a configuration of one
+    // candidate stays valid.
+    for (text, places) in [
+        ("dht_places = 0\n", 0),
+        ("max_candidates = 3\ndht_places = 3\n", 3),
+        ("max_candidates = 1\n", 1),
+    ] {
+        let cfg = load(&format!("[discovery]\n{text}")).unwrap();
+        assert_eq!(cfg.discovery.dht_places(), places, "{text}");
+        let limits = DiscoveryLimits::from_config(&cfg.discovery);
+        assert_eq!(limits.dht_places, places, "{text}");
+    }
+    // Never more places than a search has.
+    for text in [
+        "max_candidates = 3\ndht_places = 4\n",
+        "dht_places = 9\n",
+        "max_candidates = 1\ndht_places = 2\n",
+    ] {
+        let err = load(&format!("[discovery]\n{text}")).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("discovery.dht_places"), "{text}: {err}");
+    }
 }
 
 #[tokio::test]

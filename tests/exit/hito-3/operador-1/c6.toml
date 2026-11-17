@@ -1,0 +1,27 @@
+# c6 (case 2): a client of operator 1 on network A, entering through r1,
+# whose searches have three places; the harness saves three contacts, the
+# routers r1, r2 and r3, before it starts. With the default dht_places, 2
+# of the 3 places stay for the providers the DHT finds.
+[agent]
+name = "c6"
+description = "Cliente c6 del operador 1 en la prueba de salida del hito 3"
+
+[gateway]
+listen = "127.0.0.1:7420"
+
+[worker]
+adapter = "echo"
+
+[net]
+relay = false
+listen = "0.0.0.0:4433"
+
+[discovery]
+max_candidates = 3
+
+[dht]
+enabled = true
+mode = "client"
+bootstrap = ["@TICKET_R1@"]
+record_ttl_s = 120
+republish_s = 40

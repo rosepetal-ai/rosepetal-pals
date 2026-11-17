@@ -433,9 +433,11 @@ pub(crate) enum Command {
     HeldProviders(RecordKey, oneshot::Sender<Vec<(AgentId, Vec<Multiaddr>)>>),
     /// The contact and the announce of an agent the node holds.
     HeldRecords(AgentId, oneshot::Sender<HeldRecords>),
-    /// A lookup of the providers of the capability whose key it is.
+    /// A lookup of the providers of the capability whose key it is, but
+    /// for those of `known`.
     Providers {
         key: RecordKey,
+        known: HashSet<AgentId>,
         limit: usize,
         deadline: tokio::time::Instant,
         reply: oneshot::Sender<Result<DhtLookup, DhtError>>,
@@ -718,10 +720,11 @@ impl Task {
             }
             Command::Providers {
                 key,
+                known,
                 limit,
                 deadline,
                 reply,
-            } => self.start_lookup(key, limit, deadline, reply),
+            } => self.start_lookup(key, known, limit, deadline, reply),
         }
     }
 
@@ -1747,7 +1750,7 @@ pub(super) mod tests {
         );
         let (reply, _answer) = oneshot::channel();
         let deadline = tokio::time::Instant::now() + PROMPTLY;
-        searcher.start_lookup(capability, 8, deadline, reply);
+        searcher.start_lookup(capability, HashSet::new(), 8, deadline, reply);
         let addrs = tokio::time::timeout(PROMPTLY, async {
             loop {
                 let event = searcher.swarm.select_next_some().await;

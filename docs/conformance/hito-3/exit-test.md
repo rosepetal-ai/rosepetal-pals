@@ -9,6 +9,64 @@ La ejecuta el arnés [`tests/exit/hito-3.sh`](../../../tests/exit/README.md#prue
 
 **No es una prueba en varias máquinas físicas.** Los agentes comparten kernel, reloj y máquina. Entre ellos solo hay dos redes de Docker `--internal` (ver [«Lo que no cubre»](#lo-que-no-cubre)). Lo decidió H3-D2 ([registro](../../decisions/2026-11-16-hito-3-decisiones.md#h3-d2-quién-opera-los-puntos-de-arranque-y-los-routers-de-la-prueba)): el agente que implementa el hito opera los dos operadores, cada uno con sus identidades, su configuración y sus puntos de arranque. Una prueba con Docker cierra un hito (D2 del cierre de los hitos 1 y 2).
 
+## Ejecución tras reservar huecos a la DHT (2026-11-17)
+
+Después del cierre del hito 3, el responsable decidió reservar huecos a la DHT entre los candidatos de una búsqueda ([registro de decisión](../../decisions/2026-11-17-huecos-dht.md)). El caso 2 ganó una comprobación: `c6`, con tantos contactos guardados como huecos, encuentra un proveedor en la DHT. La prueba entera se ejecutó una vez sobre el árbol con ese cambio. Las secciones siguientes, desde [«Resultado (2026-11-17)»](#resultado-2026-11-17), son la ejecución que cerró el hito 3, y quedan como estaban.
+
+**Resultado.** Los nueve casos, superados en una sola ejecución completa, a la primera. Al acabar no quedó ningún contenedor ni red con la etiqueta de la ejecución, y se conservaron las imágenes `pals-exit-h3:latest` y `pals-exit-a:latest`.
+
+| Dato | Valor |
+|-|-|
+| Fecha | 2026-11-17, de 10:39:40 a 10:56:36 UTC (16 min 56 s, con los 300 s de reposo) |
+| Commit | `e3e5843`, con el árbol limpio: el reparto de los huecos (`3870709`), la comprobación de `c6` (`4d0baba`) y su documentación. Después solo cambia este registro |
+| Binarios | `cargo build --release --locked -p pals` y `--examples` en el anfitrión: `pals 0.1.0` (sha256 `74c75029…`) y `dht_rogue` (sha256 `98d8c4f9…`) |
+| Imagen | `pals-exit-h3:latest` (id `6fa4bcf19e77…`), la de la ejecución anterior |
+| Anfitrión | El mismo, compartido con otros proyectos. Carga media al empezar: 21,4 / 37,6 / 76,2, tras la batería de pruebas del daemon y la carga de otros proyectos. La de un minuto, de 18,9 a 15,6 durante el reposo y de 15,6 a 5,8 durante los casos |
+| Contenedores | Doce de la topología y cinco de sus casos (`c0`, `cx`, `c6`, `c5` y `rogue`) |
+
+| Caso | Resultado | Lo medido |
+|-|-|-|
+| 1. Sin fuga | Superado | `c0`, 0 pares y 0 conexiones antes y después de la búsqueda de `cx`. `cx`: `GET /dht` 404 y `dht_requests 0` |
+| 2. Encontrar un proveedor sin contacto previo | Superado | 160 de 160 búsquedas conformes, como en la ejecución anterior: `dht_requests` 20 en todas, 2 contactados y cobertura `timeout`. La pregunta de `c1` a `p1`: `echo: hola`. Y `c6`, más abajo |
+| 3. Sin el arranque original | Superado | Con `r1` parado, 16 de 16 conformes. `c5` entra por `r3`: primer candidato a los 11,3 s, los dos proveedores de cada capacidad a los 33,5 s |
+| 4. Caducar anuncios | Superado | Los routers olvidan a `p1` a los 116,1 s, y las búsquedas, a los 116,3 s. Límite: 160 s |
+| 5. Caída de routers y renovación | Superado | Cobertura inmediata 1, entera a los 0 s (límite 80 s). A los 166 s, con todo lo de antes caducado, 1 en 16 búsquedas |
+| 6. Contacto con firma inválida | Superado | Los 4 routers: `bad_contact` +1, y guardan 2 registros del `rogue`, sin contacto |
+| 7. Búsquedas repetidas o maliciosamente amplias | Superado | Ráfaga de 200 desde `c1` en 6,2 s: 4 `200` y 196 `429 too many searches`. `refused.streams` 0 en los cuatro routers |
+| 8. Política | Superado | Cada router guarda 4 registros de `p2` antes y después de una vuelta suya. `capability_not_announced` 0 → 0 |
+| 9. Cambio de red | Superado | `c1` y `c2` verifican la card y la oferta de `p3` en la red A a los 6,5 s (límite 80 s) |
+
+**La comprobación nueva, `c6` en el caso 2.** `c6` entra por `r1`. Tiene `[discovery] max_candidates = 3`, `dht_places` por defecto, 2, y tres contactos guardados, los routers `r1`, `r2` y `r3`. Su primera búsqueda de `vision.ocr` ya tenía a `p1`:
+
+| Dato | Valor |
+|-|-|
+| Búsquedas hasta tener a `p1` | 1 |
+| `p1` | En el ranking con `from_dht: true`, su card verificada y su oferta `available`, sin grant (`grant_held: false`) |
+| Contactos evaluados | `r1`, el primero por nombre, descartado en la card: `no skill of vision.ocr`. `r2` y `r3` quedan fuera |
+| De la DHT | `p1` y `p3`. `p3`, de la otra red, descartado en la card: `timeout` |
+| Contactados | 3, su `max_candidates` |
+| `dht_requests` | 20 |
+| Cobertura | Parcial: `candidate limit`, por `r2` y `r3`; `dht timeout`, porque la búsqueda en la DHT llegó a su plazo de 3 s, con los dos proveedores ya encontrados; y `timeout`, por `p3` |
+| Tiempo | 6,0 s: los 3 s de la búsqueda en la DHT y los 3 s de `p3`. Primer candidato válido a los 3031 ms |
+
+Con `dht_places = 0`, como antes de reservar huecos, una búsqueda como la de `c6` no consulta la DHT: sus tres contactos llenan sus tres huecos, con `dht_requests 0` y `candidate limit`. Lo comprueba `contacts_that_fill_every_place_leave_the_dht_alone`, en `crates/pals/tests/dht_search.rs`.
+
+Los commits posteriores a `e53de05`, de la corrección tras la revisión, cambian el reparto para los contactos que la DHT da: uno posterior a los que siempre se evalúan ocupa un hueco de la DHT como el contacto que es. No se repitió esta ejecución, porque los contactos de `c6` son routers que no anuncian nada. Lo cubren las pruebas de integración `a_contact_left_out_of_its_places_can_take_one_of_the_dhts`, `the_dht_takes_its_kept_places_and_no_more_behind_enough_contacts` y `behind_few_contacts_the_dht_takes_more_than_its_kept_places`, en `crates/pals/tests/dht_search.rs`.
+
+Las líneas del arnés:
+
+```text
+RESULTADO caso 1: superado (c0 GET /dht (caso1-c0): routing_peers 0, connections 0, connections_accepted 0;c0 GET /dht (caso1-c0-despues): routing_peers 0, connections 0, connections_accepted 0;cx GET /dht: HTTP 404;cx vision.ocr: ranked [], discarded [('c0', 'card', 'no skill of vision.ocr')], complete, dht_requests 0, contacted 1;)
+RESULTADO caso 2: superado (búsquedas 160, conformes 160; pregunta a p1: echo: hola; c6: 1 búsquedas; en caso2b-c6-01, contactos evaluados ['r1'] de ['r1', 'r2', 'r3'], de la DHT ['p1', 'p3'], contactados 3, dht_requests 20, partial (candidate limit, dht timeout, timeout), 6.0 s)
+RESULTADO caso 3: superado (conectados: 16 búsquedas, conformes 16, coberturas ['partial (dht timeout, timeout)'];c5: 8 búsquedas; primer candidato a los 11.3 s de arrancar; los dos proveedores de cada capacidad a los 33.5 s; entra por r3: sí;)
+RESULTADO caso 4: superado (los routers lo olvidan a los 116.1 s; las búsquedas dejan de devolverlo a los 116.3 s; límite 160 s; 18 sondeos, 72 búsquedas; carga 9.18 13.57 42.26)
+RESULTADO caso 5: superado (cobertura inmediata 1.0; cobertura completa a los 0.0 s (límite 80 s); etiquetas {'partial (dht timeout, timeout)': 16}; carga 10.02 11.38 35.80;renovación: a los 166 s de pararlos (todo lo de antes ya caducado a los 160 s), cobertura 1.0 en 16 búsquedas; etiquetas {'partial (dht timeout, timeout)': 16};)
+RESULTADO caso 6: superado (r1: bad_contact +1, guarda del rogue 2;r2: bad_contact +1, guarda del rogue 2;r3: bad_contact +1, guarda del rogue 2;r4: bad_contact +1, guarda del rogue 2;)
+RESULTADO caso 7: superado (ráfaga de c1: 200 búsquedas, 8 a la vez, en 6.2 s; códigos {'200': 4, '429': 196};refused.streams de cada router durante el caso: {'r1': 0, 'r2': 0, 'r3': 0, 'r4': 0};)
+RESULTADO caso 8: superado (r1: guarda de p2 4 -> 4; capability_not_announced 0 -> 0;r2: guarda de p2 4 -> 4; capability_not_announced 0 -> 0;r3: guarda de p2 4 -> 4; capability_not_announced 0 -> 0;r4: guarda de p2 4 -> 4; capability_not_announced 0 -> 0;)
+RESULTADO caso 9: superado (c1 y c2 verifican la card y la oferta de p3 en su dirección nueva a los {'c2': 6.5, 'c1': 6.5} s del cambio (límite 80 s); carga 5.83 9.69 32.71)
+```
+
 ## Resultado (2026-11-17)
 
 Los nueve casos, superados en una sola ejecución completa, a la primera, sobre `8c5ef66` tal como está en el repositorio: el daemon y el arnés con las correcciones de la revisión final de la fase 2 (ver [«Correcciones»](#correcciones-antes-de-esta-ejecución), punto 6). Al acabar no quedó ningún contenedor ni red con la etiqueta de la ejecución. La ejecución anterior, sobre `9ff835f`, antes de esas correcciones, también superó los nueve.

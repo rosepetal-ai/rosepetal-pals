@@ -14,7 +14,7 @@ La prueba se hace con Docker en una sola máquina, como decidió H3-D2 ([registr
 | Caso | Qué se comprueba |
 |-|-|
 | 1. Sin fuga | Las dos redes son internas. `c0`, aislado, no encuentra a nadie, y su `GET /dht` da 0 pares y 0 conexiones. `cx`, sin `[dht]`, no abre ninguna conexión `agentnet-kad/0`, y su búsqueda no hace peticiones a la DHT |
-| 2. Encontrar un proveedor sin contacto previo | Cada cliente busca 10 veces cada capacidad: los dos proveedores de cada una salen de la DHT. El de su red queda en el ranking `from_dht`, con su card y su oferta verificadas, y el de la otra red, descartado en la card por inalcanzable. Después, `p1` da un grant a `c1`, y `pals discover --capability vision.ocr --ask "hola"` desde `c1` obtiene `echo: hola` de `p1` por A2A estándar |
+| 2. Encontrar un proveedor sin contacto previo | Cada cliente busca 10 veces cada capacidad: los dos proveedores de cada una salen de la DHT. El de su red queda en el ranking `from_dht`, con su card y su oferta verificadas, y el de la otra red, descartado en la card por inalcanzable. Después, `p1` da un grant a `c1`, y `pals discover --capability vision.ocr --ask "hola"` desde `c1` obtiene `echo: hola` de `p1` por A2A estándar. Por último, `c6`, con tantos contactos guardados como huecos, también encuentra a `p1` en la DHT |
 | 3. Sin el arranque original | Se para `r1`. Los clientes conectados siguen encontrando los dos proveedores de cada capacidad. `c5` arranca, entra por `r3` y los encuentra |
 | 4. Caducar anuncios | Se para `p1` sin aviso. Los routers dejan de guardar sus registros y las búsquedas dejan de devolverlo antes de `record_ttl_s + republish_s` (160 s) |
 | 5. Caída de routers y renovación | Se paran `r2` y `r4`, uno de cada operador. Se miden la cobertura inmediata y el tiempo hasta recuperarla entera, que tiene que ser menos de `2 × republish_s` (80 s). Y sigue entera cuando ya ha caducado todo lo publicado antes de pararlos |
@@ -69,6 +69,7 @@ Dos redes Docker `--internal`, sin salida ni ruta entre ellas: A, `10.213.73.0/2
 | `c0` | | A `.40` | cliente, aislado | nadie (caso 1) |
 | `cx` | | A `.46` | sin `[dht]` | (caso 1) |
 | `c5` | 1 | A `.45` | cliente | `r1`, parado, y el ticket de `r3` guardado como contacto (caso 3) |
+| `c6` | 1 | A `.47` | cliente, con `[discovery] max_candidates = 3` | `r1`, con los tickets de `r1`, `r2` y `r3` guardados como contactos (caso 2) |
 | `rogue` | | B `.50` | `dht_rogue` | `r3` (caso 6) |
 
 Todos los daemons llevan lo mismo:
@@ -88,7 +89,7 @@ Las capacidades y los servicios son los de la fase 1, todos públicos. Cada capa
 | `p3` | `vision.ocr`, `vision.defect-detection` | |
 | `p4` | `code.rust.review`, `knowledge.documentation` | |
 
-Ningún cliente tiene contactos guardados: todo lo que encuentra sale de la DHT. Las búsquedas usan los límites por defecto de `[discovery]`: 3 s por candidato y 15 s en total. El descarte de un proveedor de la otra red llega cuando se agota su plazo, así que cada búsqueda tarda unos 3 s.
+Los clientes `c1` a `c4` no tienen contactos guardados: todo lo que encuentran sale de la DHT. Las búsquedas usan los límites por defecto de `[discovery]`: 3 s por candidato y 15 s en total; solo `c6` tiene menos candidatos, 3. El descarte de un proveedor de la otra red llega cuando se agota su plazo, así que cada búsqueda tarda unos 3 s.
 
 ## 0. Requisitos
 
@@ -166,6 +167,7 @@ Cada caso juzga con un guion de Python sobre lo que guardó. Un caso solo se sup
 1. Cada cliente busca 10 veces cada capacidad, una tras otra, los cuatro clientes a la vez: 160 búsquedas.
 2. `p1` da a `c1` un grant del proyecto `demo` (`pals grant issue --to <id de c1>`), y `c1` lo importa.
 3. Desde `c1`: `pals discover --capability vision.ocr --ask "hola"`.
+4. `c6` arranca en la red A y entra por `r1`. Tiene `[discovery] max_candidates = 3` y, guardados como contactos antes de arrancar, los tickets de `r1`, `r2` y `r3`: tantos contactos como huecos. Busca `vision.ocr`, con 3 s de pausa entre una búsqueda y la siguiente, hasta tener a `p1` en el ranking, como mucho 240 s. Después se para.
 
 **Esperado:**
 - **En cada búsqueda,** los dos proveedores de la capacidad salen de la DHT, y nadie más. El de la red del cliente está en el ranking con `from_dht: true`, la card firmada por él (`card_signature: verified`, `kid` su id) y su oferta, de él y para el cliente. El de la otra red está en los descartes, en la etapa `card`, con `timeout` o `card: peer unreachable`. La cobertura es parcial, `timeout`, por ese descarte.
@@ -176,6 +178,12 @@ Cada caso juzga con un guion de Python sobre lo que guardó. Un caso solo se sup
 
   La pregunta va por el outbox y el gateway de `c1`, con los bindings estándar de A2A sobre `http-over-iroh/v1`, como la de cualquier contacto.
 - **`p1`**, con un `task.accepted` en su registro de eventos: el de esa tarea.
+- **`c6`**, en la primera búsqueda que tiene a `p1` en el ranking:
+  - `p1` con `from_dht: true`, su card y su oferta verificadas;
+  - 3 candidatos contactados: al menos uno de sus contactos, pero no los tres, y los demás de la DHT;
+  - `dht_requests` mayor que 0, y la cobertura parcial con `candidate limit`, porque quedan fuera contactos.
+
+  Con `dht_places` por defecto, 2 de sus 3 huecos son para la DHT ([registro de decisión](../decisions/2026-11-17-huecos-dht.md)). Si la DHT da `p1` y `p3`, se evalúa un contacto, `r1`, el primero por nombre, y `p3`, de la otra red, queda descartado por inalcanzable. Antes de reservar esos huecos, `c6` no consultaba la DHT: sus contactos llenaban todos los huecos.
 
 Tras las 160 búsquedas se cuentan además las líneas del registro de cada router, en su nivel por defecto, que nombran a un cliente por su id de agente o por su `PeerId`. Es una observación, no una comprobación (sección 4, filtraciones de metadatos).
 

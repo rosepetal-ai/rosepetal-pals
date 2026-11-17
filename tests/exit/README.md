@@ -183,6 +183,7 @@ Todos los contenedores salen de la imagen [`hito-3/Dockerfile`](hito-3/Dockerfil
 | `pals-exit-h3-c1`, `-c2` | 1 | A | Clientes, entran por `r1` |
 | `pals-exit-h3-c3`, `-c4` | 2 | B | Clientes, entran por `r3` |
 | `pals-exit-h3-c0`, `-cx` | | A | Caso 1. `c0`, con la DHT y aislado, sin arranque ni contactos. `cx`, sin `[dht]`, con `c0` como único contacto |
+| `pals-exit-h3-c6` | 1 | A | Caso 2. Entra por `r1`, con `[discovery] max_candidates = 3` y tres contactos guardados, los routers `r1`, `r2` y `r3`: tantos como huecos |
 | `pals-exit-h3-c5` | 1 | A | Caso 3. Su arranque es `r1`, que está parado, y tiene guardado el ticket de `r3`, la invitación del operador 2 |
 | `pals-exit-h3-rogue` | | B | Caso 6. [`dht_rogue`](../../crates/pals/examples/dht_rogue.rs) publica `vision.ocr` con un contacto de firma alterada |
 

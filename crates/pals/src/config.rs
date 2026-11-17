@@ -120,6 +120,12 @@ max_candidates = 8
 max_concurrent_queries = 3
 per_candidate_timeout_ms = 3000
 total_budget_ms = 15000
+# With the DHT on ([dht] below), the places of max_candidates a search keeps
+# for the providers it finds there, from 0 to max_candidates; unset, 2, or
+# max_candidates when that is fewer. The saved contacts take the others,
+# and those the DHT cannot fill. With 0 the contacts take every place
+# first, and as many contacts as places leave the DHT out.
+# dht_places = 2
 # Other names a search may give a capability: with this one, `pals
 # discover --capability ocr` searches vision.ocr. One step: what an alias
 # names is searched as it is, even when it is another alias. Each names a
@@ -585,6 +591,12 @@ pub struct DiscoveryCfg {
     /// How long a search takes at most, from 1 to
     /// [`MAX_TOTAL_BUDGET_MS`].
     pub total_budget_ms: u64,
+    /// The places of [`max_candidates`](Self::max_candidates) a search
+    /// that looks in the DHT keeps for the providers it finds there, from 0
+    /// to `max_candidates` ([`crate::discovery::search`]), as the
+    /// configuration says, `None` when it does not:
+    /// [`DiscoveryCfg::dht_places`] is the number that applies.
+    pub dht_places: Option<usize>,
     /// `[discovery.aliases]`: another name a search may give a capability,
     /// and the capability it searches, one step. At most [`MAX_ALIASES`],
     /// each naming a capability (`capability_tag`).
@@ -601,11 +613,26 @@ pub const MAX_PER_CANDIDATE_TIMEOUT_MS: u64 = 10_000;
 pub const MAX_TOTAL_BUDGET_MS: u64 = 60_000;
 /// The most aliases of capabilities that may be configured.
 pub const MAX_ALIASES: usize = 256;
+/// The places of a search's candidates kept for the DHT when the
+/// configuration does not say, as many as there are when fewer.
+pub const DHT_PLACES: usize = 2;
+
+impl DiscoveryCfg {
+    /// The places kept for the DHT: those configured, or [`DHT_PLACES`],
+    /// or [`max_candidates`](Self::max_candidates) when it is fewer, so
+    /// that a configuration of fewer candidates, valid before the key
+    /// existed, stays valid.
+    pub fn dht_places(&self) -> usize {
+        self.dht_places
+            .unwrap_or_else(|| DHT_PLACES.min(self.max_candidates))
+    }
+}
 
 impl Default for DiscoveryCfg {
     /// The public view, offers valid 15 s, as the example of design §7.2,
     /// and the limits of a search of design §7.3: 8 candidates, 3 queries
-    /// at once, 3 s per candidate and 15 s in all.
+    /// at once, 3 s per candidate and 15 s in all; 2 of the 8 places kept
+    /// for the DHT.
     fn default() -> Self {
         Self {
             public: true,
@@ -614,6 +641,7 @@ impl Default for DiscoveryCfg {
             max_concurrent_queries: 3,
             per_candidate_timeout_ms: 3000,
             total_budget_ms: 15_000,
+            dht_places: None,
             aliases: BTreeMap::new(),
         }
     }
@@ -837,6 +865,13 @@ impl Config {
             bail!(
                 "invalid {}: discovery.{name} must be from 1 to {max}",
                 path.display()
+            );
+        }
+        if discovery.dht_places() > discovery.max_candidates {
+            bail!(
+                "invalid {}: discovery.dht_places must be from 0 to {}, discovery.max_candidates",
+                path.display(),
+                discovery.max_candidates
             );
         }
         if discovery.aliases.len() > MAX_ALIASES {
