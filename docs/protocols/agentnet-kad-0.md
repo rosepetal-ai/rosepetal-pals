@@ -4,7 +4,7 @@ Especificación de la DHT con la que un agente PALS encuentra a los proveedores 
 
 Los valores de este documento son los del código, `crates/pals/src/dht/`, y el vector `crates/pals-core/tests/vectors/kad-v0.json` congela la identidad, las claves y las formas de dirección. El backend es `kad-iroh`, ratificado en el [registro del backend](../decisions/2026-11-16-hito-3-backend-dht.md#decisión) (H3-D1).
 
-Este documento crece con el código de la fase 2 del hito 3. Hoy describe la identidad, las claves, las formas de dirección, la conexión con sus límites, lo que guarda un router, el swarm del daemon, con sus modos y su entrada en la red, y lo que un nodo publica, cuándo caduca y cómo se busca en la DHT. La DHT como fuente de la búsqueda de servicios se añade con su código.
+Describe el protocolo tal como lo deja el hito 3: la identidad, las claves, las formas de dirección, la conexión con sus límites, lo que guarda un router, el swarm del daemon, con sus modos y su entrada en la red, lo que un nodo publica, cuándo caduca y cómo se busca en la DHT, y cómo usa la DHT la búsqueda de servicios (sección 9). Lo que el hito deja fuera, como una forma de dirección con relay o las políticas de admisión, está en «Fuera de alcance» del [plan](../plans/2026-11-16-hito-3-descubrimiento-kademlia.md#fuera-de-alcance).
 
 ## 1. Identificación
 
@@ -396,3 +396,47 @@ Con `[dht] announce`, `GET /dht` y `pals dht status --json` llevan `publication`
 | `last_round_unix` | cuándo terminó la última vuelta, por el reloj del nodo |
 | `last_error` | por qué se quedó corta la última vuelta. Si hay más de un motivo, el más grave: la tienda del propio nodo no tenía sitio para sus registros; no contestó ningún router; o cuántas capacidades no se anunciaron, por ejemplo `2 capabilities not provided` |
 | `failed_capabilities` | las capacidades que la última vuelta no pudo anunciar, en el orden del inventario: no cabían en la tienda del nodo, ningún router de su clave contestó al anuncio, o su provider record no llegó a salir |
+
+## 9. La DHT como fuente de la búsqueda de servicios
+
+El código es `crates/pals/src/discovery/search.rs` (`Searcher`), y sus pruebas, `crates/pals/tests/dht_search.rs`. La búsqueda es la del hito 2 (`pals discover`, `pals_discover` del MCP y `POST /discovery/search` del gateway): la card verificada, la consulta de servicio por [`agentnet-discovery/0`](agentnet-discovery-0.md) y la selección en dos etapas. La DHT le añade candidatos, los pasos 3 y 4 del §5.3 del diseño, y no cambia nada más: con la DHT apagada, una búsqueda es la del hito 2.
+
+### Los candidatos
+
+1. **Alias.** La capacidad pasa primero por `[discovery.aliases]`, un solo paso: un alias busca la capacidad que nombra, aunque esa sea el nombre de otro alias. Hay 256 alias como mucho, y cada uno nombra una capacidad válida; si no, la configuración se rechaza al leerla.
+2. **Los contactos,** primero, como en el hito 2.
+3. **La DHT,** detrás, solo si el nodo la tiene encendida y la búsqueda no nombra contactos (`--peer`, `peers`) ni dice `--no-dht` (`exclude_dht`). A la DHT solo va la clave de la capacidad (sección 3). La búsqueda en la DHT (sección 8) pide hasta `max_candidates` + 1 proveedores, con el plazo `min(per_candidate_timeout, lo que quede del presupuesto)`: con la DHT encendida, una búsqueda espera a la DHT, como mucho `per_candidate_timeout` (3 s por defecto), antes de evaluar sus contactos. Los proveedores se añaden en el orden en que llegaron, por su id de agente. Uno que ya es contacto sigue siendo el contacto, una sola vez, y la DHT nunca da al propio agente.
+4. **El límite.** Solo se contactan los `max_candidates` primeros (8 por defecto), contactos y proveedores de la DHT juntos.
+
+Las peticiones de la búsqueda en la DHT se cuentan aparte, en `dht_requests` de las métricas.
+
+### Cobertura parcial
+
+La búsqueda nunca falla por la DHT. Cuando la DHT no da todo lo que podría, los contactos se buscan igual, y la cobertura es parcial con una de estas etiquetas, además de las del hito 2 (`time budget` y `timeout`):
+
+| Etiqueta | Cuándo |
+|-|-|
+| `candidate limit` | quedaron fuera contactos o proveedores de la DHT por `max_candidates`, o la búsqueda en la DHT trajo tantos proveedores como pidió, así que pudo dejar alguno |
+| `dht timeout` | la búsqueda en la DHT llegó a su plazo y se cortó (`cut`, sección 8) |
+| `dht unavailable` | no contestó ningún router (`no DHT router answered`) |
+
+Una búsqueda vacía o con cobertura parcial no prueba que no haya proveedor (§5.3).
+
+### La verificación de un candidato de la DHT
+
+Lo que llega de la DHT no se usa sin comprobarlo, y a un candidato no se le envía nada antes de esto:
+
+- **Los descartes de la DHT.** Un proveedor que la búsqueda en la DHT descartó (sección 8) se descarta en la etapa `Card` con el motivo `dht: <por qué>`, por ejemplo `dht: no valid contact`. Si ese agente es un contacto, cuenta solo como contacto.
+- **Sus registros.** Su contacto y su anuncio, que la búsqueda en la DHT ya verificó, pasan por `Store::peer_record_accept`, como los de una respuesta de `agentnet-discovery/0`. Uno que vuelve atrás respecto al más nuevo que este agente conoce de ese agente lo descarta en la etapa `Card`, con el motivo `record regression`.
+- **Su card y su oferta.** Se le marca en las direcciones directas y el relay de su contacto, y se evalúa como cualquier par PALS: su card, firmada con `kid` igual a su id de agente, y su oferta por `agentnet-discovery/0`.
+- **Sin grant, nada privado.** Va con el grant que este agente tenga de él, si tiene alguno. Si no tiene ninguno del proyecto de la búsqueda, no recibe ni el proyecto ni los ids del inventario, y entra en el ranking con `grant_held: false`. Todo candidato de la DHT lleva `from_dht: true`, y `pals discover` escribe `found in the DHT`.
+
+### Preguntar
+
+Como en el hito 2: a un par del que este agente no tiene un grant que sirva tareas no se le pregunta nunca (`no grant held`). Encontrarlo en la DHT no autoriza nada. A uno encontrado en la DHT se le pregunta por su id de agente, y el gateway lo marca, aunque no sea un contacto guardado, en el contacto firmado más nuevo que este agente conoce de él y que sigue en vigor por el reloj del nodo, con 60 s de tolerancia. Ese contacto le llegó de una respuesta de descubrimiento o de la DHT, verificado. Si no tiene ninguno, lo marca solo por su id. La tarea va, como siempre, con los bindings estándar de A2A sobre `http-over-iroh/v1`.
+
+### Lo que nunca hace
+
+Buscar en la DHT no ejecuta trabajo: ni en los routers, que contestan desde su tienda, ni en los proveedores encontrados, a los que solo se pide su card y una oferta. Lo prueba `querying_the_dht_runs_no_work`: veinte búsquedas, las más amplias con proyecto, preferencias e informes de benchmark, no ejecutan ninguna tarea en los proveedores ni en los routers, y ninguno acepta una tarea.
+
+Pruebas de esta sección, en `crates/pals/tests/dht_search.rs`: `a_provider_with_no_prior_contact_is_found`, `contacts_come_first_and_each_agent_once`, `exclude_dht_and_named_peers_never_touch_the_dht`, `dht_without_routers_leaves_the_contacts_search_intact`, `a_tampered_card_is_discarded_even_with_a_valid_dht_announce`, `a_dht_record_that_goes_back_is_discarded`, `inventory_ids_never_go_to_a_dht_candidate_without_a_grant`, `an_alias_searches_its_capability`, `aliases_to_invalid_capabilities_are_refused`, `a_dht_candidate_is_asked_once_a_grant_is_held`, `querying_the_dht_runs_no_work` y `discover_cli_and_mcp_take_exclude_dht`.
