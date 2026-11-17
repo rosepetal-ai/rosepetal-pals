@@ -11,9 +11,9 @@ La ejecuta el arnés [`tests/exit/hito-3.sh`](../../../tests/exit/README.md#prue
 
 ## Resultado (2026-11-17)
 
-Los nueve casos, superados en una sola ejecución completa, a la primera. Al acabar no quedó ningún contenedor ni red con la etiqueta de la ejecución.
+Los nueve casos, superados en una sola ejecución completa, a la primera, con el arnés de `9ff835f` tal como está en el repositorio. Al acabar no quedó ningún contenedor ni red con la etiqueta de la ejecución.
 
-Antes, los ensayos encontraron un fallo del daemon, corregido en `db4d1ee` con su prueba: con un router caído, los proveedores dejaban de publicar y sus registros caducaban en la DHT. También llevaron a varias correcciones del arnés (ver [«Correcciones»](#correcciones-antes-de-esta-ejecución)).
+Antes, los ensayos encontraron un fallo del daemon, corregido en `db4d1ee` con su prueba: con un router caído, los proveedores dejaban de publicar y sus registros caducaban en la DHT. Los ensayos y la revisión de la tarea llevaron también a varias correcciones del arnés. La más importante: cinco casos daban por superado un caso cuando su propio guion de comprobación se rompía. Ahora fallan (ver [«Correcciones»](#correcciones-antes-de-esta-ejecución)).
 
 Tres desviaciones, en los casos 2, 3, 5, 7, 8 y 9, comprueban lo que decidió quien dirige el hito y no la letra del plan, porque tal como estaba escrita no se podía cumplir ni observar: los proveedores de la otra red (casos 2, 3, 5 y 9), `held_providers` (caso 8) y la ráfaga (caso 7). El caso 5 comprueba además la renovación (ver [«Dónde se aparta de la redacción del plan»](#dónde-se-aparta-de-la-redacción-del-plan)).
 
@@ -21,39 +21,39 @@ Tres desviaciones, en los casos 2, 3, 5, 7, 8 y 9, comprueban lo que decidió qu
 |-|-|-|-|
 | 1. Sin fuga | Superado | Las dos redes, `Internal=true`. `c0`, aislado, no encuentra a nadie en las 4 capacidades (`dht unavailable`), y su `GET /dht` da 0 pares, 0 conexiones y 0 aceptadas, antes y después de la búsqueda de `cx`. `cx`, sin `[dht]`: `GET /dht` 404, `dht_requests 0`, y llega a `c0` por A2A sin abrirle ninguna conexión `agentnet-kad/0` | 25 s |
 | 2. Encontrar un proveedor sin contacto previo | Superado | 160 de 160 búsquedas conformes. El proveedor de la red del cliente, en el ranking desde la DHT con card y oferta verificadas; el de la otra red, descartado en la card (`timeout`). `pals discover --capability vision.ocr --ask "hola"` desde `c1`, con el grant de `p1`: `echo: hola`, código 0, tarea `TASK_STATE_COMPLETED`, un `task.accepted` en `p1` | 2 min 11 s |
-| 3. Sin el arranque original | Superado | Con `r1` parado, las 16 búsquedas de los clientes conectados, conformes (`dht timeout, timeout`). `c5` entra por `r3` (`a saved contact is a DHT router: entering through it`): primer candidato a los 12,7 s de arrancar, los dos proveedores de cada capacidad a los 34,5 s. Las 4 vueltas de publicación de los proveedores con `r1` parado, sin error | 1 min 38 s, con la restauración |
-| 4. Caducar anuncios | Superado | `p1` parado sin aviso. Los routers olvidan sus 16 registros (4 cada uno) a los 116,7 s, y las búsquedas dejan de devolverlo a los 116,9 s. Límite: 160 s | 2 min 2 s |
-| 5. Caída de routers y renovación | Superado | `r2` y `r4` parados. Cobertura inmediata 1, entera a los 0 s (límite 80 s). A los 166 s, con todo lo de antes caducado, cobertura 1 en 16 búsquedas. 16 vueltas de publicación sin error | 3 min 20 s |
-| 6. Contacto con firma inválida | Superado | Los 4 routers: `bad_contact` +1, y guardan del `rogue` 2 registros, su anuncio y su provider record, sin contacto. Los 4 clientes: el `rogue` fuera del ranking y descartado `dht: no valid contact` | 13 s |
-| 7. Búsquedas repetidas o maliciosamente amplias | Superado | Ráfaga de 200 desde `c1`, 8 a la vez, en 3,4 s: 5 `200` y 195 `429 too many searches`, ninguna anómala. Las 2 búsquedas de `c3` durante la ráfaga, `200`. Los mismos PID de los routers, `healthz` 200, y `refused.streams` 0 en los cuatro | 8 s |
-| 8. Política | Superado | Cada router guarda 4 registros de `p2` antes y después de una vuelta suya: 2 más sus 2 capacidades públicas. `capability_not_announced` 0 → 0. Las 8 búsquedas de `audio.transcribe` (privada) y `data.extraction` (de proyecto) preguntan a la DHT (`dht_requests 4`) y no encuentran a `p2`. Con `exclude_dht` (`--no-dht`), `dht_requests 0`; sin él, 28 | 18 s |
-| 9. Cambio de red | Superado | `p3` emite su contacto `seq` 2 con `10.213.73.23:4433` en el segundo en que empieza a moverse, y termina una vuelta sin error. `c1` y `c2` verifican su card y su oferta en la red A a los 6,8 s (límite 80 s). El contacto que `c1` recibió de la DHT es el nuevo | 14 s |
+| 3. Sin el arranque original | Superado | Con `r1` parado, las 16 búsquedas de los clientes conectados, conformes (`dht timeout, timeout`). `c5` entra por `r3` (`a saved contact is a DHT router: entering through it`): primer candidato a los 26,5 s de arrancar, los dos proveedores de cada capacidad a los 43,3 s. Las 7 vueltas de publicación de los proveedores vistas con `r1` parado, sin error | 1 min 40 s, con la restauración |
+| 4. Caducar anuncios | Superado | `p1` parado sin aviso. Los routers olvidan sus 16 registros (4 cada uno) a los 121,2 s, y las búsquedas dejan de devolverlo a los 114,7 s. Límite: 160 s | 2 min 13 s |
+| 5. Caída de routers y renovación | Superado | `r2` y `r4` parados. Cobertura inmediata 1, entera a los 0 s (límite 80 s). A los 165 s, con todo lo de antes caducado, cobertura 1 en 16 búsquedas. 16 vueltas de publicación sin error | 3 min 47 s |
+| 6. Contacto con firma inválida | Superado | Los 4 routers: `bad_contact` +1, y guardan del `rogue` 2 registros, su anuncio y su provider record, sin contacto. Los 4 clientes: el `rogue` fuera del ranking y descartado `dht: no valid contact` | 12 s |
+| 7. Búsquedas repetidas o maliciosamente amplias | Superado | Ráfaga de 200 desde `c1`, 8 a la vez, en 6,2 s: 4 `200` y 196 `429 too many searches`, ninguna anómala. Las 3 búsquedas de `c3` durante la ráfaga, `200`. Cada router, el mismo proceso en marcha (PID y hora de arranque), `healthz` 200, y `refused.streams` 0 en los cuatro | 14 s |
+| 8. Política | Superado | Cada router guarda 4 registros de `p2` antes y después de una vuelta suya: 2 más sus 2 capacidades públicas. `capability_not_announced` 0 → 0. Las 8 búsquedas de `audio.transcribe` (privada) y `data.extraction` (de proyecto) preguntan a la DHT (`dht_requests 4`) y no encuentran a `p2`. Con `exclude_dht` (`--no-dht`), `dht_requests 0`; sin él, 28 | 15 s |
+| 9. Cambio de red | Superado | `p3` emite su contacto `seq` 2 con `10.213.73.23:4433` en el segundo en que empieza a moverse, y termina una vuelta sin error. `c1` y `c2` verifican su card y su oferta en la red A a los 6,5 s (límite 80 s). El contacto que `c1` recibió de la DHT es el nuevo | 14 s |
 
 Las líneas del arnés:
 
 ```text
 RESULTADO caso 1: superado (c0 GET /dht (caso1-c0): routing_peers 0, connections 0, connections_accepted 0;c0 GET /dht (caso1-c0-despues): routing_peers 0, connections 0, connections_accepted 0;cx GET /dht: HTTP 404;cx vision.ocr: ranked [], discarded [('c0', 'card', 'no skill of vision.ocr')], complete, dht_requests 0, contacted 1;)
 RESULTADO caso 2: superado (búsquedas 160, conformes 160; pregunta a p1: echo: hola)
-RESULTADO caso 3: superado (conectados: 16 búsquedas, conformes 16, coberturas ['partial (dht timeout, timeout)'];c5: 8 búsquedas; primer candidato a los 12.7 s de arrancar; los dos proveedores de cada capacidad a los 34.5 s; entra por r3: sí;)
-RESULTADO caso 4: superado (los routers lo olvidan a los 116.7 s; las búsquedas dejan de devolverlo a los 116.9 s; límite 160 s; 18 sondeos, 72 búsquedas; carga 10.97 12.76 20.03)
-RESULTADO caso 5: superado (cobertura inmediata 1.0; cobertura completa a los 0.0 s (límite 80 s); etiquetas {'partial (dht timeout, timeout)': 16}; carga 9.17 11.34 18.12;renovación: a los 166 s de pararlos (todo lo de antes ya caducado a los 160 s), cobertura 1.0 en 16 búsquedas; etiquetas {'partial (dht timeout, timeout)': 16};)
+RESULTADO caso 3: superado (conectados: 16 búsquedas, conformes 16, coberturas ['partial (dht timeout, timeout)'];c5: 12 búsquedas; primer candidato a los 26.5 s de arrancar; los dos proveedores de cada capacidad a los 43.3 s; entra por r3: sí;)
+RESULTADO caso 4: superado (los routers lo olvidan a los 121.2 s; las búsquedas dejan de devolverlo a los 114.7 s; límite 160 s; 19 sondeos, 76 búsquedas; carga 3.42 5.88 7.98)
+RESULTADO caso 5: superado (cobertura inmediata 1.0; cobertura completa a los 0.0 s (límite 80 s); etiquetas {'partial (dht timeout, timeout)': 16}; carga 4.11 5.23 7.33;renovación: a los 165 s de pararlos (todo lo de antes ya caducado a los 160 s), cobertura 1.0 en 16 búsquedas; etiquetas {'partial (dht timeout, timeout)': 16};)
 RESULTADO caso 6: superado (r1: bad_contact +1, guarda del rogue 2;r2: bad_contact +1, guarda del rogue 2;r3: bad_contact +1, guarda del rogue 2;r4: bad_contact +1, guarda del rogue 2;)
-RESULTADO caso 7: superado (ráfaga de c1: 200 búsquedas, 8 a la vez, en 3.4 s; códigos {'200': 5, '429': 195};refused.streams de cada router durante el caso: {'r1': 0, 'r2': 0, 'r3': 0, 'r4': 0};)
+RESULTADO caso 7: superado (ráfaga de c1: 200 búsquedas, 8 a la vez, en 6.2 s; códigos {'200': 4, '429': 196};refused.streams de cada router durante el caso: {'r1': 0, 'r2': 0, 'r3': 0, 'r4': 0};)
 RESULTADO caso 8: superado (r1: guarda de p2 4 -> 4; capability_not_announced 0 -> 0;r2: guarda de p2 4 -> 4; capability_not_announced 0 -> 0;r3: guarda de p2 4 -> 4; capability_not_announced 0 -> 0;r4: guarda de p2 4 -> 4; capability_not_announced 0 -> 0;)
-RESULTADO caso 9: superado (c1 y c2 verifican la card y la oferta de p3 en su dirección nueva a los {'c1': 6.8, 'c2': 6.8} s del cambio (límite 80 s); carga 6.56 10.34 17.36)
+RESULTADO caso 9: superado (c1 y c2 verifican la card y la oferta de p3 en su dirección nueva a los {'c1': 6.5, 'c2': 6.5} s del cambio (límite 80 s); carga 5.61 5.41 7.20)
 ```
 
 ### Entorno
 
 | Dato | Valor |
 |-|-|
-| Fecha | 2026-11-17, de 02:41:29 a 02:57:42 UTC (16 min 13 s, con los 300 s de reposo) |
-| Commit | `db4d1ee`, con la corrección del daemon, y el arnés y los documentos de esta tarea aún sin commit: son los del commit que añade este registro. `preparar` lo anota como «con cambios sin commit». El daemon que corrió es el de `db4d1ee` |
+| Fecha | 2026-11-17, de 03:27:08 a 03:43:54 UTC (16 min 46 s, con los 300 s de reposo) |
+| Commit | `9ff835f`, con el árbol limpio (`git status --porcelain` vacío): el arnés de esa revisión, sobre el daemon de `db4d1ee`, que lleva la corrección. Después solo cambia este registro |
 | Binarios | `cargo build --release --locked -p pals` y `--examples` en el anfitrión: `pals 0.1.0` (sha256 `06c3b9e2…`), el mismo fichero en todos los contenedores, y `dht_rogue` (sha256 `c9fc0924…`) solo en el del caso 6 |
 | Rust | 1.99.1 |
 | Versiones fijadas | `iroh =1.4.1`, `libp2p =0.57.1` (`libp2p-kad` 0.49.0, `libp2p-swarm` 0.48.0), `iroh-blobs =0.105.0`, `a2a-lf =0.4.2`, `a2a-server-lf =0.5.3`, `a2a-client-lf =0.2.9` |
 | Imagen | `pals-exit-h3:latest` (id `6fa4bcf19e77…`), de [`tests/exit/hito-3/Dockerfile`](../../../tests/exit/hito-3/Dockerfile) sobre `debian:trixie-slim@sha256:a72b4433…` (Debian 13, Python 3.13.5) |
-| Anfitrión | Linux x86_64, kernel 6.12 de Debian 13, 32 CPU, compartido con otros proyectos. Carga media al empezar: 27,4 / 26,5 / 28,9; al empezar los casos, 15,0, y durante ellos, de 6,6 a 15,6. El arnés corre en un entorno Ubuntu 24.04 con Docker 29.4.1 |
+| Anfitrión | Linux x86_64, kernel 6.12 de Debian 13, 32 CPU, compartido con otros proyectos. Carga media al empezar: 9,3 / 12,0 / 10,5; durante el reposo, de 6,4 a 6,9, y durante los casos, de 3,4 a 7,0. El arnés corre en un entorno Ubuntu 24.04 con Docker 29.4.1 |
 | Redes | `pals-exit-h3-red-a` (`10.213.73.0/24`) y `pals-exit-h3-red-b` (`10.213.74.0/24`), las dos `--internal`. `preparar` comprobó que ninguna otra red de Docker se solapaba |
 | Contenedores | Doce de la topología y cuatro de sus casos (`c0`, `cx`, `c5`, `rogue`), con una CPU y 512 MiB cada uno. Las direcciones, en el runbook |
 | Configuración | La de cada operador, en [`operador-1/`](../../../tests/exit/hito-3/operador-1) y [`operador-2/`](../../../tests/exit/hito-3/operador-2): `relay = false`, `[net] listen = "0.0.0.0:4433"`, `[dht] record_ttl_s = 120` y `republish_s = 40`, el worker `echo` y `[discovery]` por defecto (3 s por candidato) |
@@ -101,7 +101,7 @@ Lo decidió quien dirige el hito antes de la ejecución. El runbook lo explica c
    4. los proveedores y los clientes de cada operador por su router de entrada, `r1` o `r3`.
 
    Los routers declaran sus dos direcciones en `external_addrs`, y su ticket las lleva.
-3. A los 4 s cada router guardaba 4 registros de cada proveedor: contacto, anuncio y un provider record de cada una de sus dos capacidades. Estado:
+3. A los 3 s cada router guardaba 4 registros de cada proveedor: contacto, anuncio y un provider record de cada una de sus dos capacidades. Estado:
 
    ```text
    r1 … r4: router, routing_peers 3, connections 8, records 8, provider records 8, por agente {p1: 4, p2: 4, p3: 4, p4: 4}
@@ -141,7 +141,7 @@ Cada cliente buscó 10 veces cada capacidad, una tras otra, y los cuatro cliente
 ranked:    p3  from_dht, card_signature verified kid <p3>, oferta de <p3> para <c3>, available, skill ocr
 discarded: p1  card: timeout
 coverage:  partial (timeout)
-metrics:   dht_requests 20, contacted 2, messages 2, bytes sent 176, bytes received 3974, first valid 45 ms, matching 3 us, elapsed 3033 ms
+metrics:   dht_requests 20, contacted 2, messages 2, bytes sent 176, bytes received 3974, first valid 41 ms, matching 4 us, elapsed 3031 ms
 ```
 
 Cada búsqueda tarda unos 3 s, el plazo por candidato: el proveedor de la otra red no contesta. Las 20 peticiones a la DHT son:
@@ -153,23 +153,23 @@ Después, `p1` da un grant del proyecto `demo` a `c1`, por su id de agente, y `c
 ```text
 $ pals discover --capability vision.ocr --ask "hola"
 ranked:
-  1. <p1> (agent <p1>): available, skill ocr, time unknown, preferred met 0, benchmark none, completed 0 failed 0, grant held, found in the DHT, card verified <p1>, offer offer-124b5734… until 2026-11-17T02:49:50Z
+  1. <p1> (agent <p1>): available, skill ocr, time unknown, preferred met 0, benchmark none, completed 0 failed 0, grant held, found in the DHT, card verified <p1>, offer offer-72f95647… until 2026-11-17T03:35:26Z
 discarded:
   <p3> (card): timeout
 coverage: partial (timeout)
-metrics: contacted 2, messages 3, bytes sent 961, bytes received 6087, first valid 52 ms, matching 3 us, elapsed 3032 ms
+metrics: contacted 2, messages 3, bytes sent 961, bytes received 6087, first valid 117 ms, matching 4 us, elapsed 3044 ms
 asked: <p1>
 echo: hola
 código 0
 $ pals task ls | tail -n 2
-965257d0-…	TASK_STATE_COMPLETED	<p1>	…
+53b700de-…	TASK_STATE_COMPLETED	<p1>	…
 ```
 
 En `p1`, un `task.accepted` en su registro de eventos. La pregunta va por el outbox y el gateway de `c1`, con los bindings estándar de A2A sobre `http-over-iroh/v1`. A `p1` se le marca en la dirección de su contacto, que llegó de la DHT.
 
 ### Caso 3. Sin el arranque original: superado
 
-Con `r1` parado (`docker kill`), cada cliente buscó cada capacidad una vez: 16 de 16 conformes, todas con cobertura `partial (dht timeout, timeout)`. La búsqueda en la DHT también pregunta a `r1`, que no contesta. Agota sus 3 s, y aun así encuentra los dos proveedores en los demás routers. Cada búsqueda tarda unos 6,8 s: 3 s de la DHT y 3 s del candidato de la otra red.
+Con `r1` parado (`docker kill`), cada cliente buscó cada capacidad una vez: 16 de 16 conformes, todas con cobertura `partial (dht timeout, timeout)`. La búsqueda en la DHT también pregunta a `r1`, que no contesta. Agota sus 3 s, y aun así encuentra los dos proveedores en los demás routers. Cada búsqueda tarda unos 6,1 s: 3 s de la DHT y 3 s del candidato de la otra red.
 
 `c5` arranca con `bootstrap = [r1]` y el ticket de `r3` guardado como contacto. Su registro:
 
@@ -179,16 +179,16 @@ INFO pals::dht::swarm: dialing the saved contacts, to find a DHT router among th
 INFO pals::dht::swarm: a saved contact is a DHT router: entering through it peer=<PeerId de r3>
 ```
 
-El arnés comprueba que ese `PeerId` es el de `r3`. `c5` tuvo su primer candidato a los 12,7 s de arrancar y los dos proveedores de cada capacidad a los 34,5 s, en 8 búsquedas. En ellas, `r3`, su contacto, sale además descartado en la card (`no skill of <capacidad>`): es un router sin servicios.
+El arnés comprueba que ese `PeerId` es el de `r3`. `c5` tuvo su primer candidato a los 26,5 s de arrancar y los dos proveedores de cada capacidad a los 43,3 s, en 12 búsquedas. Las 7 primeras, mientras aún entraba en la red, no tuvieron candidato (`dht unavailable` o `dht timeout`). En todas, `r3`, su contacto, sale además descartado en la card (`no skill of <capacidad>`): es un router sin servicios.
 
-Mientras `r1` estuvo parado, las 4 vueltas de publicación de los proveedores terminaron sin error. Antes de la corrección `db4d1ee` no era así (ver «Correcciones»).
+Mientras `r1` estuvo parado, las 7 vueltas de publicación de los proveedores que se vieron terminaron sin error, y el caso lo exige. Antes de la corrección `db4d1ee` no era así (ver «Correcciones»).
 
 ### Caso 4. Caducar anuncios: superado
 
 `p1` parado sin aviso (`docker kill`). Antes, cada router guardaba de él 4 registros: contacto, anuncio y dos provider records. Cada 3 s, el estado de los routers y una búsqueda de una capacidad de `p1` desde cada cliente:
 
 ```text
-los routers lo olvidan a los 116.7 s; las búsquedas dejan de devolverlo a los 116.9 s; límite 160 s; 18 sondeos, 72 búsquedas; carga 10.97 12.76 20.03
+los routers lo olvidan a los 121.2 s; las búsquedas dejan de devolverlo a los 114.7 s; límite 160 s; 19 sondeos, 76 búsquedas; carga 3.42 5.88 7.98
 ```
 
 **Cómo se mide.**
@@ -197,10 +197,11 @@ los routers lo olvidan a los 116.7 s; las búsquedas dejan de devolverlo a los 1
 
 **Lo que da el tiempo.**
 - Caducaron 16 registros.
-- Lo publicado vive `record_ttl_s` (120 s) desde la última vuelta que llegó a los routers, como mucho 40 s antes de parar.
-- 116,7 s cae dentro de esa ventana, de 80 a 120 s.
+- Lo publicado vive `record_ttl_s` (120 s) desde la última vuelta que llegó a los routers, como mucho 40 s antes de parar: de 80 a 120 s después.
+- Los routers olvidan a `p1` entre el último sondeo que aún guardaba algo y el primero a 0, que fue a los 121,2 s. Los sondeos van cada 4 o 5 s, y la última vuelta de `p1` llegó a los routers justo antes de pararlo.
+- Las búsquedas lo dejan de devolver antes, a los 114,7 s, cuando caducan sus provider records. Sus valores, el contacto y el anuncio, duran un poco más.
 
-En la fase 1 fueron 106,6 s y 99,3 s.
+En la ejecución anterior fueron 116,7 s y 116,9 s; en la fase 1, 106,6 s y 99,3 s.
 
 ### Caso 5. Caída de routers y renovación: superado
 
@@ -212,11 +213,11 @@ En la fase 1 fueron 106,6 s y 99,3 s.
 La renovación: el arnés esperó, con `r2` y `r4` parados, hasta 160 s después de pararlos, leyendo cada 15 s el estado de los proveedores, e hizo otra ronda:
 
 ```text
-renovación: a los 166 s de pararlos (todo lo de antes ya caducado a los 160 s), cobertura 1.0 en 16 búsquedas
+renovación: a los 165 s de pararlos (todo lo de antes ya caducado a los 160 s), cobertura 1.0 en 16 búsquedas
 vueltas de publicación vistas con r2 y r4 parados: 16, con error: 0
 ```
 
-Lo que guardaban entonces `r1` y `r3` salió de las vueltas hechas sin `r2` ni `r4`, y bastó. Cuando volvieron a arrancar, los routers tuvieron otra vez todo en 8 s.
+Lo que guardaban entonces `r1` y `r3` salió de las vueltas hechas sin `r2` ni `r4`, y bastó. Cuando volvieron a arrancar, los routers tuvieron otra vez todo en 35 s.
 
 ### Caso 6. Contacto con firma inválida: superado
 
@@ -242,25 +243,27 @@ El motivo del descarte es `no valid contact`, y no `bad_contact`. Si algún rout
 ### Caso 7. Búsquedas repetidas o maliciosamente amplias: superado
 
 ```text
-ráfaga de c1: 200 búsquedas, 8 a la vez, en 3.4 s; códigos {'200': 5, '429': 195}; 200 de capacidades que existen 3, con candidato 3; 200 de las que no existen 2, con candidato 0; anómalas ninguna
-c3 durante la ráfaga: 2 búsquedas, códigos {'200': 2}
+ráfaga de c1: 200 búsquedas, 8 a la vez, en 6.2 s; códigos {'200': 4, '429': 196}; 200 de capacidades que existen 4, con candidato 4; 200 de las que no existen 0, con candidato 0; anómalas ninguna
+c3 durante la ráfaga: 3 búsquedas, códigos {'200': 3}; en total 4
 refused.streams de cada router durante el caso: {'r1': 0, 'r2': 0, 'r3': 0, 'r4': 0}
-PID antes: r1=15 r2=15 r3=29 r4=15; después: los mismos; healthz: 200 los cuatro
+daemons (PID:arranque) antes y después, iguales: r1=15:160679049 r2=15:160713216 r3=27:160623772 r4=15:160713295; healthz: 200 los cuatro
 ```
 
 **Cómo se reparte la ráfaga.**
 - Cada búsqueda es de una de 24 capacidades, por turno: las 4 y `example:inexistente-01` a `-20`.
 - El daemon de `c1` admite 4 búsquedas a la vez y contesta a las demás, en el acto, `429` con `{"error":"too many searches"}`.
-- Las que entraron fueron 3 de capacidades que existen (unos 3,2 s y 20 peticiones a la DHT cada una) y 2 de las que no existen (9 y 106 ms y 4 peticiones).
+- Las que entraron fueron 4 de capacidades que existen, de unos 3 s y 20 peticiones a la DHT cada una (28 la de `vision.ocr`, con los registros del `rogue`, aún vivos). Una tardó 6 s porque esperó su sitio entre las consultas del daemon.
 
-**Lo que vieron los routers.** No rechazaron ningún stream: el límite de búsquedas del cliente corta la ráfaga antes de que llegue a sus cuotas (8 streams a la vez y 600 por minuto por par). Las búsquedas de `c3`, otro daemon, siguieron y terminaron con `200`.
+**Lo que vieron los routers.** No rechazaron ningún stream: el límite de búsquedas del cliente corta la ráfaga antes de que llegue a sus cuotas (8 streams a la vez y 600 por minuto por par). Las búsquedas de `c3`, otro daemon, siguieron y terminaron con `200`. La ráfaga empezó cuando la primera de `c3` había contestado, con la siguiente en marcha.
+
+**Ningún router se cae.** De cada router se lee, antes y después, el PID de su daemon y la hora a la que arrancó el proceso (`/proc/<pid>/stat`), solo si sigue vivo. Un daemon que muriera, o que se arrancara otra vez, no daría lo mismo.
 
 ### Caso 8. Política: superado
 
 `p2` tiene, además de sus dos servicios públicos, `audio.transcribe` privado y `data.extraction` del proyecto `demo` ([`p2-inventario.toml`](../../../tests/exit/hito-3/operador-1/p2-inventario.toml)).
 
 ```text
-p2 publica ['code.rust.review', 'vision.defect-detection']; última vuelta 11 s después de empezar el caso, error None
+p2 publica ['code.rust.review', 'vision.defect-detection']; última vuelta 9 s después de empezar el caso, error None
 r1: guarda de p2 4 -> 4 (2 + sus 2 públicas); capability_not_announced 0 -> 0
 r2: guarda de p2 4 -> 4; capability_not_announced 0 -> 0
 r3: guarda de p2 4 -> 4; capability_not_announced 0 -> 0
@@ -283,24 +286,24 @@ código 0
 
 ### Caso 9. Cambio de red: superado
 
-`p3`, con su daemon en marcha, pasa de la red B a la A: `docker network disconnect` de `pals-exit-h3-red-b` y `docker network connect --ip 10.213.73.23` a `pals-exit-h3-red-a`, 0,3 s en total.
+`p3`, con su daemon en marcha, pasa de la red B a la A: `docker network disconnect` de `pals-exit-h3-red-b` y `docker network connect --ip 10.213.73.23` a `pals-exit-h3-red-a`, 0,2 s en total.
 
 ```text
 contacto de p3 antes:   seq 1, direct_addrs ["10.213.74.23:4433"]
-registro de p3:         02:57:24.666 issued a signed record kind="contact" seq=2
-                        02:57:24.667 renewed this agent's records: its addresses changed
-contacto de p3 después: seq 2, direct_addrs ["10.213.73.23:4433"], issued_at 02:57:24Z
+registro de p3:         03:43:42.841 issued a signed record kind="contact" seq=2
+                        03:43:42.842 renewed this agent's records: its addresses changed
+contacto de p3 después: seq 2, direct_addrs ["10.213.73.23:4433"], issued_at 03:43:42Z
 última vuelta de publicación de p3: en el mismo segundo del cambio, error None
 el contacto de p3 que guarda c1, de la DHT: seq 2, ["10.213.73.23:4433"]
 antes del cambio, c1 y c2: p3 descartado por inalcanzable (las 4 búsquedas, conformes)
-c1 y c2 verifican la card y la oferta de p3 en su dirección nueva a los 6.8 s del cambio (límite 80 s)
+c1 y c2 verifican la card y la oferta de p3 en su dirección nueva a los 6.5 s del cambio (límite 80 s)
 ```
 
 **El endpoint de Iroh de `p3`.** Está ligado a `0.0.0.0:4433` y vio su dirección nueva dentro del contenedor en el mismo segundo del cambio. `Records::renew` emitió el contacto, y el cambio lanzó una vuelta de publicación.
 
 **`c1` y `c2`.**
-- **La primera búsqueda.** Empezó 0,1 s antes de que `p3` emitiera su contacto nuevo, así que aún lo vio en la red B y lo descartó por inalcanzable al cabo de sus 3 s. Descartó también al `rogue` del caso 6 (`dht: no valid contact`), cuyos registros aún no habían caducado: el arnés lo admite solo con un motivo de la DHT.
-- **La siguiente.** Empezó 3 s después y ya tuvo a `p3` en el ranking, desde la DHT, con su card y su oferta verificadas, en 0,18 s. De ahí los 6,8 s.
+- **La primera búsqueda.** Empezó 0,15 s antes de que `p3` emitiera su contacto nuevo, así que aún lo vio en la red B y lo descartó por inalcanzable al cabo de sus 3 s. Descartó también al `rogue` del caso 6 (`dht: no valid contact`), cuyos registros aún no habían caducado: el arnés lo admite solo con un motivo de la DHT.
+- **La siguiente.** Empezó 3 s después y ya tuvo a `p3` en el ranking, desde la DHT, con su card y su oferta verificadas, en 49 ms. De ahí los 6,5 s.
 - **Los routers.** El contacto `seq` 2 que guarda `c1` solo pudo llegarle de la DHT, así que los routers tenían el nuevo.
 
 ## Métricas del §14
@@ -309,17 +312,17 @@ Salvo que se diga otra cosa, son las 160 búsquedas del caso 2, con la red enter
 
 | Métrica | Valor | Cómo se midió |
 |-|-|-|
-| Tiempo hasta el primer candidato válido | p50 44 ms, p95 67 ms (de 30 a 134 ms). La búsqueda entera, p50 3032 ms, p95 3055 ms | `time_to_first_valid_ms` de cada búsqueda, en el reloj monótono del cliente. Toda búsqueda espera los 3 s del proveedor de la otra red (`elapsed_ms`). Con routers caídos, unos 6 s (casos 3 y 5) |
-| Porcentaje de búsquedas con candidato | 100 %: 160 de 160 | Respuestas con `ranked` no vacío. En el resto de la ejecución, las búsquedas de capacidades que existen sin candidato fueron solo las esperadas: las de `c0` y `cx` (caso 1), las dos primeras de `c5`, antes de entrar en la red (caso 3), y las de los clientes de la red A que buscaban a `p1` parado, con el otro proveedor en la red B (caso 4) |
+| Tiempo hasta el primer candidato válido | p50 42 ms, p95 178 ms (de 32 a 234 ms). La búsqueda entera, p50 3031 ms, p95 3100 ms | `time_to_first_valid_ms` de cada búsqueda, en el reloj monótono del cliente. Toda búsqueda espera los 3 s del proveedor de la otra red (`elapsed_ms`). Con routers caídos, unos 6 s (casos 3 y 5) |
+| Porcentaje de búsquedas con candidato | 100 %: 160 de 160 | Respuestas con `ranked` no vacío. En el resto de la ejecución, las búsquedas de capacidades que existen sin candidato fueron solo las esperadas: las de `c0` y `cx` (caso 1), las 7 primeras de `c5`, antes de entrar en la red (caso 3), y las de los clientes de la red A que buscaban a `p1` parado, con el otro proveedor en la red B (caso 4) |
 | Peticiones a la DHT por búsqueda | 20 en todas: `GET_PROVIDERS` a los 4 routers, y el contacto y el anuncio de 2 proveedores a cada uno | `metrics.dht_requests`. Una capacidad sin proveedores: 4 (caso 8) |
-| Bytes por búsqueda | Por las interfaces del cliente, menos su tráfico en reposo en el mismo tiempo: p50 32 747 B, p95 35 158 B. Las dos primeras de cada cliente, con las conexiones por abrir, de 87 a 166 kB. De ellos, los mensajes de discovery: 182 B enviados y 3978 B recibidos (p50) | Contadores de `/sys/class/net/*/statistics` dentro del contenedor del cliente, antes y después de cada búsqueda (`metricas.py busca`), menos el ritmo del cliente en el reposo (unos 400 B/s). Incluyen la DHT, la card y la consulta del proveedor de su red, y la sobrecarga de QUIC. En la fase 1, sin cards ni consultas, 27 841 B |
+| Bytes por búsqueda | Por las interfaces del cliente, menos su tráfico en reposo en el mismo tiempo: p50 32 748 B, p95 35 058 B. Las dos primeras de cada cliente, con las conexiones por abrir, hasta 165 kB. De ellos, los mensajes de discovery: 182 B enviados y 3978 B recibidos (p50) | Contadores de `/sys/class/net/*/statistics` dentro del contenedor del cliente, antes y después de cada búsqueda (`metricas.py busca`), menos el ritmo del cliente en el reposo (unos 400 B/s). Incluyen la DHT, la card y la consulta del proveedor de su red, y la sobrecarga de QUIC. En la fase 1, sin cards ni consultas, 27 841 B |
 | Candidatos contactados | 2 en todas | `contacted`: los dos proveedores de la capacidad, el de la otra red sin respuesta |
-| Anuncios caducados y tiempo | 16 registros de `p1` (4 en cada router); olvidados a los 116,7 s y fuera de las búsquedas a los 116,9 s, límite 160 s | Caso 4 |
-| Recuperación | Caso 3, `c5` sin el arranque original: primer candidato a los 12,7 s, todo a los 34,5 s. Caso 5: cobertura inmediata 1, entera a los 0 s, y entera aún a los 166 s con lo renovado. Caso 9: contacto nuevo en el mismo segundo, verificado por los clientes a los 6,8 s | Desde el arranque de `c5`, desde la parada de los routers y desde el inicio del cambio de red |
-| Coste del matching | `matching_us` p50 3 µs, p95 4 µs, máximo 5 µs | El tiempo de las dos etapas en el cliente. **No medido:** el coste de la consulta en cada proveedor, que ninguno informa |
-| Memoria en reposo, por papel | Routers: RSS medio 40,0 MiB (de 38,7 a 40,5). Proveedores: 37,7 MiB (de 37,6 a 37,8). Clientes: 37,2 MiB (de 36,9 a 37,4) | `VmRSS` del daemon en `/proc/<pid>/status`, 6 muestras en 300 s |
-| Conexiones `agentnet-kad/0` en reposo | Routers: 2,8 de media, 8 como mucho. Proveedores y clientes: 1,3 de media, 4 como mucho | `connections` de `GET /dht` en esas muestras. Se cierran a los 10 s sin streams. Un router mantiene las de la replicación cada 40 s, y un proveedor, las de su vuelta |
-| Tráfico en reposo, por papel | Routers: 314,8 kB/min (de 297,7 a 324,6). Proveedores: 242,6 kB/min (de 236,9 a 248,0). Clientes: 24,2 kB/min (de 22,7 a 26,3) | Bytes por las interfaces, en los dos sentidos, en 300 s. Con `republish_s = 40`: los proveedores publican cada 40 s, y los routers replican cada 40 s y reciben las vueltas, que son casi todo el tráfico de un router o un proveedor. Con los valores por defecto (1200 s) serían 30 veces menos frecuentes. En la fase 1, con los mismos plazos y otro proceso: 355 418 B/min un router y 27 142 B/min un cliente |
+| Anuncios caducados y tiempo | 16 registros de `p1` (4 en cada router); olvidados a los 121,2 s y fuera de las búsquedas a los 114,7 s, límite 160 s | Caso 4 |
+| Recuperación | Caso 3, `c5` sin el arranque original: primer candidato a los 26,5 s, todo a los 43,3 s. Caso 5: cobertura inmediata 1, entera a los 0 s, y entera aún a los 165 s con lo renovado. Caso 9: contacto nuevo en el mismo segundo, verificado por los clientes a los 6,5 s | Desde el arranque de `c5`, desde la parada de los routers y desde el inicio del cambio de red |
+| Coste del matching | `matching_us` p50 4 µs, p95 4 µs, máximo 6 µs | El tiempo de las dos etapas en el cliente. **No medido:** el coste de la consulta en cada proveedor, que ninguno informa |
+| Memoria en reposo, por papel | Routers: RSS medio 38,5 MiB (de 38,3 a 38,7). Proveedores: 38,4 MiB (de 37,1 a 39,7). Clientes: 38,1 MiB (de 36,9 a 39,3) | `VmRSS` del daemon en `/proc/<pid>/status`, 6 muestras en 300 s |
+| Conexiones `agentnet-kad/0` en reposo | Routers: 3,3 de media, 8 como mucho. Proveedores: 2 de media, 4 como mucho. Clientes: 1,3 de media, 4 como mucho | `connections` de `GET /dht` en esas muestras. Se cierran a los 10 s sin streams. Un router mantiene las de la replicación cada 40 s, y un proveedor, las de su vuelta |
+| Tráfico en reposo, por papel | Routers: 317,8 kB/min (de 306,2 a 327,4). Proveedores: 242,6 kB/min (de 236,8 a 247,9). Clientes: 23,3 kB/min (de 21,3 a 25,0) | Bytes por las interfaces, en los dos sentidos, en 300 s. Con `republish_s = 40`: los proveedores publican cada 40 s, y los routers replican cada 40 s y reciben las vueltas, que son casi todo el tráfico de un router o un proveedor. Con los valores por defecto (1200 s) serían 30 veces menos frecuentes. En la fase 1, con los mismos plazos y otro proceso: 355 418 B/min un router y 27 142 B/min un cliente |
 
 ## Coste de mantener el adaptador
 
@@ -357,7 +360,7 @@ H3-D4 acepta que cada búsqueda en la DHT diga a los routers qué agente busca q
 
 ## Correcciones antes de esta ejecución
 
-Cuatro ensayos, cada uno en un `PALS_EXIT_DIR` nuevo, llevaron a esta ejecución. Un caso que falló se corrigió y se repitió.
+Cuatro ensayos, una primera ejecución completa y la revisión de la tarea llevaron a esta ejecución, cada una en un `PALS_EXIT_DIR` nuevo. Un caso que falló se corrigió y se repitió.
 
 1. **Producto: un router caído hacía fallar las vueltas de publicación (`db4d1ee`).**
    - **El síntoma.** En el primer ensayo, sobre `ad9b9e3`, con `r1` parado en el caso 3, las vueltas de publicación de los proveedores empezaron a fallar con `2 capabilities not provided`, y alguna con `no DHT router answered`. Sus registros caducaron en los routers: `p4` dejó de salir en las búsquedas de `c5` unos 100 s después de parar `r1`, y `p2` poco después. Con `r1` parado, uno de cuatro routers, los proveedores iban saliendo de la DHT.
@@ -371,7 +374,7 @@ Cuatro ensayos, cada uno en un `PALS_EXIT_DIR` nuevo, llevaron a esta ejecución
    - **La prueba.** `dht_transport::a_peer_down_costs_one_dial_whatever_its_addresses` falla sin la corrección, porque el segundo marcado espera su propio plazo. Comprueba también que un marcado nuevo vuelve a intentarlo, y que uno de una dirección que el fallido no llevaba sigue intentándolo.
    - **Los checks.** `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` y `cargo test --workspace --locked`, en verde.
 
-   En esta ejecución, las 4 vueltas de los proveedores con `r1` parado y las 16 con `r2` y `r4` parados terminaron sin error.
+   En esta ejecución, las 7 vueltas de los proveedores vistas con `r1` parado y las 16 con `r2` y `r4` parados terminaron sin error.
 2. **Producto, la primera versión de esa corrección.** Hacía fallar cualquier marcado posterior a un fallo del mismo par. En el segundo ensayo, la red no llegó a asentarse: los routers no tenían los registros de los proveedores del otro operador. Un marcado puede llevar menos direcciones de las que libp2p prueba, cuando la libreta de direcciones aún no las conoce todas. Desde entonces solo cuenta el fallo de un marcado que llevaba esa dirección, y la prueba lo cubre.
 3. **Arnés.**
    - **Caso 3.** `c5` tiene a `r3` como contacto, y su búsqueda lo descarta en la card (`no skill of …`); el arnés lo contaba como un candidato de más. Además, al recrear el contenedor de `c5` el arnés seguía usando el id de agente del anterior.
@@ -379,17 +382,32 @@ Cuatro ensayos, cada uno en un `PALS_EXIT_DIR` nuevo, llevaron a esta ejecución
    - **Caso 9.** En el cuarto ensayo el caso falló porque el arnés tomaba la hora del cambio cuando volvía `docker network connect`, y para entonces `p3` ya había emitido y publicado su contacto nuevo. Ahora el cambio cuenta desde antes del `disconnect`, y el caso comprueba también que `c1` recibe de la DHT el contacto nuevo.
    - **Las búsquedas de prueba.** Se guardan con el nodo y el cuerpo, y los registros de los routers se revisan tras el caso 2.
 4. **Una ejecución interrumpida.** El tercer ensayo coincidió con la batería de pruebas del daemon y con otra carga del anfitrión: la carga llegó a 224, y un `docker cp` se quedó parado en `preparar`. Se interrumpió con `SIGTERM`. El arnés desmontó todo lo suyo (`quedan: 0 contenedores, 0 redes`), y comprobó así la protección de las ejecuciones interrumpidas.
+5. **Arnés, tras la revisión de la tarea (`9ff835f`).**
+   - **La primera ejecución completa.** Se hizo con el arnés de `29f8c5b`, aún sin commit, sobre `db4d1ee`, entre las 02:41 y las 02:57 UTC, y superó los nueve casos. Sus líneas `RESULTADO` muestran que cada guion de comprobación llegó al final.
+   - **El fallo.** La revisión encontró que cinco casos (1, 3, 6, 8 y 9) daban por superado un caso cuando su propio guion de Python se rompía. Juzgaban por la ausencia de líneas `PROBLEMA`, y un guion roto no escribe ninguna. Una búsqueda guardada vacía, por un `docker exec` fallido, rompía el guion. Lo reprodujo con el caso 6 y el caso 9.
+   - **Fallar cerrado.** Ahora cada caso se supera solo si su guion termina con estado 0 y escribe `OK`. Un fichero de búsqueda vacío o que no es una búsqueda queda como una búsqueda sin respuesta: con su nodo, sacado del nombre, y ordenada la última. Una búsqueda sin respuesta es un problema del caso. Comprobado aparte, con los ficheros de la primera ejecución:
+     - con un fichero vacío, el caso 6 y el caso 9 fallan;
+     - con una línea rota en `estados.jsonl`, el guion del caso 6 se rompe, y el caso falla.
+   - **Las demás correcciones de la revisión:**
+     - en el caso 7, el daemon de cada router se reconoce por su PID y la hora de arranque de un proceso vivo, no por el contenido de `daemon.pid`, y la ráfaga empieza cuando `c3` ya busca;
+     - una restauración que no consigue que los routers vuelvan a guardarlo todo hace fallar el caso que paró a los agentes;
+     - un `PeerId` que no se lee hace fallar el caso, en lugar de valer para cualquier línea;
+     - el caso 3 exige que ninguna vuelta de publicación de los proveedores falle con `r1` parado;
+     - la topología se define una vez en el arnés y llega a los guiones como JSON;
+     - la nota de procedencia de `preparar` usa `git status --porcelain`, que también ve los ficheros sin seguimiento.
+
+     Esta ejecución es la primera con el arnés en un commit, `9ff835f`, sin cambios en el árbol.
 
 ## Observaciones
 
 1. **Cada búsqueda espera al proveedor de la otra red.**
-   - Con los 3 s por candidato por defecto, toda búsqueda tarda 3 s y dice `partial (timeout)`, aunque el primer candidato válido llegue en unos 44 ms. Es la topología: el contacto de un proveedor de la otra red lleva una dirección que el cliente no puede alcanzar.
+   - Con los 3 s por candidato por defecto, toda búsqueda tarda 3 s y dice `partial (timeout)`, aunque el primer candidato válido llegue en unos 42 ms. Es la topología: el contacto de un proveedor de la otra red lleva una dirección que el cliente no puede alcanzar.
    - En redes reales, con `relay = true` o con rutas entre las redes, ese candidato contestaría. Con direcciones privadas de otras redes en los contactos, el plazo por candidato es el coste.
 2. **Un router caído retrasa cada búsqueda 3 s.** `libp2p-kad` 0.49 no quita de la tabla de rutas a un par que no contesta mientras no le haga falta el sitio, y con 4 routers nunca le hace falta. Mientras el router está parado, cada búsqueda en la DHT le pregunta y agota sus 3 s (`dht timeout`). Aun así, encuentra a los proveedores en los demás (casos 3 y 5).
 3. **La ráfaga no llega a los routers.** El límite de 4 búsquedas de un daemon recorta una ráfaga antes de que pese en las cuotas de los routers, y `refused.streams` se quedó en 0. Lo que esas cuotas aguantan lo prueban las pruebas de integración (`a_round_of_32_capabilities_fits_the_routers_quotas` y los límites de `dht_transport`), no esta ráfaga.
 4. **El cambio de red se ve en el acto.** Dentro del contenedor, Iroh vio la interfaz nueva y la dirección nueva en el mismo segundo. El contacto nuevo llegó a los routers antes de que los clientes buscaran.
-5. **El tráfico en reposo depende de `republish_s`.** Con los plazos de la fase 1 (40 s), un router mueve unos 315 kB/min y un proveedor 243 kB/min. Con los valores por defecto (`republish_s = 1200`), las vueltas y la replicación serían 30 veces menos frecuentes.
-6. **La carga del anfitrión**, de 6,6 a 27,4 durante la ejecución, no cortó ninguna búsqueda por plazos más allá de los esperados. En el cuarto ensayo, con la carga entre 10 y 34, el primer candidato válido tuvo p50 41 ms y p95 181 ms; aquí, 44 ms y 67 ms.
+5. **El tráfico en reposo depende de `republish_s`.** Con los plazos de la fase 1 (40 s), un router mueve unos 318 kB/min y un proveedor 243 kB/min. Con los valores por defecto (`republish_s = 1200`), las vueltas y la replicación serían 30 veces menos frecuentes.
+6. **La carga del anfitrión**, de 3,4 a 9,3 durante la ejecución, no cortó ninguna búsqueda por plazos más allá de los esperados. Los tiempos varían de una ejecución a otra sin relación clara con la carga. En la ejecución anterior, con la carga entre 6,6 y 27,4, el primer candidato válido tuvo p50 44 ms y p95 67 ms; aquí, 42 ms y 178 ms.
 
 ## Lo que no cubre
 
