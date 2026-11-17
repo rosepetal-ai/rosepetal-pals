@@ -41,8 +41,8 @@
 //! [`Store::peer_record_accept`] as a discovery answer's do: one that goes
 //! back from the newest this agent knows of the agent discards it at the
 //! card, `record regression`. Then it is dialed at its contact record's
-//! direct addresses and relay ([`contact_addr`]) and evaluated as any PALS
-//! peer, below, with the grant this agent holds of it, if any: one it holds
+//! direct addresses and relay, those [`contact_addr`] keeps, and evaluated
+//! as any PALS peer, below, with the grant this agent holds of it, if any: one it holds
 //! no grant of for the project gets neither the project nor the inventory
 //! ids, and is ranked with `grant_held: false` and `from_dht: true`.
 //!
@@ -297,6 +297,10 @@ pub struct SearcherParts {
     /// The node's DHT, when it is on: where a search finds the providers
     /// that are no contacts.
     pub dht: Option<Dht>,
+    /// Whether the node's endpoint is bound to loopback: only then is a
+    /// loopback address of a DHT provider's contact dialed
+    /// ([`contact_addr`]).
+    pub on_loopback: bool,
 }
 
 /// Searches this agent's contacts for a provider (see the [module](self)).
@@ -787,6 +791,7 @@ impl Searcher {
         let store = Arc::clone(&self.inner.parts.store);
         let project = req.project.clone();
         let now = self.inner.parts.clock.now_unix();
+        let on_loopback = self.inner.parts.on_loopback;
         let checked = tokio::task::spawn_blocking(move || {
             let mut entries = Vec::new();
             let mut discarded = Vec::new();
@@ -800,7 +805,7 @@ impl Searcher {
                     discarded.push(discard(&name, Stage::Card, REGRESSION));
                     continue;
                 }
-                let addr = contact_addr(&found.contact.doc.iroh);
+                let addr = contact_addr(&found.contact.doc.iroh, on_loopback);
                 let peer = pals_peer(&store, found.agent_id, addr, &project, now, true)?;
                 entries.push(Entry {
                     name,

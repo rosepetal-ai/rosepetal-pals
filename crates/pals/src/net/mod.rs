@@ -13,14 +13,15 @@
 //!
 //! An agent's id is its endpoint's id ([`agent_id_of`], [`endpoint_id_of`]);
 //! [`peer_addr`] is where to dial one from its ticket, and [`contact_addr`]
-//! from its signed contact record.
+//! from its signed contact record, which another agent wrote: only at the
+//! addresses [`routable`] keeps and an `https` relay.
 
 mod tunnel_client;
 mod tunnel_server;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
-use iroh::{EndpointAddr, EndpointId, RelayUrl, TransportAddr};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use iroh_tickets::endpoint::EndpointTicket;
 use pals_core::identity::AgentId;
 use pals_core::records::IrohContact;
@@ -81,20 +82,46 @@ pub fn peer_addr(id: &AgentId, ticket: Option<&str>) -> EndpointAddr {
     EndpointAddr::from_parts(endpoint_id, addrs)
 }
 
+/// Whether `endpoint` is bound to loopback: only then is a peer's
+/// loopback address one to dial.
+pub fn bound_on_loopback(endpoint: &Endpoint) -> bool {
+    endpoint
+        .bound_sockets()
+        .iter()
+        .any(|socket| socket.ip().is_loopback())
+}
+
+/// Whether `ip`, an address another agent gave, is one to dial: not
+/// unspecified, multicast nor link-local, and loopback only when this
+/// node is bound there (`on_loopback`, [`bound_on_loopback`]). Private
+/// ranges are: a LAN is one.
+pub fn routable(ip: IpAddr, on_loopback: bool) -> bool {
+    let ip = ip.to_canonical();
+    let link_local = match ip {
+        IpAddr::V4(ip) => ip.is_link_local(),
+        IpAddr::V6(ip) => ip.is_unicast_link_local(),
+    };
+    !ip.is_unspecified() && !ip.is_multicast() && !link_local && (!ip.is_loopback() || on_loopback)
+}
+
 /// Where to dial the endpoint of `contact`, an agent's contact record:
-/// its direct addresses and its relay, each that reads as one. The record
-/// is verified before: its endpoint is its agent's own, and the
-/// connection's handshake proves it.
-pub fn contact_addr(contact: &IrohContact) -> EndpointAddr {
+/// its direct addresses that read as one and are [`routable`] from a node
+/// bound on loopback or not (`on_loopback`), and its relay when it reads as
+/// one and is `https`. The record is verified before: its endpoint is its
+/// agent's own, and the connection's handshake proves it; what it names is
+/// the agent's word all the same.
+pub fn contact_addr(contact: &IrohContact, on_loopback: bool) -> EndpointAddr {
     let direct = contact
         .direct_addrs
         .iter()
         .filter_map(|addr| addr.parse::<SocketAddr>().ok())
+        .filter(|addr| routable(addr.ip(), on_loopback))
         .map(TransportAddr::Ip);
     let relay = contact
         .relay_url
         .as_deref()
         .and_then(|url| url.parse::<RelayUrl>().ok())
+        .filter(|url| url.scheme() == "https")
         .map(TransportAddr::Relay);
     EndpointAddr::from_parts(endpoint_id_of(&contact.endpoint_id), direct.chain(relay))
 }
@@ -147,7 +174,7 @@ mod tests {
                 "[2001:db8::10]:4433".to_owned(),
             ],
         };
-        let addr = contact_addr(&contact);
+        let addr = contact_addr(&contact, false);
         assert_eq!(addr.id, endpoint_id_of(&id));
         let relay: RelayUrl = "https://relay.example.org./".parse().unwrap();
         assert_eq!(
@@ -164,6 +191,66 @@ mod tests {
             direct_addrs: Vec::new(),
             ..contact
         };
-        assert_eq!(contact_addr(&bare), EndpointAddr::new(endpoint_id_of(&id)));
+        assert_eq!(
+            contact_addr(&bare, false),
+            EndpointAddr::new(endpoint_id_of(&id))
+        );
+    }
+
+    #[test]
+    fn contact_addr_keeps_only_routable_addresses_and_an_https_relay() {
+        let id = AgentKey::generate().id();
+        let contact = IrohContact {
+            endpoint_id: id,
+            relay_url: Some("http://relay.example.org./".to_owned()),
+            direct_addrs: vec![
+                "169.254.10.1:4433".to_owned(),
+                "[fe80::1]:4433".to_owned(),
+                "0.0.0.0:4433".to_owned(),
+                "[::]:4433".to_owned(),
+                "224.0.0.251:4433".to_owned(),
+                "[ff02::1]:4433".to_owned(),
+                "127.0.0.1:4433".to_owned(),
+                "[::1]:4433".to_owned(),
+                "[::ffff:127.0.0.1]:4433".to_owned(),
+                "192.0.2.10:4433".to_owned(),
+                "10.213.73.20:4433".to_owned(),
+            ],
+        };
+        let ip = |addr: &str| TransportAddr::Ip(addr.parse().unwrap());
+        // An http relay, link-local, unspecified and multicast addresses
+        // go; private ranges stay, and loopback only for a node bound
+        // there.
+        let elsewhere = contact_addr(&contact, false);
+        assert_eq!(
+            elsewhere.addrs,
+            [ip("192.0.2.10:4433"), ip("10.213.73.20:4433")].into()
+        );
+        let on_loopback = contact_addr(&contact, true);
+        assert_eq!(
+            on_loopback.addrs,
+            [
+                ip("127.0.0.1:4433"),
+                ip("[::1]:4433"),
+                ip("[::ffff:127.0.0.1]:4433"),
+                ip("192.0.2.10:4433"),
+                ip("10.213.73.20:4433"),
+            ]
+            .into()
+        );
+        // Only an https relay is dialed.
+        for (url, kept) in [
+            ("https://relay.example.org./", true),
+            ("http://relay.example.org./", false),
+            ("ftp://relay.example.org./", false),
+        ] {
+            let relayed = IrohContact {
+                relay_url: Some(url.to_owned()),
+                direct_addrs: Vec::new(),
+                ..contact.clone()
+            };
+            let addrs = contact_addr(&relayed, false).addrs;
+            assert_eq!(addrs.len(), usize::from(kept), "{url}: {addrs:?}");
+        }
     }
 }

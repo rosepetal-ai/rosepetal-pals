@@ -216,7 +216,7 @@ use crate::discovery::{
 use crate::inventory::InventoryState;
 #[cfg(doc)]
 use crate::inventory::RefreshReport;
-use crate::net::{PeerHttp, TunnelError, contact_addr, peer_addr};
+use crate::net::{PeerHttp, TunnelError, bound_on_loopback, contact_addr, peer_addr};
 use crate::node::ticket_of;
 use crate::outbox::{AskError, OfferLookupError, Outbox, received_offer_ref};
 
@@ -385,6 +385,7 @@ impl GatewayState {
             limits: discovery_limits,
             aliases,
             dht: dht.clone(),
+            on_loopback: bound_on_loopback(&endpoint),
         });
         Self {
             inner: Arc::new(Inner {
@@ -658,6 +659,7 @@ impl GatewayState {
     async fn resolve(&self, peer: String) -> Result<Option<Resolved>, StoreUnavailable> {
         let store = Arc::clone(&self.inner.store);
         let now = self.inner.clock.now_unix();
+        let on_loopback = bound_on_loopback(&self.inner.endpoint);
         blocking(move || {
             let (id, contact) = match peer.parse::<AgentId>() {
                 Ok(id) => (id, store.contact_by_id(&id)?),
@@ -668,7 +670,7 @@ impl GatewayState {
             };
             let addr = match contact {
                 Some(contact) => peer_addr(&id, contact.ticket.as_deref()),
-                None => recorded_addr(&store, &id, now)?,
+                None => recorded_addr(&store, &id, now, on_loopback)?,
             };
             Ok(Some(Resolved::Peer(Target { id, addr })))
         })
@@ -724,19 +726,25 @@ impl GatewayState {
 }
 
 /// Where to dial `id`, an agent with no saved contact: at the direct
-/// addresses and relay of the newest contact record `store` knows of it
-/// ([`contact_addr`]), when that record verifies as `id`'s own and is in
+/// addresses and relay of the newest contact record `store` knows of it,
+/// those [`contact_addr`] keeps for a node bound on loopback or not
+/// (`on_loopback`), when that record verifies as `id`'s own and is in
 /// force at `now_unix`, with [`CLOCK_SKEW_S`] of tolerance; else by its id
 /// alone ([`peer_addr`]). Records come from discovery answers and the DHT,
 /// each verified and accepted when it arrived.
 ///
 /// [`CLOCK_SKEW_S`]: pals_core::grant::CLOCK_SKEW_S
-fn recorded_addr(store: &Store, id: &AgentId, now_unix: i64) -> anyhow::Result<EndpointAddr> {
+fn recorded_addr(
+    store: &Store,
+    id: &AgentId,
+    now_unix: i64,
+    on_loopback: bool,
+) -> anyhow::Result<EndpointAddr> {
     let recorded = store.peer_record(id, CONTACT)?.and_then(|(_, json)| {
         let record = Signed::<ContactRecord>::from_json(&json).ok()?;
         let doc = &record.doc;
         let in_force = check_validity(&doc.issued_at, &doc.expires_at, now_unix).is_ok();
-        (doc.agent_id == *id && in_force).then(|| contact_addr(&doc.iroh))
+        (doc.agent_id == *id && in_force).then(|| contact_addr(&doc.iroh, on_loopback))
     });
     Ok(recorded.unwrap_or_else(|| peer_addr(id, None)))
 }

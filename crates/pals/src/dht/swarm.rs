@@ -144,7 +144,7 @@ use super::transport::{
 use super::validate::{self, Rejection, Verdict};
 use super::{DhtError, DhtLookup, DhtParts, DhtStatus, DhtTiming};
 use crate::config::DhtMode;
-use crate::net::agent_id_of;
+use crate::net::{agent_id_of, bound_on_loopback, routable};
 use crate::node::dialable_addr;
 
 /// The DHT's own Kademlia protocol (design §6.2), never IPFS's: frozen by
@@ -604,7 +604,7 @@ impl Task {
             .first()
             .copied()
             .context("the endpoint is bound to no socket")?;
-        let on_loopback = sockets.iter().any(|socket| socket.ip().is_loopback());
+        let on_loopback = bound_on_loopback(&endpoint);
         swarm
             .listen_on(quic_addr(bound))
             .with_context(|| format!("libp2p cannot listen on the endpoint's {bound}"))?;
@@ -963,11 +963,10 @@ impl Task {
         }
     }
 
-    /// Whether a peer's `socket` is one to dial: not unspecified nor
-    /// multicast, and loopback only when this node is bound there.
+    /// Whether a peer's `socket` is one to dial: [`routable`] from this
+    /// node.
     fn routable(&self, socket: SocketAddr) -> bool {
-        let ip = socket.ip();
-        !ip.is_unspecified() && !ip.is_multicast() && (!ip.is_loopback() || self.on_loopback)
+        routable(socket.ip(), self.on_loopback)
     }
 
     /// `libp2p-kad` drops every address of a peer a dial to it failed at,
