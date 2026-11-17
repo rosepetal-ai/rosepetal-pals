@@ -628,6 +628,35 @@ async fn contacts_come_first_and_each_agent_once() {
 }
 
 #[tokio::test]
+async fn contacts_that_fill_every_place_leave_the_dht_alone() {
+    let net = network(NodeOptions::default()).await;
+    let one = NodeOptions {
+        search_limits: Some(DiscoveryLimits {
+            max_candidates: 1,
+            ..patient()
+        }),
+        ..NodeOptions::default()
+    };
+    let a = requester(&net, one, |_| {}).await;
+    a.add_contact("p2", &net.p2);
+
+    // One place, and one contact to fill it: the lookup is not made, so
+    // no request goes to a router and P1 is never seen; the coverage says
+    // the DHT may have had more.
+    let outcome = a.node.searcher().search(request()).await.unwrap();
+    assert_eq!(outcome.metrics.dht_requests, 0, "{:?}", outcome.metrics);
+    let ranked: Vec<&str> = outcome.ranked.iter().map(|c| c.peer.as_str()).collect();
+    assert_eq!(ranked, ["p2"], "{outcome:#?}");
+    assert!(!names(&outcome, net.p1.id()), "{outcome:#?}");
+    assert_eq!(
+        outcome.coverage,
+        Coverage::Partial {
+            reasons: vec!["candidate limit".to_owned()]
+        }
+    );
+}
+
+#[tokio::test]
 async fn exclude_dht_and_named_peers_never_touch_the_dht() {
     let net = network(NodeOptions::default()).await;
     let a = plain_requester(&net).await;

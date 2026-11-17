@@ -15,8 +15,11 @@
 //!
 //! Then, behind the contacts, the providers of the capability the DHT finds
 //! ([`Dht::providers`]), in the order they arrived, named by their agent id:
-//! only when the node runs the DHT and the request names no `peers` and does
-//! not say `exclude_dht` (H3-D4). Only the capability's key goes to the DHT.
+//! only when the node runs the DHT, the request names no `peers` and does
+//! not say `exclude_dht` (H3-D4), and the contacts leave room for one
+//! ([`DiscoveryLimits::max_candidates`]); when they fill every place, the
+//! lookup is not made, and the coverage is partial, `candidate limit`. Only
+//! the capability's key goes to the DHT.
 //! The lookup asks for up to [`DiscoveryLimits::max_candidates`] + 1
 //! providers within `min(per_candidate_timeout, the budget left)`: a search
 //! with the DHT on waits for it, at most `per_candidate_timeout`, before it
@@ -388,8 +391,8 @@ struct FromDht {
     discarded: Vec<Discarded>,
     /// The requests the lookup sent.
     requests: u64,
-    /// The lookup took every provider it asked for: it may have left some
-    /// out.
+    /// The lookup took every provider it asked for, or was not made
+    /// because the contacts fill every place: it may have left some out.
     full: bool,
     /// Why the DHT leaves the coverage partial: `dht timeout` or
     /// `dht unavailable`.
@@ -698,7 +701,9 @@ impl Searcher {
 
     /// The providers of `req`'s capability the DHT finds behind
     /// `contacts`, as the [module](self) says: nothing when the node runs
-    /// no DHT, or the request names its peers or keeps out of the DHT.
+    /// no DHT, or the request names its peers or keeps out of the DHT; and
+    /// no lookup when `contacts` fill every place, which may leave some
+    /// out.
     async fn looked_up(
         &self,
         req: &SearchRequest,
@@ -712,6 +717,15 @@ impl Searcher {
             return FromDht::default();
         }
         let limits = self.limits();
+        // With no place left behind the contacts, the lookup would tell the
+        // routers what this agent looks for and wait for them, for
+        // providers that would all be left out.
+        if contacts.len() >= limits.max_candidates {
+            return FromDht {
+                full: true,
+                ..FromDht::default()
+            };
+        }
         // Room for every candidate, and one more: a lookup that finds them
         // all may have left some out.
         let limit = limits.max_candidates.saturating_add(1);
