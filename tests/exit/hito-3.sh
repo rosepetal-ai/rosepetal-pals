@@ -15,7 +15,8 @@
 #   pals-exit-h3-p3, -p4   providers of operator 2 on B, through r3
 #   pals-exit-h3-c1, -c2   clients of operator 1 on A, through r1
 #   pals-exit-h3-c3, -c4   clients of operator 2 on B, through r3
-#   pals-exit-h3-c0, -cx, -c5, -rogue   only for their case (1, 1, 3, 6)
+#   pals-exit-h3-c0, -cx, -c6, -c5, -rogue   only for their case (1, 1, 2,
+#                       3, 6)
 #
 # Each agent's config.toml comes from tests/exit/hito-3/operador-1/ or
 # operador-2/, its bootstrap tickets filled in when the routers run; the
@@ -110,12 +111,13 @@ declare -A ADDRS=(
     [r3]="a=10.213.73.13 b=10.213.74.13" [r4]="a=10.213.73.14 b=10.213.74.14"
     [p1]="a=10.213.73.21" [p2]="a=10.213.73.22" [p3]="b=10.213.74.23" [p4]="b=10.213.74.24"
     [c1]="a=10.213.73.31" [c2]="a=10.213.73.32" [c3]="b=10.213.74.33" [c4]="b=10.213.74.34"
-    [c0]="a=10.213.73.40" [c5]="a=10.213.73.45" [cx]="a=10.213.73.46" [rogue]="b=10.213.74.50"
+    [c0]="a=10.213.73.40" [c5]="a=10.213.73.45" [cx]="a=10.213.73.46" [c6]="a=10.213.73.47"
+    [rogue]="b=10.213.74.50"
 )
 # Case 9: p3's address once it moves to network A.
 P3_MOVED=10.213.73.23
 declare -A OPERATOR=(
-    [r1]=1 [r2]=1 [p1]=1 [p2]=1 [c1]=1 [c2]=1 [c0]=1 [c5]=1 [cx]=1
+    [r1]=1 [r2]=1 [p1]=1 [p2]=1 [c1]=1 [c2]=1 [c0]=1 [c5]=1 [cx]=1 [c6]=1
     [r3]=2 [r4]=2 [p3]=2 [p4]=2 [c3]=2 [c4]=2
 )
 # The same topology for the checks, which read it from H3_TOPO: each
@@ -929,8 +931,90 @@ EOS
 )
     note "p1: $accepted task.accepted en su registro de eventos"
     check "p1 acepta una tarea, la de c1" test "$accepted" = 1
+
+    # A searcher with as many saved contacts as places still finds a
+    # provider in the DHT, in the places kept for it ([discovery]
+    # dht_places, 2 by default): c6 has three places (max_candidates = 3,
+    # c6.toml) and three contacts, the routers, which offer nothing.
+    note "c6: max_candidates = 3 y tres contactos guardados, r1, r2 y r3; busca vision.ocr hasta encontrar a p1"
+    local t2 i start c6_out
+    T1=$(ticket r1) || die "no ticket from r1"
+    t2=$(ticket r2) || die "no ticket from r2"
+    T3=$(ticket r3) || die "no ticket from r3"
+    crea c6 && configura c6 || die "c6's container did not start"
+    en c6 <<< "pals init > /dev/null && pals contact add '$T1' --name r1 && pals contact add '$t2' --name r2 && pals contact add '$T3' --name r3" \
+        || die "c6 cannot save its contacts"
+    arranca c6 || die "c6 did not start"
+    agent_id c6 > /dev/null
+    start=$SECONDS
+    i=0
+    while :; do
+        i=$((i + 1))
+        busca c6 "caso2b-c6-$(printf %02d "$i")" "$(cuerpo vision.ocr)"
+        if py "caso2b-c6-$(printf %02d "$i")" <<'PY'
+o = outcome(search(LOGS / "busquedas" / f"{sys.argv[1]}.json"))
+c = parts(o)[0].get(IDS["p1"]) if o else None
+sys.exit(0 if c and verified(c, IDS["p1"], IDS["c6"]) else 1)
+PY
+        then break; fi
+        if [ $((SECONDS - start)) -ge "$FIND_MAX_S" ]; then note "c6 no encuentra a p1 en $FIND_MAX_S s"; break; fi
+        pausa "$POLL_S"
+    done
+    c6_out=$(py <<'PY'
+contacts = ("r1", "r2", "r3")
+places = 3
+ss = sorted(searches("caso2b-c6-"), key=lambda s: s["t1"])
+p1, c6 = IDS["p1"], IDS["c6"]
+problems_ = []
+if not ss:
+    problems_.append("c6 no hizo ninguna búsqueda")
+if unanswered(ss):
+    problems_.append(f"búsquedas de c6 sin respuesta: {unanswered(ss)}")
+first = None
+for s in ss:
+    o = outcome(s)
+    c = parts(o)[0].get(p1) if o else None
+    if c and verified(c, p1, c6):
+        first = s
+        break
+data = {"busquedas": len(ss)}
+if first is None:
+    problems_.append("c6 no tiene a p1 en el ranking desde la DHT, con su card y su oferta verificadas")
+else:
+    o = outcome(first)
+    ranked, discarded = parts(o)
+    evaluated = sorted(n for n in contacts if n in discarded or any(c["peer"] == n for c in o["ranked"]))
+    from_dht = sorted(name(a) for a, c in ranked.items() if c.get("from_dht")) \
+        + sorted(name(a) for a in discarded if a not in contacts)
+    m = o["metrics"]
+    data.update({"busqueda": first["nombre"], "contactos_evaluados": evaluated, "de_la_dht": from_dht,
+                 "contactados": m["contacted"], "dht_requests": m.get("dht_requests", 0),
+                 "cobertura": coverage(o), "segundos": round(first["t1"] - first["t0"], 1)})
+    print(f"c6: {len(ss)} búsquedas; en {first['nombre']}, contactos evaluados {evaluated} de {list(contacts)}, "
+          f"de la DHT {from_dht}, contactados {m['contacted']}, dht_requests {m.get('dht_requests', 0)}, "
+          f"{coverage(o)}, {data['segundos']} s")
+    if m["contacted"] != places or len(evaluated) + len(from_dht) != places:
+        problems_.append(f"c6 no evalúa {places} candidatos: {evaluated} y {from_dht}")
+    if not 1 <= len(evaluated) < len(contacts):
+        problems_.append(f"c6 evalúa los contactos {evaluated}: ni todos ni ninguno")
+    if not m.get("dht_requests"):
+        problems_.append("c6 no pregunta a la DHT")
+    if "candidate limit" not in coverage(o):
+        problems_.append("la cobertura de c6 no dice candidate limit")
+for p in problems_:
+    print("PROBLEMA:", p)
+data["problemas"] = problems_
+save("caso2-c6", data)
+print("OK" if not problems_ else "PROBLEMA")
+PY
+)
+    st=$?
+    echo "$c6_out"
+    check "c6, con tantos contactos guardados como huecos (3), encuentra a p1 en la DHT: en el ranking desde la DHT, con su card y su oferta verificadas; sus contactos ocupan los huecos que la DHT deja" \
+        passed "$st" "$c6_out"
+    docker stop -t 5 "$(ctr c6)" > /dev/null
     [ "$FAILS" = 0 ] || ok=fail
-    result "caso 2" "$ok" "${summary%%, coberturas*}; pregunta a p1: $(grep -x 'echo: hola' <<< "$out")"
+    result "caso 2" "$ok" "${summary%%, coberturas*}; pregunta a p1: $(grep -x 'echo: hola' <<< "$out"); $(grep -E '^c6:' <<< "$c6_out" | cut -c1-240)"
 }
 
 caso3() {
