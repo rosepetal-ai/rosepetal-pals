@@ -67,7 +67,8 @@
 //!   the capabilities the announce no longer lists: an agent has at most
 //!   [`MAX_ANNOUNCED_CAPABILITIES`] provider records at a router at any
 //!   time, each with at most [`validate::MAX_PROVIDER_ADDRS`] addresses
-//!   that name it.
+//!   that name it. A value it stores lives no longer than its signature
+//!   has left by the node's clock, whoever put it.
 //! - **Entry.** Each `[dht] bootstrap` ticket gives its direct IP
 //!   addresses, which go to Kademlia and to the [`AddressBook`], and the
 //!   node bootstraps. If no router answered by the end of it, the node
@@ -1119,14 +1120,19 @@ impl Task {
     }
 
     /// A `PutRecord` to this node: stored only if [`validate::check_put`]
-    /// says so.
-    fn on_put(&mut self, source: PeerId, record: Record) {
+    /// says so, for no longer than its signature has left by the node's
+    /// clock, whoever put it.
+    fn on_put(&mut self, source: PeerId, mut record: Record) {
         let now = self.clock.now_unix();
         let held = held_value(self.kad().store_mut(), &record.key);
         match validate::check_put(&record.key, &record.value, held.as_deref(), now) {
             Verdict::Store => {
                 let changed = held.as_deref() != Some(record.value.as_slice());
                 let (key, value) = (record.key.clone(), record.value.clone());
+                // A third party may put an agent's valid record just before
+                // its signature expires: the copy goes with the signature.
+                let signed_end = self.expiry_of(&key, &value);
+                record.expires = Some(record.expires.map_or(signed_end, |at| at.min(signed_end)));
                 // Too large a value counts as no room too: only a test's
                 // store is smaller than `MAX_RECORD_BYTES`.
                 if let Err(error) = self.with_room(|kad| kad.store_mut().put(record.clone())) {
@@ -1354,7 +1360,7 @@ pub(super) mod tests {
     use iroh::{EndpointAddr, RelayMode, SecretKey, TransportAddr};
     use libp2p::futures::task::noop_waker;
     use pals_core::card_jws::CardHash;
-    use pals_core::clock::SystemClock;
+    use pals_core::clock::{ManualClock, SystemClock};
     use pals_core::grant::format_timestamp;
     use pals_core::identity::AgentKey;
     use pals_core::records::{
@@ -1806,6 +1812,47 @@ pub(super) mod tests {
         let mut kept = vec![located_nowhere(&peer), at(1), at(2)];
         kept.extend((4..=8).map(at));
         assert_eq!(held[0].addresses, kept);
+    }
+
+    #[tokio::test]
+    async fn a_router_keeps_a_copy_no_longer_than_its_signature() {
+        // A router, and an agent's contact and announce whose signature
+        // has 600 s left by the router's clock, put by a third party with
+        // the router's whole `record_ttl`, as `libp2p-kad` hands them over.
+        let clock = Arc::new(ManualClock::new(SystemClock.now_unix()));
+        let router_key = AgentKey::generate();
+        let router_endpoint = endpoint(&router_key).await;
+        let cfg = DhtCfg {
+            enabled: true,
+            mode: DhtMode::Router,
+            ..DhtCfg::default()
+        };
+        let (mut router, _listener) =
+            task_with(router_key, router_endpoint, cfg, None, clock.clone());
+        let ttl = router.timing.record_ttl;
+        let agent = AgentKey::generate();
+        let (contact, announce) =
+            Fixed::expiring(&agent, &["vision.ocr"], clock.now_unix(), 600).current();
+        let keys = [contact_key(&agent.id()), announce_key(&agent.id())];
+        let before = std::time::Instant::now();
+        for (key, value) in keys.iter().zip([contact, announce]) {
+            let mut record = Record::new(key.clone(), value);
+            record.expires = Some(std::time::Instant::now() + ttl);
+            router.on_put(PeerId::random(), record);
+        }
+        let after = std::time::Instant::now();
+        // It keeps each 600 s from when it took it, not its 3600 s.
+        for key in &keys {
+            let expires = router
+                .kad()
+                .store_mut()
+                .get(key)
+                .expect("stored")
+                .expires
+                .expect("an expiry");
+            assert!(expires >= before + Duration::from_secs(600), "{expires:?}");
+            assert!(expires <= after + Duration::from_secs(600), "{expires:?}");
+        }
     }
 
     #[test]

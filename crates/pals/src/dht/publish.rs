@@ -12,7 +12,8 @@
 //! the contact or the announce never outlives its signature: it goes with
 //! the smaller of `record_ttl` and what its signature has left by the
 //! node's clock, which `libp2p-kad` sends as the record's TTL, and a router
-//! keeps the smaller of that and its own `record_ttl`.
+//! keeps the smaller of that, its own `record_ttl` and what the signature
+//! has left by its own clock, whoever put the copy.
 //!
 //! **A round of publication.** There is one when the node enters the
 //! network, one every `republish`, one each time a record is issued again
@@ -89,7 +90,7 @@ use serde::Serialize;
 use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 
-use super::keys::{Slot, agent_of, announce_key, contact_key, provider_key};
+use super::keys::{Slot, agent_of, announce_key, contact_key, provider_key, slot};
 use super::swarm::Task;
 use super::validate::{self, Rejection};
 use super::{DhtCandidate, DhtError, DhtLookup};
@@ -503,10 +504,11 @@ impl Task {
         self.end_round(round);
     }
 
-    /// When a copy of one of the node's own records stops living at the
-    /// routers: `record_ttl` from now, or sooner, when its signature
-    /// expires first at `signed_expires_unix`, by the node's clock. The
-    /// routers keep the smaller of this and their own `record_ttl`.
+    /// When a copy of a signed record stops living, at the routers when it
+    /// is one of the node's own, here when the node is a router:
+    /// `record_ttl` from now, or sooner, when its signature expires first at
+    /// `signed_expires_unix`, by the node's clock. A router keeps the smaller
+    /// of what the copy came with and this.
     fn expiry(&self, signed_expires_unix: Option<i64>) -> std::time::Instant {
         let now = std::time::Instant::now();
         let ttl_end = now + self.timing.record_ttl;
@@ -515,6 +517,17 @@ impl Task {
         };
         let left = u64::try_from(expires - self.clock.now_unix()).unwrap_or(0);
         ttl_end.min(now + Duration::from_secs(left))
+    }
+
+    /// When a copy of `value`, the signed contact or announce under `key`,
+    /// stops living here: [`Task::expiry`] of its signature's `expires_at`.
+    pub(super) fn expiry_of(&self, key: &RecordKey, value: &[u8]) -> std::time::Instant {
+        let signed = match slot(key) {
+            Some(Slot::Contact(_)) => signed_expiry::<ContactRecord>(value),
+            Some(Slot::Announce(_)) => signed_expiry::<AnnounceRecord>(value),
+            None => None,
+        };
+        self.expiry(signed)
     }
 
     /// Puts one of the node's own records at the routers closest to its
