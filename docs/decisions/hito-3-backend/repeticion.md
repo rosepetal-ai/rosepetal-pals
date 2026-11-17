@@ -132,7 +132,7 @@ TTL_S = 3600, REPUBLISH_S = 1200, IDLE_S = 2400. `kad-iroh-production-dial-once`
 | `client_sent_bytes_per_min_p50` | 11737 | 9023 |
 | `client_sent_bytes_per_min_max` | 12153 | 9608 |
 
-Con los intervalos de producción, el tráfico en reposo de un router baja a una cuarta parte, más o menos, en los dos candidatos: de una mediana de 365 130 a 90 908 B/min en `kad-iroh` y de 246 889 a 67 950 en `kad-libp2p`. La distancia entre ellos baja de 1,48 a 1,34 veces, pero son dos cambios a la vez (intervalos y marcado) y una sola ejecución por candidato. La memoria (p50) sigue a favor de `kad-iroh` en los tres papeles, como en la fase 1.
+Con los intervalos de producción, el tráfico en reposo de un router baja a una cuarta parte, más o menos, en los dos candidatos: de una mediana de 365 130 a 90 908 B/min en `kad-iroh` y de 246 889 a 67 950 en `kad-libp2p`. La distancia entre ellos baja de 1,48 a 1,34 veces, pero son dos cambios a la vez (intervalos y marcado) y una sola ejecución por candidato. Tampoco es la misma ventana: con los intervalos de la prueba, el reposo dura 300 s (`IDLE_S` de `params.env`) y S6 llega tras S0 a S5 en la misma ejecución; con los de producción, dura 2400 s y S6 corre sola (`--only S6`). La memoria (p50) sigue a favor de `kad-iroh` en los tres papeles, como en la fase 1.
 
 ### Marcando una sola vez
 

@@ -156,7 +156,7 @@ Sin `listen`, todo queda como en el hito 2: con relay, los puertos libres del pr
 
 ## 6. Lo que guarda un router
 
-El código es `crates/pals/src/dht/validate.rs`, y sus pruebas, `crates/pals/tests/dht_validate.rs`. Un router comprueba cada `PutRecord` y cada `AddProvider` que recibe antes de que llegue a su tienda (`StoreInserts::FilterBoth` de `libp2p-kad`). Quien busca lee los contactos y los anuncios que recibe con las comprobaciones de los valores, el tamaño de la regla 1 y la regla 2, al `Clock` del nodo, y de varias copias de un registro se queda con la válida de mayor `seq` (sección 8). La búsqueda de servicios compara después el contacto y el anuncio de cada proveedor que encontró con los más nuevos que conoce de ese agente, como los de una respuesta de `agentnet-discovery/0` (`Store::peer_record_accept`): uno que vuelve atrás descarta al proveedor, con el motivo `record regression`. Cada registro tiene en un router uno de tres resultados:
+El código es `crates/pals/src/dht/validate.rs`, y sus pruebas, `crates/pals/tests/dht_validate.rs`. Un router comprueba cada `PutRecord` y cada `AddProvider` que recibe antes de que llegue a su tienda (`StoreInserts::FilterBoth` de `libp2p-kad`). Quien busca lee los contactos y los anuncios que recibe con las comprobaciones de los valores, el tamaño de la regla 1 y la regla 2, al `Clock` del nodo, y de varias copias de un registro se queda con la válida de mayor `seq` (sección 8). La búsqueda de servicios compara después el contacto y el anuncio de cada proveedor que encontró y que entra en `max_candidates` (sección 9) con los más nuevos que conoce de ese agente, como los de una respuesta de `agentnet-discovery/0` (`Store::peer_record_accept`): uno que vuelve atrás descarta al proveedor, con el motivo `record regression`. Cada registro tiene en un router uno de tres resultados:
 
 | Resultado | Qué hace el router |
 |-|-|
@@ -342,7 +342,7 @@ Cada vuelta:
 
 1. Deja de anunciar las capacidades que el anuncio ya no lista. Después guarda en la tienda del nodo el provider record propio de cada una de las demás, en el orden del inventario. Una capacidad que no cabe falla sola, por ejemplo en un router que también anuncia y tiene llenas sus 1024 claves de proveedores.
 2. Pone el contacto y el anuncio en los routers más cercanos a sus claves, con quórum de todos ellos. Un registro llegó cuando al menos un router contestó.
-3. Cuando ha terminado el `put` del anuncio, lleva cada capacidad a los routers, como mucho 4 a la vez y en el orden del inventario: cuando termina una, empieza la siguiente. Así una vuelta de muchas capacidades no hace cola tras sí misma por los 4 streams propios que el nodo abre con cada router (sección 5), y esa espera no gasta el plazo de sus peticiones. Para cada capacidad:
+3. Cuando ha terminado el `put` del anuncio, lleva cada capacidad a los routers, como mucho 4 a la vez y en el orden del inventario: cuando termina una, empieza la siguiente. Así una vuelta de muchas capacidades no hace cola tras sí misma por los 4 streams propios que el nodo abre con cada router (sección 5). No los tiene para ella sola: el `put` del contacto puede coincidir con las 4 primeras capacidades, y las búsquedas del nodo pasan por el mismo límite. Lo que un stream espera ahí cuenta en el plazo de 10 s de su petición (sección 5). Para cada capacidad:
    - busca los routers más cercanos a su clave;
    - les pone el anuncio, con quórum de todos ellos: el `put` espera a cada uno;
    - si llegó al menos a uno, les envía después el provider record.
@@ -386,8 +386,8 @@ El nodo nunca se encuentra a sí mismo. Un proveedor que no es candidato se desc
 | Motivo | Cuándo |
 |-|-|
 | `capability_not_announced` | su anuncio válido no lista la capacidad |
-| el de la sección 6 | el último rechazo de una copia de su contacto o de su anuncio, por ejemplo `bad_contact` |
-| `no valid contact`, `no valid announce` | no llegó ninguna copia de su contacto, o de su anuncio |
+| el de la sección 6 | el último rechazo de una copia del registro del que no tiene ninguna válida, por ejemplo `bad_contact`. Si no tiene ninguno de los dos, el del anuncio; si no se rechazó ninguna copia del anuncio, el del contacto |
+| `no valid contact`, `no valid announce` | no llegó ninguna copia del registro que le falta, ni válida ni rechazada. Si le faltan los dos, `no valid contact` |
 
 Una búsqueda termina de una de tres formas:
 

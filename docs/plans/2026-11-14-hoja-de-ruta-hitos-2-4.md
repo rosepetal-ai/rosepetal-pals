@@ -116,7 +116,7 @@ Como se cerró el hito 1, en la última tarea de cada plan:
 
 ### Tareas previstas
 
-Es el esquema de antes de la comparación. El plan lo convirtió en sus tareas 1 a 15, en dos fases, y su tabla «Cómo se reparten las tareas de la hoja de ruta», en [«Cambios respecto al spec y a la hoja de ruta»](2026-11-16-hito-3-descubrimiento-kademlia.md#cambios-respecto-al-spec-y-a-la-hoja-de-ruta), dice adónde fue cada una de estas: la 3 no aplica.
+Es el esquema de antes de la comparación. El plan lo convirtió en sus tareas 1 a 15, en dos fases. La tarea 1 de esta tabla, la comparación, es su fase 1 (tareas 1 a 6). Su tabla «Cómo se reparten las tareas de la hoja de ruta», en [«Cambios respecto al spec y a la hoja de ruta»](2026-11-16-hito-3-descubrimiento-kademlia.md#cambios-respecto-al-spec-y-a-la-hoja-de-ruta), dice adónde fueron en la fase 2 las tareas 2 a 9: la 3 no aplica.
 
 | Tarea | Entregable | Parte del criterio |
 |-|-|-|

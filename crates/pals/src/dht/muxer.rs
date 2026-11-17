@@ -23,9 +23,11 @@
 //!   other side takes to see a stream close, and for a second connection.
 //!   Rounds of publication, lookups and a router's replication all go
 //!   through this one cap. One more waits ([`StreamMuxer::poll_outbound`]
-//!   is pending) until one of them closes, which wakes it; the cap never
-//!   fails a stream. A well-behaved node is never refused for its own
-//!   traffic.
+//!   is pending) until one of them closes, which wakes it: the cap refuses
+//!   no stream. The wait is not free, though: `libp2p-swarm` starts a
+//!   requested stream's timer before it asks the muxer for it, so a stream
+//!   that waits past `libp2p-kad`'s 10 s request timeout fails that
+//!   request. A well-behaved node is never refused for its own traffic.
 //! - **Idle streams.** A stream the other side opened that goes the idle
 //!   timeout with no read or write through it is reset with [`REFUSED`] and
 //!   counted in [`Refusals`], and libp2p drops it, which frees its place in

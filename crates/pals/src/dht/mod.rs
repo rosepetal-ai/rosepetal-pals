@@ -174,9 +174,11 @@ pub struct DhtLookup {
     pub found: Vec<DhtCandidate>,
     /// The providers that were not candidates by the end, each with why:
     /// `capability_not_announced` when its valid announce does not list the
-    /// capability; else the name of the last refusal of a copy of its
-    /// records ([`validate::Rejection::as_str`]), or, with none refused,
-    /// `no valid contact` or `no valid announce`.
+    /// capability; else the record it has no valid copy of: the name of
+    /// the last refusal of a copy of it ([`validate::Rejection::as_str`]),
+    /// or, with none refused, `no valid contact` or `no valid announce`.
+    /// When it has neither, the announce's refusal, else the contact's,
+    /// else `no valid contact`.
     pub discarded: Vec<(AgentId, String)>,
     /// The requests its queries sent to the network.
     pub requests: u64,
