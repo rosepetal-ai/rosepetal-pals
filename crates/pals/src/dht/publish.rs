@@ -18,12 +18,17 @@
 //! network, one every `republish`, one each time a record is issued again
 //! ([`PublishedRecords::changes`]: an address change, or the renewal at
 //! 12 h) and, after a round that reached no router, one after
-//! `retry_after`. A new round finishes whatever queries the previous one
-//! left (`query_mut(id).finish()`). One still looking for its routers then
-//! sends to those it found, which the routers' rules make harmless: an
-//! older record is kept out, and a provider record of a capability the
-//! newer announce no longer lists is refused, or dropped once that announce
-//! arrives. A round:
+//! `retry_after`. A round the timer makes due while another runs waits for
+//! it, and starts as it ends: every round ends in bounded time, each of its
+//! queries lasting `query_timeout` at most. A round of records issued again
+//! does not wait: it supersedes the one running, which ends there, and
+//! finishes the queries it left (`query_mut(id).finish()`). What the
+//! superseded round had not provided yet goes to `failed_capabilities`, and
+//! `last_error` says a new round superseded it, until the new one ends. A
+//! query of it still looking for its routers then sends to those it found,
+//! which the routers' rules make harmless: an older record is kept out, and
+//! a provider record of a capability the newer announce no longer lists is
+//! refused, or dropped once that announce arrives. A round:
 //! 1. stops providing the capabilities the records no longer list, and
 //!    holds the node's own provider record of each of the others, in the
 //!    records' order, with the addresses the node declares;
@@ -47,9 +52,9 @@
 //! answered the announce, or when its provider record never went (its
 //! query ended first). It goes to `failed_capabilities`, in the records'
 //! order, for the next round to try again, and `last_error` says how many
-//! failed, unless something worse went wrong. A round in which no router
-//! answered ends with `last_error` too, and the next comes `retry_after`
-//! later.
+//! failed, unless something worse went wrong. Those a superseded round had
+//! not provided yet go there too. A round in which no router answered ends
+//! with `last_error` too, and the next comes `retry_after` later.
 //!
 //! **A lookup** ([`super::Dht::providers`]) asks for the providers of a
 //! capability's key and, for each provider as it arrives, up to its limit,
@@ -110,13 +115,15 @@ pub struct PublicationStatus {
     /// When the last round ended, by the node's clock.
     pub last_round_unix: Option<i64>,
     /// Why the last round fell short, if it did; the worst reason: the
-    /// node's own store had no room for its records, no router answered
-    /// any of its puts, or how many capabilities it did not provide.
+    /// node's own store had no room for its records, a new round superseded
+    /// it, no router answered any of its puts, or how many capabilities it
+    /// did not provide.
     pub last_error: Option<String>,
-    /// The capabilities the last round could not provide, in the records'
+    /// The capabilities the last round did not provide, in the records'
     /// order: no room in the node's own store, no router closest to their
-    /// key answered their announce, or their provider record never went.
-    /// The next round tries them again.
+    /// key answered their announce, their provider record never went, or a
+    /// new round superseded it before they went. The next round tries them
+    /// again.
     pub failed_capabilities: Vec<String>,
 }
 
@@ -130,8 +137,11 @@ pub(crate) struct Publication {
     /// The round running, if one is.
     round: Option<Round>,
     /// When the next round is due; none before the node entered the
-    /// network.
+    /// network, and none while a round that came due waits for the one
+    /// running.
     next_at: Option<Instant>,
+    /// Whether a round came due while one ran: it starts as that one ends.
+    due: bool,
     status: PublicationStatus,
 }
 
@@ -149,6 +159,7 @@ impl Publication {
             provided: Vec::new(),
             round: None,
             next_at: None,
+            due: false,
             status,
         }
     }
@@ -174,10 +185,12 @@ struct Round {
     /// Whether a router answered any of its puts.
     reached: bool,
     /// The capabilities not provided: no room in the node's store, no
-    /// router that answered their announce, or a provider record that
-    /// never went.
+    /// router that answered their announce, a provider record that never
+    /// went, or a new round that superseded this one first.
     failed: Vec<String>,
     error: Option<String>,
+    /// Whether a new round superseded it.
+    superseded: bool,
 }
 
 /// The capabilities a round takes to the routers at a time: finding their
@@ -339,7 +352,7 @@ impl Task {
     }
 
     /// Ends the lookups whose deadline came, and starts the round that is
-    /// due.
+    /// due; or, while one runs, keeps it due until that one ends.
     pub(super) fn on_timers(&mut self) {
         let now = Instant::now();
         let due: Vec<u64> = self
@@ -357,8 +370,16 @@ impl Task {
             .as_ref()
             .and_then(|p| p.next_at)
             .is_some_and(|at| at <= now);
-        if round_due {
-            self.start_round();
+        if !round_due {
+            return;
+        }
+        match self.publication.as_mut() {
+            Some(publication) if publication.round.is_some() => {
+                publication.next_at = None;
+                publication.due = true;
+                tracing::debug!("a DHT round is due while one runs: it starts once that one ends");
+            }
+            _ => self.start_round(),
         }
     }
 
@@ -372,22 +393,23 @@ impl Task {
         }
     }
 
-    /// Starts a round of publication, as the module says, finishing the
-    /// previous one's queries.
+    /// Starts a round of publication, as the module says, superseding the
+    /// one running, if any.
     pub(super) fn start_round(&mut self) {
         let republish = self.timing.republish;
         let Some(publication) = self.publication.as_mut() else {
             return;
         };
+        publication.due = false;
+        if let Some(previous) = publication.round.take() {
+            self.supersede(previous);
+        }
+        let Some(publication) = self.publication.as_mut() else {
+            return;
+        };
         publication.next_at = Some(Instant::now() + republish);
-        let previous = publication.round.take();
         let provided = std::mem::take(&mut publication.provided);
         let records = Arc::clone(&publication.records);
-        for id in previous.iter().flat_map(|round| round.queries.keys()) {
-            if let Some(mut query) = self.kad().query_mut(id) {
-                query.finish();
-            }
-        }
         let (contact, announce) = records.current();
         let capabilities = records.capabilities();
 
@@ -435,6 +457,7 @@ impl Task {
             reached: false,
             failed,
             error: None,
+            superseded: false,
         };
         match self.put_own(contact_record) {
             Ok(id) => {
@@ -452,6 +475,32 @@ impl Task {
             }
         }
         self.keep_round(round);
+    }
+
+    /// `round` ends here, as a new round starts: the queries it left are
+    /// finished, and the capabilities it had not provided yet, waiting or
+    /// on their way, count as not provided.
+    fn supersede(&mut self, mut round: Round) {
+        for id in round.queries.keys() {
+            if let Some(mut query) = self.kad().query_mut(id) {
+                query.finish();
+            }
+        }
+        let on_their_way = round.queries.drain().filter_map(|(_, step)| match step {
+            Step::Closest(capability, _)
+            | Step::AnnounceAt(capability, _)
+            | Step::Providing(capability) => Some(capability),
+            Step::Contact | Step::Announce => None,
+        });
+        let left: Vec<String> = round
+            .waiting
+            .drain(..)
+            .map(|(capability, _)| capability)
+            .chain(on_their_way)
+            .collect();
+        round.failed.extend(left);
+        round.superseded = true;
+        self.end_round(round);
     }
 
     /// When a copy of one of the node's own records stops living at the
@@ -618,11 +667,14 @@ impl Task {
         self.keep_round(round);
     }
 
-    /// `round` is over: what it did becomes the publication's status, and a
-    /// round that reached no router is tried again after `retry_after`.
+    /// `round` is over: what it did becomes the publication's status. Then,
+    /// unless a new round superseded it, the round that came due while it
+    /// ran starts, and a round that reached no router is tried again after
+    /// `retry_after`.
     fn end_round(&mut self, round: Round) {
         let now_unix = self.clock.now_unix();
-        let retry = Instant::now() + self.timing.retry_after;
+        let now = Instant::now();
+        let retry = now + self.timing.retry_after;
         let Some(publication) = self.publication.as_mut() else {
             return;
         };
@@ -631,15 +683,24 @@ impl Task {
             reached,
             mut failed,
             error,
+            superseded,
             ..
         } = round;
         failed.sort_by_key(|failed| capabilities.iter().position(|c| c == failed));
-        // The worst first: the node's own store, then no router at all.
+        // The worst first: the node's own store, then a new round, which
+        // cut this one short, then no router at all.
         let error = error
+            .or_else(|| superseded.then(|| superseded_error(failed.len())))
             .or_else(|| (!reached).then(|| DhtError::NoRouters.to_string()))
             .or_else(|| (!failed.is_empty()).then(|| not_provided(failed.len())));
-        if !reached {
-            publication.next_at = Some(publication.next_at.map_or(retry, |at| at.min(retry)));
+        // A superseded round's next one is the round that superseded it.
+        if !superseded {
+            if std::mem::take(&mut publication.due) {
+                publication.next_at = Some(now);
+            }
+            if !reached {
+                publication.next_at = Some(publication.next_at.map_or(retry, |at| at.min(retry)));
+            }
         }
         if !failed.is_empty() {
             if failed != publication.status.failed_capabilities {
@@ -892,6 +953,15 @@ fn not_provided(count: usize) -> String {
     }
 }
 
+/// The last error of a round a new round superseded, leaving `count`
+/// capabilities not provided.
+fn superseded_error(count: usize) -> String {
+    match count {
+        0 => "superseded by a new round".to_owned(),
+        n => format!("superseded by a new round: {}", not_provided(n)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
@@ -1071,6 +1141,119 @@ mod tests {
         let key0 = provider_key(&capabilities[0]).unwrap();
         task.on_round_provided(providing, Ok(AddProviderOk { key: key0 }));
         assert_eq!(looking_for(&task, &capabilities), capabilities[1..5]);
+    }
+
+    /// Ends every capability of the round running, each with no router to
+    /// go to and its provider record sent, until the round is over.
+    fn provide_all(task: &mut Task) {
+        loop {
+            let Some(round) = task.publication.as_ref().and_then(|p| p.round.as_ref()) else {
+                return;
+            };
+            let (id, closest_step) = round
+                .queries
+                .iter()
+                .find_map(|(id, step)| match step {
+                    Step::Closest(..) => Some((*id, true)),
+                    Step::Providing(_) => Some((*id, false)),
+                    _ => None,
+                })
+                .expect("a capability on its way");
+            if closest_step {
+                task.on_round_closest(id, closest(&[]));
+            } else {
+                let key = RecordKey::new(b"k");
+                task.on_round_provided(id, Ok(AddProviderOk { key }));
+            }
+        }
+    }
+
+    /// The round that is due comes due now, as `republish` after the last
+    /// one started would make it.
+    fn due_now(task: &mut Task) {
+        task.publication.as_mut().unwrap().next_at = Some(Instant::now());
+    }
+
+    #[tokio::test]
+    async fn a_round_due_while_one_runs_waits_for_it_to_end() {
+        let key = AgentKey::generate();
+        let capabilities: Vec<String> = (0..6).map(|n| format!("test.capability-{n}")).collect();
+        let listed: Vec<&str> = capabilities.iter().map(String::as_str).collect();
+        let mut task = publisher(&key, Fixed::of(&key, &listed)).await;
+        task.start_round();
+        records_answered(&mut task);
+        let first = query(
+            &task,
+            |s| matches!(s, Step::Closest(c, _) if *c == capabilities[0]),
+        );
+
+        // The timer of the next round comes due while this one runs: the
+        // round goes on as it was, with its queries.
+        due_now(&mut task);
+        task.on_timers();
+        assert_eq!(looking_for(&task, &capabilities), capabilities[..4]);
+        let still = query(
+            &task,
+            |s| matches!(s, Step::Closest(c, _) if *c == capabilities[0]),
+        );
+        assert_eq!(still, first, "the same query");
+        assert_eq!(task.next_wake(), None, "no wake for a round while one runs");
+
+        // Once every capability went, the round ends whole, and the next
+        // one is due at once.
+        provide_all(&mut task);
+        let publication = task.publication.as_ref().unwrap();
+        assert!(publication.round.is_none(), "the round ended");
+        assert_eq!(publication.status.failed_capabilities, Vec::<String>::new());
+        assert_eq!(publication.status.last_error, None);
+        assert!(task.next_wake().is_some(), "the next round is due");
+        task.on_timers();
+        let next = task.publication.as_ref().unwrap();
+        assert!(next.round.is_some(), "the next round started");
+        assert_eq!(looking_for(&task, &capabilities), Vec::<String>::new());
+        query(&task, |s| matches!(s, Step::Contact));
+    }
+
+    #[tokio::test]
+    async fn a_round_superseded_by_new_records_reports_what_it_left() {
+        let key = AgentKey::generate();
+        let capabilities: Vec<String> = (0..6).map(|n| format!("test.capability-{n}")).collect();
+        let listed: Vec<&str> = capabilities.iter().map(String::as_str).collect();
+        let mut task = publisher(&key, Fixed::of(&key, &listed)).await;
+        task.start_round();
+        records_answered(&mut task);
+        // The first capability goes whole; the next three are on their
+        // way, and the last two wait.
+        let first = query(
+            &task,
+            |s| matches!(s, Step::Closest(c, _) if *c == capabilities[0]),
+        );
+        task.on_round_closest(first, closest(&[]));
+        let providing = query(&task, |s| matches!(s, Step::Providing(_)));
+        let key0 = provider_key(&capabilities[0]).unwrap();
+        task.on_round_provided(providing, Ok(AddProviderOk { key: key0 }));
+
+        // Records issued again start a round at once: the one running ends
+        // there, and the five it had not provided are
+        // what the status says it left.
+        task.on_change(true);
+        let publication = task.publication.as_ref().unwrap();
+        assert!(publication.round.is_some(), "the new round runs");
+        assert_eq!(looking_for(&task, &capabilities), Vec::<String>::new());
+        let status = publication.status();
+        assert_eq!(status.failed_capabilities, capabilities[1..]);
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("superseded by a new round: 5 capabilities not provided")
+        );
+        assert!(status.last_round_unix.is_some());
+
+        // The new round, once it ends whole, says so.
+        records_answered(&mut task);
+        provide_all(&mut task);
+        let status = task.publication.as_ref().unwrap().status();
+        assert_eq!(status.failed_capabilities, Vec::<String>::new());
+        assert_eq!(status.last_error, None);
     }
 
     #[tokio::test]

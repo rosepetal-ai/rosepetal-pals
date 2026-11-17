@@ -334,7 +334,9 @@ Un nodo publica en vueltas:
 | Cada vez que el nodo vuelve a emitir uno de sus registros: un cambio de direcciones, o la renovación de las 12 h | que el contacto nuevo llegue a los routers en cuanto se emite, no en la vuelta siguiente |
 | 30 s después de una vuelta que no llegó a ningún router | entrar cuanto antes, por ejemplo tras arrancar con los routers caídos |
 
-Una vuelta nueva cierra las consultas que quedaban de la anterior. Cada vuelta:
+Una vuelta que toca por el temporizador nunca corta a la que sigue en curso: espera a que termine y empieza en cuanto termina. Toda vuelta termina en un tiempo acotado, porque cada una de sus consultas dura 20 s como mucho. Una vuelta por registros nuevos, en cambio, no espera: sustituye a la que sigue en curso y cierra las consultas que esa dejó. Lo que la vuelta sustituida no llegó a anunciar va a `failed_capabilities`, y `last_error` dice que la sustituyó una vuelta nueva, hasta que esa termina. Lo prueban `a_round_due_while_one_runs_waits_for_it_to_end` y `a_round_superseded_by_new_records_reports_what_it_left`, en `publish.rs`.
+
+Cada vuelta:
 
 1. Deja de anunciar las capacidades que el anuncio ya no lista. Después guarda en la tienda del nodo el provider record propio de cada una de las demás, en el orden del inventario. Una capacidad que no cabe falla sola, por ejemplo en un router que también anuncia y tiene llenas sus 1024 claves de proveedores.
 2. Pone el contacto y el anuncio en los routers más cercanos a sus claves, con quórum de todos ellos. Un registro llegó cuando al menos un router contestó.
@@ -350,7 +352,7 @@ Una capacidad falla sola, y las demás siguen sin que se deshaga nada, cuando:
 - ningún router de los más cercanos a su clave contestó al anuncio;
 - su provider record no llegó a salir: su consulta terminó antes.
 
-Una capacidad que falla va a `failed_capabilities`, en el orden del inventario, y la vuelta siguiente la intenta otra vez.
+Una capacidad que falla va a `failed_capabilities`, en el orden del inventario, y la vuelta siguiente la intenta otra vez. También van allí las que una vuelta sustituida no llegó a anunciar.
 
 Una vuelta en la que ningún router contestó termina con `last_error`, y la siguiente llega a los 30 s. Con `libp2p-kad` 0.49, un router contesta también a lo que rechaza (sección 6): si lo guardó o no, lo dicen el estado del router y sus rechazos.
 
@@ -405,8 +407,8 @@ Con `[dht] announce`, `GET /dht` y `pals dht status --json` llevan `publication`
 |-|-|
 | `capabilities` | las capacidades públicas de la última vuelta; antes de que termine la primera, las del anuncio en vigor |
 | `last_round_unix` | cuándo terminó la última vuelta, por el reloj del nodo |
-| `last_error` | por qué se quedó corta la última vuelta. Si hay más de un motivo, el más grave: la tienda del propio nodo no tenía sitio para sus registros; no contestó ningún router; o cuántas capacidades no se anunciaron, por ejemplo `2 capabilities not provided` |
-| `failed_capabilities` | las capacidades que la última vuelta no pudo anunciar, en el orden del inventario: no cabían en la tienda del nodo, ningún router de su clave contestó al anuncio, o su provider record no llegó a salir |
+| `last_error` | por qué se quedó corta la última vuelta. Si hay más de un motivo, el más grave: la tienda del propio nodo no tenía sitio para sus registros; una vuelta nueva la sustituyó, por ejemplo `superseded by a new round: 3 capabilities not provided`; no contestó ningún router; o cuántas capacidades no se anunciaron, por ejemplo `2 capabilities not provided` |
+| `failed_capabilities` | las capacidades que la última vuelta no anunció, en el orden del inventario: no cabían en la tienda del nodo, ningún router de su clave contestó al anuncio, su provider record no llegó a salir, o una vuelta nueva la sustituyó antes |
 
 ## 9. La DHT como fuente de la búsqueda de servicios
 
