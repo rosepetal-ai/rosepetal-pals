@@ -142,7 +142,7 @@ a c1 curl -sS http://127.0.0.1:7420/dht
 
 Las búsquedas van por `POST /discovery/search` del gateway de cada cliente, como las de `pals discover`, con `metricas.py busca`. Cada respuesta se guarda con su tiempo y con los bytes que pasaron por las interfaces del cliente mientras duró. Los estados son `GET /dht`.
 
-Nada espera un tiempo fijo: el arnés sondea el estado, cada 3 s, hasta que se cumple lo que espera. Un techo generoso solo sirve para fallar. Los tiempos que tienen un límite (casos 4, 5 y 9) se miden desde el cambio de estado, y se anota la carga del anfitrión.
+Nada espera un tiempo fijo: el arnés sondea el estado, con 3 s de pausa entre un sondeo y el siguiente, hasta que se cumple lo que espera. Un sondeo que busca tarda lo que tarda la búsqueda: en el caso 4, uno cada 6,7 s, más o menos. Un techo generoso solo sirve para fallar. Los tiempos que tienen un límite (casos 4, 5 y 9) se miden desde el cambio de estado, y se anota la carga del anfitrión.
 
 Cada caso juzga con un guion de Python sobre lo que guardó. Un caso solo se supera si el guion llega al final sin error y escribe `OK`: uno que se rompe lo hace fallar. Una búsqueda sin respuesta, o cuyo fichero no se puede leer, cuenta como un problema del caso. Si un caso que paró agentes no consigue que los routers vuelvan a guardarlo todo al restaurarlos, el que falla es ese caso, no el siguiente.
 
@@ -183,7 +183,7 @@ Tras las 160 búsquedas se cuentan además las líneas del registro de cada rout
 
 1. Se para `r1` con `docker kill`, después de leer los tickets de `r1` y `r3`.
 2. Cada cliente busca cada capacidad una vez.
-3. `c5` arranca en la red A. Su arranque es solo `r1`, parado, y antes de arrancar guarda el ticket de `r3` como contacto: la invitación del operador 2. Busca las cuatro capacidades cada 3 s, hasta encontrar los dos proveedores de cada una.
+3. `c5` arranca en la red A. Su arranque es solo `r1`, parado, y antes de arrancar guarda el ticket de `r3` como contacto: la invitación del operador 2. Busca las cuatro capacidades, con 3 s de pausa entre una ronda y la siguiente, hasta encontrar los dos proveedores de cada una.
 4. `c5` se para. `r1` vuelve a arrancar, y se espera a que los routers vuelvan a guardarlo todo.
 
 **Esperado:**
@@ -289,7 +289,7 @@ Se anota el `refused.streams` de cada router durante el caso. Un número distint
    ```
 
    El daemon sigue en marcha. Su endpoint de Iroh, ligado a `0.0.0.0:4433`, ve cambiar sus direcciones.
-3. `c1` y `c2` buscan las capacidades de `p3` cada 3 s, hasta que los dos verifican su card y su oferta.
+3. `c1` y `c2` buscan las capacidades de `p3`, con 3 s de pausa entre una ronda y la siguiente, hasta que los dos verifican su card y su oferta.
 
 **Esperado:**
 - **Antes del cambio,** `p3` descartado en la card por inalcanzable.
