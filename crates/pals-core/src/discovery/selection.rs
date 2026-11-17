@@ -310,9 +310,14 @@ pub struct SearchMetrics {
     pub matching_us: u64,
     pub elapsed_ms: u64,
     /// The requests the lookup in the DHT sent; 0 when there was none, or
-    /// when no router answered it.
-    #[serde(default)]
+    /// when no router answered it. Omitted when 0, so that a search with
+    /// the DHT off writes the metrics of milestone 2 as they were.
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub dht_requests: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// What a search found.
@@ -858,13 +863,22 @@ mod tests {
             ..plain
         };
         assert_eq!(serde_json::to_value(&found).unwrap()["from_dht"], true);
-        // The metrics of milestone 2 read with no lookup.
-        let metrics: SearchMetrics = serde_json::from_value(serde_json::json!({
-            "time_to_first_valid_ms": null, "contacted": 0, "messages": 0, "bytes_sent": 0,
-            "bytes_received": 0, "matching_us": 0, "elapsed_ms": 0
-        }))
-        .unwrap();
+        // The metrics of milestone 2 read with no lookup, and write back
+        // byte for byte; a lookup's requests write when there are some.
+        let hito2 = r#"{"time_to_first_valid_ms":null,"contacted":0,"messages":0,"bytes_sent":0,"bytes_received":0,"matching_us":0,"elapsed_ms":0}"#;
+        let metrics: SearchMetrics = serde_json::from_str(hito2).unwrap();
         assert_eq!(metrics, SearchMetrics::default());
+        assert_eq!(serde_json::to_string(&metrics).unwrap(), hito2);
+        let looked_up = SearchMetrics {
+            dht_requests: 20,
+            ..metrics
+        };
+        let json = serde_json::to_value(&looked_up).unwrap();
+        assert_eq!(json["dht_requests"], 20, "{json}");
+        assert_eq!(
+            serde_json::from_value::<SearchMetrics>(json).unwrap(),
+            looked_up
+        );
     }
 
     #[test]

@@ -261,7 +261,8 @@ def report(reg):
         "con_candidato_pct_caso2": round(100 * with_candidate / len(searches), 1) if searches else None,
         "primer_valido_ms": metric("time_to_first_valid_ms"),
         "elapsed_ms": metric("elapsed_ms"),
-        "dht_requests": metric("dht_requests"),
+        # Omitted when 0: a search whose lookup sent nothing.
+        "dht_requests": spread([o["metrics"].get("dht_requests", 0) for o in outcomes]),
         "contactados": metric("contacted"),
         "mensajes": metric("messages"),
         "bytes_enviados_busqueda": metric("bytes_sent"),

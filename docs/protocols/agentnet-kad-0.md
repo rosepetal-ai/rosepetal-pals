@@ -423,7 +423,7 @@ El código es `crates/pals/src/discovery/search.rs` (`Searcher`), y sus pruebas,
 3. **La DHT,** detrás, solo si el nodo la tiene encendida, la búsqueda no nombra contactos (`--peer`, `peers`) ni dice `--no-dht` (`exclude_dht`), y los contactos dejan sitio dentro de `max_candidates`. Si lo llenan, la búsqueda no consulta la DHT: no envía nada a los routers, y la cobertura es parcial, `candidate limit`. A la DHT solo va la clave de la capacidad (sección 3). La búsqueda en la DHT (sección 8) pide hasta `max_candidates` + 1 proveedores, con el plazo `min(per_candidate_timeout, lo que quede del presupuesto)`: con la DHT encendida, una búsqueda espera a la DHT, como mucho `per_candidate_timeout` (3 s por defecto), antes de evaluar sus contactos. Los proveedores se añaden en el orden en que llegaron, por su id de agente. Uno que ya es contacto sigue siendo el contacto, una sola vez, y la DHT nunca da al propio agente.
 4. **El límite.** Solo se contactan los `max_candidates` primeros (8 por defecto), contactos y proveedores de la DHT juntos.
 
-Las peticiones de la búsqueda en la DHT se cuentan aparte, en `dht_requests` de las métricas.
+Las peticiones de la búsqueda en la DHT se cuentan aparte, en `dht_requests` de las métricas. Cuando son 0, porque no hubo búsqueda en la DHT o no contestó ningún router, el campo se omite: con la DHT apagada, las métricas se escriben como en el hito 2.
 
 ### Cobertura parcial
 

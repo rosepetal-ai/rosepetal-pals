@@ -792,7 +792,7 @@ for s in searches("caso1-c0-"):
         problems.append(f"c0 {capability(s)}: HTTP {s['http']}")
         continue
     print(f"c0 {capability(s)}: ranked {len(o['ranked'])}, discarded {len(o['discarded'])}, "
-          f"{coverage(o)}, dht_requests {o['metrics']['dht_requests']}")
+          f"{coverage(o)}, dht_requests {o['metrics'].get('dht_requests', 0)}")
     if o["ranked"] or o["discarded"]:
         problems.append(f"c0 encuentra a alguien buscando {capability(s)}")
 for tag in ("caso1-c0", "caso1-c0-despues"):
@@ -814,8 +814,8 @@ if o is None:
 else:
     print(f"cx vision.ocr: ranked {[c['peer'] for c in o['ranked']]}, discarded "
           f"{[(d['peer'], d['stage'], d['reason']) for d in o['discarded']]}, {coverage(o)}, "
-          f"dht_requests {o['metrics']['dht_requests']}, contacted {o['metrics']['contacted']}")
-    if o["metrics"]["dht_requests"] != 0:
+          f"dht_requests {o['metrics'].get('dht_requests', 0)}, contacted {o['metrics']['contacted']}")
+    if o["metrics"].get("dht_requests", 0) != 0:
         problems.append("cx hace peticiones a la DHT")
     if any(c.get("from_dht") for c in o["ranked"]):
         problems.append("cx tiene un candidato de la DHT")
@@ -1415,21 +1415,21 @@ for s in hidden:
         problems_.append(f"{s['nombre']}: HTTP {s['http']}")
         continue
     seen = mentions(s, p2)
-    print(f"{s['nodo']} busca {capability(s)}: p2 {'ENCONTRADO' if seen else 'no'}, dht_requests {o['metrics']['dht_requests']}, "
+    print(f"{s['nodo']} busca {capability(s)}: p2 {'ENCONTRADO' if seen else 'no'}, dht_requests {o['metrics'].get('dht_requests', 0)}, "
           f"ranked {len(o['ranked'])}, discarded {len(o['discarded'])}")
-    if seen or o["metrics"]["dht_requests"] == 0:
-        problems_.append(f"{s['nombre']}: p2 {seen}, dht_requests {o['metrics']['dht_requests']}")
+    if seen or o["metrics"].get("dht_requests", 0) == 0:
+        problems_.append(f"{s['nombre']}: p2 {seen}, dht_requests {o['metrics'].get('dht_requests', 0)}")
 for which in ("nodht", "condht"):
     s = search(LOGS / "busquedas" / f"caso8-c1-{which}.json")
     o = outcome(s)
     if o is None:
         problems_.append(f"{which}: HTTP {s['http']}")
         continue
-    print(f"c1 vision.ocr {'con exclude_dht (--no-dht)' if which == 'nodht' else 'sin exclude_dht'}: dht_requests {o['metrics']['dht_requests']}, "
+    print(f"c1 vision.ocr {'con exclude_dht (--no-dht)' if which == 'nodht' else 'sin exclude_dht'}: dht_requests {o['metrics'].get('dht_requests', 0)}, "
           f"de la DHT {sum(1 for c in o['ranked'] if c.get('from_dht'))} en el ranking, {len(o['discarded'])} descartados")
-    if which == "nodht" and (o["metrics"]["dht_requests"] != 0 or any(c.get("from_dht") for c in o["ranked"]) or o["discarded"]):
+    if which == "nodht" and (o["metrics"].get("dht_requests", 0) != 0 or any(c.get("from_dht") for c in o["ranked"]) or o["discarded"]):
         problems_.append("con exclude_dht la búsqueda va a la DHT")
-    if which == "condht" and o["metrics"]["dht_requests"] == 0:
+    if which == "condht" and o["metrics"].get("dht_requests", 0) == 0:
         problems_.append("sin exclude_dht la búsqueda no va a la DHT")
 for p in problems_:
     print("PROBLEMA:", p)

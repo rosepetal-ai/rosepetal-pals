@@ -1092,6 +1092,10 @@ async fn discover_cli_and_mcp_take_exclude_dht() {
         .await,
     );
     assert_eq!(excluded["ranked"], json!([]), "{excluded}");
-    assert_eq!(excluded["metrics"]["dht_requests"], 0, "{excluded}");
+    // No request to the DHT: the metrics write none, as in milestone 2.
+    assert!(
+        excluded["metrics"].get("dht_requests").is_none(),
+        "{excluded}"
+    );
     client.cancel().await.expect("close the session");
 }
