@@ -200,8 +200,9 @@ impl Node {
     /// progress and removes
     /// their working directories ([`TASKS_DIR`]); frees the dedup keys it
     /// left with no execution behind them, and purges the dedup rows older
-    /// than [`DEDUP_RETENTION_S`], and the expired pages of peers' views and
-    /// offers; logs how many questions of its own
+    /// than [`DEDUP_RETENTION_S`], the expired pages of peers' views and
+    /// offers, and the peers' records it no longer needs
+    /// ([`Store::peer_records_purge`]); logs how many questions of its own
     /// [outbox](Outbox) are still pending, and leaves them for
     /// [`Outbox::resume`]: it never sends them again on its own; binds the
     /// gateway's listener on `gateway.listen`, which must be a loopback
@@ -221,8 +222,9 @@ impl Node {
     /// own ([`Dht::spawn`]), and serves [`ALPN_KAD`] with the rest; with
     /// `[dht] announce` too, the DHT publishes those records, and again each
     /// time one is renewed ([`crate::dht::publish`]). While it runs, the node
-    /// purges the dedup rows, the expired pages of peers' views and the
-    /// expired offers again and renews its records every hour, renews them
+    /// purges the dedup rows, the expired pages of peers' views, the
+    /// expired offers and the peers' records it no longer needs again and
+    /// renews its records every hour, renews them
     /// too whenever the endpoint's addresses change, and runs the inventory
     /// adapters every `[inventory] refresh_interval_s`. With the `exec`
     /// worker, its offers report the worker's load
@@ -491,6 +493,8 @@ impl Opened {
                 purge_inventory_cache(&store, started)
                     .context("cannot purge the expired pages of peers' views")?;
                 purge_offers(&store, started).context("cannot purge the expired offers")?;
+                purge_peer_records(&store, started)
+                    .context("cannot purge the peers' forgotten records")?;
                 let pending = store
                     .outbox_pending()
                     .context("cannot read the outbox")?
@@ -858,9 +862,20 @@ fn purge_offers(store: &Store, now_unix: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// [`purge_dedup`], and [`purge_inventory_cache`] and [`purge_offers`] at
-/// `clock`'s time, every [`DEDUP_PURGE_INTERVAL`], for as long as it runs. A
-/// failed purge is logged, and the next one tries again.
+/// Deletes the records of peers that count as none any more at `now_unix`
+/// ([`Store::peer_records_purge`]).
+fn purge_peer_records(store: &Store, now_unix: i64) -> anyhow::Result<()> {
+    let purged = store.peer_records_purge(now_unix)?;
+    if purged > 0 {
+        tracing::debug!(purged, "purged peers' forgotten records");
+    }
+    Ok(())
+}
+
+/// [`purge_dedup`], and [`purge_inventory_cache`], [`purge_offers`] and
+/// [`purge_peer_records`] at `clock`'s time, every
+/// [`DEDUP_PURGE_INTERVAL`], for as long as it runs. A failed purge is
+/// logged, and the next one tries again.
 async fn purge_hourly(store: Arc<Store>, clock: Arc<dyn Clock>) {
     let start = tokio::time::Instant::now() + DEDUP_PURGE_INTERVAL;
     let mut ticks = tokio::time::interval_at(start, DEDUP_PURGE_INTERVAL);
@@ -873,7 +888,8 @@ async fn purge_hourly(store: Arc<Store>, clock: Arc<dyn Clock>) {
             purge_dedup(&store).context("cannot purge the old dedup rows")?;
             purge_inventory_cache(&store, now)
                 .context("cannot purge the expired pages of peers' views")?;
-            purge_offers(&store, now).context("cannot purge the expired offers")
+            purge_offers(&store, now).context("cannot purge the expired offers")?;
+            purge_peer_records(&store, now).context("cannot purge the peers' forgotten records")
         })
         .await;
         match purged {

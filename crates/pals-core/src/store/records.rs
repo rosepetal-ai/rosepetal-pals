@@ -173,6 +173,20 @@ impl Store {
         Ok(accept)
     }
 
+    /// Deletes the records of peers that count as none any more: those
+    /// whose `expires_at` + [`RECORD_TTL_S`] + [`CLOCK_SKEW_S`] is reached at
+    /// `now_unix`, when [`Store::peer_record_accept`] forgets them; how
+    /// many. Searches keep the records of the providers the DHT finds, so
+    /// strangers' too: this keeps them from piling up.
+    pub fn peer_records_purge(&self, now_unix: i64) -> anyhow::Result<u64> {
+        let window = RECORD_TTL_S.saturating_add(CLOCK_SKEW_S);
+        let purged = self.conn().execute(
+            "DELETE FROM peer_records WHERE expires_at <= ?1",
+            [now_unix.saturating_sub(window)],
+        )?;
+        Ok(u64::try_from(purged)?)
+    }
+
     /// The newest record of `kind` known of `agent`, with its `seq`, whether
     /// or not it has expired: the caller checks its validity.
     pub fn peer_record(
