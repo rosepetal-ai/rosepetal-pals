@@ -1,0 +1,21 @@
+# c2: a client of operator 1 on network A, entering through r1.
+[agent]
+name = "c2"
+description = "Cliente c2 del operador 1 en la prueba de salida del hito 3"
+
+[gateway]
+listen = "127.0.0.1:7420"
+
+[worker]
+adapter = "echo"
+
+[net]
+relay = false
+listen = "0.0.0.0:4433"
+
+[dht]
+enabled = true
+mode = "client"
+bootstrap = ["@TICKET_R1@"]
+record_ttl_s = 120
+republish_s = 40

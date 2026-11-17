@@ -1,0 +1,23 @@
+# p4: a provider of operator 2 on network B; announces its public
+# capabilities (p4-inventario.toml), entering through r3.
+[agent]
+name = "p4"
+description = "Proveedor p4 del operador 2 en la prueba de salida del hito 3"
+
+[gateway]
+listen = "127.0.0.1:7420"
+
+[worker]
+adapter = "echo"
+
+[net]
+relay = false
+listen = "0.0.0.0:4433"
+
+[dht]
+enabled = true
+mode = "client"
+bootstrap = ["@TICKET_R3@"]
+announce = true
+record_ttl_s = 120
+republish_s = 40

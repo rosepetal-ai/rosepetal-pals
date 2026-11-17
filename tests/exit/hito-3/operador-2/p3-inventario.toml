@@ -1,0 +1,15 @@
+# p3's inventory: two public services, so two capabilities in the DHT.
+
+[[services]]
+id = "ocr"
+name = "OCR"
+description = "Reads the text of an image"
+capabilities = ["vision.ocr"]
+visibility = "public"
+
+[[services]]
+id = "defects"
+name = "Defect detection"
+description = "Finds defects in images of parts"
+capabilities = ["vision.defect-detection"]
+visibility = "public"

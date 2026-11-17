@@ -1,0 +1,21 @@
+# c0 (case 1): a client on network A with the DHT on but isolated: no
+# bootstrap and no saved contacts.
+[agent]
+name = "c0"
+description = "Cliente c0, aislado, en la prueba de salida del hito 3"
+
+[gateway]
+listen = "127.0.0.1:7420"
+
+[worker]
+adapter = "echo"
+
+[net]
+relay = false
+listen = "0.0.0.0:4433"
+
+[dht]
+enabled = true
+mode = "client"
+record_ttl_s = 120
+republish_s = 40

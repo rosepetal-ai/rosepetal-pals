@@ -1,0 +1,23 @@
+# c5 (case 3): a client of operator 1 on network A whose bootstrap is r1
+# alone; the harness saves r3's ticket as its contact, operator 2's
+# invitation, before it starts, and starts it with r1 down.
+[agent]
+name = "c5"
+description = "Cliente c5 del operador 1 en la prueba de salida del hito 3"
+
+[gateway]
+listen = "127.0.0.1:7420"
+
+[worker]
+adapter = "echo"
+
+[net]
+relay = false
+listen = "0.0.0.0:4433"
+
+[dht]
+enabled = true
+mode = "client"
+bootstrap = ["@TICKET_R1@"]
+record_ttl_s = 120
+republish_s = 40

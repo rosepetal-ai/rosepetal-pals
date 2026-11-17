@@ -1,0 +1,22 @@
+# r1: a router of operator 1 on networks A and B, and the original entry
+# point of the DHT: no bootstrap, it waits for the others to dial it.
+[agent]
+name = "r1"
+description = "Router r1 del operador 1 en la prueba de salida del hito 3"
+
+[gateway]
+listen = "127.0.0.1:7420"
+
+[worker]
+adapter = "echo"
+
+[net]
+relay = false
+listen = "0.0.0.0:4433"
+
+[dht]
+enabled = true
+mode = "router"
+external_addrs = ["10.213.73.11:4433", "10.213.74.11:4433"]
+record_ttl_s = 120
+republish_s = 40

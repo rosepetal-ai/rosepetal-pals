@@ -1,0 +1,23 @@
+# r3: a router of operator 2 on networks A and B; enters the network
+# through r1, operator 1's, and is the entry point of operator 2.
+[agent]
+name = "r3"
+description = "Router r3 del operador 2 en la prueba de salida del hito 3"
+
+[gateway]
+listen = "127.0.0.1:7420"
+
+[worker]
+adapter = "echo"
+
+[net]
+relay = false
+listen = "0.0.0.0:4433"
+
+[dht]
+enabled = true
+mode = "router"
+bootstrap = ["@TICKET_R1@"]
+external_addrs = ["10.213.73.13:4433", "10.213.74.13:4433"]
+record_ttl_s = 120
+republish_s = 40

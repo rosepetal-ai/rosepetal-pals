@@ -1,0 +1,30 @@
+# p2's inventory: two public services, announced in the DHT, and a private
+# service and a project one, which never reach it (case 8).
+
+[[services]]
+id = "review"
+name = "Rust review"
+description = "Reviews Rust code"
+capabilities = ["code.rust.review"]
+visibility = "public"
+
+[[services]]
+id = "defects"
+name = "Defect detection"
+description = "Finds defects in images of parts"
+capabilities = ["vision.defect-detection"]
+visibility = "public"
+
+[[services]]
+id = "transcriber"
+name = "Transcriber"
+description = "Transcribes meetings"
+capabilities = ["audio.transcribe"]
+visibility = "private"
+
+[[services]]
+id = "extraction"
+name = "Data extraction"
+description = "Extracts data from the demo project's documents"
+capabilities = ["data.extraction"]
+visibility = { project = ["demo"] }
